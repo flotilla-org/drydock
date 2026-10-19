@@ -59,7 +59,7 @@ fn tagged_wire_fixtures() {
 #[test]
 fn secret_debug_redacts_without_changing_wire() {
     let value = "sensitive-token";
-    let secret = Secret(value.into());
+    let secret = Secret::new(value);
     let refresh = CredentialRefresh {
         value: secret.clone(),
     };
@@ -99,7 +99,7 @@ fn compatibility_policy() {
         serde_json::from_value::<ResumeToken>(json!({"token":"a","future":true}))
             .unwrap()
             .token
-            .0,
+            .expose(),
         "a"
     );
 }
@@ -120,5 +120,19 @@ fn route_and_version_contract() {
                 .get(format!("/v1/providers/{{provider}}/{operation}"))
                 .is_none()
         );
+    }
+}
+
+// Version negotiation must reject every mismatch, including empty and deceptively similar versions.
+#[test]
+fn hello_requires_exact_protocol_version() {
+    for version in [PROTOCOL_VERSION, "", "0", "2", "1.0.0", "1 "] {
+        let hello = Hello {
+            protocol_version: version.into(),
+            host_version: "test".into(),
+            modules: vec![],
+            providers: vec![],
+        };
+        assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
 }

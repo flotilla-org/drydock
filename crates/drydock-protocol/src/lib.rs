@@ -10,10 +10,24 @@ pub mod openapi;
 pub const PROTOCOL_VERSION: &str = "1";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
+/// PartialEq is for wire-value comparisons, NOT constant-time authentication.
+/// Authentication belongs to hosts, which must use constant-time token comparison.
+/// This type does not promise secure erasure of strings or serialization buffers.
 #[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(transparent)]
 #[schema(value_type = String)]
-pub struct Secret(pub String);
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Explicit plaintext access for transport adapters. Never log this value.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
 
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,6 +76,14 @@ pub struct Hello {
     pub modules: Vec<LoadedModule>,
     pub providers: Vec<ProviderDeclaration>,
 }
+impl Hello {
+    /// Whether this host speaks exactly the client's current wire version.
+    /// Callers must still inspect per-provider readiness before placement.
+    pub fn is_compatible(&self) -> bool {
+        self.protocol_version == PROTOCOL_VERSION
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct LoadedModule {
     pub name: String,

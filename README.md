@@ -94,3 +94,11 @@ confirmed client deletion, matching ADR 0058's loss vocabulary.
 
 Relay and exec clients send `Connection: Upgrade` and `Upgrade: drydock-stream`;
 a successful 101 response echoes both headers before the raw byte stream begins.
+
+`Hello::is_compatible()` performs exact wire-version comparison; callers still
+check each provider's readiness. `Secret::expose()` makes plaintext access
+explicit. Secret's value equality is for protocol data tests and is not a
+constant-time authentication primitive. Hosts must compare authentication tokens
+in constant time and own secret-buffer lifetimes; this wire wrapper does not
+promise secure erasure of SDK or serialization copies. Secret intentionally has
+no Display implementation. Explicit-null serialization is part of protocol v1.

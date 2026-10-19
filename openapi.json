@@ -2081,7 +2081,7 @@
       },
       "Secret": {
         "type": "string",
-        "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value."
+        "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value.\nPartialEq is for wire-value comparisons, NOT constant-time authentication.\nAuthentication belongs to hosts, which must use constant-time token comparison.\nThis type does not promise secure erasure of strings or serialization buffers."
       },
       "Size": {
         "type": "object",
