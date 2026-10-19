@@ -107,3 +107,7 @@ constant-time authentication primitive. Hosts must compare authentication tokens
 in constant time and own secret-buffer lifetimes; this wire wrapper does not
 promise secure erasure of SDK or serialization copies. Secret intentionally has
 no Display implementation. Explicit-null serialization is part of protocol v1.
+
+Exec intentionally uses POST with a 101 upgrade, while relay uses GET; some HTTP
+proxies and generated clients handle POST upgrades poorly, so hosts and clients
+must use a transport that preserves the upgrade rather than changing the method.
