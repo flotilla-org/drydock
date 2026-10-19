@@ -1367,6 +1367,12 @@ async fn first_snapshot_does_not_wait_for_large_poll_interval() {
     h.credential("a", "ready").await;
     let mut stream = tokio::time::timeout(Duration::from_secs(1), h.stream(None)).await.expect("first snapshot must not wait two hours");
     assert!(matches!(stream.next().await, ObserveRecord::Snapshot {environments,..} if environments.is_empty()));
+    // A single slot is indivisible: the immediate poll consumes this shared
+    // window, so a subsequent route is rate-limited with a retry hint.
+    let response = h.ok(Method::GET, "/providers/a/environments", Value::Null, 429).await;
+    assert!(response.headers()["retry-after"].to_str().unwrap().parse::<u64>().unwrap() > 0);
+    assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::RateLimited { .. }));
+    assert_eq!(control.list_calls.load(SeqCst), 1);
 }
 
 // A poll can see absence before the deleting call returns. Only a confirmed
