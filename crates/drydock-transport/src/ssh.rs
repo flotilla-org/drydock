@@ -29,6 +29,7 @@ pub struct SshConfig {
 /// Agent socket permissions and the remote path are the provider's responsibility.
 pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport> {
     limits.validate()?;
+    validate_host_key(&config.host_key)?;
     if config.host.is_empty()
         || config.host.starts_with('-')
         || config.host.contains(['\n', '\r', ' ', '\t', '@'])
@@ -67,7 +68,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     let control = dir.path().join("master");
     let local = forward(&outgoing_path, &config.agent_socket)?;
     let remote = forward(&config.reverse_socket, &incoming_path)?;
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .args([
             "-F",
             "/dev/null",
@@ -110,6 +111,11 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         .stderr(stderr)
         .kill_on_drop(true)
         .spawn()?;
+    let mut setup = SetupGuard {
+        child: Some(child),
+        dir: Some(dir),
+    };
+    let child = setup.child.as_mut().unwrap();
     tokio::time::timeout(limits.header_timeout, async {
         loop {
             if let Some(status) = child.try_wait()? {
@@ -154,6 +160,8 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSH forwarding setup"))??;
+    let mut child = setup.child.take().unwrap();
+    let dir = setup.dir.take().unwrap();
     let (ended, status) = watch::channel(false);
     let (stop, shutdown) = oneshot::channel();
     tokio::spawn(async move {
@@ -219,5 +227,84 @@ impl Connections for SshConnections {
             result = self.native.accept() => result,
             _ = status.wait_for(|ended| *ended) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected")),
         }
+    }
+}
+
+// Setup cancellation and failure use the same reap-before-remove order as a
+// successful transport. Ownership transfers to the live monitor only on success.
+struct SetupGuard {
+    child: Option<tokio::process::Child>,
+    dir: Option<tempfile::TempDir>,
+}
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        if let (Some(mut child), Some(dir)) = (self.child.take(), self.dir.take()) {
+            tokio::spawn(async move {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
+            });
+        }
+    }
+}
+
+fn validate_host_key(key: &str) -> io::Result<()> {
+    let mut fields = key.split_whitespace();
+    let kind = fields.next().unwrap_or_default();
+    let supported = matches!(
+        kind,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+    );
+    let blob = fields.next().unwrap_or_default();
+    if !supported
+        || blob.is_empty()
+        || !blob
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+        || key.contains(['\n', '\r'])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH reach requires a raw OpenSSH host public key, not known-hosts options or markers",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    // Real process boundary: cancelling a partially initialized setup must reap
+    // its child before deleting the socket directory, not leave an orphan behind.
+    #[tokio::test]
+    async fn cancelled_setup_reaps_before_removing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_owned();
+        let child = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        drop(SetupGuard {
+            child: Some(child),
+            dir: Some(dir),
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tokio::fs::try_exists(&path).await.unwrap() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be reaped before its directory disappears"
+        );
     }
 }

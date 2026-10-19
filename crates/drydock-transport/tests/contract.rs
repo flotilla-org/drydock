@@ -803,3 +803,176 @@ async fn fallback_session_limit_preserves_native_accepts() {
     .await
     .unwrap();
 }
+
+// Scripted socket boundary: queue one valid stream, then a transient failure.
+// A full application queue must not prevent the listener from requesting the
+// next connection; dropping a transient diagnostic is safe under overload.
+struct ScriptedAccept {
+    incoming:
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<io::Result<drydock_transport::ByteStream>>>,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl drydock_transport::Connections for ScriptedAccept {
+    async fn connect(&self) -> io::Result<drydock_transport::ByteStream> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+    async fn accept(&self) -> io::Result<drydock_transport::ByteStream> {
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.incoming
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+    }
+}
+#[tokio::test]
+async fn full_queue_does_not_block_transient_accept_recovery() {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let (send, incoming) = tokio::sync::mpsc::channel(4);
+        let source = Arc::new(ScriptedAccept {
+            incoming: tokio::sync::Mutex::new(incoming),
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut transport = Transport::native(
+            source.clone(),
+            Limits {
+                queue: 1,
+                pending_headers: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let (mut client, accepted) = tokio::io::duplex(32);
+        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream))
+            .await
+            .ok()
+            .unwrap();
+        client.write_all(b"DDT\x01\x00\x00").await.unwrap();
+        while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // pending_headers=1 means the first stream is already queued here.
+        send.send(Err(io::Error::from_raw_os_error(libc::EMFILE)))
+            .await
+            .ok()
+            .unwrap();
+        while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            transport.accept().await.unwrap().unwrap().purpose,
+            Purpose::Control
+        );
+        let (mut next, accepted) = tokio::io::duplex(32);
+        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream))
+            .await
+            .ok()
+            .unwrap();
+        next.write_all(b"DDT\x01\x00\x01").await.unwrap();
+        assert_eq!(
+            transport.accept().await.unwrap().unwrap().purpose,
+            Purpose::Router
+        );
+    })
+    .await
+    .expect("a dropped transient notice must not stall a full incoming queue");
+}
+
+// Resource exhaustion backs off exponentially up to one second. Aborted/reset
+// peer connections yield cooperatively without sleeping or throttling admission.
+#[tokio::test(start_paused = true)]
+async fn accept_backoff_distinguishes_resource_exhaustion_and_churn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut errors: Vec<_> = (0..6)
+        .map(|_| io::Error::from_raw_os_error(libc::EMFILE))
+        .collect();
+    errors.extend([
+        io::Error::from(io::ErrorKind::ConnectionAborted),
+        io::Error::from(io::ErrorKind::ConnectionReset),
+        io::Error::from_raw_os_error(libc::ENFILE),
+    ]);
+    let source = FaultyAccept {
+        native: UnixConnections::new(
+            UnixListener::bind(dir.path().join("listen")).unwrap(),
+            dir.path().join("peer"),
+        ),
+        failures: tokio::sync::Mutex::new(errors.into()),
+    };
+    let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
+    let mut previous = tokio::time::Instant::now();
+    for delay in [0, 100, 200, 400, 800, 1000, 1000, 0, 0] {
+        assert_eq!(
+            transport.accept().await.err().unwrap().scope,
+            drydock_transport::ErrorScope::Retrying
+        );
+        assert_eq!(previous.elapsed(), Duration::from_millis(delay));
+        previous = tokio::time::Instant::now();
+    }
+}
+
+// Raw host-key validation refuses known-hosts directives, certificates and bad
+// key blobs before starting an SSH process, even with no usable identity file.
+#[tokio::test]
+async fn ssh_rejects_host_key_options_and_markers() {
+    for key in [
+        "@cert-authority ssh-ed25519 AAAA",
+        "@revoked ssh-ed25519 AAAA",
+        "ssh-ed25519-cert-v01@openssh.com AAAA",
+        "ssh-ed25519",
+        "ssh-ed25519 bad!",
+        "ssh-ed25519 AAAA\n",
+    ] {
+        let config = ssh::SshConfig {
+            host: "127.0.0.1".into(),
+            port: 22,
+            user: "vessel".into(),
+            host_key: key.into(),
+            identity_file: "/nonexistent-drydock-identity".into(),
+            agent_socket: "/tmp/unused-agent".into(),
+            reverse_socket: "/tmp/unused-reverse".into(),
+        };
+        let error = ssh::connect(
+            config,
+            Limits {
+                header_timeout: Duration::from_millis(20),
+                ..Limits::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
+// A rejected remote forward must fail setup, and the same server remains usable
+// for a subsequent valid setup without changing its configuration or credentials.
+#[tokio::test]
+async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("guest");
+    let reverse = dir.path().join("reverse");
+    let (mut config, mut server) = ssh_server(
+        dir.path(),
+        guest.to_str().unwrap(),
+        reverse.to_str().unwrap(),
+    )
+    .await;
+    config.reverse_socket = dir.path().join("missing-directory/reverse");
+    assert_eq!(
+        ssh::connect(config.clone(), Limits::default())
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    config.reverse_socket = reverse.clone();
+    let transport = ssh::connect(config, Limits::default()).await.unwrap();
+    assert!(UnixStream::connect(reverse).await.is_ok());
+    drop(transport);
+    server.kill().await.unwrap();
+}

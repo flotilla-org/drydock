@@ -159,7 +159,8 @@ impl Transport {
         self.opener.open(purpose).await
     }
     /// Connection errors discard only that stream. Retrying errors report a
-    /// transient listener failure; the driver applies backoff and keeps accepting.
+    /// transient listener failure; resource errors back off, connection churn yields.
+    /// Retrying notices are best-effort when the incoming queue is full.
     /// Terminal errors end the driver; drain any queued streams until None.
     pub async fn accept(&mut self) -> Result<Option<Incoming>, AcceptError> {
         self.incoming.recv().await.transpose()
@@ -177,6 +178,7 @@ impl Transport {
         let task = tokio::spawn(async move {
             let mut headers: JoinSet<Option<Transport>> = JoinSet::new();
             let mut sessions = JoinSet::new();
+            let mut backoff = Duration::from_millis(100);
             loop {
                 tokio::select! {
                     biased;
@@ -205,6 +207,7 @@ impl Transport {
                     result = source.accept(), if headers.len() < settings.pending_headers => {
                         match result {
                             Ok(mut stream) => {
+                                backoff = Duration::from_millis(100);
                                 let tx = tx.clone();
                                 let settings = settings.clone();
                                 headers.spawn(async move {
@@ -221,10 +224,24 @@ impl Transport {
                             Err(e) => {
                                 let retry = retryable_accept(&e);
                                 let scope = if retry { ErrorScope::Retrying } else { ErrorScope::Terminal };
-                                if tx.send(Err(AcceptError::new(scope, e))).await.is_err() || !retry { break; }
-                                tokio::select! {
-                                    _ = tx.closed() => break,
-                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                                if !retry {
+                                    let _ = tx.send(Err(AcceptError::new(scope, e))).await;
+                                    break;
+                                }
+                                let connection_churn = matches!(e.kind(), io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted);
+                                // Transient diagnostics are best-effort: a full queue
+                                // must not stop listener progress or task reaping.
+                                if matches!(tx.try_send(Err(AcceptError::new(scope, e))), Err(mpsc::error::TrySendError::Closed(_))) { break; }
+                                if connection_churn {
+                                    backoff = Duration::from_millis(100);
+                                    tokio::task::yield_now().await;
+                                } else {
+                                    let delay = backoff;
+                                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                                    tokio::select! {
+                                        _ = tx.closed() => break,
+                                        _ = tokio::time::sleep(delay) => {},
+                                    }
                                 }
                             }
                         }
