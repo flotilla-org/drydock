@@ -1,0 +1,27 @@
+[package]
+name = "drydock-transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+libc = "0.2"
+axum = { version = "0.8", default-features = false, features = ["http2", "tokio"] }
+bytes = "1"
+futures = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time", "macros", "process", "fs"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+yamux = "0.13"
+tempfile = "3"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+hegeltest = "=0.48.1"
