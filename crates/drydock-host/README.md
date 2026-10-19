@@ -1,11 +1,9 @@
 # Rust reference host
 
 `drydock-host` serves protocol v1 directly from `drydock-protocol`. Its binary
-registers the `reference` module. The crate and binary require Unix (tested on
-Linux): they use Unix sockets, kernel peer credentials, and Unix shutdown signals. Embedders register additional Rust factories in
-`module::Registry` and use the same `Host` router and listeners. The configuration's
-`entrypoint` selects a registered factory, not a shared-library path: Rust's ABI
-is not a plugin ABI. One factory can configure several independent providers.
+registers the in-memory `reference` module. Embedders register additional compiled
+Rust factories in `module::Registry` and use the same router/listeners. The crate
+requires Unix and is tested on Linux.
 
 ```sh
 mkdir -m 700 /tmp/drydock-example
@@ -13,15 +11,17 @@ cargo run -p drydock-host -- --unix /tmp/drydock-example/host.sock
 # Or: --tcp 127.0.0.1:9280 --token-file /tmp/drydock-example/token
 ```
 
-The runtime directory must already exist, be owned by the host user and have
-mode 0700. Rigging creates the 0600 socket or bearer token file. Unix callers must
-have the host's effective UID; an embedder can explicitly select another UID.
-TCP accepts loopback addresses only, requires bearer authorization, and compares
-token hashes in constant time. TCP clients send the numeric bound address in
-`Host`, for example `127.0.0.1:9280`. A restart rotates the token. Ctrl-C and SIGTERM both drain event/upgrade streams
-and remove the owned Unix socket.
+The runtime directory must exist, belong to the host user, and have mode 0700.
+Rigging owns socket binding, peer credentials, token-file creation, constant-time
+comparison, and Host/Origin enforcement. TCP is loopback only and uses the numeric
+bound authority in Host. The host selects bearer-only TCP and the supervisor UID
+through small caller-policy layers pending shared Rigging policy options (#20).
+Ctrl-C and SIGTERM stop observers, drain event/upgrade streams and unlink the
+owned Unix socket. Restart rotates the TCP token.
 
-Configure over the authenticated connection:
+## Configuration and module interface
+
+Send this to `PUT /v1/config` over the authenticated connection:
 
 ```json
 {
@@ -35,98 +35,113 @@ Configure over the authenticated connection:
 }
 ```
 
-Send this document to `PUT /v1/config`, then send `{"value":"example-secret"}`
-to `PUT /v1/providers/test/credential`. Direct values live only in memory;
-configuration holds a reference, never the resolved value. Send the credential
-route again to rotate it. A module's CredentialRejected error marks the provider
-not ready until refresh. The host does not resolve references itself. `Credentials::new` initializes Direct
-mode with no value, never an empty secret; the refresh route is its only delivery
-path and refuses empty strings. Refresh repairs missing-credential readiness.
-Missing-tool, version-mismatch and unknown states remain unchanged; restart those
-modules after correcting their external prerequisites.
+`entrypoint` selects a compiled factory, not a shared-library path. Each factory
+creates an `Arc<dyn Provider>`. **Every provider method takes `&self`; the host
+holds no provider operation lock.** Concurrent prepare, inspect, list, snapshot
+and credential refresh calls remain independent. Stateful modules synchronize
+only their own data; the reference uses a short internal Mutex with no await.
 
-Exact repeated configuration preserves provider state and credentials. New providers
-can be added atomically; replacing or removing a configured provider requires a
-restart and is refused with a typed error. This protects live reference resources
-from accidental loss. Restarting the reference module clears all its state.
-Factories must not publish events or start observations until their provider is
-used, because a later factory can reject the configuration transaction.
+Factories validate settings before commit and must not publish or start detached
+work while configuring. The reference parses a typed settings struct, accepts an
+optional `poll_interval_ms` (positive, default 10) and `fault: <ProtocolError>` for
+error-class conformance, and rejects unknown settings. Exact repeated documents
+preserve providers and credentials; additions commit atomically. Replacement or
+removal currently requires restart, protecting in-memory resources. Stateless
+settings replacement is tracked in #22.
 
-In Proxied mode, the provider's `Credentials` holds the supervisor's placeholder
-and an HTTP client configured to use its proxy. `DRYDOCK_PROXY_CA` names the PEM
-CA file for the binary; embedders use `Host::with_proxy_ca`. Modules use
-`credentials.http` and `credentials.token()` for vendor calls. The client has no
-automatic retries, no redirects, a 30-second timeout, no ambient proxy settings,
-and Rigging's TLS provider. Proxied providers reject Direct refreshes. Modules
-must not build a bypass client, persist credentials, or log serialized requests
-or raw vendor errors. The host does not log request bodies or credentials.
+One shared call helper resolves a provider, checks readiness and cached capability,
+reserves the declared operation/global rate budget, invokes it and records the
+outcome. Optional methods have no duplicate unsupported defaults. A missing
+credential means Unavailable (503), without a vendor call. CredentialRejected
+(502) means a vendor actually rejected a delivered value; readiness then becomes
+MissingCredential until refresh. A stale rejection cannot undo a newer credential
+generation. Hello reads cached declarations without waiting on vendor I/O.
 
-All routes in `openapi.json` are implemented, including optional export, exec,
-usage and quota. Capability declarations gate optional operations. Malformed JSON
-is refused without returning deserialization diagnostics that could contain a
-secret. Errors retain the protocol class and agreed HTTP status; retry hints also
-appear in `Retry-After`. Modules own vendor bounds, granted resources, and vendor
-idempotency. The host checks request sizes, prepared-provider ownership, destination
-syntax, usage periods, and finite reported metering values. It never retries.
+Provision returns a typed Created/Existing result; the host chooses 201/200.
+The same label with a valid changed body returns the existing sandbox, not an
+update. Reach returns a module connection recipe; Relay is a marker and the host
+builds its escaped route. Streams reuse `drydock-transport::ByteStream`.
 
-`Provider` is an asynchronous trait. The host serializes calls within each provider. A short-lived map lock protects
-configuration commits; provider A cannot hold up hello, credential refresh, or
-provider B. Requests use a credential snapshot and generation, so a stale
-rejection cannot undo a newer refresh. Hello reads cached declarations, refreshed
-after provider outcomes and credential changes.
-`EventSink` assigns host-wide cursors and provider identity. Modules publish all
-billing transitions, with RFC 3339 times and their provenance. Background
-observations can publish through a cloned sink. A snapshot records its cursor
-before listing so concurrent observations are replayed rather than lost. This is
-not an atomic vendor snapshot: a background change can appear in both its rows
-and an event replayed after its cursor. Consumers reconcile snapshot rows by
-provider/ID, then apply events in cursor order. A snapshot marks a metering gap;
-its rows do not create extra billing transitions. Event cursors still resume
-exclusively. ADR 0070 does not prescribe an atomic cut between list and events;
-this host chooses overlap over dropping a concurrent observation.
+## Credentials and HTTP transport
 
-The host retains the latest 1024 events in memory. `GET /v1/events` starts with a
-complete snapshot. `?since=` resumes exclusively at a retained cursor, including
-the boundary immediately before the oldest retained event. Unknown, expired or
-previous-process cursors produce a complete snapshot that marks a metering gap.
-Slow readers also recover through snapshots. Streams stay open for new events;
-an unready provider is never called for a snapshot. A complete snapshot cannot
-omit providers, so an initial snapshot failure returns its typed error. One
-unready provider therefore blocks initial/recovery snapshots for all providers;
-replay from a retained cursor continues without listing providers. Recovery lists
-providers sequentially and waits for their operation locks, so its latency can
-include in-flight vendor calls plus each list round trip. Configure request timeouts
-accordingly; the supplied HTTP client bounds each vendor request at 30 seconds.
-Modules must bound any other vendor I/O they perform. A later
-recovery failure fails the HTTP body (rather than clean EOF), allowing the client
-to reconnect. Protocol v1 defines no terminal error record. History is deliberately not persisted.
+Send `{"value":"example-secret"}` to
+`PUT /v1/providers/test/credential`, again whenever it rotates. Direct values
+exist only in memory. `Credentials::new` has no initial secret; empty refreshes
+are refused. The host does not resolve credential references. Tool/version/unknown
+readiness is separate from credential refresh.
 
-Relay clients use `Connection: Upgrade` and `Upgrade: drydock-relay`; exec uses
-POST with a JSON `ExecRequest` and `Upgrade: drydock-stream`. Responses echo both
-headers with 101, then bridge raw bytes with half-close propagation. Modules must
-return a connected stream only after checking the environment and command. Exec
-request bodies are limited to 1 MiB and must arrive within five seconds; timeout
-is a typed Refused error before any provider operation starts.
+Factories receive `Arc<dyn rigging_http_client::HttpClient>` separately from
+credential mode and values. Modules build requests, add the current credential,
+and execute through that port, allowing Rigging stand-in/replay clients in tests.
+The production client comes from Rigging's `ReqwestHttpClient::restricted`:
+no ambient proxy, retries or redirects, a 30-second timeout, an explicit proxy
+when configured and additional supervisor CA roots. No client construction is
+copied into Drydock. `DRYDOCK_PROXY_CA` names a PEM file for the binary;
+embedders use `Host::with_proxy_ca`. Never log serialized credentials, request
+bodies, or raw vendor errors. Proxied providers refuse Direct refreshes.
 
-The reference module implements preparation, concurrent label idempotency,
-list/inspect/destroy, reach/relay, suspend/resume, export, exec, usage and quota.
-Repeated provision with a valid but changed body returns the original sandbox: a
-label identifies creation, not an update. Zero-byte memory/disk and empty usage
-intervals are valid; unsigned wire fields reject negative sizes. Both bare and
-bracketed IPv6 direct host syntax are accepted by the host.
+## Host-owned observation
 
-Its relay and `exec ["cat"]` echo raw bytes; `exec ["echo", ...]` writes one line.
-It spawns no OS processes. Usage returns an empty measurement set and quota counts
-running sandboxes; it has no vendor billing account. It reports advisory egress
-and refuses direct destinations, because an in-memory sandbox cannot enforce a
-firewall. Settings may contain `fault: <ProtocolError>` to exercise every error
-class in conformance tests; this mode is intended only for testing.
+A provider declares `ObservationMode::Poll { interval }` or Push. For Poll the
+host owns one list loop, last-seen state and diffing. It stretches the interval
+within declared list/global limits, shares the budget with route calls, and
+skips missed ticks. Failed or unready lists preserve prior state and never report
+resources gone. Successful complete lists emit Created/Running, Stopped/Paused,
+Resumed/Running, size changes, and Gone transitions. Confirmed requested deletions
+use DestroyedByRequest; unexplained absence uses MissingOnList.
+
+Modules return `ObservedSandbox` from list/inspect: the sandbox plus an optional
+typed provider timestamp. Polling uses that time, including matching inspect
+metadata when list has none; otherwise the host stamps first observation with
+TimestampSource::Adaptor. Push modules publish through EventSink with an optional
+typed timestamp. Some means Provider provenance; None asks the host to stamp
+Adaptor time. Modules never format event times. The reference declares Poll and
+publishes no events itself, so its lifecycle tests exercise the host poller.
+
+The host retains 1024 host-wide events in memory. `GET /v1/events` starts with a
+complete snapshot; `?since=` resumes exclusively at retained cursors. Unknown,
+expired and previous-process cursors produce a new complete gap snapshot. Snapshot
+cursors precede listing: background observations may appear in both rows and later
+events. Reconcile rows by provider/ID, then apply events in cursor order; snapshot
+rows mark a metering gap and are not extra billing transitions. ADR 0070 leaves
+this concurrent cut unspecified; the host chooses overlap over losing a change.
+
+An unready provider blocks a complete snapshot rather than silently omitting its
+resources. Retained-cursor replay does not list. Recovery lists sequentially and
+may wait for vendor calls themselves, but not for an unrelated prepare on the
+same provider. Initial failures are typed HTTP errors; later recovery failures
+fail the HTTP body instead of clean EOF. V1 defines no terminal NDJSON error
+record. Polling naturally cannot report transitions that occur entirely between
+samples; modules with event streams declare Push.
+
+## Routes and validation
+
+All routes in `openapi.json` are implemented. Typed JSON/path extraction returns
+sanitized Refused errors without echoing diagnostics; no status-rewriting layer
+is used. `ProtocolError::status` and every OpenAPI route carry the shared status
+contract. Destination host/IP/CIDR parsing and ordered RFC3339 periods are validated
+by protocol deserialization, and their patterns/formats/invariants appear in the
+schema for other language hosts. Host-specific checks retain provider ownership,
+label semantics and module capability gates.
+
+Relay requests send `Connection: Upgrade` and `Upgrade: drydock-relay`. Exec uses
+POST, typed JSON `ExecRequest`, and `Upgrade: drydock-stream`; its upgrade extractor
+preserves metadata while using the same JSON body path as other routes. Successful
+101 responses echo the headers and bridge raw streams with half-close propagation.
+Shared all-route body deadlines and auth policy options are tracked in #20 and
+Rigging #18. Generic provider call lifetime/cancellation policy is tracked in #19.
+
+The reference echoes relay and `exec ["cat"]`; `exec ["echo", ...]` writes a line
+without OS processes. It reports advisory egress, refuses direct destinations,
+returns no vendor usage measurements and counts running resources for quota.
+Usage/quota numeric output assertions belong in conformance (#21), not routing.
 
 ```sh
-cargo test -p drydock-host --locked
+cargo test -p drydock-host -p drydock-protocol --locked
 ```
 
-The integration suite drives real Unix sockets and loopback TCP. A generated
-stateful scenario checks label idempotency and isolation after each operation;
-named scenarios cover event replay/gaps, concurrent retries, credential rotation,
-all error classes, peer/bearer auth, semantic refusals and raw stream upgrades.
+Tests drive real Unix/TCP endpoints, a generated label lifecycle, host polling,
+provider/inspect timestamp provenance, replay/eviction, concurrent same-provider
+calls, credential rotation, Rigging replay injection, raw upgrades, rate limits,
+auth and shutdown. Shared protocol properties compare decoding with schema rules.
+Endpoint-driven reuse across language hosts is tracked in #21.

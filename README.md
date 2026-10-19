@@ -84,8 +84,10 @@ handshake's `PROTOCOL_VERSION`; it is a wire version, not a Cargo package versio
 Hosts perform semantic validation: CPUs must be finite and strictly positive;
 memory/disk sizes and usage hours must be nonnegative, and hours and reported
 credits must be finite. Credits may be negative when a vendor reports a debt.
-Timestamp formats are schema hints; hosts validate RFC 3339 timestamps, ordered
-periods, destination syntax and provider-specific bounds before vendor calls.
+The protocol's validated HostAddress, Cidr, Port, Timestamp and Period types enforce
+destination syntax and ordered RFC 3339 periods. The generated schema carries the
+same patterns, formats, bounds and period invariant for other hosts. Providers
+validate their own resource bounds before vendor calls.
 
 `Secret` redacts Debug output, including nested credential and reach recipes,
 but deliberately serializes the original string for transport. Never log their

@@ -1,5 +1,6 @@
 //! Reference Rust language host. See the crate README for module and serving contracts.
 pub mod module;
+mod observer;
 pub mod reference;
 use axum::{
     Json, Router,
@@ -11,16 +12,18 @@ use axum::{
     routing::{get, post, put},
 };
 use drydock_protocol::*;
-use module::{Credentials, Provider, Registry, Result, refused};
+use module::{
+    Connection, Credentials, ObservationMode, ObservedSandbox, Provider, Provisioned, Registry,
+    Result, refused,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, watch};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
 const EVENT_HISTORY_CAPACITY: usize = 1024;
-const EXEC_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct EventSink {
@@ -39,8 +42,7 @@ impl EventSink {
         &self,
         id: String,
         label: Option<String>,
-        timestamp: String,
-        source: TimestampSource,
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
         event: EventKind,
     ) {
         let mut log = self
@@ -54,8 +56,12 @@ impl EventSink {
             id,
             provider: self.provider.clone(),
             label,
-            timestamp,
-            timestamp_source: source,
+            timestamp: timestamp.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
+            timestamp_source: if timestamp.is_some() {
+                TimestampSource::Provider
+            } else {
+                TimestampSource::Adaptor
+            },
             event,
         });
         if log.records.len() > EVENT_HISTORY_CAPACITY {
@@ -71,19 +77,138 @@ struct Authentication {
 }
 struct Instance {
     config: ProviderConfiguration,
-    provider: Arc<AsyncMutex<Box<dyn Provider>>>,
-    // Short synchronous access only: release this guard before every await.
+    provider: Arc<dyn Provider>,
+    // Synchronous metadata access only; never hold this guard across await.
     auth: Mutex<Authentication>,
     capabilities: Capabilities,
     rate_limits: Vec<RateLimit>,
+    budget: Mutex<BTreeMap<String, VecDeque<tokio::time::Instant>>>,
+    events: EventSink,
+    observation: ObservationMode,
+    destroyed: Mutex<BTreeSet<String>>,
+    inspected: Mutex<BTreeMap<String, ObservedSandbox>>,
 }
-// Provider operations own a credential snapshot, so refresh never waits for vendor I/O.
-struct Session {
-    instance: Arc<Instance>,
-    provider: OwnedMutexGuard<Box<dyn Provider>>,
-    credentials: Credentials,
-    generation: u64,
+#[derive(Clone, Copy)]
+enum Gate {
+    Any(&'static str),
+    Suspend,
+    Resume,
+    Export,
+    Exec,
+    Usage,
+    Quota,
 }
+impl Gate {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Any(name) => name,
+            Self::Suspend => "suspend",
+            Self::Resume => "resume",
+            Self::Export => "export",
+            Self::Exec => "exec",
+            Self::Usage => "usage",
+            Self::Quota => "quota",
+        }
+    }
+    fn supported(self, c: &Capabilities) -> bool {
+        match self {
+            Self::Any(_) => true,
+            Self::Suspend | Self::Resume => c.suspend_resume,
+            Self::Export => c.export,
+            Self::Exec => c.fallback_runner,
+            Self::Usage => c.usage,
+            Self::Quota => c.quota,
+        }
+    }
+}
+impl Instance {
+    /// Resolve readiness, gate cached capabilities, enforce declared budgets, invoke,
+    /// and update credential rejection state once for every route and host poll.
+    async fn call<T, F, Fut>(&self, gate: Gate, f: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        let (credentials, generation) = {
+            let auth = self
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(auth.readiness, Readiness::Ready) {
+                return Err(ProtocolError::Unavailable {
+                    reason: "provider is not ready; inspect hello".into(),
+                    retry_after: None,
+                });
+            }
+            (auth.credentials.clone(), auth.generation)
+        };
+        if !gate.supported(&self.capabilities) {
+            return Err(refused("operation capability not declared"));
+        }
+        self.reserve(gate.name())?;
+        let result = f(self.provider.clone(), credentials).await;
+        let mut auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if auth.generation == generation {
+            auth.readiness = if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
+                Readiness::MissingCredential {
+                    reason: "credential rejected".into(),
+                }
+            } else {
+                self.provider.readiness(&auth.credentials)
+            };
+        }
+        result
+    }
+    fn reserve(&self, operation: &'static str) -> Result<()> {
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = tokio::time::Instant::now();
+        let limits: Vec<_> = self
+            .rate_limits
+            .iter()
+            .filter(|r| r.operation == operation || r.operation == "*")
+            .collect();
+        for limit in &limits {
+            let longest = self
+                .rate_limits
+                .iter()
+                .filter(|r| r.operation == limit.operation)
+                .map(|r| r.period_seconds)
+                .max()
+                .unwrap_or(0);
+            let times = budget.entry(limit.operation.clone()).or_default();
+            while times.front().is_some_and(|at| {
+                now.duration_since(*at) >= std::time::Duration::from_secs(longest)
+            }) {
+                times.pop_front();
+            }
+            let window = std::time::Duration::from_secs(limit.period_seconds);
+            let active: Vec<_> = times
+                .iter()
+                .filter(|at| now.duration_since(**at) < window)
+                .collect();
+            if active.len() >= limit.requests as usize {
+                let remaining = window.saturating_sub(now.duration_since(*active[0]));
+                return Err(ProtocolError::RateLimited {
+                    reason: "declared provider rate limit".into(),
+                    retry_after: Some(remaining.as_secs().saturating_add(1)),
+                });
+            }
+        }
+        let scopes: BTreeSet<_> = limits.iter().map(|limit| limit.operation.clone()).collect();
+        for scope in scopes {
+            budget.entry(scope).or_default().push_back(now);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default, Clone)]
 struct Configuration {
     modules: Vec<LoadedModule>,
@@ -172,25 +297,10 @@ impl Host {
             .route("/v1/providers/{provider}/usage", get(usage))
             .route("/v1/providers/{provider}/quota", get(quota))
             .fallback(|| async { ApiError(refused("unknown route")) })
+            .method_not_allowed_fallback(|| async { ApiError(refused("unsupported method")) })
             .with_state(self.clone())
-            .layer(middleware::from_fn(
-                |request: Request, next: Next| async move {
-                    let response = next.run(request).await;
-                    // Module responses use ProtocolError statuses. Normalize only HTTP
-                    // extraction/routing failures; never echo their diagnostics.
-                    match response.status() {
-                        StatusCode::BAD_REQUEST
-                        | StatusCode::METHOD_NOT_ALLOWED
-                        | StatusCode::PAYLOAD_TOO_LARGE
-                        | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
-                            ApiError(refused("invalid request or unsupported method"))
-                                .into_response()
-                        }
-                        _ => response,
-                    }
-                },
-            ))
     }
+
     /// Only the specified kernel UID is admitted. TCP auth is provided by rigging.
     pub async fn serve_unix<F: std::future::Future<Output = ()> + Send + 'static>(
         &self,
@@ -246,29 +356,22 @@ impl Host {
             stopping.send_replace(true);
         }
     }
-    async fn instance(&self, name: &str) -> Result<Session> {
-        let instance = self
-            .config
+    async fn instance(&self, name: &str) -> Result<Arc<Instance>> {
+        self.config
             .read()
             .await
             .providers
             .get(name)
             .cloned()
-            .ok_or_else(|| refused("unknown provider"))?;
-        let provider = instance.provider.clone().lock_owned().await;
-        let (credentials, generation) = {
-            let auth = instance
-                .auth
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (auth.credentials.clone(), auth.generation)
-        };
-        Ok(Session {
-            instance,
-            provider,
-            credentials,
-            generation,
-        })
+            .ok_or_else(|| refused("unknown provider"))
+    }
+    async fn call<T, F, Fut>(&self, name: &str, gate: Gate, f: F) -> Result<T>
+    where
+        T: Send,
+        F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T>> + Send,
+    {
+        self.instance(name).await?.call(gate, f).await
     }
     async fn records(&self, cursor: Option<&str>) -> Result<Vec<ObserveRecord>> {
         let replay = {
@@ -317,10 +420,14 @@ impl Host {
         drop(config);
         let mut sandboxes = vec![];
         for name in names {
-            let mut session = self.instance(&name).await?;
-            ready(&session)?;
-            let result = session.provider.list(&session.credentials).await;
-            sandboxes.extend(outcome(&mut session, result)?);
+            let rows = self
+                .call(
+                    &name,
+                    Gate::Any("list"),
+                    |p, c| async move { p.list(&c).await },
+                )
+                .await?;
+            sandboxes.extend(rows.into_iter().map(|row| row.sandbox));
         }
         Ok(ObserveRecord::Snapshot { cursor, sandboxes })
     }
@@ -334,14 +441,7 @@ impl From<ProtocolError> for ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, retry) = match &self.0 {
-            ProtocolError::Refused { .. } => (422, None),
-            ProtocolError::Unavailable { retry_after, .. } => (503, *retry_after),
-            ProtocolError::RateLimited { retry_after, .. } => (429, *retry_after),
-            ProtocolError::QuotaExhausted { .. } => (402, None),
-            ProtocolError::CredentialRejected { .. } => (502, None),
-            ProtocolError::Internal { .. } => (500, None),
-        };
+        let (status, retry) = (self.0.status(), self.0.retry_after());
         let mut response = (StatusCode::from_u16(status).unwrap(), Json(self.0)).into_response();
         if let Some(seconds) = retry {
             response
@@ -352,45 +452,39 @@ impl IntoResponse for ApiError {
     }
 }
 type ApiResult<T> = std::result::Result<T, ApiError>;
-// Never return serde's diagnostics: malformed secret fields could otherwise appear in errors.
-fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
-    serde_json::from_slice(body).map_err(|_| refused("invalid JSON request"))
-}
-fn outcome<T>(session: &mut Session, result: Result<T>) -> Result<T> {
-    let mut auth = session
-        .instance
-        .auth
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // An old rejected request must not undo a concurrently delivered refresh.
-    if auth.generation == session.generation {
-        auth.readiness = if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
-            Readiness::MissingCredential {
-                reason: "credential rejected".into(),
-            }
-        } else {
-            session.provider.readiness(&auth.credentials)
-        };
+// Typed extraction refuses malformed input without echoing diagnostics or secrets.
+struct ApiJson<T>(T);
+impl<S, T> axum::extract::FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+    async fn from_request(
+        request: Request,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(request, state)
+            .await
+            .map_err(|_| ApiError(refused("invalid JSON request")))?;
+        Ok(Self(value))
     }
-    result
 }
-fn ready(session: &Session) -> Result<()> {
-    let auth = session
-        .instance
-        .auth
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match &auth.readiness {
-        Readiness::Ready => Ok(()),
-        Readiness::MissingCredential { reason } => Err(ProtocolError::CredentialRejected {
-            reason: reason.clone(),
-        }),
-        Readiness::MissingTool { reason }
-        | Readiness::VersionMismatch { reason }
-        | Readiness::Unknown { reason } => Err(ProtocolError::Unavailable {
-            reason: reason.clone(),
-            retry_after: None,
-        }),
+struct ApiPath<T>(T);
+impl<S, T> axum::extract::FromRequestParts<S> for ApiPath<T>
+where
+    S: Send + Sync,
+    T: serde::de::DeserializeOwned + Send,
+{
+    type Rejection = ApiError;
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let Path(value) = Path::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError(refused("invalid route identifier")))?;
+        Ok(Self(value))
     }
 }
 async fn hello(State(host): State<Host>) -> Json<Hello> {
@@ -417,8 +511,10 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
             .collect(),
     })
 }
-async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCode> {
-    let request: HostConfiguration = decode(&body)?;
+async fn configure(
+    State(host): State<Host>,
+    ApiJson(request): ApiJson<HostConfiguration>,
+) -> ApiResult<StatusCode> {
     let _transaction = host.configuring.lock().await;
     let mut config = host.config.read().await.clone();
     // Exact repeats preserve resources and delivered credentials. Changes to live providers
@@ -457,21 +553,37 @@ async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCod
             continue;
         }
         let module = &host.registry[&modules[&p.module]];
-        let credentials = Credentials::new(
-            p.credential.clone(),
-            host.proxy_ca.as_deref().map(Vec::as_slice),
-        )?;
+        let credentials = Credentials::new(p.credential.clone());
+        let proxy = match &p.credential {
+            CredentialMode::Proxied { proxy_url, .. } => Some(proxy_url.as_str()),
+            _ => None,
+        };
+        let http = Arc::new(
+            rigging_http_client::ReqwestHttpClient::restricted(
+                proxy,
+                host.proxy_ca.as_deref().map(Vec::as_slice),
+            )
+            .map_err(|_| refused("invalid HTTP transport configuration"))?,
+        );
         let mut sink = host.events.clone();
         sink.provider = p.name.clone();
-        let provider = module.configure(p, sink).await?;
+        let provider = module.configure(p, sink.clone(), http).await?;
         let readiness = provider.readiness(&credentials);
         let capabilities = provider.capabilities();
         let rate_limits = provider.rate_limits();
+        if rate_limits
+            .iter()
+            .any(|r| r.requests == 0 || r.period_seconds == 0)
+        {
+            return Err(refused("invalid declared rate limit").into());
+        }
+        let observation = provider.observation();
+        observer::poll_interval(observation, &rate_limits)?;
         additions.insert(
             p.name.clone(),
             Arc::new(Instance {
                 config: p.clone(),
-                provider: Arc::new(AsyncMutex::new(provider)),
+                provider,
                 auth: Mutex::new(Authentication {
                     credentials,
                     readiness,
@@ -479,10 +591,16 @@ async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCod
                 }),
                 capabilities,
                 rate_limits,
+                events: sink,
+                observation,
+                budget: Mutex::new(BTreeMap::new()),
+                destroyed: Mutex::new(BTreeSet::new()),
+                inspected: Mutex::new(BTreeMap::new()),
             }),
         );
     }
     config.entrypoints = modules;
+    let observers: Vec<_> = additions.values().cloned().collect();
     config.providers.extend(additions);
     config.modules = request
         .modules
@@ -493,14 +611,16 @@ async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCod
         })
         .collect();
     *host.config.write().await = config;
+    for instance in observers {
+        observer::spawn(instance, host.stopping.subscribe());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn credential(
     State(host): State<Host>,
-    Path(p): Path<String>,
-    body: Bytes,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(refresh): ApiJson<CredentialRefresh>,
 ) -> ApiResult<StatusCode> {
-    let refresh: CredentialRefresh = decode(&body)?;
     if refresh.value.expose().is_empty() {
         return Err(refused("credential must not be empty").into());
     }
@@ -530,221 +650,196 @@ async fn credential(
 }
 
 async fn prepare(
-    State(host): State<Host>,
-    Path(p): Path<String>,
-    body: Bytes,
+    State(h): State<Host>,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(r): ApiJson<PrepareRequest>,
 ) -> ApiResult<Json<Prepared>> {
-    let request: PrepareRequest = decode(&body)?;
-    if request.image_digest.is_empty() || request.tools_digest.is_empty() {
+    if r.image_digest.is_empty() || r.tools_digest.is_empty() {
         return Err(refused("digests must not be empty").into());
     }
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    let result = i.provider.prepare(request, &i.credentials).await;
-    Ok(Json(outcome(&mut i, result)?))
-}
-fn valid_host(host: &str) -> bool {
-    if host
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok())
-    {
-        return true;
-    }
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-    let dns = host.strip_suffix('.').unwrap_or(host);
-    !dns.is_empty()
-        && dns.len() <= 253
-        && dns.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    Ok(Json(
+        h.call(&p, Gate::Any("prepare"), |p, c| async move {
+            p.prepare(r, &c).await
         })
+        .await?,
+    ))
 }
-fn validate_provision(p: &str, r: &ProvisionRequest) -> Result<()> {
+async fn provision(
+    State(h): State<Host>,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(r): ApiJson<ProvisionRequest>,
+) -> ApiResult<Response> {
     if r.prepared.provider != p
         || r.label.is_empty()
         || !r.size.cpus.is_finite()
         || r.size.cpus <= 0.0
     {
-        return Err(refused("invalid size, label or prepared provider"));
+        return Err(refused("invalid size, label or prepared provider").into());
     }
-    if let EgressRequest::DenyAll { direct } = &r.egress {
-        for d in direct {
-            let valid = match d {
-                Destination::HostPort { host, port } => *port > 0 && valid_host(host),
-                Destination::Cidr { cidr } => cidr.split_once('/').is_some_and(|(ip, bits)| {
-                    ip.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-                        bits.parse::<u8>()
-                            .is_ok_and(|bits| bits <= if ip.is_ipv4() { 32 } else { 128 })
-                    })
-                }),
-            };
-            if !valid {
-                return Err(refused("invalid direct destination"));
-            }
-        }
+    let result = h
+        .call(&p, Gate::Any("provision"), |p, c| async move {
+            p.provision(r, &c).await
+        })
+        .await?;
+    Ok(match result {
+        Provisioned::Created(s) => (StatusCode::CREATED, Json(s)),
+        Provisioned::Existing(s) => (StatusCode::OK, Json(s)),
     }
-    Ok(())
+    .into_response())
 }
-async fn provision(
-    State(host): State<Host>,
-    Path(p): Path<String>,
-    body: Bytes,
-) -> ApiResult<Response> {
-    let request: ProvisionRequest = decode(&body)?;
-    validate_provision(&p, &request)?;
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    let result = i.provider.provision(request, &i.credentials).await;
-    let (sandbox, created) = outcome(&mut i, result)?;
-    Ok((
-        if created {
-            StatusCode::CREATED
-        } else {
-            StatusCode::OK
-        },
-        Json(sandbox),
-    )
-        .into_response())
+async fn list(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Vec<Sandbox>>> {
+    Ok(Json(
+        h.call(
+            &p,
+            Gate::Any("list"),
+            |p, c| async move { p.list(&c).await },
+        )
+        .await?
+        .into_iter()
+        .map(|r| r.sandbox)
+        .collect(),
+    ))
 }
-macro_rules! simple {
-    ($name:ident, $output:ty) => {
-        async fn $name(
-            State(host): State<Host>,
-            Path((p, id)): Path<(String, String)>,
-        ) -> ApiResult<Json<$output>> {
-            let mut i = host.instance(&p).await?;
-            ready(&i)?;
-            let result = i.provider.$name(&id, &i.credentials).await;
-            Ok(Json(outcome(&mut i, result)?))
-        }
-    };
-}
-simple!(inspect, Sandbox);
-simple!(reach, Reach);
-async fn list(State(host): State<Host>, Path(p): Path<String>) -> ApiResult<Json<Vec<Sandbox>>> {
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    let result = i.provider.list(&i.credentials).await;
-    Ok(Json(outcome(&mut i, result)?))
+async fn inspect(
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
+) -> ApiResult<Json<Sandbox>> {
+    let instance = h.instance(&p).await?;
+    let row = instance
+        .call(Gate::Any("inspect"), |p, c| async move {
+            p.inspect(&id, &c).await
+        })
+        .await?;
+    if row.timestamp.is_some() {
+        instance
+            .inspected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(row.sandbox.id.clone(), row.clone());
+    }
+    Ok(Json(row.sandbox))
 }
 async fn destroy(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    let result = i.provider.destroy(&id, &i.credentials).await;
-    outcome(&mut i, result)?;
+    let instance = h.instance(&p).await?;
+    let removed = id.clone();
+    instance
+        .call(Gate::Any("destroy"), |p, c| async move {
+            p.destroy(&id, &c).await
+        })
+        .await?;
+    instance
+        .destroyed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(removed);
     Ok(StatusCode::NO_CONTENT)
 }
+async fn reach(
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
+) -> ApiResult<Json<Reach>> {
+    let environment = id.clone();
+    let connection = h
+        .call(&p, Gate::Any("reach"), |p, c| async move {
+            p.reach(&id, &c).await
+        })
+        .await?;
+    let reach = match connection {
+        Connection::Relay => {
+            let mut url = reqwest::Url::parse("http://localhost").expect("static URL");
+            url.path_segments_mut().expect("base URL").extend([
+                "v1",
+                "providers",
+                &p,
+                "environments",
+                &environment,
+                "relay",
+            ]);
+            Reach::Relay {
+                path: url.path().into(),
+            }
+        }
+        Connection::Ssh {
+            endpoint,
+            user,
+            host_key,
+        } => Reach::Ssh {
+            endpoint,
+            user,
+            host_key,
+        },
+        Connection::Dial {
+            url,
+            token,
+            expires_at,
+        } => Reach::Dial {
+            url,
+            token,
+            expires_at,
+        },
+    };
+    Ok(Json(reach))
+}
 async fn suspend(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
 ) -> ApiResult<Json<ResumeToken>> {
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().suspend_resume {
-        return Err(refused("suspend unsupported").into());
-    }
-    let result = i.provider.suspend(&id, &i.credentials).await;
-    Ok(Json(outcome(&mut i, result)?))
+    Ok(Json(
+        h.call(
+            &p,
+            Gate::Suspend,
+            |p, c| async move { p.suspend(&id, &c).await },
+        )
+        .await?,
+    ))
 }
 async fn resume(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
-    body: Bytes,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
+    ApiJson(token): ApiJson<ResumeToken>,
 ) -> ApiResult<StatusCode> {
-    let token = decode(&body)?;
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().suspend_resume {
-        return Err(refused("resume unsupported").into());
-    }
-    let result = i.provider.resume(&id, token, &i.credentials).await;
-    outcome(&mut i, result)?;
+    h.call(&p, Gate::Resume, |p, c| async move {
+        p.resume(&id, token, &c).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
 ) -> ApiResult<Json<Export>> {
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().export {
-        return Err(refused("export unsupported").into());
-    }
-    let result = i.provider.export(&id, &i.credentials).await;
-    Ok(Json(outcome(&mut i, result)?))
-}
-fn valid_period(period: &Period) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(&period.start),
-        chrono::DateTime::parse_from_rfc3339(&period.end),
-    ) {
-        (Ok(a), Ok(b)) => a <= b,
-        _ => false,
-    }
-}
-#[derive(Deserialize)]
-struct UsageQuery {
-    start: String,
-    end: String,
+    Ok(Json(
+        h.call(
+            &p,
+            Gate::Export,
+            |p, c| async move { p.export(&id, &c).await },
+        )
+        .await?,
+    ))
 }
 async fn usage(
-    State(host): State<Host>,
-    Path(p): Path<String>,
-    query: std::result::Result<Query<UsageQuery>, axum::extract::rejection::QueryRejection>,
+    State(h): State<Host>,
+    ApiPath(p): ApiPath<String>,
+    query: std::result::Result<Query<Period>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Json<Usage>> {
-    let Query(q) = query.map_err(|_| refused("invalid usage period"))?;
-    let period = Period {
-        start: q.start,
-        end: q.end,
-    };
-    if !valid_period(&period) {
-        return Err(refused("invalid usage period").into());
-    }
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().usage {
-        return Err(refused("usage unsupported").into());
-    }
-    let result = i.provider.usage(period, &i.credentials).await;
-    let usage = outcome(&mut i, result)?;
-    if !valid_period(&usage.period)
-        || usage.sandbox_hours.iter().any(|s| {
-            !s.hours.is_finite() || s.hours < 0.0 || !s.size.cpus.is_finite() || s.size.cpus <= 0.0
-        })
-    {
-        return Err(internal("module returned invalid usage").into());
-    }
-    Ok(Json(usage))
+    let Query(period) = query.map_err(|_| refused("invalid usage period"))?;
+    Ok(Json(
+        h.call(
+            &p,
+            Gate::Usage,
+            |p, c| async move { p.usage(period, &c).await },
+        )
+        .await?,
+    ))
 }
-async fn quota(State(host): State<Host>, Path(p): Path<String>) -> ApiResult<Json<Quota>> {
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().quota {
-        return Err(refused("quota unsupported").into());
-    }
-    let result = i.provider.quota(&i.credentials).await;
-    let quota = outcome(&mut i, result)?;
-    if quota.credits_remaining.is_some_and(|v| !v.is_finite()) {
-        return Err(internal("module returned nonfinite credits").into());
-    }
-    Ok(Json(quota))
-}
-fn internal(reason: &str) -> ProtocolError {
-    ProtocolError::Internal {
-        reason: reason.into(),
-        provider_error: String::new(),
-    }
+async fn quota(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Quota>> {
+    Ok(Json(
+        h.call(&p, Gate::Quota, |p, c| async move { p.quota(&c).await })
+            .await?,
+    ))
 }
 
 fn validate_upgrade(request: &Request, protocol: &str) -> Result<()> {
@@ -766,12 +861,11 @@ fn validate_upgrade(request: &Request, protocol: &str) -> Result<()> {
     Ok(())
 }
 fn upgrade(
-    request: &mut Request,
+    on_upgrade: hyper::upgrade::OnUpgrade,
     protocol: &'static str,
     stream: module::ByteStream,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<Response> {
-    let on_upgrade = hyper::upgrade::on(request);
     tokio::spawn(async move {
         if *stopping.borrow() {
             return;
@@ -796,51 +890,60 @@ fn upgrade(
     )
         .into_response())
 }
+struct StreamUpgrade(hyper::upgrade::OnUpgrade);
+struct ExecUpgrade {
+    upgrade: StreamUpgrade,
+    command: ExecRequest,
+}
+impl<S: Send + Sync> axum::extract::FromRequest<S> for ExecUpgrade {
+    type Rejection = ApiError;
+    async fn from_request(
+        mut request: Request,
+        state: &S,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        validate_upgrade(&request, "drydock-stream")?;
+        let upgrade = StreamUpgrade(hyper::upgrade::on(&mut request));
+        let ApiJson(command) = ApiJson::<ExecRequest>::from_request(request, state).await?;
+        if command.command.is_empty() {
+            return Err(refused("empty command").into());
+        }
+        Ok(Self { upgrade, command })
+    }
+}
 async fn relay(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
     mut request: Request,
 ) -> ApiResult<Response> {
     validate_upgrade(&request, "drydock-relay")?;
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    let result = i.provider.relay(&id, &i.credentials).await;
-    let stream = outcome(&mut i, result)?;
+    let on = hyper::upgrade::on(&mut request);
+    let stream = h
+        .call(&p, Gate::Any("relay"), |p, c| async move {
+            p.relay(&id, &c).await
+        })
+        .await?;
     Ok(upgrade(
-        &mut request,
+        on,
         "drydock-relay",
         stream,
-        host.stopping.subscribe(),
+        h.stopping.subscribe(),
     )?)
 }
 async fn exec(
-    State(host): State<Host>,
-    Path((p, id)): Path<(String, String)>,
-    request: Request,
+    State(h): State<Host>,
+    ApiPath((p, id)): ApiPath<(String, String)>,
+    request: ExecUpgrade,
 ) -> ApiResult<Response> {
-    validate_upgrade(&request, "drydock-stream")?;
-    let (parts, body) = request.into_parts();
-    let bytes = tokio::time::timeout(EXEC_BODY_TIMEOUT, axum::body::to_bytes(body, 1024 * 1024))
-        .await
-        .map_err(|_| refused("exec body deadline exceeded"))?
-        .map_err(|_| refused("exec body too large"))?;
-    let command: ExecRequest = decode(&bytes)?;
-    if command.command.is_empty() {
-        return Err(refused("empty command").into());
-    }
-    let mut request = Request::from_parts(parts, Body::empty());
-    let mut i = host.instance(&p).await?;
-    ready(&i)?;
-    if !i.provider.capabilities().fallback_runner {
-        return Err(refused("exec unsupported").into());
-    }
-    let result = i.provider.exec(&id, command, &i.credentials).await;
-    let stream = outcome(&mut i, result)?;
+    let stream = h
+        .call(&p, Gate::Exec, |p, c| async move {
+            p.exec(&id, request.command, &c).await
+        })
+        .await?;
     Ok(upgrade(
-        &mut request,
+        request.upgrade.0,
         "drydock-stream",
         stream,
-        host.stopping.subscribe(),
+        h.stopping.subscribe(),
     )?)
 }
 #[derive(Deserialize)]
@@ -910,27 +1013,5 @@ fn stream_error_class(error: &ProtocolError) -> &'static str {
         ProtocolError::QuotaExhausted { .. } => "event snapshot quota exhausted",
         ProtocolError::CredentialRejected { .. } => "event snapshot credential rejected",
         ProtocolError::Internal { .. } => "event snapshot internal error",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    // IPv4 and IPv6 destinations, including bracketed IPv6, are accepted; appending
-    // URL syntax cannot turn an invalid host into a direct network destination.
-    #[hegel::test]
-    fn generated_ip_destination_syntax(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let octets: Vec<_> = (0..4)
-            .map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(255)))
-            .collect();
-        let ipv4 = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
-        let tail = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
-        let ipv6 = format!("2001:db8::{tail:x}");
-        assert!(valid_host(&ipv4));
-        assert!(valid_host(&ipv6));
-        assert!(valid_host(&format!("[{ipv6}]")));
-        assert!(!valid_host(&format!("{ipv4}/path")));
-        assert!(!valid_host(&format!("[{ipv4}]")));
     }
 }

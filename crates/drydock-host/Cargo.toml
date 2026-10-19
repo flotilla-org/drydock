@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 drydock-protocol = { path = "../drydock-protocol" }
+rigging-http-client.workspace = true
 rigging-http-serve.workspace = true
+drydock-transport = { path = "../drydock-transport" }
 rigging-tls.workspace = true
 async-trait = "0.1"
 axum = "0.8"
@@ -21,6 +23,7 @@ libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 [dev-dependencies]
+rigging-replay-testkit.workspace = true
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query"] }
 futures = "0.3"

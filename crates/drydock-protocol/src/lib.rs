@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 pub mod openapi;
+pub mod validation;
+pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
 pub const PROTOCOL_VERSION: &str = "1";
@@ -177,8 +179,8 @@ impl Default for EgressRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Destination {
-    HostPort { host: String, port: u16 },
-    Cidr { cidr: String },
+    HostPort { host: HostAddress, port: Port },
+    Cidr { cidr: Cidr },
 }
 /// Preparation is look-up-or-build at the provider, keyed by both digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -321,11 +323,12 @@ pub enum ObserveRecord {
     Snapshot { cursor: String, sandboxes: Vec<Sandbox> },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(try_from = "UncheckedPeriod")]
 pub struct Period {
     #[schema(format = DateTime)]
-    pub start: String,
+    start: Timestamp,
     #[schema(format = DateTime)]
-    pub end: String,
+    end: Timestamp,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
@@ -382,4 +385,42 @@ pub enum ProtocolError {
         /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
         provider_error: String,
     },
+}
+
+#[derive(Deserialize)]
+struct UncheckedPeriod {
+    start: Timestamp,
+    end: Timestamp,
+}
+impl TryFrom<UncheckedPeriod> for Period {
+    type Error = &'static str;
+    fn try_from(raw: UncheckedPeriod) -> Result<Self, Self::Error> {
+        let value = Self {
+            start: raw.start,
+            end: raw.end,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+impl ProtocolError {
+    /// HTTP status is part of the shared wire contract, independent of a host framework.
+    pub const fn status(&self) -> u16 {
+        match self {
+            Self::Refused { .. } => 422,
+            Self::Unavailable { .. } => 503,
+            Self::RateLimited { .. } => 429,
+            Self::QuotaExhausted { .. } => 402,
+            Self::CredentialRejected { .. } => 502,
+            Self::Internal { .. } => 500,
+        }
+    }
+    pub const fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Unavailable { retry_after, .. } | Self::RateLimited { retry_after, .. } => {
+                *retry_after
+            }
+            _ => None,
+        }
+    }
 }

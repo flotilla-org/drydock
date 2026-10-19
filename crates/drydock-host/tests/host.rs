@@ -1,3 +1,4 @@
+use drydock_host::module::{Connection, HttpClient, ObservationMode, ObservedSandbox, Provisioned};
 use drydock_host::{Host, reference};
 use drydock_protocol::*;
 use futures::{StreamExt, stream::BoxStream};
@@ -197,7 +198,7 @@ async fn hello_configuration_credentials_and_atomic_rejection() {
             .iter()
             .all(|p| matches!(p.readiness, Readiness::MissingCredential { .. }))
     );
-    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502)
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 503)
         .await;
     h.ok(
         Method::PUT,
@@ -416,7 +417,12 @@ async fn all_typed_error_classes() {
         errors
             .iter()
             .enumerate()
-            .map(|(n, (_, e))| provider(&format!("p{n}"), json!({"fault":e})))
+            .map(|(n, (_, e))| {
+                provider(
+                    &format!("p{n}"),
+                    json!({"fault":e,"poll_interval_ms":100000}),
+                )
+            })
             .collect(),
     )
     .await;
@@ -763,6 +769,7 @@ async fn event_eviction_and_initial_error() {
     for n in 0..513 {
         h.provision("a", &format!("item-{n}"), &prepared, 201).await;
     }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let mut expired = h.stream(Some(cursor(&start))).await;
     let snapshot = expired.next().await;
     assert!(matches!(&snapshot,ObserveRecord::Snapshot {sandboxes,..} if sandboxes.len()==513));
@@ -816,12 +823,27 @@ async fn proxied_credentials_use_supervisor_proxy() {
         placeholder_token: Secret::new("proxy-placeholder"),
         proxy_url: format!("http://{address}"),
     };
-    let credentials = Credentials::new(mode.clone(), None).unwrap();
-    let response = credentials
-        .http
-        .get("http://vendor.invalid/resource")
-        .bearer_auth(credentials.token().unwrap().expose())
-        .send()
+    let credentials = Credentials::new(mode.clone());
+    let transport = rigging_http_client::ReqwestHttpClient::restricted(
+        Some(&format!("http://{address}")),
+        None,
+    )
+    .unwrap();
+    let mut request = reqwest::Request::new(
+        reqwest::Method::GET,
+        "http://vendor.invalid/resource".parse().unwrap(),
+    );
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", credentials.token().unwrap().expose())
+            .parse()
+            .unwrap(),
+    );
+    let response = transport
+        .execute(
+            request,
+            &rigging_http_client::http_channel_label("GET", "http://vendor.invalid/resource"),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), 204);
@@ -831,7 +853,6 @@ async fn proxied_credentials_use_supervisor_proxy() {
         head.to_lowercase()
             .contains("authorization: bearer proxy-placeholder")
     );
-    assert!(Credentials::new(mode.clone(), Some(b"invalid PEM")).is_err());
     let h = Harness::start().await;
     let mut config = provider("proxied", json!({}));
     config["credential"] = serde_json::to_value(mode).unwrap();
@@ -914,6 +935,13 @@ async fn shutdown_closes_event_stream() {
 
 #[derive(Default)]
 struct Control {
+    poll: std::sync::atomic::AtomicBool,
+    execute_http: std::sync::atomic::AtomicBool,
+    disable_exec: std::sync::atomic::AtomicBool,
+    skip_list_timestamp: std::sync::atomic::AtomicBool,
+    timestamp: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    list_limit: std::sync::atomic::AtomicU32,
+    list_period: std::sync::atomic::AtomicU64,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     list_error: std::sync::atomic::AtomicBool,
@@ -926,7 +954,8 @@ struct Control {
 }
 struct ControlledModule(std::sync::Arc<Control>);
 struct ControlledProvider {
-    inner: Box<dyn drydock_host::module::Provider>,
+    http: std::sync::Arc<dyn HttpClient>,
+    inner: std::sync::Arc<dyn drydock_host::module::Provider>,
     control: std::sync::Arc<Control>,
 }
 // The gate and error flag stand in for the vendor network boundary; all resource
@@ -940,23 +969,63 @@ impl drydock_host::module::Module for ControlledModule {
         &self,
         c: &ProviderConfiguration,
         sink: drydock_host::EventSink,
-    ) -> drydock_host::module::Result<Box<dyn drydock_host::module::Provider>> {
+        http: std::sync::Arc<dyn HttpClient>,
+    ) -> drydock_host::module::Result<std::sync::Arc<dyn drydock_host::module::Provider>> {
         *self.0.sink.lock().unwrap() = Some(sink.clone());
-        let inner =
-            drydock_host::module::Module::configure(&reference::ReferenceModule, c, sink).await?;
-        Ok(Box::new(ControlledProvider {
+        let inner = drydock_host::module::Module::configure(
+            &reference::ReferenceModule,
+            c,
+            sink,
+            http.clone(),
+        )
+        .await?;
+        Ok(std::sync::Arc::new(ControlledProvider {
             inner,
+            http,
             control: self.0.clone(),
         }))
     }
 }
 #[async_trait::async_trait]
 impl drydock_host::module::Provider for ControlledProvider {
+    fn observation(&self) -> ObservationMode {
+        if self.control.poll.load(std::sync::atomic::Ordering::SeqCst) {
+            ObservationMode::Poll {
+                interval: Duration::from_millis(10),
+            }
+        } else {
+            ObservationMode::Push
+        }
+    }
+    fn rate_limits(&self) -> Vec<RateLimit> {
+        let requests = self
+            .control
+            .list_limit
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if requests == 0 {
+            vec![]
+        } else {
+            vec![RateLimit {
+                operation: "list".into(),
+                requests,
+                period_seconds: self
+                    .control
+                    .list_period
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .max(1),
+            }]
+        }
+    }
     fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
+        let mut capabilities = self.inner.capabilities();
+        capabilities.fallback_runner = !self
+            .control
+            .disable_exec
+            .load(std::sync::atomic::Ordering::SeqCst);
+        capabilities
     }
     async fn prepare(
-        &mut self,
+        &self,
         r: PrepareRequest,
         c: &drydock_host::module::Credentials,
     ) -> drydock_host::module::Result<Prepared> {
@@ -967,21 +1036,48 @@ impl drydock_host::module::Provider for ControlledProvider {
                 reason: "old credential rejected".into(),
             });
         }
+        if self
+            .control
+            .execute_http
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let url = "https://vendor.example/prepare";
+            let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
+            request.headers_mut().insert(
+                "Authorization",
+                format!("Bearer {}", c.token().unwrap().expose())
+                    .parse()
+                    .unwrap(),
+            );
+            let response = self
+                .http
+                .execute(
+                    request,
+                    &rigging_http_client::http_channel_label("GET", url),
+                )
+                .await
+                .map_err(|_| ProtocolError::Unavailable {
+                    reason: "transport failure".into(),
+                    retry_after: None,
+                })?;
+            assert!(response.status().is_success());
+        }
         self.inner.prepare(r, c).await
     }
     async fn provision(
-        &mut self,
+        &self,
         r: ProvisionRequest,
         c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<(Sandbox, bool)> {
+    ) -> drydock_host::module::Result<Provisioned> {
         self.inner.provision(r, c).await
     }
     async fn list(
-        &mut self,
+        &self,
         c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<Vec<Sandbox>> {
+    ) -> drydock_host::module::Result<Vec<ObservedSandbox>> {
         use std::sync::atomic::Ordering::SeqCst;
         self.control.list_calls.fetch_add(1, SeqCst);
+        self.control.list_entered.notify_one();
         if self.control.list_error.load(SeqCst) {
             return Err(ProtocolError::Unavailable {
                 reason: "vendor unavailable".into(),
@@ -994,30 +1090,100 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
         let mut rows = self.inner.list(c).await?;
         if let Some(row) = self.control.snapshot_row.lock().unwrap().clone() {
-            rows.push(row);
+            rows.push(ObservedSandbox {
+                sandbox: row,
+                timestamp: if self.control.skip_list_timestamp.load(SeqCst) {
+                    None
+                } else {
+                    *self.control.timestamp.lock().unwrap()
+                },
+            });
         }
         Ok(rows)
     }
     async fn inspect(
-        &mut self,
+        &self,
         id: &str,
         c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<Sandbox> {
+    ) -> drydock_host::module::Result<ObservedSandbox> {
+        if let Some(row) = self
+            .control
+            .snapshot_row
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|row| row.id == id)
+        {
+            return Ok(ObservedSandbox {
+                sandbox: row,
+                timestamp: *self.control.timestamp.lock().unwrap(),
+            });
+        }
         self.inner.inspect(id, c).await
     }
     async fn destroy(
-        &mut self,
+        &self,
         id: &str,
         c: &drydock_host::module::Credentials,
     ) -> drydock_host::module::Result<()> {
         self.inner.destroy(id, c).await
     }
     async fn reach(
-        &mut self,
+        &self,
         id: &str,
         c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<Reach> {
+    ) -> drydock_host::module::Result<Connection> {
         self.inner.reach(id, c).await
+    }
+    async fn relay(
+        &self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<drydock_host::module::ByteStream> {
+        self.inner.relay(id, c).await
+    }
+    async fn exec(
+        &self,
+        id: &str,
+        r: ExecRequest,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<drydock_host::module::ByteStream> {
+        self.inner.exec(id, r, c).await
+    }
+    async fn suspend(
+        &self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<ResumeToken> {
+        self.inner.suspend(id, c).await
+    }
+    async fn resume(
+        &self,
+        id: &str,
+        r: ResumeToken,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<()> {
+        self.inner.resume(id, r, c).await
+    }
+    async fn export(
+        &self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Export> {
+        self.inner.export(id, c).await
+    }
+    async fn usage(
+        &self,
+        r: Period,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Usage> {
+        self.inner.usage(r, c).await
+    }
+    async fn quota(
+        &self,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Quota> {
+        self.inner.quota(c).await
     }
 }
 async fn controlled() -> (Harness, std::sync::Arc<Control>) {
@@ -1056,6 +1222,13 @@ async fn independent_providers_and_inflight_credential_refresh() {
         h.ok(Method::GET, "/hello", Value::Null, 200).await;
         h.ok(Method::GET, "/providers/b/environments", Value::Null, 200)
             .await;
+        h.ok(Method::GET, "/providers/a/environments", Value::Null, 200)
+            .await;
+        let mut events = h.stream(None).await;
+        assert!(matches!(
+            events.next().await,
+            ObserveRecord::Snapshot { .. }
+        ));
         h.credential("a", "new").await;
     })
     .await
@@ -1079,7 +1252,7 @@ async fn snapshots_never_call_unready_providers() {
     use std::sync::atomic::Ordering::SeqCst;
     let (h, control) = controlled().await;
     h.configure(vec![provider("a", json!({}))]).await;
-    h.ok(Method::GET, "/events", Value::Null, 502).await;
+    h.ok(Method::GET, "/events", Value::Null, 503).await;
     assert_eq!(control.list_calls.load(SeqCst), 0);
     h.credential("a", "ready").await;
     let mut records = h.stream(None).await;
@@ -1104,13 +1277,7 @@ async fn recovery_snapshot_error_fails_stream() {
     control.list_error.store(true, SeqCst);
     let sink = control.sink.lock().unwrap().clone().unwrap();
     for n in 0..1030 {
-        sink.publish(
-            format!("id-{n}"),
-            None,
-            "2026-10-19T00:00:00Z".into(),
-            TimestampSource::Adaptor,
-            EventKind::Created,
-        );
+        sink.publish(format!("id-{n}"), None, None, EventKind::Created);
     }
     let failed = tokio::time::timeout(Duration::from_secs(2), records.stream.next())
         .await
@@ -1292,8 +1459,7 @@ async fn snapshot_overlap_replays_background_observation() {
     control.sink.lock().unwrap().as_ref().unwrap().publish(
         sandbox.id.clone(),
         sandbox.label.clone(),
-        "2026-10-19T00:00:00Z".into(),
-        TimestampSource::Adaptor,
+        None,
         EventKind::Created,
     );
     control.list_release.notify_one();
@@ -1316,37 +1482,286 @@ async fn snapshot_overlap_replays_background_observation() {
     assert_eq!(replay.next().await, event);
 }
 
-// An authenticated client that never completes its exec JSON cannot retain a task
-// indefinitely: the bounded body-read deadline returns a typed refusal before exec.
+// The reference module declares polling and emits no events itself. Host list diffs
+// produce creation/running, stopped, resumed/running, and confirmed deletion events.
 #[tokio::test]
-async fn incomplete_exec_body_has_deadline() {
+async fn reference_polling_billing_transitions() {
     let h = Harness::start().await;
     h.normal().await;
     let prepared = h.prepared("a").await;
-    let sandbox = h.provision("a", "slow-body", &prepared, 201).await;
-    let mut socket = tokio::net::UnixStream::connect(&h.path).await.unwrap();
-    socket.write_all(format!("POST /v1/providers/a/environments/{}/exec HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-stream\r\nContent-Length: 100\r\n\r\n{{",sandbox.id).as_bytes()).await.unwrap();
-    let mut reader = BufReader::new(socket);
-    let mut status = String::new();
-    tokio::time::timeout(Duration::from_secs(8), reader.read_line(&mut status))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.starts_with("HTTP/1.1 422"), "{status}");
-    let mut length = None;
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        if line == "\r\n" {
-            break;
-        }
-        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
-            length = Some(value.trim().parse::<usize>().unwrap());
-        }
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let s = h.provision("a", "polled", &prepared, 201).await;
+    for expected in ["created", "running"] {
+        let ObserveRecord::Event { event } = events.next().await else {
+            panic!("expected event")
+        };
+        assert_eq!(event.id, s.id);
+        assert_eq!(event.timestamp_source, TimestampSource::Adaptor);
+        assert_eq!(serde_json::to_value(event.event).unwrap()["kind"], expected);
     }
-    let mut body = vec![0; length.unwrap()];
-    reader.read_exact(&mut body).await.unwrap();
+    let path = format!("/providers/a/environments/{}", s.id);
+    let token: ResumeToken = h
+        .ok(Method::POST, &format!("{path}/suspend"), Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
     assert!(
-        matches!(serde_json::from_slice::<ProtocolError>(&body).unwrap(),ProtocolError::Refused {reason} if reason=="exec body deadline exceeded")
+        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Stopped {..}))
     );
+    h.ok(
+        Method::POST,
+        &format!("{path}/resume"),
+        serde_json::to_value(token).unwrap(),
+        204,
+    )
+    .await;
+    assert!(
+        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Resumed))
+    );
+    assert!(
+        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Running {..}))
+    );
+    h.ok(Method::DELETE, &path, Value::Null, 204).await;
+    assert!(
+        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Gone {cause:GoneCause::DestroyedByRequest}))
+    );
+}
+
+// External changes observed through polling retain typed provider timestamps.
+// Failed lists keep prior state; only a successful complete list can report loss.
+#[tokio::test]
+async fn polled_provider_time_pause_and_authoritative_loss() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let time = "2026-10-19T00:00:00Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    *control.timestamp.lock().unwrap() = Some(time);
+    let row = Sandbox {
+        id: "vendor".into(),
+        label: None,
+        provider: "a".into(),
+        state: Observation::Running,
+        granted_size: Some(Size {
+            cpus: 2.0,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        }),
+        egress: Enforcement::Advisory,
+    };
+    *control.snapshot_row.lock().unwrap() = Some(row.clone());
+    for _ in 0..2 {
+        let ObserveRecord::Event { event } = events.next().await else {
+            panic!("expected event")
+        };
+        assert_eq!(event.timestamp_source, TimestampSource::Provider);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&event.timestamp).unwrap(),
+            time
+        );
+    }
+    control.snapshot_row.lock().unwrap().as_mut().unwrap().state = Observation::Stopped {
+        cause: StopCause::PausedByProvider,
+    };
+    assert!(
+        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Paused {cause:StopCause::PausedByProvider}))
+    );
+    control.list_error.store(true, SeqCst);
+    *control.snapshot_row.lock().unwrap() = None;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), events.stream.next())
+            .await
+            .is_err()
+    );
+    control.list_error.store(false, SeqCst);
+    assert!(
+        matches!(events.next().await,ObserveRecord::Event {event} if event.timestamp_source==TimestampSource::Adaptor && matches!(event.event,EventKind::Gone {cause:GoneCause::MissingOnList}))
+    );
+}
+
+// The host stretches a requested 10ms poll interval to the declared two lists/sec,
+// and manual list requests share that budget rather than bypassing the poll limit.
+#[tokio::test]
+async fn polling_respects_declared_list_budget() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    control.list_limit.store(2, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    tokio::time::timeout(Duration::from_secs(2), control.list_entered.notified())
+        .await
+        .unwrap();
+    let first = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), control.list_entered.notified())
+        .await
+        .unwrap();
+    assert!(first.elapsed() >= Duration::from_millis(450));
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 429)
+        .await;
+    assert_eq!(control.list_calls.load(SeqCst), 2);
+}
+
+// Modules receive the shared HttpClient port independently of credentials. A
+// Rigging replay client can replace production transport without changing a module.
+#[tokio::test]
+async fn module_uses_rigging_replay_http_port() {
+    use drydock_host::module::{Credentials, Module};
+    use rigging_replay_testkit::{Masks, NoExtra, ReplayHttpClient, Session};
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    control
+        .execute_http
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let session = Session::<NoExtra>::replaying_from_str(
+        r#"
+interactions:
+  - channel: http
+    method: GET
+    url: https://vendor.example/prepare
+    request_headers:
+      authorization: Bearer placeholder
+    status: 200
+    response_body: '{}'
+"#,
+        Masks::new(),
+    );
+    let http = std::sync::Arc::new(ReplayHttpClient::new(session.clone()));
+    let config: ProviderConfiguration = serde_json::from_value(provider("a", json!({}))).unwrap();
+    let sink = control.sink.lock().unwrap().clone().unwrap();
+    let module = ControlledModule(control);
+    let provider = module.configure(&config, sink, http).await.unwrap();
+    let mut credentials = Credentials::new(config.credential);
+    credentials.value = Some(Secret::new("placeholder"));
+    let prepared = provider
+        .prepare(
+            PrepareRequest {
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+            },
+            &credentials,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prepared.provider, "a");
+    session.assert_complete();
+}
+
+// Optional operation gates use the declaration cached at configure, rather than
+// re-reading dynamic module capabilities or depending on unsupported method defaults.
+#[tokio::test]
+async fn cached_capability_gate_refuses_exec() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.disable_exec.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let prepared = h.prepared("a").await;
+    let sandbox = h.provision("a", "exec", &prepared, 201).await;
+    control.disable_exec.store(false, SeqCst);
+    let response = h
+        .client
+        .post(format!(
+            "http://localhost/v1/providers/a/environments/{}/exec",
+            sandbox.id
+        ))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "drydock-stream")
+        .json(&json!({"command":["cat"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+}
+
+// If list has no timestamp, matching inspect metadata supplies the provider's
+// timestamp. A held poll list does not prevent the same provider's inspect call.
+#[tokio::test]
+async fn poll_uses_matching_inspect_timestamp() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    control.skip_list_timestamp.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    control.list_entered.notified().await;
+    control.hold_list.store(true, SeqCst);
+    let time = "2026-01-01T00:00:00Z"
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    *control.timestamp.lock().unwrap() = Some(time);
+    *control.snapshot_row.lock().unwrap() = Some(Sandbox {
+        id: "external".into(),
+        label: None,
+        provider: "a".into(),
+        state: Observation::Running,
+        granted_size: Some(Size {
+            cpus: 1.0,
+            memory_bytes: 0,
+            disk_bytes: 0,
+        }),
+        egress: Enforcement::Advisory,
+    });
+    tokio::time::timeout(Duration::from_secs(2), control.list_entered.notified())
+        .await
+        .unwrap();
+    h.ok(
+        Method::GET,
+        "/providers/a/environments/external",
+        Value::Null,
+        200,
+    )
+    .await;
+    control.hold_list.store(false, SeqCst);
+    control.list_release.notify_one();
+    let ObserveRecord::Event { event } = events.next().await else {
+        panic!("expected event")
+    };
+    assert_eq!(event.timestamp_source, TimestampSource::Provider);
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(&event.timestamp).unwrap(),
+        time
+    );
+}
+
+// Invalid poll policies cannot panic a background observer or partly commit a
+// provider document: zero intervals and overflowing declared periods are refused.
+#[tokio::test]
+async fn invalid_poll_intervals_leave_configuration_empty() {
+    let h = Harness::start().await;
+    h.ok(Method::PUT,"/config",json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("a",json!({"poll_interval_ms":0}))]}),422).await;
+    let hello: Hello = h
+        .ok(Method::GET, "/hello", Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(hello.providers.is_empty());
+    let (h, control) = controlled().await;
+    control
+        .poll
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    control
+        .list_limit
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    control
+        .list_period
+        .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+    h.ok(Method::PUT,"/config",json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("a",json!({}))]}),422).await;
+    let hello: Hello = h
+        .ok(Method::GET, "/hello", Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(hello.providers.is_empty());
 }

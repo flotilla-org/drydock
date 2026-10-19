@@ -4,8 +4,32 @@ use crate::*;
 use utoipa::OpenApi;
 
 #[derive(utoipa::IntoResponses)]
-#[response(status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.")]
-struct ErrorResponses(ProtocolError);
+enum ErrorResponses {
+    #[response(status = 422, description = "Refused: request cannot be met")]
+    Refused(ProtocolError),
+    #[response(
+        status = 503,
+        description = "Unavailable: provider not ready or temporarily unavailable"
+    )]
+    Unavailable(ProtocolError),
+    #[response(
+        status = 429,
+        description = "RateLimited: retry_after is whole seconds"
+    )]
+    RateLimited(ProtocolError),
+    #[response(status = 402, description = "QuotaExhausted")]
+    QuotaExhausted(ProtocolError),
+    #[response(
+        status = 502,
+        description = "CredentialRejected: vendor rejected delivered credentials"
+    )]
+    CredentialRejected(ProtocolError),
+    #[response(
+        status = 500,
+        description = "Internal: sensitive provider error for supervisor diagnostics"
+    )]
+    Internal(ProtocolError),
+}
 
 #[utoipa::path(get, path = "/v1/hello",
 responses((status = 200, description = "Success", body = Hello), ErrorResponses)
@@ -147,10 +171,38 @@ struct Document;
 pub fn document() -> utoipa::openapi::OpenApi {
     let mut document = Document::openapi();
     document.info.version = PROTOCOL_VERSION.to_owned();
+    // Keep runtime and cross-language schema rules identical.
+    use utoipa::openapi::{RefOr, schema::Schema};
+    let schemas = &mut document.components.as_mut().expect("components").schemas;
+    if let Some(RefOr::T(Schema::Object(port))) = schemas.get_mut("Port") {
+        port.minimum = Some(1.into());
+        port.maximum = Some(65535.into());
+    }
+    if let Some(RefOr::T(Schema::Object(host))) = schemas.get_mut("HostAddress") {
+        host.pattern = Some(validation::host_pattern().into());
+        host.max_length = Some(253);
+    }
+    if let Some(RefOr::T(Schema::Object(cidr))) = schemas.get_mut("Cidr") {
+        cidr.pattern = Some(validation::cidr_pattern().into());
+    }
+    if let Some(RefOr::T(Schema::Object(period))) = schemas.get_mut("Period") {
+        period.extensions = Some(
+            utoipa::openapi::extensions::ExtensionsBuilder::new()
+                .add("x-drydock-invariants", serde_json::json!(["start <= end"]))
+                .build(),
+        );
+        period.description = Some(
+            "RFC 3339 endpoints; start must be <= end (equal endpoints are an empty interval)."
+                .into(),
+        );
+    }
     document
 }
 
 /// Stable JSON presentation shared by the generator and drift test.
 pub fn to_json() -> String {
-    format!("{}\n", document().to_pretty_json().expect("OpenAPI serializes"))
+    format!(
+        "{}\n",
+        document().to_pretty_json().expect("OpenAPI serializes")
+    )
 }
