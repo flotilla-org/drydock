@@ -2,9 +2,11 @@
 
 The substrate for just launching vessels: isolated environments for AI coding agents, on any provider.
 
-Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) embeds it; it is also usable on its own.
+Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a bidirectional stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) embeds it; it is also usable on its own.
 
-Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace implemented; language hosts and providers are next.
+Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace and [`drydock-transport`](crates/drydock-transport) implemented; language hosts, providers, and the agent are next.
+
+See the [transport guide](crates/drydock-transport/README.md) for the API, wire format, lifecycle, and transport test instructions.
 
 Project contents and roadmap:
 
