@@ -15,6 +15,13 @@ jobs:
         id: workspace
         run: |
           if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      # The transport crate's SSH contract tests start a disposable loopback sshd.
+      - name: Install SSH test prerequisites
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client openssh-server
+          sudo mkdir -p /run/sshd
       - name: Install pinned Rust
         if: steps.workspace.outputs.present == 'true'
         run: rustup show
