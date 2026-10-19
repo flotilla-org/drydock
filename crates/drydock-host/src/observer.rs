@@ -43,15 +43,23 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             if *stopping.borrow() {
                 break;
             }
-            tokio::select! {_=clock.tick()=>{},_=stopping.changed()=>break}
+            tokio::select! {
+                _ = clock.tick() => {},
+                _ = stopping.changed() => break,
+            }
             let Some(instance) = weak.upgrade() else {
                 break;
             };
             // Cancellation on shutdown releases an outstanding vendor future. Modules
             // must own no detached retry or mutation task on this list-only path.
             let rows = tokio::select! {
-                result=instance.call(Gate::Any("list"),|p,c|async move {p.list(&c).await})=>match result {Ok(rows)=>rows,Err(_)=>continue},
-                _=stopping.changed()=>break,
+                result = instance.call(Gate::Any("list"), |p, c| async move {
+                    p.list(&c).await
+                }) => match result {
+                    Ok(rows) => rows,
+                    Err(_) => continue,
+                },
+                _ = stopping.changed() => break,
             };
             reconcile(&instance, &mut seen, rows);
         }
@@ -143,7 +151,13 @@ fn reconcile(
             );
         }
     }
-    destroyed.clear();
+    // A list may predate a concurrent successful destroy. Keep its marker while
+    // that stale inventory still contains the resource; consume it on disappearance.
+    destroyed.retain(|id| {
+        current
+            .get(id)
+            .is_some_and(|row| !matches!(row.sandbox.state, Observation::Gone { .. }))
+    });
     // Replace the inventory, pruning every row no longer returned, including Gone.
     *seen = current;
 }

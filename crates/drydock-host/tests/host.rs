@@ -946,6 +946,8 @@ struct Control {
     release: tokio::sync::Notify,
     list_error: std::sync::atomic::AtomicBool,
     hold_list: std::sync::atomic::AtomicBool,
+    hold_list_result: std::sync::atomic::AtomicBool,
+    list_result_ready: tokio::sync::Notify,
     list_entered: tokio::sync::Notify,
     list_release: tokio::sync::Notify,
     snapshot_row: std::sync::Mutex<Option<Sandbox>>,
@@ -1098,6 +1100,10 @@ impl drydock_host::module::Provider for ControlledProvider {
                     *self.control.timestamp.lock().unwrap()
                 },
             });
+        }
+        if self.control.hold_list_result.swap(false, SeqCst) {
+            self.control.list_result_ready.notify_one();
+            self.control.list_release.notified().await;
         }
         Ok(rows)
     }
@@ -1764,4 +1770,37 @@ async fn invalid_poll_intervals_leave_configuration_empty() {
         .await
         .unwrap();
     assert!(hello.providers.is_empty());
+}
+
+// A successful deletion can race a list response containing the pre-delete row.
+// That stale poll must not discard attribution before the next list sees absence.
+#[tokio::test]
+async fn destroy_attribution_survives_stale_poll() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let prepared = h.prepared("a").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let sandbox = h.provision("a", "delete-race", &prepared, 201).await;
+    for _ in 0..2 {
+        events.next().await;
+    }
+    control.hold_list_result.store(true, SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), control.list_result_ready.notified())
+        .await
+        .unwrap();
+    h.ok(
+        Method::DELETE,
+        &format!("/providers/a/environments/{}", sandbox.id),
+        Value::Null,
+        204,
+    )
+    .await;
+    control.list_release.notify_one();
+    assert!(matches!(events.next().await, ObserveRecord::Event { event }
+        if event.id == sandbox.id && matches!(event.event,
+            EventKind::Gone { cause: GoneCause::DestroyedByRequest })));
 }

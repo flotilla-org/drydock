@@ -101,6 +101,9 @@ pub trait Provider: Send + Sync {
     }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
+    /// Running observations must include granted_size to emit a billing Running
+    /// event, whose protocol payload requires that size. Without it, inventory is
+    /// still visible but no billable Running transition can be inferred.
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedSandbox>>;
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedSandbox>;
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()>;
