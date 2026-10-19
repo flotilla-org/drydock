@@ -1,0 +1,2169 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Drydock adaptor protocol",
+    "description": "ADR 0070. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by capabilities. Observe is NDJSON; relay and exec upgrade to raw streams.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/v1/config": {
+      "put": {
+        "tags": [],
+        "operationId": "configure",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "tags": [],
+        "operationId": "observe",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "description": "Exclusive last-seen cursor; absent starts with a snapshot",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObserveRecord"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/hello": {
+      "get": {
+        "tags": [],
+        "operationId": "hello",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Hello"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/credential": {
+      "put": {
+        "tags": [],
+        "operationId": "refresh_credential",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialRefresh"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments": {
+      "get": {
+        "tags": [],
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Sandbox"
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "operationId": "provision",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sandbox"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created; repeats by label return 200",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sandbox"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}": {
+      "get": {
+        "tags": [],
+        "operationId": "inspect",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sandbox"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "operationId": "destroy",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success; destroying an already absent resource succeeds"
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/exec": {
+      "post": {
+        "tags": [],
+        "operationId": "exec",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "101": {
+            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Upgrade"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "drydock-stream"
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/export": {
+      "post": {
+        "tags": [],
+        "operationId": "export",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Export"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/reach": {
+      "post": {
+        "tags": [],
+        "operationId": "reach",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reach"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/relay": {
+      "get": {
+        "tags": [],
+        "operationId": "relay",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-relay",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Upgrade"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "drydock-relay"
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/resume": {
+      "post": {
+        "tags": [],
+        "operationId": "resume",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeToken"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/suspend": {
+      "post": {
+        "tags": [],
+        "operationId": "suspend",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResumeToken"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/prepare": {
+      "post": {
+        "tags": [],
+        "operationId": "prepare",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Prepared"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/quota": {
+      "get": {
+        "tags": [],
+        "operationId": "quota",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quota"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/usage": {
+      "get": {
+        "tags": [],
+        "operationId": "usage",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "RFC 3339 period start",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "description": "RFC 3339 period end",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Usage"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BootstrapRoute": {
+        "type": "string",
+        "enum": [
+          "bake",
+          "upload"
+        ]
+      },
+      "Capabilities": {
+        "type": "object",
+        "required": [
+          "material_modes",
+          "checkout_strategies",
+          "workspace_root",
+          "suspend_resume",
+          "export",
+          "egress",
+          "fallback_runner",
+          "bootstrap",
+          "usage",
+          "quota"
+        ],
+        "properties": {
+          "bootstrap": {
+            "$ref": "#/components/schemas/BootstrapRoute"
+          },
+          "checkout_strategies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CheckoutStrategy"
+            }
+          },
+          "egress": {
+            "$ref": "#/components/schemas/EgressCapability"
+          },
+          "export": {
+            "type": "boolean"
+          },
+          "fallback_runner": {
+            "type": "boolean"
+          },
+          "material_modes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MaterialMode"
+            }
+          },
+          "quota": {
+            "type": "boolean"
+          },
+          "suspend_resume": {
+            "type": "boolean"
+          },
+          "usage": {
+            "type": "boolean"
+          },
+          "workspace_root": {
+            "type": "string"
+          }
+        }
+      },
+      "CheckoutStrategy": {
+        "type": "string",
+        "enum": [
+          "host_worktree",
+          "host_clone",
+          "clone_in_vessel"
+        ]
+      },
+      "CredentialMode": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "credential_reference",
+              "mode"
+            ],
+            "properties": {
+              "credential_reference": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "direct"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "placeholder_token",
+              "proxy_url",
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "proxied"
+                ]
+              },
+              "placeholder_token": {
+                "$ref": "#/components/schemas/Secret"
+              },
+              "proxy_url": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "CredentialRefresh": {
+        "type": "object",
+        "description": "Delivered in memory over the authenticated host connection; never persisted.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/Secret"
+          }
+        }
+      },
+      "Destination": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "host",
+              "port",
+              "kind"
+            ],
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host_port"
+                ]
+              },
+              "port": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cidr",
+              "kind"
+            ],
+            "properties": {
+              "cidr": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "cidr"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "EgressCapability": {
+        "type": "object",
+        "required": [
+          "routes",
+          "enforcement"
+        ],
+        "properties": {
+          "enforcement": {
+            "$ref": "#/components/schemas/Enforcement"
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressRoute"
+            }
+          }
+        }
+      },
+      "EgressRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "direct": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Destination"
+                }
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "deny_all"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "open"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Deny all is the default. Providers must refuse unrepresentable destinations, never widen them."
+      },
+      "EgressRoute": {
+        "type": "string",
+        "enum": [
+          "none",
+          "explicit_proxy",
+          "transparent_proxy",
+          "open"
+        ]
+      },
+      "Enforcement": {
+        "type": "string",
+        "enum": [
+          "enforced",
+          "advisory"
+        ]
+      },
+      "Event": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "id",
+          "provider",
+          "timestamp",
+          "timestamp_source",
+          "event"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "string",
+            "description": "Opaque cursor to send as `since` on reconnect; resume is exclusive."
+          },
+          "event": {
+            "$ref": "#/components/schemas/EventKind"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "description": "RFC 3339 timestamp."
+          },
+          "timestamp_source": {
+            "$ref": "#/components/schemas/TimestampSource"
+          }
+        }
+      },
+      "EventKind": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "created"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "granted_size",
+              "kind"
+            ],
+            "properties": {
+              "granted_size": {
+                "$ref": "#/components/schemas/Size"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cause",
+              "kind"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/StopCause"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "stopped"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Explicit pause transition, distinct from the more general stopped observation.",
+            "required": [
+              "cause",
+              "kind"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/StopCause"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "paused"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "resumed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cause",
+              "kind"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/GoneCause"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "gone"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ExecRequest": {
+        "type": "object",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Export": {
+        "type": "object",
+        "required": [
+          "reference"
+        ],
+        "properties": {
+          "reference": {
+            "type": "string"
+          }
+        }
+      },
+      "GoneCause": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "lifetime_cap_reached"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "evicted_by_provider"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host_out_of_memory"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "code",
+              "kind"
+            ],
+            "properties": {
+              "code": {
+                "type": "integer",
+                "format": "int32"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "vmm_exited"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "guest_powered_off"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A previously known sandbox is absent from an authoritative complete list.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "missing_on_list"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The provider confirmed deletion requested by the client.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "destroyed_by_request"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "Hello": {
+        "type": "object",
+        "required": [
+          "protocol_version",
+          "host_version",
+          "modules",
+          "providers"
+        ],
+        "properties": {
+          "host_version": {
+            "type": "string"
+          },
+          "modules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadedModule"
+            }
+          },
+          "protocol_version": {
+            "type": "string"
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderDeclaration"
+            }
+          }
+        }
+      },
+      "HostConfiguration": {
+        "type": "object",
+        "required": [
+          "modules",
+          "providers"
+        ],
+        "properties": {
+          "modules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModuleConfiguration"
+            }
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProviderConfiguration"
+            }
+          }
+        }
+      },
+      "LoadedModule": {
+        "type": "object",
+        "required": [
+          "name",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "MaterialMode": {
+        "type": "string",
+        "enum": [
+          "frozen",
+          "pushed",
+          "shared"
+        ]
+      },
+      "ModuleConfiguration": {
+        "type": "object",
+        "required": [
+          "name",
+          "entrypoint"
+        ],
+        "properties": {
+          "entrypoint": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "Observation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cause",
+              "state"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/StopCause"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "stopped"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cause",
+              "state"
+            ],
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/GoneCause"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "gone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "state"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/components/schemas/UnknownReason"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ObserveRecord": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "event",
+              "type"
+            ],
+            "properties": {
+              "event": {
+                "$ref": "#/components/schemas/Event"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "event"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "cursor",
+              "sandboxes",
+              "type"
+            ],
+            "properties": {
+              "cursor": {
+                "type": "string"
+              },
+              "sandboxes": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Sandbox"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "snapshot"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Hosts unable to replay emit one complete list snapshot, explicitly marking the gap."
+      },
+      "Period": {
+        "type": "object",
+        "required": [
+          "start",
+          "end"
+        ],
+        "properties": {
+          "end": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "start": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PrepareRequest": {
+        "type": "object",
+        "description": "Preparation is look-up-or-build at the provider, keyed by both digests.",
+        "required": [
+          "image_digest",
+          "tools_digest"
+        ],
+        "properties": {
+          "image_digest": {
+            "type": "string"
+          },
+          "tools_digest": {
+            "type": "string"
+          }
+        }
+      },
+      "Prepared": {
+        "type": "object",
+        "required": [
+          "provider",
+          "id",
+          "image_digest",
+          "tools_digest"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "image_digest": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "tools_digest": {
+            "type": "string"
+          }
+        }
+      },
+      "ProtocolError": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "refused"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unavailable"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "retry_after": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "rate_limited"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "retry_after": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "quota_exhausted"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "credential_rejected"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "provider_error",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "internal"
+                ]
+              },
+              "provider_error": {
+                "type": "string",
+                "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "Adaptors never retry. Internal preserves the vendor's raw error text."
+      },
+      "ProviderConfiguration": {
+        "type": "object",
+        "required": [
+          "name",
+          "module",
+          "settings",
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/CredentialMode"
+          },
+          "module": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "settings": {
+            "type": "object",
+            "description": "Non-secret vendor-specific configuration only.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ProviderDeclaration": {
+        "type": "object",
+        "required": [
+          "provider",
+          "module",
+          "capabilities",
+          "readiness",
+          "rate_limits"
+        ],
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/Capabilities"
+          },
+          "module": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "rate_limits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateLimit"
+            }
+          },
+          "readiness": {
+            "$ref": "#/components/schemas/Readiness"
+          }
+        }
+      },
+      "ProvisionRequest": {
+        "type": "object",
+        "description": "Repeated creation with the same label returns the existing sandbox (200).\nPrepared forms belong to one provider; cross-provider use is Refused.",
+        "required": [
+          "label",
+          "prepared",
+          "size"
+        ],
+        "properties": {
+          "egress": {
+            "$ref": "#/components/schemas/EgressRequest"
+          },
+          "label": {
+            "type": "string"
+          },
+          "prepared": {
+            "$ref": "#/components/schemas/Prepared"
+          },
+          "size": {
+            "$ref": "#/components/schemas/Size"
+          },
+          "ssh_public_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Quota": {
+        "type": "object",
+        "properties": {
+          "concurrency_in_use": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "concurrency_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "credit_unit": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "credits_remaining": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "RateLimit": {
+        "type": "object",
+        "required": [
+          "operation",
+          "requests",
+          "period_seconds"
+        ],
+        "properties": {
+          "operation": {
+            "type": "string"
+          },
+          "period_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Reach": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "endpoint",
+              "user",
+              "host_key",
+              "kind"
+            ],
+            "properties": {
+              "endpoint": {
+                "type": "string"
+              },
+              "host_key": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "ssh"
+                ]
+              },
+              "user": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "url",
+              "token",
+              "expires_at",
+              "kind"
+            ],
+            "properties": {
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "dial"
+                ]
+              },
+              "token": {
+                "$ref": "#/components/schemas/Secret"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "relay"
+                ]
+              },
+              "path": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "Readiness": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "status"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "missing_tool"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "missing_credential"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "version_mismatch"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ResumeToken": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "$ref": "#/components/schemas/Secret"
+          }
+        }
+      },
+      "Sandbox": {
+        "type": "object",
+        "required": [
+          "id",
+          "provider",
+          "state",
+          "egress"
+        ],
+        "properties": {
+          "egress": {
+            "$ref": "#/components/schemas/Enforcement"
+          },
+          "granted_size": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Size"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Unlabelled resources are listable, inspectable and destroyable."
+          },
+          "provider": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/Observation"
+          }
+        }
+      },
+      "Secret": {
+        "type": "string",
+        "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value.\nPartialEq is for wire-value comparisons, NOT constant-time authentication.\nAuthentication belongs to hosts, which must use constant-time token comparison.\nThis type does not promise secure erasure of strings or serialization buffers."
+      },
+      "Size": {
+        "type": "object",
+        "required": [
+          "cpus",
+          "memory_bytes",
+          "disk_bytes"
+        ],
+        "properties": {
+          "cpus": {
+            "type": "number",
+            "format": "double"
+          },
+          "disk_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "SizeUsage": {
+        "type": "object",
+        "required": [
+          "size",
+          "hours"
+        ],
+        "properties": {
+          "hours": {
+            "type": "number",
+            "format": "double"
+          },
+          "size": {
+            "$ref": "#/components/schemas/Size"
+          }
+        }
+      },
+      "StopCause": {
+        "type": "string",
+        "enum": [
+          "suspended_by_request",
+          "paused_by_provider",
+          "guest_halted"
+        ]
+      },
+      "TimestampSource": {
+        "type": "string",
+        "enum": [
+          "provider",
+          "adaptor"
+        ]
+      },
+      "UnknownReason": {
+        "type": "string",
+        "enum": [
+          "host_unreachable",
+          "provider_api_error",
+          "guest_unresponsive"
+        ]
+      },
+      "Usage": {
+        "type": "object",
+        "required": [
+          "period",
+          "sandbox_hours"
+        ],
+        "properties": {
+          "period": {
+            "$ref": "#/components/schemas/Period"
+          },
+          "sandbox_hours": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SizeUsage"
+            }
+          }
+        }
+      }
+    }
+  }
+}
