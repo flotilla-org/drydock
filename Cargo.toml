@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/drydock-protocol", "crates/drydock-transport"]
+members = ["crates/drydock-protocol", "crates/drydock-transport", "crates/drydock-host"]
 resolver = "3"
 
 [workspace.package]
