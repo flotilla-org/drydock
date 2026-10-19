@@ -8,7 +8,8 @@ pub enum ConnectionKind {
 }
 
 /// Link streams carry exactly one long-lived HTTP/2 connection. Raw streams
-/// identify a cleat session or a TCP destination (DNS name, IPv4 or IPv6 literal).
+/// identify a cleat session or requested TCP destination. The receiver validates
+/// host syntax and authorizes the destination before opening it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Purpose {
     Control,

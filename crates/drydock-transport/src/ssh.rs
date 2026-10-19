@@ -4,8 +4,13 @@
 use crate::{ByteStream, Connections, Limits, Transport, native::UnixConnections};
 use async_trait::async_trait;
 use std::{io, path::PathBuf, process::Stdio, sync::Arc};
-use tokio::{net::UnixListener, process::Command, sync::watch};
+use tokio::{
+    net::UnixListener,
+    process::Command,
+    sync::{oneshot, watch},
+};
 
+#[derive(Clone)]
 pub struct SshConfig {
     pub host: String,
     pub port: u16,
@@ -19,8 +24,9 @@ pub struct SshConfig {
 }
 
 /// Starts and owns one SSH session. Local temporary files and the process are
-/// removed when the transport is dropped. Agent socket permissions and the
-/// remote forwarding path are the provider's responsibility.
+/// removed asynchronously after drop: the monitor kills and reaps the process
+/// before removing the directory. Keep the runtime running during teardown.
+/// Agent socket permissions and the remote path are the provider's responsibility.
 pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport> {
     limits.validate()?;
     if config.host.is_empty()
@@ -36,19 +42,29 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
             "invalid SSH reach recipe",
         ));
     }
-    let dir = tempfile::Builder::new()
-        .prefix("dd-ssh-")
-        .tempdir_in("/tmp")?;
+    // Keep Unix socket paths below sun_path limits even with a long TMPDIR.
+    let dir = tokio::task::spawn_blocking(|| {
+        tempfile::Builder::new()
+            .prefix("dd-ssh-")
+            .tempdir_in("/tmp")
+    })
+    .await
+    .map_err(io::Error::other)??;
     let incoming_path = dir.path().join("in");
     let outgoing_path = dir.path().join("out");
     let listener = UnixListener::bind(&incoming_path)?;
     let known_hosts = dir.path().join("known_hosts");
-    std::fs::write(
+    tokio::fs::write(
         &known_hosts,
         format!("drydock-vessel {}\n", config.host_key),
-    )?;
+    )
+    .await?;
     let stderr_path = dir.path().join("stderr");
-    let stderr = std::fs::File::create(&stderr_path)?;
+    let stderr = tokio::fs::File::create(&stderr_path)
+        .await?
+        .into_std()
+        .await;
+    let control = dir.path().join("master");
     let local = forward(&outgoing_path, &config.agent_socket)?;
     let remote = forward(&config.reverse_socket, &incoming_path)?;
     let mut child = Command::new("ssh")
@@ -85,10 +101,9 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         .arg(config.port.to_string())
         .arg("-l")
         .arg(&config.user)
-        .arg("-L")
-        .arg(local)
-        .arg("-R")
-        .arg(remote)
+        .arg("-M")
+        .arg("-S")
+        .arg(&control)
         .arg(&config.host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -102,11 +117,36 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
                     io::ErrorKind::ConnectionAborted,
                     format!(
                         "SSH exited ({status}): {}",
-                        std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                        tokio::fs::read_to_string(&stderr_path)
+                            .await
+                            .unwrap_or_default()
                     ),
                 ));
             }
-            if outgoing_path.exists() {
+            if tokio::fs::try_exists(&control).await? {
+                // The multiplexing control command waits for the remote forward
+                // acknowledgement. Local socket existence alone is not readiness.
+                let output = Command::new("ssh")
+                    .args(["-F", "/dev/null", "-S"])
+                    .arg(&control)
+                    .args(["-O", "forward", "-L"])
+                    .arg(&local)
+                    .arg("-R")
+                    .arg(&remote)
+                    .arg(&config.host)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!(
+                            "SSH forwarding rejected: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        ),
+                    ));
+                }
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -115,15 +155,21 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSH forwarding setup"))??;
     let (ended, status) = watch::channel(false);
-    let monitor = tokio::spawn(async move {
+    let (stop, shutdown) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = child.wait() => {},
+            _ = shutdown => { let _ = child.kill().await; }
+        }
         let _ = child.wait().await;
         let _ = ended.send(true);
+        // Reap the owned child before removing its private socket directory.
+        let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
     });
     let connections = SshConnections {
         native: UnixConnections::new(listener, outgoing_path),
         status,
-        monitor,
-        _dir: dir,
+        stop: Some(stop),
     };
     Transport::native(Arc::new(connections), limits)
 }
@@ -147,12 +193,13 @@ fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<Stri
 struct SshConnections {
     native: UnixConnections,
     status: watch::Receiver<bool>,
-    monitor: tokio::task::JoinHandle<()>,
-    _dir: tempfile::TempDir,
+    stop: Option<oneshot::Sender<()>>,
 }
 impl Drop for SshConnections {
     fn drop(&mut self) {
-        self.monitor.abort();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
     }
 }
 #[async_trait]

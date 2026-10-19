@@ -1,4 +1,6 @@
-use crate::{ByteStream, Driver, Limits, Open, Opener, Transport, receive};
+use crate::{
+    AcceptError, ByteStream, Driver, ErrorScope, Limits, Open, Opener, Transport, receive,
+};
 use async_trait::async_trait;
 use futures::future::poll_fn;
 use std::{io, sync::Arc};
@@ -69,7 +71,7 @@ impl Transport {
                                         headers.spawn(receive(Box::new(stream.compat()), tx.clone(), timeout));
                                     } // Overload resets the new stream, never stalls the driver.
                                 }
-                                Some(Err(e)) => { let _ = tx.try_send(Err(io::Error::other(e))); break; }
+                                Some(Err(e)) => { let _ = tx.try_send(Err(AcceptError::new(ErrorScope::Terminal, io::Error::other(e)))); break; }
                                 None => break,
                             }
                         }

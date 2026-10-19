@@ -32,11 +32,55 @@ pub struct Incoming {
     pub stream: ByteStream,
 }
 
+/// Whether an accept error affects one connection, triggers listener retry, or
+/// ends the driver. After Terminal, queued streams may drain before None.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorScope {
+    Connection,
+    Retrying,
+    Terminal,
+}
+#[derive(Debug)]
+pub struct AcceptError {
+    pub scope: ErrorScope,
+    source: io::Error,
+}
+impl AcceptError {
+    pub(crate) fn new(scope: ErrorScope, source: io::Error) -> Self {
+        Self { scope, source }
+    }
+    pub fn kind(&self) -> io::ErrorKind {
+        self.source.kind()
+    }
+}
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.scope, self.source)
+    }
+}
+impl std::error::Error for AcceptError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn retryable_accept(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
 /// A native two-way connection source. Paths, addresses and authentication belong
 /// to the adapter. Each call creates/accepts an independent connection.
 #[async_trait]
 pub trait Connections: Send + Sync + 'static {
     async fn connect(&self) -> io::Result<ByteStream>;
+    /// Must be cancellation-safe: the driver selects this against task completions.
     async fn accept(&self) -> io::Result<ByteStream>;
 }
 
@@ -50,6 +94,7 @@ trait Open: Send + Sync {
 pub struct Limits {
     pub queue: usize,
     pub pending_headers: usize,
+    pub max_sessions: usize,
     pub header_timeout: Duration,
 }
 impl Default for Limits {
@@ -57,13 +102,18 @@ impl Default for Limits {
         Self {
             queue: 64,
             pending_headers: 64,
+            max_sessions: 64,
             header_timeout: Duration::from_secs(10),
         }
     }
 }
 impl Limits {
     fn validate(&self) -> io::Result<()> {
-        if self.queue == 0 || self.pending_headers == 0 || self.header_timeout.is_zero() {
+        if self.queue == 0
+            || self.pending_headers == 0
+            || self.max_sessions == 0
+            || self.header_timeout.is_zero()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "transport limits must be nonzero",
@@ -102,18 +152,21 @@ impl Opener {
 
 pub struct Transport {
     pub opener: Opener,
-    incoming: mpsc::Receiver<io::Result<Incoming>>,
+    incoming: mpsc::Receiver<Result<Incoming, AcceptError>>,
 }
 impl Transport {
     pub async fn open(&self, purpose: Purpose) -> io::Result<ByteStream> {
         self.opener.open(purpose).await
     }
-    pub async fn accept(&mut self) -> io::Result<Option<Incoming>> {
+    /// Connection errors discard only that stream. Retrying errors report a
+    /// transient listener failure; the driver applies backoff and keeps accepting.
+    /// Terminal errors end the driver; drain any queued streams until None.
+    pub async fn accept(&mut self) -> Result<Option<Incoming>, AcceptError> {
         self.incoming.recv().await.transpose()
     }
 
-    /// Independent native connections. Each accepted connection is negotiated on
-    /// its own task, so a partial header cannot delay another connection.
+    /// Independent native connections. Partial handshakes, established fallback
+    /// sessions, and established raw streams have separate lifetimes and limits.
     pub fn native(connections: Arc<dyn Connections>, limits: Limits) -> io::Result<Self> {
         limits.validate()?;
         let (tx, incoming) = mpsc::channel(limits.queue);
@@ -122,38 +175,58 @@ impl Transport {
         let source = connections.clone();
         let settings = limits.clone();
         let task = tokio::spawn(async move {
-            let mut headers = JoinSet::new();
+            let mut headers: JoinSet<Option<Transport>> = JoinSet::new();
+            let mut sessions = JoinSet::new();
             loop {
                 tokio::select! {
                     biased;
                     _ = tx.closed() => break,
-                    Some(_) = headers.join_next(), if !headers.is_empty() => {},
+                    Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+                    Some(result) = headers.join_next(), if !headers.is_empty() => {
+                        if let Ok(Some(mut mux)) = result {
+                            if sessions.len() >= settings.max_sessions {
+                                let _ = tx.try_send(Err(AcceptError::new(ErrorScope::Connection, io::Error::other("yamux session limit reached"))));
+                                continue;
+                            }
+                            *fallback.write().unwrap() = Some(Arc::downgrade(&mux.opener.inner));
+                            let tx = tx.clone();
+                            sessions.spawn(async move {
+                                loop {
+                                    let item = match mux.accept().await {
+                                        Ok(Some(incoming)) => Ok(incoming),
+                                        Ok(None) => break,
+                                        Err(mut error) => { error.scope = ErrorScope::Connection; Err(error) },
+                                    };
+                                    if tx.send(item).await.is_err() { break; }
+                                }
+                            });
+                        }
+                    },
                     result = source.accept(), if headers.len() < settings.pending_headers => {
                         match result {
                             Ok(mut stream) => {
                                 let tx = tx.clone();
                                 let settings = settings.clone();
-                                let fallback = fallback.clone();
                                 headers.spawn(async move {
                                     let kind = tokio::time::timeout(settings.header_timeout, read_connection_kind(&mut stream)).await;
                                     match kind {
                                         Ok(Ok(ConnectionKind::Single)) => receive(stream, tx, settings.header_timeout).await,
-                                        Ok(Ok(ConnectionKind::Yamux)) => {
-                                            // Negotiating fallback selects the same yamux session
-                                            // for reverse opens, even without native reverse reach.
-                                            if let Ok(mut mux) = Self::yamux_after_preface(stream, false, settings) {
-                                                *fallback.write().unwrap() = Some(Arc::downgrade(&mux.opener.inner));
-                                                while let Some(item) = mux.incoming.recv().await {
-                                                    if tx.send(item).await.is_err() { break; }
-                                                }
-                                            }
-                                        }
-                                        Ok(Err(e)) => { let _ = tx.send(Err(e)).await; }
-                                        Err(_) => { let _ = tx.send(Err(io::Error::new(io::ErrorKind::TimedOut, "connection preface"))).await; }
+                                        Ok(Ok(ConnectionKind::Yamux)) => return Self::yamux_after_preface(stream, false, settings).ok(),
+                                        Ok(Err(e)) => { let _ = tx.send(Err(AcceptError::new(ErrorScope::Connection, e))).await; }
+                                        Err(_) => { let _ = tx.send(Err(AcceptError::new(ErrorScope::Connection, io::Error::new(io::ErrorKind::TimedOut, "connection preface")))).await; }
                                     }
+                                    None
                                 });
                             }
-                            Err(e) => { let _ = tx.send(Err(e)).await; break; }
+                            Err(e) => {
+                                let retry = retryable_accept(&e);
+                                let scope = if retry { ErrorScope::Retrying } else { ErrorScope::Terminal };
+                                if tx.send(Err(AcceptError::new(scope, e))).await.is_err() || !retry { break; }
+                                tokio::select! {
+                                    _ = tx.closed() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                                }
+                            }
                         }
                     }
                 }
@@ -223,7 +296,7 @@ impl Open for NativeOpen {
 
 async fn receive(
     mut stream: ByteStream,
-    tx: mpsc::Sender<io::Result<Incoming>>,
+    tx: mpsc::Sender<Result<Incoming, AcceptError>>,
     timeout: Duration,
 ) {
     let result = match tokio::time::timeout(timeout, wire::read_purpose(&mut stream)).await {
@@ -234,5 +307,7 @@ async fn receive(
             "stream purpose header",
         )),
     };
-    let _ = tx.send(result).await;
+    let _ = tx
+        .send(result.map_err(|e| AcceptError::new(ErrorScope::Connection, e)))
+        .await;
 }
