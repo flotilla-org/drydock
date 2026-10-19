@@ -24,11 +24,7 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "yamux connection closed")
 }
 impl Transport {
-    pub(crate) fn yamux_after_preface(
-        stream: ByteStream,
-        initiator: bool,
-        limits: Limits,
-    ) -> io::Result<Self> {
+    pub(crate) fn yamux_after_preface(stream: ByteStream, initiator: bool, limits: Limits) -> Self {
         let mode = if initiator {
             yamux::Mode::Client
         } else {
@@ -69,6 +65,8 @@ impl Transport {
                                 Some(Ok(stream)) => {
                                     if headers.len() < limits.pending_headers {
                                         headers.spawn(receive(Box::new(stream.compat()), tx.clone(), timeout));
+                                    } else {
+                                        tracing::warn!(limit = limits.pending_headers, "vessel yamux stream refused: unfinished-header limit");
                                     } // Overload resets the new stream, never stalls the driver.
                                 }
                                 Some(Err(e)) => { let _ = tx.try_send(Err(AcceptError::new(ErrorScope::Terminal, io::Error::other(e)))); break; }
@@ -83,13 +81,13 @@ impl Transport {
                 }
             }
         });
-        Ok(Self {
+        Self {
             opener: Opener {
                 inner: Arc::new(MuxOpen(requests)),
                 _driver: Arc::new(Driver(task.abort_handle())),
                 timeout,
             },
             incoming,
-        })
+        }
     }
 }

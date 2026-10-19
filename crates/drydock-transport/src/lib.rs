@@ -130,7 +130,8 @@ impl Drop for Driver {
     }
 }
 
-/// A clonable concurrent stream opener. Retains its transport driver.
+/// A clonable concurrent opener for a live Transport. A clone does
+/// not replace Transport ownership: keep the Transport alive while using it.
 #[derive(Clone)]
 pub struct Opener {
     inner: Arc<dyn Open>,
@@ -179,6 +180,7 @@ impl Transport {
             let mut headers: JoinSet<Option<Transport>> = JoinSet::new();
             let mut sessions = JoinSet::new();
             let mut backoff = Duration::from_millis(100);
+            let mut churn = 0usize;
             loop {
                 tokio::select! {
                     biased;
@@ -187,6 +189,7 @@ impl Transport {
                     Some(result) = headers.join_next(), if !headers.is_empty() => {
                         if let Ok(Some(mut mux)) = result {
                             if sessions.len() >= settings.max_sessions {
+                                tracing::warn!(limit = settings.max_sessions, "vessel yamux session refused: session limit");
                                 let _ = tx.try_send(Err(AcceptError::new(ErrorScope::Connection, io::Error::other("yamux session limit reached"))));
                                 continue;
                             }
@@ -208,13 +211,14 @@ impl Transport {
                         match result {
                             Ok(mut stream) => {
                                 backoff = Duration::from_millis(100);
+                                churn = 0;
                                 let tx = tx.clone();
                                 let settings = settings.clone();
                                 headers.spawn(async move {
                                     let kind = tokio::time::timeout(settings.header_timeout, read_connection_kind(&mut stream)).await;
                                     match kind {
                                         Ok(Ok(ConnectionKind::Single)) => receive(stream, tx, settings.header_timeout).await,
-                                        Ok(Ok(ConnectionKind::Yamux)) => return Self::yamux_after_preface(stream, false, settings).ok(),
+                                        Ok(Ok(ConnectionKind::Yamux)) => return Some(Self::yamux_after_preface(stream, false, settings)),
                                         Ok(Err(e)) => { let _ = tx.send(Err(AcceptError::new(ErrorScope::Connection, e))).await; }
                                         Err(_) => { let _ = tx.send(Err(AcceptError::new(ErrorScope::Connection, io::Error::new(io::ErrorKind::TimedOut, "connection preface")))).await; }
                                     }
@@ -234,8 +238,11 @@ impl Transport {
                                 if matches!(tx.try_send(Err(AcceptError::new(scope, e))), Err(mpsc::error::TrySendError::Closed(_))) { break; }
                                 if connection_churn {
                                     backoff = Duration::from_millis(100);
-                                    tokio::task::yield_now().await;
+                                    churn = churn.saturating_add(1);
+                                    if churn >= 8 { tokio::time::sleep(Duration::from_millis(1)).await; }
+                                    else { tokio::task::yield_now().await; }
                                 } else {
+                                    churn = 0;
                                     let delay = backoff;
                                     backoff = (backoff * 2).min(Duration::from_secs(1));
                                     tokio::select! {
@@ -284,7 +291,7 @@ impl Transport {
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "yamux preface"))??;
-        Self::yamux_after_preface(stream, initiator, limits)
+        Ok(Self::yamux_after_preface(stream, initiator, limits))
     }
 }
 

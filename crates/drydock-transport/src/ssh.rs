@@ -3,7 +3,14 @@
 //! and the reach recipe's host public key. No ambient SSH configuration is read.
 use crate::{ByteStream, Connections, Limits, Transport, native::UnixConnections};
 use async_trait::async_trait;
-use std::{io, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::VecDeque,
+    io,
+    path::PathBuf,
+    process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{
     net::UnixListener,
     process::Command,
@@ -12,6 +19,8 @@ use tokio::{
 
 #[derive(Clone)]
 pub struct SshConfig {
+    /// Budget for TCP connection, authentication, and forwarding setup.
+    pub connect_timeout: Duration,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -30,7 +39,8 @@ pub struct SshConfig {
 pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport> {
     limits.validate()?;
     validate_host_key(&config.host_key)?;
-    if config.host.is_empty()
+    if config.connect_timeout.is_zero()
+        || config.host.is_empty()
         || config.host.starts_with('-')
         || config.host.contains(['\n', '\r', ' ', '\t', '@'])
         || config.user.is_empty()
@@ -43,7 +53,8 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
             "invalid SSH reach recipe",
         ));
     }
-    // Keep Unix socket paths below sun_path limits even with a long TMPDIR.
+    // Unix-only adapter, validated on Linux. Keep socket paths below sun_path
+    // limits even with a long TMPDIR; Windows hosts are not supported.
     let dir = tokio::task::spawn_blocking(|| {
         tempfile::Builder::new()
             .prefix("dd-ssh-")
@@ -60,15 +71,10 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         format!("drydock-vessel {}\n", config.host_key),
     )
     .await?;
-    let stderr_path = dir.path().join("stderr");
-    let stderr = tokio::fs::File::create(&stderr_path)
-        .await?
-        .into_std()
-        .await;
     let control = dir.path().join("master");
     let local = forward(&outgoing_path, &config.agent_socket)?;
     let remote = forward(&config.reverse_socket, &incoming_path)?;
-    let child = Command::new("ssh")
+    let mut child = Command::new("ssh")
         .args([
             "-F",
             "/dev/null",
@@ -77,6 +83,8 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
             "-N",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "LogLevel=ERROR",
             "-o",
             "IdentitiesOnly=yes",
             "-o",
@@ -96,6 +104,14 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         ])
         .arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-o")
+        .arg(format!(
+            "ConnectTimeout={}",
+            config
+                .connect_timeout
+                .as_secs()
+                .saturating_add(u64::from(config.connect_timeout.subsec_nanos() != 0))
+        ))
         .arg("-i")
         .arg(&config.identity_file)
         .arg("-p")
@@ -108,25 +124,23 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         .arg(&config.host)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr)
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    let stderr = StderrTail::drain(child.stderr.take().unwrap());
     let mut setup = SetupGuard {
         child: Some(child),
         dir: Some(dir),
+        stderr: Some(stderr),
     };
     let child = setup.child.as_mut().unwrap();
-    tokio::time::timeout(limits.header_timeout, async {
+    let stderr = setup.stderr.as_ref().unwrap();
+    tokio::time::timeout(config.connect_timeout, async {
         loop {
             if let Some(status) = child.try_wait()? {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    format!(
-                        "SSH exited ({status}): {}",
-                        tokio::fs::read_to_string(&stderr_path)
-                            .await
-                            .unwrap_or_default()
-                    ),
+                    format!("SSH exited ({status}): {}", stderr.text()),
                 ));
             }
             if tokio::fs::try_exists(&control).await? {
@@ -162,6 +176,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SSH forwarding setup"))??;
     let mut child = setup.child.take().unwrap();
     let dir = setup.dir.take().unwrap();
+    let stderr = setup.stderr.take().unwrap();
     let (ended, status) = watch::channel(false);
     let (stop, shutdown) = oneshot::channel();
     tokio::spawn(async move {
@@ -171,6 +186,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         }
         let _ = child.wait().await;
         let _ = ended.send(true);
+        drop(stderr);
         // Reap the owned child before removing its private socket directory.
         let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
     });
@@ -235,16 +251,57 @@ impl Connections for SshConnections {
 struct SetupGuard {
     child: Option<tokio::process::Child>,
     dir: Option<tempfile::TempDir>,
+    stderr: Option<StderrTail>,
 }
 impl Drop for SetupGuard {
     fn drop(&mut self) {
+        let stderr = self.stderr.take();
         if let (Some(mut child), Some(dir)) = (self.child.take(), self.dir.take()) {
             tokio::spawn(async move {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                drop(stderr);
                 let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
             });
         }
+    }
+}
+
+const STDERR_TAIL_BYTES: usize = 8192;
+struct StderrTail {
+    bytes: Arc<Mutex<VecDeque<u8>>>,
+    task: tokio::task::AbortHandle,
+}
+impl StderrTail {
+    fn drain<R: tokio::io::AsyncRead + Unpin + Send + 'static>(mut reader: R) -> Self {
+        let bytes = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)));
+        let buffer = bytes.clone();
+        let task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0; 1024];
+            while let Ok(n) = reader.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let mut tail = buffer.lock().unwrap();
+                let excess = (tail.len() + n).saturating_sub(STDERR_TAIL_BYTES);
+                tail.drain(..excess);
+                tail.extend(&chunk[..n]);
+            }
+        });
+        Self {
+            bytes,
+            task: task.abort_handle(),
+        }
+    }
+    fn text(&self) -> String {
+        let bytes: Vec<_> = self.bytes.lock().unwrap().iter().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+impl Drop for StderrTail {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -294,6 +351,7 @@ mod tests {
         drop(SetupGuard {
             child: Some(child),
             dir: Some(dir),
+            stderr: None,
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while tokio::fs::try_exists(&path).await.unwrap() {
@@ -306,5 +364,25 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "child must be reaped before its directory disappears"
         );
+    }
+    // Long-lived SSH diagnostics must drain without pipe backpressure or disk
+    // growth, retaining only the documented 8 KiB suffix for error reporting.
+    #[tokio::test]
+    async fn stderr_drain_retains_only_bounded_tail() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let tail = StderrTail::drain(reader);
+        let mut data = vec![b'x'; 1024 * 1024];
+        data.extend_from_slice(b"last diagnostic");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            writer.write_all(&data).await.unwrap();
+            writer.shutdown().await.unwrap();
+            while !tail.text().ends_with("last diagnostic") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tail.text().as_bytes(), &data[data.len() - 8192..]);
     }
 }

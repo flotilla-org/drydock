@@ -137,6 +137,7 @@ async fn ssh_server(
     .unwrap();
     (
         ssh::SshConfig {
+            connect_timeout: Duration::from_secs(5),
             host: "127.0.0.1".into(),
             port,
             user,
@@ -926,6 +927,7 @@ async fn ssh_rejects_host_key_options_and_markers() {
         "ssh-ed25519 AAAA\n",
     ] {
         let config = ssh::SshConfig {
+            connect_timeout: Duration::from_secs(5),
             host: "127.0.0.1".into(),
             port: 22,
             user: "vessel".into(),
@@ -974,5 +976,81 @@ async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
     let transport = ssh::connect(config, Limits::default()).await.unwrap();
     assert!(UnixStream::connect(reverse).await.is_ok());
     drop(transport);
+    server.kill().await.unwrap();
+}
+
+// A persistently failing listener must eventually sleep rather than burning a
+// worker core. Short bursts retain the zero-delay connection-churn path.
+#[tokio::test(start_paused = true)]
+async fn persistent_connection_churn_has_a_floor_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = FaultyAccept {
+        native: UnixConnections::new(
+            UnixListener::bind(dir.path().join("listen")).unwrap(),
+            dir.path().join("peer"),
+        ),
+        failures: tokio::sync::Mutex::new(
+            (0..10)
+                .map(|_| io::Error::from(io::ErrorKind::ConnectionReset))
+                .collect(),
+        ),
+    };
+    let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
+    let start = tokio::time::Instant::now();
+    for _ in 0..10 {
+        assert_eq!(
+            transport.accept().await.err().unwrap().scope,
+            drydock_transport::ErrorScope::Retrying
+        );
+    }
+    assert_eq!(start.elapsed(), Duration::from_millis(2));
+}
+
+// SSH bootstrap has its own budget. A tiny raw-header deadline must not abort
+// authentication; a silent TCP endpoint must obey the explicit connect budget.
+#[tokio::test]
+async fn ssh_setup_timeout_is_independent_of_raw_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("guest");
+    let reverse = dir.path().join("reverse");
+    let (mut config, mut server) = ssh_server(
+        dir.path(),
+        guest.to_str().unwrap(),
+        reverse.to_str().unwrap(),
+    )
+    .await;
+    let mut invalid = config.clone();
+    invalid.connect_timeout = Duration::ZERO;
+    assert_eq!(
+        ssh::connect(invalid, Limits::default())
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    let transport = ssh::connect(
+        config.clone(),
+        Limits {
+            header_timeout: Duration::from_nanos(1),
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(reverse.exists());
+    drop(transport);
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.port = silent.local_addr().unwrap().port();
+    config.connect_timeout = Duration::from_millis(50);
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        ssh::connect(config, Limits::default()),
+    )
+    .await
+    .unwrap()
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     server.kill().await.unwrap();
 }
