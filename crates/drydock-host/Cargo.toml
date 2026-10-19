@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 drydock-protocol = { path = "../drydock-protocol" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "9379d92f722dc121d32eac9abd284ce57b1bff47" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "9379d92f722dc121d32eac9abd284ce57b1bff47" }
+rigging-http-serve.workspace = true
+rigging-tls.workspace = true
 async-trait = "0.1"
 axum = "0.8"
 serde.workspace = true
