@@ -31,7 +31,12 @@ pub(super) fn poll_interval(
     Ok(Some(interval))
 }
 pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>) {
-    let Ok(Some(interval)) = poll_interval(instance.observation, &instance.rate_limits) else {
+    let interval = poll_interval(instance.observation, &instance.rate_limits);
+    debug_assert!(
+        interval.is_ok(),
+        "polling policy was validated at configuration"
+    );
+    let Ok(Some(interval)) = interval else {
         return;
     };
     let weak: Weak<Instance> = Arc::downgrade(&instance);
@@ -102,6 +107,8 @@ fn reconcile(
                 if old.is_some_and(|s| matches!(s.state, Observation::Stopped { .. })) {
                     kinds.push(EventKind::Resumed);
                 }
+                // Restart emits Running even with unchanged size; a running row
+                // also emits it when the granted size changes.
                 if old.is_none_or(|old| {
                     !matches!(old.state, Observation::Running) || old.granted_size != s.granted_size
                 }) && let Some(granted_size) = s.granted_size.clone()

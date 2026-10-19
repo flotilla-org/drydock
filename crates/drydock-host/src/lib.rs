@@ -442,11 +442,19 @@ impl From<ProtocolError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, retry) = (self.0.status(), self.0.retry_after());
-        let mut response = (StatusCode::from_u16(status).unwrap(), Json(self.0)).into_response();
+        let mut response = (
+            StatusCode::from_u16(status).expect("protocol error status is valid HTTP"),
+            Json(self.0),
+        )
+            .into_response();
         if let Some(seconds) = retry {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, seconds.to_string().parse().unwrap());
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                seconds
+                    .to_string()
+                    .parse()
+                    .expect("decimal retry seconds form a valid header"),
+            );
         }
         response
     }
