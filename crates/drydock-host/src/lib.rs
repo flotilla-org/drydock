@@ -15,10 +15,11 @@ use module::{Credentials, Provider, Registry, Result, refused};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    convert::Infallible,
     sync::{Arc, Mutex},
 };
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, watch};
+
+const EVENT_HISTORY_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 pub struct EventSink {
@@ -41,7 +42,10 @@ impl EventSink {
         source: TimestampSource,
         event: EventKind,
     ) {
-        let mut log = self.log.lock().unwrap();
+        let mut log = self
+            .log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         log.serial += 1;
         let cursor = format!("{}:{}", log.epoch, log.serial);
         log.records.push_back(Event {
@@ -53,28 +57,42 @@ impl EventSink {
             timestamp_source: source,
             event,
         });
-        if log.records.len() > 1024 {
+        if log.records.len() > EVENT_HISTORY_CAPACITY {
             log.records.pop_front();
         }
         self.changed.send_replace(log.serial);
     }
 }
+struct Authentication {
+    credentials: Credentials,
+    generation: u64,
+    readiness: Readiness,
+}
 struct Instance {
     config: ProviderConfiguration,
-    provider: Box<dyn Provider>,
-    credentials: Credentials,
-    rejected: bool,
+    provider: Arc<AsyncMutex<Box<dyn Provider>>>,
+    auth: Mutex<Authentication>,
+    capabilities: Capabilities,
+    rate_limits: Vec<RateLimit>,
 }
-#[derive(Default)]
+// Provider operations own a credential snapshot, so refresh never waits for vendor I/O.
+struct Session {
+    instance: Arc<Instance>,
+    provider: OwnedMutexGuard<Box<dyn Provider>>,
+    credentials: Credentials,
+    generation: u64,
+}
+#[derive(Default, Clone)]
 struct Configuration {
     modules: Vec<LoadedModule>,
     entrypoints: BTreeMap<String, String>,
-    providers: BTreeMap<String, Instance>,
+    providers: BTreeMap<String, Arc<Instance>>,
 }
 #[derive(Clone)]
 pub struct Host {
     registry: Arc<Registry>,
-    config: Arc<AsyncMutex<Configuration>>,
+    config: Arc<RwLock<Configuration>>,
+    configuring: Arc<AsyncMutex<()>>,
     events: EventSink,
     proxy_ca: Option<Arc<Vec<u8>>>,
     stopping: watch::Sender<bool>,
@@ -84,7 +102,8 @@ impl Host {
         let (changed, _) = watch::channel(0);
         Self {
             registry: Arc::new(registry),
-            config: Arc::new(AsyncMutex::new(Configuration::default())),
+            config: Arc::new(RwLock::new(Configuration::default())),
+            configuring: Arc::new(AsyncMutex::new(())),
             events: EventSink {
                 log: Arc::new(Mutex::new(Log {
                     serial: 0,
@@ -92,7 +111,9 @@ impl Host {
                     epoch: format!(
                         "{}-{}",
                         std::process::id(),
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+                        chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .expect("current time fits nanoseconds")
                     ),
                 })),
                 changed,
@@ -153,6 +174,8 @@ impl Host {
             .layer(middleware::from_fn(
                 |request: Request, next: Next| async move {
                     let response = next.run(request).await;
+                    // Module responses use ProtocolError statuses. Normalize only HTTP
+                    // extraction/routing failures; never echo their diagnostics.
                     match response.status() {
                         StatusCode::BAD_REQUEST
                         | StatusCode::METHOD_NOT_ALLOWED
@@ -221,9 +244,37 @@ impl Host {
             stopping.send_replace(true);
         }
     }
+    async fn instance(&self, name: &str) -> Result<Session> {
+        let instance = self
+            .config
+            .read()
+            .await
+            .providers
+            .get(name)
+            .cloned()
+            .ok_or_else(|| refused("unknown provider"))?;
+        let provider = instance.provider.clone().lock_owned().await;
+        let (credentials, generation) = {
+            let auth = instance
+                .auth
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (auth.credentials.clone(), auth.generation)
+        };
+        Ok(Session {
+            instance,
+            provider,
+            credentials,
+            generation,
+        })
+    }
     async fn records(&self, cursor: Option<&str>) -> Result<Vec<ObserveRecord>> {
         let replay = {
-            let log = self.events.log.lock().unwrap();
+            let log = self
+                .events
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cursor.and_then(|c| {
                 let serial = c
                     .strip_prefix(&format!("{}:", log.epoch))?
@@ -249,17 +300,25 @@ impl Host {
         }
     }
     async fn snapshot(&self) -> Result<ObserveRecord> {
-        let mut config = self.config.lock().await;
+        let config = self.config.read().await;
+        let names: Vec<_> = config.providers.keys().cloned().collect();
         // Capture the cursor before list calls, so background observations during a slow
         // snapshot are replayed rather than silently skipped (consumers reconcile IDs).
         let cursor = {
-            let log = self.events.log.lock().unwrap();
+            let log = self
+                .events
+                .log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             format!("{}:{}", log.epoch, log.serial)
         };
+        drop(config);
         let mut sandboxes = vec![];
-        for instance in config.providers.values_mut() {
-            let result = instance.provider.list(&instance.credentials).await;
-            sandboxes.extend(outcome(instance, result)?);
+        for name in names {
+            let mut session = self.instance(&name).await?;
+            ready(&session)?;
+            let result = session.provider.list(&session.credentials).await;
+            sandboxes.extend(outcome(&mut session, result)?);
         }
         Ok(ObserveRecord::Snapshot { cursor, sandboxes })
     }
@@ -295,33 +354,45 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
     serde_json::from_slice(body).map_err(|_| refused("invalid JSON request"))
 }
-fn instance<'a>(config: &'a mut Configuration, name: &str) -> Result<&'a mut Instance> {
-    config
-        .providers
-        .get_mut(name)
-        .ok_or_else(|| refused("unknown provider"))
-}
-fn outcome<T>(instance: &mut Instance, result: Result<T>) -> Result<T> {
-    if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
-        instance.rejected = true;
+fn outcome<T>(session: &mut Session, result: Result<T>) -> Result<T> {
+    let mut auth = session
+        .instance
+        .auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // An old rejected request must not undo a concurrently delivered refresh.
+    if auth.generation == session.generation {
+        auth.readiness = if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
+            Readiness::MissingCredential {
+                reason: "credential rejected".into(),
+            }
+        } else {
+            session.provider.readiness(&auth.credentials)
+        };
     }
     result
 }
-fn ready(instance: &Instance) -> Result<()> {
-    if instance.rejected
-        || !matches!(
-            instance.provider.readiness(&instance.credentials),
-            Readiness::Ready
-        )
-    {
-        return Err(ProtocolError::CredentialRejected {
-            reason: "provider is not ready; deliver or refresh credentials".into(),
-        });
+fn ready(session: &Session) -> Result<()> {
+    let auth = session
+        .instance
+        .auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &auth.readiness {
+        Readiness::Ready => Ok(()),
+        Readiness::MissingCredential { reason } => Err(ProtocolError::CredentialRejected {
+            reason: reason.clone(),
+        }),
+        Readiness::MissingTool { reason }
+        | Readiness::VersionMismatch { reason }
+        | Readiness::Unknown { reason } => Err(ProtocolError::Unavailable {
+            reason: reason.clone(),
+            retry_after: None,
+        }),
     }
-    Ok(())
 }
 async fn hello(State(host): State<Host>) -> Json<Hello> {
-    let config = host.config.lock().await;
+    let config = host.config.read().await;
     Json(Hello {
         protocol_version: PROTOCOL_VERSION.into(),
         host_version: env!("CARGO_PKG_VERSION").into(),
@@ -332,22 +403,22 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
             .map(|(name, i)| ProviderDeclaration {
                 provider: name.clone(),
                 module: i.config.module.clone(),
-                capabilities: i.provider.capabilities(),
-                readiness: if i.rejected {
-                    Readiness::MissingCredential {
-                        reason: "credential rejected".into(),
-                    }
-                } else {
-                    i.provider.readiness(&i.credentials)
-                },
-                rate_limits: i.provider.rate_limits(),
+                capabilities: i.capabilities.clone(),
+                readiness: i
+                    .auth
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .readiness
+                    .clone(),
+                rate_limits: i.rate_limits.clone(),
             })
             .collect(),
     })
 }
 async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCode> {
     let request: HostConfiguration = decode(&body)?;
-    let mut config = host.config.lock().await;
+    let _transaction = host.configuring.lock().await;
+    let mut config = host.config.read().await.clone();
     // Exact repeats preserve resources and delivered credentials. Changes to live providers
     // are refused: silently replacing one would lose in-memory reference resources.
     let mut modules = BTreeMap::new();
@@ -390,14 +461,23 @@ async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCod
         )?;
         let mut sink = host.events.clone();
         sink.provider = p.name.clone();
+        let provider = module.configure(p, sink).await?;
+        let readiness = provider.readiness(&credentials);
+        let capabilities = provider.capabilities();
+        let rate_limits = provider.rate_limits();
         additions.insert(
             p.name.clone(),
-            Instance {
+            Arc::new(Instance {
                 config: p.clone(),
-                provider: module.configure(p, sink).await?,
-                credentials,
-                rejected: false,
-            },
+                provider: Arc::new(AsyncMutex::new(provider)),
+                auth: Mutex::new(Authentication {
+                    credentials,
+                    readiness,
+                    generation: 0,
+                }),
+                capabilities,
+                rate_limits,
+            }),
         );
     }
     config.entrypoints = modules;
@@ -410,6 +490,7 @@ async fn configure(State(host): State<Host>, body: Bytes) -> ApiResult<StatusCod
             version: host.registry[&m.entrypoint].version().into(),
         })
         .collect();
+    *host.config.write().await = config;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn credential(
@@ -418,15 +499,32 @@ async fn credential(
     body: Bytes,
 ) -> ApiResult<StatusCode> {
     let refresh: CredentialRefresh = decode(&body)?;
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    if !matches!(i.credentials.mode, CredentialMode::Direct { .. }) {
+    if refresh.value.expose().is_empty() {
+        return Err(refused("credential must not be empty").into());
+    }
+    let instance = host
+        .config
+        .read()
+        .await
+        .providers
+        .get(&p)
+        .cloned()
+        .ok_or_else(|| refused("unknown provider"))?;
+    let mut auth = instance
+        .auth
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !matches!(auth.credentials.mode, CredentialMode::Direct { .. }) {
         return Err(refused("proxied provider cannot accept direct credentials").into());
     }
-    i.credentials.value = Some(refresh.value);
-    i.rejected = false;
+    auth.credentials.value = Some(refresh.value);
+    auth.generation += 1;
+    if matches!(auth.readiness, Readiness::MissingCredential { .. }) {
+        auth.readiness = Readiness::Ready;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
+
 async fn prepare(
     State(host): State<Host>,
     Path(p): Path<String>,
@@ -436,13 +534,19 @@ async fn prepare(
     if request.image_digest.is_empty() || request.tools_digest.is_empty() {
         return Err(refused("digests must not be empty").into());
     }
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     let result = i.provider.prepare(request, &i.credentials).await;
-    Ok(Json(outcome(i, result)?))
+    Ok(Json(outcome(&mut i, result)?))
 }
 fn valid_host(host: &str) -> bool {
+    if host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .is_some_and(|s| s.parse::<std::net::Ipv6Addr>().is_ok())
+    {
+        return true;
+    }
     if host.parse::<std::net::IpAddr>().is_ok() {
         return true;
     }
@@ -492,11 +596,10 @@ async fn provision(
 ) -> ApiResult<Response> {
     let request: ProvisionRequest = decode(&body)?;
     validate_provision(&p, &request)?;
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     let result = i.provider.provision(request, &i.credentials).await;
-    let (sandbox, created) = outcome(i, result)?;
+    let (sandbox, created) = outcome(&mut i, result)?;
     Ok((
         if created {
             StatusCode::CREATED
@@ -513,46 +616,42 @@ macro_rules! simple {
             State(host): State<Host>,
             Path((p, id)): Path<(String, String)>,
         ) -> ApiResult<Json<$output>> {
-            let mut config = host.config.lock().await;
-            let i = instance(&mut config, &p)?;
-            ready(i)?;
+            let mut i = host.instance(&p).await?;
+            ready(&i)?;
             let result = i.provider.$name(&id, &i.credentials).await;
-            Ok(Json(outcome(i, result)?))
+            Ok(Json(outcome(&mut i, result)?))
         }
     };
 }
 simple!(inspect, Sandbox);
 simple!(reach, Reach);
 async fn list(State(host): State<Host>, Path(p): Path<String>) -> ApiResult<Json<Vec<Sandbox>>> {
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     let result = i.provider.list(&i.credentials).await;
-    Ok(Json(outcome(i, result)?))
+    Ok(Json(outcome(&mut i, result)?))
 }
 async fn destroy(
     State(host): State<Host>,
     Path((p, id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     let result = i.provider.destroy(&id, &i.credentials).await;
-    outcome(i, result)?;
+    outcome(&mut i, result)?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn suspend(
     State(host): State<Host>,
     Path((p, id)): Path<(String, String)>,
 ) -> ApiResult<Json<ResumeToken>> {
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().suspend_resume {
         return Err(refused("suspend unsupported").into());
     }
     let result = i.provider.suspend(&id, &i.credentials).await;
-    Ok(Json(outcome(i, result)?))
+    Ok(Json(outcome(&mut i, result)?))
 }
 async fn resume(
     State(host): State<Host>,
@@ -560,28 +659,26 @@ async fn resume(
     body: Bytes,
 ) -> ApiResult<StatusCode> {
     let token = decode(&body)?;
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().suspend_resume {
         return Err(refused("resume unsupported").into());
     }
     let result = i.provider.resume(&id, token, &i.credentials).await;
-    outcome(i, result)?;
+    outcome(&mut i, result)?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(
     State(host): State<Host>,
     Path((p, id)): Path<(String, String)>,
 ) -> ApiResult<Json<Export>> {
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().export {
         return Err(refused("export unsupported").into());
     }
     let result = i.provider.export(&id, &i.credentials).await;
-    Ok(Json(outcome(i, result)?))
+    Ok(Json(outcome(&mut i, result)?))
 }
 fn valid_period(period: &Period) -> bool {
     match (
@@ -610,14 +707,13 @@ async fn usage(
     if !valid_period(&period) {
         return Err(refused("invalid usage period").into());
     }
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().usage {
         return Err(refused("usage unsupported").into());
     }
     let result = i.provider.usage(period, &i.credentials).await;
-    let usage = outcome(i, result)?;
+    let usage = outcome(&mut i, result)?;
     if !valid_period(&usage.period)
         || usage.sandbox_hours.iter().any(|s| {
             !s.hours.is_finite() || s.hours < 0.0 || !s.size.cpus.is_finite() || s.size.cpus <= 0.0
@@ -628,14 +724,13 @@ async fn usage(
     Ok(Json(usage))
 }
 async fn quota(State(host): State<Host>, Path(p): Path<String>) -> ApiResult<Json<Quota>> {
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().quota {
         return Err(refused("quota unsupported").into());
     }
     let result = i.provider.quota(&i.credentials).await;
-    let quota = outcome(i, result)?;
+    let quota = outcome(&mut i, result)?;
     if quota.credits_remaining.is_some_and(|v| !v.is_finite()) {
         return Err(internal("module returned nonfinite credits").into());
     }
@@ -703,11 +798,10 @@ async fn relay(
     mut request: Request,
 ) -> ApiResult<Response> {
     validate_upgrade(&request, "drydock-relay")?;
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     let result = i.provider.relay(&id, &i.credentials).await;
-    let stream = outcome(i, result)?;
+    let stream = outcome(&mut i, result)?;
     Ok(upgrade(
         &mut request,
         "drydock-relay",
@@ -730,14 +824,13 @@ async fn exec(
         return Err(refused("empty command").into());
     }
     let mut request = Request::from_parts(parts, Body::empty());
-    let mut config = host.config.lock().await;
-    let i = instance(&mut config, &p)?;
-    ready(i)?;
+    let mut i = host.instance(&p).await?;
+    ready(&i)?;
     if !i.provider.capabilities().fallback_runner {
         return Err(refused("exec unsupported").into());
     }
     let result = i.provider.exec(&id, command, &i.credentials).await;
-    let stream = outcome(i, result)?;
+    let stream = outcome(&mut i, result)?;
     Ok(upgrade(
         &mut request,
         "drydock-stream",
@@ -765,12 +858,19 @@ async fn events(
         loop {
             let records = match initial.take() {
                 Some(records) => records,
-                None => match host.records(cursor.as_deref()).await { Ok(records) => records, Err(_) => break },
+                None => match host.records(cursor.as_deref()).await {
+                    Ok(records) => records,
+                    Err(error) => {
+                        // Protocol v1 permits only Event/Snapshot records. Fail the HTTP
+                        // body rather than invent a terminal record or signal clean EOF.
+                        yield Err(std::io::Error::other(stream_error_class(&error)));
+                        break;
+                    }
+                },
             };
             for record in records {
-                cursor = Some(match &record { ObserveRecord::Event { event } => event.cursor.clone(), ObserveRecord::Snapshot { cursor,.. } => cursor.clone() });
-                let mut line = serde_json::to_vec(&record).expect("wire record serializes"); line.push(b'\n');
-                yield Ok::<Bytes,Infallible>(Bytes::from(line));
+                cursor = Some(record_cursor(&record).into());
+                yield Ok::<Bytes, std::io::Error>(record_line(&record));
             }
             if *stopping.borrow() { break; }
             tokio::select! {
@@ -784,4 +884,48 @@ async fn events(
         Body::from_stream(stream),
     )
         .into_response())
+}
+
+fn record_cursor(record: &ObserveRecord) -> &str {
+    match record {
+        ObserveRecord::Event { event } => &event.cursor,
+        ObserveRecord::Snapshot { cursor, .. } => cursor,
+    }
+}
+fn record_line(record: &ObserveRecord) -> Bytes {
+    let mut line = serde_json::to_vec(record).expect("wire record serializes");
+    line.push(b'\n');
+    Bytes::from(line)
+}
+fn stream_error_class(error: &ProtocolError) -> &'static str {
+    match error {
+        ProtocolError::Refused { .. } => "event snapshot refused",
+        ProtocolError::Unavailable { .. } => "event snapshot unavailable",
+        ProtocolError::RateLimited { .. } => "event snapshot rate limited",
+        ProtocolError::QuotaExhausted { .. } => "event snapshot quota exhausted",
+        ProtocolError::CredentialRejected { .. } => "event snapshot credential rejected",
+        ProtocolError::Internal { .. } => "event snapshot internal error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // IPv4 and IPv6 destinations, including bracketed IPv6, are accepted; appending
+    // URL syntax cannot turn an invalid host into a direct network destination.
+    #[hegel::test]
+    fn generated_ip_destination_syntax(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let octets: Vec<_> = (0..4)
+            .map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(255)))
+            .collect();
+        let ipv4 = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
+        let tail = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
+        let ipv6 = format!("2001:db8::{tail:x}");
+        assert!(valid_host(&ipv4));
+        assert!(valid_host(&ipv6));
+        assert!(valid_host(&format!("[{ipv6}]")));
+        assert!(!valid_host(&format!("{ipv4}/path")));
+        assert!(!valid_host(&format!("[{ipv4}]")));
+    }
 }

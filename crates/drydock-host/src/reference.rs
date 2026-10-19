@@ -216,7 +216,11 @@ impl Provider for Reference {
         self.check()?;
         let mut s = self.find(id)?;
         if matches!(s.state, Observation::Stopped { .. }) {
-            return Ok(self.tokens[id].clone());
+            return self
+                .tokens
+                .get(id)
+                .cloned()
+                .ok_or_else(|| refused("stopped environment has no resume token"));
         }
         s.state = Observation::Stopped {
             cause: StopCause::SuspendedByRequest,

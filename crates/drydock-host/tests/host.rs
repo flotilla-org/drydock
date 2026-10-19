@@ -18,10 +18,12 @@ impl Harness {
         Self::with_uid(unsafe { libc::geteuid() }).await
     }
     async fn with_uid(uid: u32) -> Self {
+        Self::with_host(Host::new(reference::registry()), uid).await
+    }
+    async fn with_host(host: Host, uid: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("host.sock");
-        let host = Host::new(reference::registry());
         let (stop, rx) = tokio::sync::oneshot::channel();
         let socket = path.clone();
         let task = tokio::spawn(async move {
@@ -710,6 +712,17 @@ async fn tcp_bearer_auth() {
     assert_eq!(
         client
             .get(&url)
+            .bearer_auth("wrong")
+            .header("Cookie", format!("rigging_token={secret}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(&url)
             .bearer_auth(secret)
             .send()
             .await
@@ -750,6 +763,7 @@ async fn event_eviction_and_initial_error() {
         json!({"fault":{"kind":"unavailable","reason":"offline","retry_after":null}}),
     )])
     .await;
+    bad.credential("fault", "delivered").await;
     let response = bad.ok(Method::GET, "/events", Value::Null, 503).await;
     assert!(matches!(
         response.json::<ProtocolError>().await.unwrap(),
@@ -879,4 +893,340 @@ async fn shutdown_closes_event_stream() {
         .unwrap()
         .unwrap();
     assert!(!h.path.exists());
+}
+
+#[derive(Default)]
+struct Control {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    list_error: std::sync::atomic::AtomicBool,
+    list_calls: std::sync::atomic::AtomicUsize,
+    sink: std::sync::Mutex<Option<drydock_host::EventSink>>,
+}
+struct ControlledModule(std::sync::Arc<Control>);
+struct ControlledProvider {
+    inner: Box<dyn drydock_host::module::Provider>,
+    control: std::sync::Arc<Control>,
+}
+// The gate and error flag stand in for the vendor network boundary; all resource
+// behavior is delegated to the real reference provider, through real HTTP sockets.
+#[async_trait::async_trait]
+impl drydock_host::module::Module for ControlledModule {
+    fn version(&self) -> &str {
+        "test"
+    }
+    async fn configure(
+        &self,
+        c: &ProviderConfiguration,
+        sink: drydock_host::EventSink,
+    ) -> drydock_host::module::Result<Box<dyn drydock_host::module::Provider>> {
+        *self.0.sink.lock().unwrap() = Some(sink.clone());
+        let inner =
+            drydock_host::module::Module::configure(&reference::ReferenceModule, c, sink).await?;
+        Ok(Box::new(ControlledProvider {
+            inner,
+            control: self.0.clone(),
+        }))
+    }
+}
+#[async_trait::async_trait]
+impl drydock_host::module::Provider for ControlledProvider {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+    async fn prepare(
+        &mut self,
+        r: PrepareRequest,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Prepared> {
+        if c.token().is_some_and(|t| t.expose() == "old") {
+            self.control.entered.notify_one();
+            self.control.release.notified().await;
+            return Err(ProtocolError::CredentialRejected {
+                reason: "old credential rejected".into(),
+            });
+        }
+        self.inner.prepare(r, c).await
+    }
+    async fn provision(
+        &mut self,
+        r: ProvisionRequest,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<(Sandbox, bool)> {
+        self.inner.provision(r, c).await
+    }
+    async fn list(
+        &mut self,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Vec<Sandbox>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.control.list_calls.fetch_add(1, SeqCst);
+        if self.control.list_error.load(SeqCst) {
+            return Err(ProtocolError::Unavailable {
+                reason: "vendor unavailable".into(),
+                retry_after: None,
+            });
+        }
+        self.inner.list(c).await
+    }
+    async fn inspect(
+        &mut self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Sandbox> {
+        self.inner.inspect(id, c).await
+    }
+    async fn destroy(
+        &mut self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<()> {
+        self.inner.destroy(id, c).await
+    }
+    async fn reach(
+        &mut self,
+        id: &str,
+        c: &drydock_host::module::Credentials,
+    ) -> drydock_host::module::Result<Reach> {
+        self.inner.reach(id, c).await
+    }
+}
+async fn controlled() -> (Harness, std::sync::Arc<Control>) {
+    let control = std::sync::Arc::new(Control::default());
+    let registry = drydock_host::module::Registry::from([(
+        "reference".into(),
+        std::sync::Arc::new(ControlledModule(control.clone()))
+            as std::sync::Arc<dyn drydock_host::module::Module>,
+    )]);
+    (
+        Harness::with_host(Host::new(registry), unsafe { libc::geteuid() }).await,
+        control,
+    )
+}
+
+// A held vendor request on A must not block B, hello, or credential refresh for A.
+// When that old request later rejects its credential, the refresh remains ready.
+#[tokio::test]
+async fn independent_providers_and_inflight_credential_refresh() {
+    let (h, control) = controlled().await;
+    h.normal().await;
+    h.credential("a", "old").await;
+    let client = h.client.clone();
+    let pending = tokio::spawn(async move {
+        client
+            .post("http://localhost/v1/providers/a/prepare")
+            .json(&json!({"image_digest":"image","tools_digest":"tools"}))
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), control.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        h.ok(Method::GET, "/hello", Value::Null, 200).await;
+        h.ok(Method::GET, "/providers/b/environments", Value::Null, 200)
+            .await;
+        h.credential("a", "new").await;
+    })
+    .await
+    .expect("other providers, hello, and refresh must not wait for vendor A");
+    control.release.notify_one();
+    assert_eq!(pending.await.unwrap().status(), 502);
+    let hello: Hello = h
+        .ok(Method::GET, "/hello", Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(hello.providers[0].readiness, Readiness::Ready));
+    h.prepared("a").await;
+}
+
+// A complete snapshot cannot omit unready providers: refuse before invoking their
+// vendor API, rather than reporting their existing sandboxes as missing.
+#[tokio::test]
+async fn snapshots_never_call_unready_providers() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.ok(Method::GET, "/events", Value::Null, 502).await;
+    assert_eq!(control.list_calls.load(SeqCst), 0);
+    h.credential("a", "ready").await;
+    let mut records = h.stream(None).await;
+    assert!(matches!(
+        records.next().await,
+        ObserveRecord::Snapshot { .. }
+    ));
+    assert_eq!(control.list_calls.load(SeqCst), 1);
+}
+
+// After headers are sent, a failed recovery snapshot fails the body, rather than
+// reporting normal EOF or introducing an undocumented NDJSON terminal-error shape.
+#[tokio::test]
+async fn recovery_snapshot_error_fails_stream() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut records = h.stream(None).await;
+    records.next().await;
+    // A synchronous burst evicts cursor zero before the server can poll its log.
+    control.list_error.store(true, SeqCst);
+    let sink = control.sink.lock().unwrap().clone().unwrap();
+    for n in 0..1030 {
+        sink.publish(
+            format!("id-{n}"),
+            None,
+            "2026-10-19T00:00:00Z".into(),
+            TimestampSource::Adaptor,
+            EventKind::Created,
+        );
+    }
+    let failed = tokio::time::timeout(Duration::from_secs(2), records.stream.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(failed, Some(Err(_))),
+        "failed snapshot must not look like normal EOF"
+    );
+}
+
+// A later factory failure leaves both existing providers and credentials intact,
+// and none of the earlier successful additions in that document become visible.
+#[tokio::test]
+async fn partial_factory_failure_preserves_configuration() {
+    let h = Harness::start().await;
+    h.normal().await;
+    let prepared = h.prepared("a").await;
+    let s = h.provision("a", "retained", &prepared, 201).await;
+    h.ok(Method::PUT,"/config",json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("a",json!({})),provider("b",json!({})),provider("temporary",json!({})),provider("fails",json!({"fault":"invalid error"}))]}),422).await;
+    let hello: Hello = h
+        .ok(Method::GET, "/hello", Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hello.providers.len(), 2);
+    assert_eq!(s, h.provision("a", "retained", &prepared, 200).await);
+    h.ok(
+        Method::GET,
+        "/providers/temporary/environments",
+        Value::Null,
+        422,
+    )
+    .await;
+}
+
+// Loopback enforcement belongs to Rigging, so the host must propagate its refusal
+// without creating a token file or introducing its own parallel bind/auth policy.
+#[tokio::test]
+async fn tcp_refuses_nonloopback_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    let error = Host::new(reference::registry())
+        .serve_tcp("0.0.0.0:0".parse().unwrap(), &token, std::future::pending())
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!token.exists());
+}
+
+// SIGTERM follows the same graceful path as Ctrl-C, ending an open event body and
+// unlinking the managed socket before the binary exits successfully.
+#[tokio::test]
+async fn binary_sigterm_drains_and_removes_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.path().join("host.sock");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock-host"))
+        .arg("--unix")
+        .arg(&path)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let client = rigging_tls::client_builder()
+        .unix_socket(path.clone())
+        .build()
+        .unwrap();
+    for _ in 0..200 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut records = client
+        .get("http://localhost/v1/events")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert!(records.next().await.unwrap().is_ok());
+    // SAFETY: the child PID is live and owned by this test; SIGTERM is its shutdown signal.
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+        0
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), records.next())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!path.exists());
+}
+
+// Wire sizes use unsigned integers: zero and u64::MAX are valid; negative sizes
+// cannot deserialize. Equal period endpoints represent a valid empty interval.
+#[tokio::test]
+async fn size_boundaries_zero_period_and_empty_credentials() {
+    let h = Harness::start().await;
+    h.normal().await;
+    let prepared = h.prepared("a").await;
+    for n in [0, u64::MAX] {
+        let mut r = request(&format!("size-{n}"), &prepared);
+        r["size"]["memory_bytes"] = json!(n);
+        r["size"]["disk_bytes"] = json!(n);
+        h.ok(Method::POST, "/providers/a/environments", r, 201)
+            .await;
+    }
+    for field in ["memory_bytes", "disk_bytes"] {
+        let mut r = request("negative", &prepared);
+        r["size"][field] = json!(-1);
+        h.ok(Method::POST, "/providers/a/environments", r, 422)
+            .await;
+    }
+    h.ok(
+        Method::GET,
+        "/providers/a/usage?start=2026-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
+        Value::Null,
+        200,
+    )
+    .await;
+    h.ok(
+        Method::PUT,
+        "/providers/a/credential",
+        json!({"value":""}),
+        422,
+    )
+    .await;
+    // A syntactically valid but changed repeat still denotes the existing label.
+    let original = h.provision("a", "repeat", &prepared, 201).await;
+    let mut changed = request("repeat", &prepared);
+    changed["size"]["cpus"] = json!(2);
+    changed["egress"] = json!({"mode":"open"});
+    let repeat: Sandbox = h
+        .ok(Method::POST, "/providers/a/environments", changed, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeat, original);
 }

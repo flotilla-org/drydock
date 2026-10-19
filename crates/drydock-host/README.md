@@ -17,7 +17,8 @@ mode 0700. Rigging creates the 0600 socket or bearer token file. Unix callers mu
 have the host's effective UID; an embedder can explicitly select another UID.
 TCP accepts loopback addresses only, requires bearer authorization, and compares
 token hashes in constant time. TCP clients send the numeric bound address in
-`Host`, for example `127.0.0.1:9280`. A restart rotates the token.
+`Host`, for example `127.0.0.1:9280`. A restart rotates the token. Ctrl-C and SIGTERM both drain event/upgrade streams
+and remove the owned Unix socket.
 
 Configure over the authenticated connection:
 
@@ -63,8 +64,11 @@ appear in `Retry-After`. Modules own vendor bounds, granted resources, and vendo
 idempotency. The host checks request sizes, prepared-provider ownership, destination
 syntax, usage periods, and finite reported metering values. It never retries.
 
-`Provider` is an asynchronous trait. The host serializes provider calls and
-configuration changes, making label look-up/create and snapshot/list coherent.
+`Provider` is an asynchronous trait. The host serializes calls within each provider. A short-lived map lock protects
+configuration commits; provider A cannot hold up hello, credential refresh, or
+provider B. Requests use a credential snapshot and generation, so a stale
+rejection cannot undo a newer refresh. Hello reads cached declarations, refreshed
+after provider outcomes and credential changes.
 `EventSink` assigns host-wide cursors and provider identity. Modules publish all
 billing transitions, with RFC 3339 times and their provenance. Background
 observations can publish through a cloned sink. A snapshot records its cursor
@@ -75,8 +79,10 @@ complete snapshot. `?since=` resumes exclusively at a retained cursor, including
 the boundary immediately before the oldest retained event. Unknown, expired or
 previous-process cursors produce a complete snapshot that marks a metering gap.
 Slow readers also recover through snapshots. Streams stay open for new events;
-a provider failure during a later recovery snapshot closes the stream, allowing
-the client to reconnect. History is deliberately not persisted.
+an unready provider is never called for a snapshot. A complete snapshot cannot
+omit providers, so an initial snapshot failure returns its typed error. A later
+recovery failure fails the HTTP body (rather than clean EOF), allowing the client
+to reconnect. Protocol v1 defines no terminal error record. History is deliberately not persisted.
 
 Relay clients use `Connection: Upgrade` and `Upgrade: drydock-relay`; exec uses
 POST with a JSON `ExecRequest` and `Upgrade: drydock-stream`. Responses echo both
@@ -85,6 +91,11 @@ return a connected stream only after checking the environment and command.
 
 The reference module implements preparation, concurrent label idempotency,
 list/inspect/destroy, reach/relay, suspend/resume, export, exec, usage and quota.
+Repeated provision with a valid but changed body returns the original sandbox: a
+label identifies creation, not an update. Zero-byte memory/disk and empty usage
+intervals are valid; unsigned wire fields reject negative sizes. Both bare and
+bracketed IPv6 direct host syntax are accepted by the host.
+
 Its relay and `exec ["cat"]` echo raw bytes; `exec ["echo", ...]` writes one line.
 It spawns no OS processes. Usage returns an empty measurement set and quota counts
 running sandboxes; it has no vendor billing account. It reports advisory egress

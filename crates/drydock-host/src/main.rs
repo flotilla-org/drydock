@@ -6,8 +6,10 @@ async fn main() -> std::io::Result<()> {
     if let Ok(path) = std::env::var("DRYDOCK_PROXY_CA") {
         host = host.with_proxy_ca(std::fs::read(path)?);
     }
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    // Register SIGTERM before binding so managed shutdown always drains streams.
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
     };
     match args.as_slice() {
         [flag, path] if flag == "--unix" => {

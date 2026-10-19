@@ -12,6 +12,9 @@ pub fn refused(reason: impl Into<String>) -> ProtocolError {
 }
 
 /// A factory creates an independent configured provider. Settings must contain no secrets.
+/// Configuration is transactional: factories MUST NOT spawn background observers or
+/// publish events here. Start observations lazily on first operation after commit;
+/// Provider::drop must cancel any background work it owns.
 /// Modules must disable vendor retries, implement idempotency at the vendor, and publish
 /// observed billing transitions through the supplied sink (including background observations).
 #[async_trait]
@@ -26,6 +29,7 @@ pub trait Module: Send + Sync {
 
 /// Context supplied to HTTP modules. Direct credentials are refreshed in memory; proxied
 /// clients must use this client and placeholder rather than bypassing the supervisor proxy.
+#[derive(Clone)]
 pub struct Credentials {
     pub mode: CredentialMode,
     pub value: Option<Secret>,
@@ -70,7 +74,10 @@ impl Credentials {
     }
 }
 
-/// Provider operations are serialized by the host. A returned error is never retried.
+/// Provider operations are serialized per provider. A returned error is never retried.
+/// Capabilities/rate limits are stable for the configured lifetime. Readiness is
+/// cached for hello at configuration and after outcomes; refresh clears a missing
+/// credential state without waiting on vendor I/O.
 /// Credentials are deliberately passed by reference on every call, so rotation is immediate.
 /// Stream methods bridge bytes only after authorization and validation have succeeded.
 #[async_trait]
