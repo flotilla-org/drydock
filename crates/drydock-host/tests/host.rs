@@ -249,7 +249,7 @@ async fn concurrent_provision_and_event_resume() {
 // CredentialRejected changes hello readiness until an explicit credential refresh.
 #[tokio::test]
 async fn all_typed_error_classes() {
-    let h = Harness::start().await;
+    let (h, _) = controlled().await;
     let errors = [
         (422, json!({"kind":"refused","reason":"no"})),
         (503, json!({"kind":"unavailable","reason":"no","retry_after":3})),
@@ -567,6 +567,10 @@ struct Control {
     reject_list: std::sync::atomic::AtomicBool,
     missing_tool: std::sync::atomic::AtomicBool,
     dropped: tokio::sync::Notify,
+    hold_destroy: std::sync::atomic::AtomicBool,
+    fail_destroy: std::sync::atomic::AtomicBool,
+    destroy_entered: tokio::sync::Notify,
+    destroy_release: tokio::sync::Notify,
     hold_success: std::sync::atomic::AtomicBool,
     success_entered: tokio::sync::Notify,
     success_release: tokio::sync::Notify,
@@ -720,7 +724,16 @@ impl drydock_host::module::Provider for ControlledProvider {
         self.inner.inspect(id, c).await
     }
     async fn destroy(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<()> {
-        self.inner.destroy(id, c).await
+        self.inner.destroy(id, c).await?;
+        if self.control.hold_destroy.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.control.destroy_entered.notify_one();
+            self.control.destroy_release.notified().await;
+        }
+        if self.control.fail_destroy.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(ProtocolError::Unavailable { reason: "ambiguous vendor failure".into(), retry_after: None })
+        } else {
+            Ok(())
+        }
     }
     async fn reach(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Connection> {
         self.inner.reach(id, c).await
@@ -1339,4 +1352,73 @@ async fn credential_refresh_respects_module_readiness() {
     h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await;
     let hello: Hello = h.hello().await;
     assert!(matches!(hello.providers[0].readiness, Readiness::Ready));
+}
+
+// The first poll is eligible immediately, even when subsequent polling is hours
+// apart. Refresh wakes the initial observer rather than waiting for the next tick.
+#[tokio::test]
+async fn first_snapshot_does_not_wait_for_large_poll_interval() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    control.list_limit.store(1, SeqCst);
+    control.list_period.store(3600, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut stream = tokio::time::timeout(Duration::from_secs(1), h.stream(None)).await.expect("first snapshot must not wait two hours");
+    assert!(matches!(stream.next().await, ObserveRecord::Snapshot {environments,..} if environments.is_empty()));
+}
+
+// A poll can see absence before the deleting call returns. Only a confirmed
+// deletion gets DestroyedByRequest; an ambiguous failed call gets MissingOnList.
+#[tokio::test]
+async fn poll_during_delete_waits_for_confirmed_cause() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for failed in [false, true] {
+        let (h, control) = controlled().await;
+        control.poll.store(true, SeqCst);
+        h.configure(vec![provider("a", json!({}))]).await;
+        h.credential("a", "ready").await;
+        let mut stream = h.stream(None).await;
+        stream.next().await;
+        let prepared = h.prepared("a").await;
+        let environment = h.provision("a", "delete-window", &prepared, 201).await;
+        stream.next().await;
+        stream.next().await;
+        control.hold_destroy.store(true, SeqCst);
+        control.fail_destroy.store(failed, SeqCst);
+        let client = h.client.clone();
+        let deletion = tokio::spawn(async move {
+            client.delete(format!("http://localhost/v1/providers/a/environments/{}", environment.id)).send().await.unwrap()
+        });
+        control.destroy_entered.notified().await;
+        let calls = control.list_calls.load(SeqCst);
+        control.wait_lists(calls + 1).await; // two completed lists with deletion still pending
+        control.destroy_release.notify_one();
+        assert_eq!(deletion.await.unwrap().status().as_u16(), if failed { 503 } else { 204 });
+        let expected = if failed { GoneCause::MissingOnList } else { GoneCause::DestroyedByRequest };
+        assert!(matches!(stream.next().await, ObserveRecord::Event { event } if event.event == EventKind::Gone {cause: expected}));
+    }
+}
+
+// Shutdown interrupts a held recovery list. A stream already serving HTTP ends
+// with normal EOF rather than converting the shutdown signal into a body error.
+#[tokio::test]
+async fn shutdown_during_recovery_ends_with_clean_eof() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut records = h.stream(None).await;
+    records.next().await;
+    control.started.notified().await;
+    control.hold_list.store(true, SeqCst);
+    let sink = control.sink.lock().unwrap().clone().unwrap();
+    for n in 0..drydock_host::EVENT_HISTORY_CAPACITY + 1 {
+        sink.publish(format!("evict-{n}"), None, None, EventKind::Created);
+    }
+    tokio::time::timeout(Duration::from_secs(2), control.list_held.notified()).await.unwrap();
+    h.stop.take().unwrap().send(()).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(2), records.stream.next()).await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(2), &mut h.task).await.unwrap().unwrap();
 }

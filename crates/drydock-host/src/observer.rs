@@ -28,6 +28,7 @@ pub(super) fn poll_interval(mode: ObservationMode, limits: &[RateLimit]) -> Resu
 }
 pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     let interval = instance.poll_interval;
+    let mut credentials = instance.credential_changes.subscribe();
     let weak: Weak<Instance> = Arc::downgrade(&instance);
     tokio::spawn(async move {
         let Some(interval) = interval else {
@@ -43,22 +44,31 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
         };
         drop(instance);
         let mut seen: BTreeMap<String, ObservedEnvironment> = BTreeMap::new();
-        let mut clock = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        let mut clock = tokio::time::interval_at(tokio::time::Instant::now(), interval);
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if *stopping.borrow() {
                 break;
             }
-            tokio::select! { _ = clock.tick() => {}, _ = stopping.changed() => break, }
+            tokio::select! {
+                _ = clock.tick() => {},
+                result = credentials.changed() => { if result.is_err() { break; } clock.reset(); },
+                _ = stopping.changed() => break,
+            }
             let Some(instance) = weak.upgrade() else {
                 break;
             };
+            let generation = instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation;
             let rows = tokio::select! {
                 result = instance.call_with_budget(Gate::List, true, |p,c| async move { p.list(&c).await }) => match result {
                     Ok(rows) => rows,
                     Err(error) => {
                         tracing::warn!(provider = %instance.config.name, route = "poll", error_class = error.class(), "poll failed; retaining inventory");
-                        *instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        let auth = instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if auth.generation == generation {
+                            *instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        }
+                        drop(auth);
                         instance.events.shared.changed.send_modify(|_| {});
                         continue;
                     },
@@ -121,17 +131,30 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironmen
         }
     }
     let mut destroyed = instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut deferred = vec![];
     for (id, row) in seen.iter() {
         if !current.contains_key(id) && !matches!(row.environment.state, Observation::Gone { .. }) {
-            let cause = if destroyed.remove(id) { GoneCause::DestroyedByRequest } else { GoneCause::MissingOnList };
+            if destroyed.get(id).is_some_and(|state| state.pending > 0 && !state.confirmed) {
+                // Vendor deletion may be visible before its call returns. Defer the
+                // billing cause until confirmation, failure or cancellation is known.
+                deferred.push((id.clone(), row.clone()));
+                continue;
+            }
+            let cause = if destroyed.get(id).is_some_and(|state| state.confirmed) {
+                GoneCause::DestroyedByRequest
+            } else {
+                GoneCause::MissingOnList
+            };
             pending.push((id.clone(), row.environment.label.clone(), None, EventKind::Gone { cause }));
         }
     }
-    // A list may predate a concurrent successful destroy. Keep its marker while
-    // that stale inventory still contains the resource; consume it on disappearance.
-    destroyed.retain(|id| current.get(id).is_some_and(|row| !matches!(row.environment.state, Observation::Gone { .. })));
-    // Replace the inventory, pruning every row no longer returned, including Gone.
+    destroyed.retain(|id, state| {
+        state.pending > 0 || current.get(id).is_some_and(|row| !matches!(row.environment.state, Observation::Gone { .. }))
+    });
+    // Snapshot inventory stays authoritative while only the pending billing diff
+    // retains an absent row awaiting a concurrent deletion outcome.
     instance.events.commit(current.values().cloned().collect(), pending);
+    current.extend(deferred);
     *seen = current;
 }
 

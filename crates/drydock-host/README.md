@@ -77,7 +77,9 @@ The production client comes from Rigging's `ReqwestHttpClient::restricted`:
 no ambient proxy, retries or redirects, a 30-second timeout, an explicit proxy
 when configured and additional supervisor CA roots. No client construction is
 copied into Drydock. `DRYDOCK_PROXY_CA` names a PEM file for the binary;
-embedders use `Host::with_proxy_ca`. Never log serialized credentials, request
+embedders use `Host::with_proxy_ca`. The file is PEM with one or more
+`-----BEGIN CERTIFICATE-----` / `-----END CERTIFICATE-----` CA blocks, not a private
+key or PKCS#12 file. Never log serialized credentials, request
 bodies, or raw vendor errors. Proxied providers refuse Direct refreshes.
 
 ## Host-owned observation
@@ -88,10 +90,14 @@ within declared list/global limits and skips missed ticks. Observation gets at
 most half the long-run list/global rate and max(1, requests/2) slots per window;
 route calls share the total budget and can use the remaining slots. An indivisible
 one-request window is polled at most every two windows: a route immediately after
-that single poll can still receive 429 until the shared window expires. Failed or unready lists preserve prior state and never report
+that single poll can still receive 429 until the shared window expires. The first
+poll is eligible immediately; Direct credential delivery wakes observation, so a
+large steady-state interval does not delay the first snapshot. Failed or unready lists preserve prior state and never report
 resources gone. Successful complete lists emit Created/Running, Stopped/Paused,
 Resumed/Running, size changes, and Gone transitions. Confirmed requested deletions
-use DestroyedByRequest; unexplained absence uses MissingOnList.
+use DestroyedByRequest; unexplained absence uses MissingOnList. If a list observes
+absence while destroy is pending, the host defers the billing cause until the call
+confirms or fails. Failure/cancellation is never promoted to confirmed deletion.
 
 Modules return `ObservedEnvironment` from list/inspect: the environment plus an optional
 typed provider timestamp. Polling uses that time, including matching inspect
@@ -175,3 +181,7 @@ calls, credential rotation, Rigging replay injection, raw upgrades, rate limits,
 auth and shutdown. Shared protocol properties compare decoding with schema rules.
 Endpoint-driven reuse across language hosts and remaining forwarding/fixture-helper
 consolidation are tracked in #21.
+
+Unix UID admission failures return a bare 403 before protocol handling, just as
+Rigging's TCP authentication failures return transport-level statuses. These are
+not module or `/v1` ProtocolError outcomes.

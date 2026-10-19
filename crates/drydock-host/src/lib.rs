@@ -97,8 +97,46 @@ struct Instance {
     poll_interval: Option<std::time::Duration>,
     poll_error: Mutex<Option<ProtocolError>>,
     credential_changes: watch::Sender<Credentials>,
-    destroyed: Mutex<BTreeSet<String>>,
+    destroyed: Mutex<BTreeMap<String, DestroyState>>,
     inspected: Mutex<BTreeMap<String, ObservedEnvironment>>,
+}
+#[derive(Default)]
+struct DestroyState {
+    pending: usize,
+    confirmed: bool,
+}
+struct DestroyAttempt {
+    instance: Arc<Instance>,
+    id: String,
+    active: bool,
+}
+impl DestroyAttempt {
+    fn begin(instance: Arc<Instance>, id: String) -> Self {
+        let active = instance.poll_interval.is_some();
+        if active {
+            instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(id.clone()).or_default().pending += 1;
+        }
+        Self { instance, id, active }
+    }
+    fn finish(&mut self, confirmed: bool) {
+        if !self.active {
+            return;
+        }
+        let mut states = self.instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(state) = states.get_mut(&self.id) {
+            state.pending -= 1;
+            state.confirmed |= confirmed;
+            if state.pending == 0 && !state.confirmed {
+                states.remove(&self.id);
+            }
+        }
+        self.active = false;
+    }
+}
+impl Drop for DestroyAttempt {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
 }
 #[derive(Clone, Copy)]
 enum Gate {
@@ -231,22 +269,21 @@ impl Instance {
         }
         result
     }
+    fn longest_window(&self, operation: &str) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.rate_limits.iter().filter(|r| r.operation == operation).map(|r| r.period_seconds).max().unwrap_or(0),
+        )
+    }
     fn reserve(&self, operation: &'static str, poll: bool) -> Result<()> {
         let mut budget = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = tokio::time::Instant::now();
         let limits: Vec<_> = self.rate_limits.iter().filter(|r| r.operation == operation || r.operation == "*").collect();
         for limit in &limits {
+            let longest = self.longest_window(&limit.operation);
             if poll {
                 let window = std::time::Duration::from_secs(limit.period_seconds);
                 let times = budget.entry(format!("poll:{}", limit.operation)).or_default();
-                let longest = self
-                    .rate_limits
-                    .iter()
-                    .filter(|r| r.operation == limit.operation)
-                    .map(|r| r.period_seconds)
-                    .max()
-                    .unwrap_or(limit.period_seconds);
-                times.retain(|at| now.duration_since(*at) < std::time::Duration::from_secs(longest));
+                times.retain(|at| now.duration_since(*at) < longest);
                 if times.iter().filter(|at| now.duration_since(**at) < window).count() >= (limit.requests / 2).max(1) as usize {
                     return Err(ProtocolError::RateLimited {
                         reason: "observation share exhausted".into(),
@@ -254,9 +291,8 @@ impl Instance {
                     });
                 }
             }
-            let longest = self.rate_limits.iter().filter(|r| r.operation == limit.operation).map(|r| r.period_seconds).max().unwrap_or(0);
             let times = budget.entry(limit.operation.clone()).or_default();
-            while times.front().is_some_and(|at| now.duration_since(*at) >= std::time::Duration::from_secs(longest)) {
+            while times.front().is_some_and(|at| now.duration_since(*at) >= longest) {
                 times.pop_front();
             }
             let window = std::time::Duration::from_secs(limit.period_seconds);
@@ -397,6 +433,7 @@ impl Host {
         async move {
             signal.await;
             host.stopping.send_replace(true);
+            let _transaction = host.configuring.lock().await;
             let tasks = std::mem::take(&mut *host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             for mut task in tasks {
                 if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await.is_err() {
@@ -467,7 +504,11 @@ impl Host {
             let mut push_rows = vec![];
             for instance in &instances {
                 if matches!(instance.observation, ObservationMode::Push) {
-                    push_rows.extend(instance.call(Gate::List, |p, c| async move { p.list(&c).await }).await?);
+                    let rows = tokio::select! {
+                        result = instance.call(Gate::List, |p,c| async move {p.list(&c).await}) => result?,
+                        _ = stopping.changed() => return Err(ProtocolError::Unavailable {reason: "host stopping".into(), retry_after: None}),
+                    };
+                    push_rows.extend(rows);
                 }
             }
             {
@@ -562,6 +603,9 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
 }
 async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfiguration>) -> ApiResult<StatusCode> {
     let _transaction = host.configuring.lock().await;
+    if *host.stopping.borrow() {
+        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+    }
     let mut config = host.config.read().await.clone();
     // Exact repeats preserve resources and delivered credentials. Changes to live providers
     // are refused: silently replacing one would lose in-memory reference resources.
@@ -629,7 +673,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
                 poll_error: Mutex::new(None),
                 credential_changes,
                 budget: Mutex::new(BTreeMap::new()),
-                destroyed: Mutex::new(BTreeSet::new()),
+                destroyed: Mutex::new(BTreeMap::new()),
                 inspected: Mutex::new(BTreeMap::new()),
             }),
         );
@@ -642,7 +686,12 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         .iter()
         .map(|m| LoadedModule { name: m.name.clone(), version: host.registry[&m.entrypoint].version().into() })
         .collect();
-    *host.config.write().await = config;
+    let mut committed = host.config.write().await;
+    if *host.stopping.borrow() {
+        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+    }
+    *committed = config;
+    drop(committed);
     for instance in observers {
         tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner))), "provider configured");
         let task = observer::spawn(instance, host.stopping.subscribe());
@@ -700,11 +749,10 @@ async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, Strin
 }
 async fn destroy(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<StatusCode> {
     let instance = h.instance(&p).await?;
-    let removed = id.clone();
-    instance.call(Gate::Destroy, |p, c| async move { p.destroy(&id, &c).await }).await?;
-    if instance.poll_interval.is_some() {
-        instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(removed);
-    }
+    let mut attempt = DestroyAttempt::begin(instance.clone(), id.clone());
+    let result = instance.call(Gate::Destroy, |p, c| async move { p.destroy(&id, &c).await }).await;
+    attempt.finish(result.is_ok());
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Reach>> {
@@ -831,9 +879,10 @@ async fn events(
                 None => match host.records(cursor.as_deref()).await {
                     Ok(records) => records,
                     Err(error) => {
+                        if *stopping.borrow() { break; }
                         // Protocol v1 permits only Event/Snapshot records. Fail the HTTP
                         // body rather than invent a terminal record or signal clean EOF.
-                        yield Err(std::io::Error::other(stream_error_class(&error)));
+                        yield Err(std::io::Error::other(error.class()));
                         break;
                     }
                 },
@@ -863,9 +912,6 @@ fn record_line(record: &ObserveRecord) -> Bytes {
     line.push(b'\n');
     Bytes::from(line)
 }
-fn stream_error_class(error: &ProtocolError) -> &'static str {
-    error.class()
-}
 
 async fn trace_request(request: Request, next: Next) -> Response {
     use tracing::Instrument;
@@ -890,5 +936,19 @@ fn readiness_status(value: &Readiness) -> &'static str {
         Readiness::MissingCredential { .. } => "missing_credential",
         Readiness::VersionMismatch { .. } => "version_mismatch",
         Readiness::Unknown { .. } => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Glue: once shutdown starts, the configuration path must refuse even an
+    // empty document rather than creating a new generation of observers.
+    #[tokio::test]
+    async fn configuration_after_shutdown_is_unavailable() {
+        let host = Host::new(reference::registry());
+        host.shutdown(async {}).await;
+        let result = configure(State(host), ApiJson(HostConfiguration { modules: vec![], providers: vec![] })).await;
+        assert!(matches!(result, Err(ApiError(ProtocolError::Unavailable { .. }))));
     }
 }
