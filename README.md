@@ -4,15 +4,15 @@ The substrate for just launching vessels: isolated environments for AI coding ag
 
 Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a bidirectional stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) embeds it; it is also usable on its own.
 
-Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace and [`drydock-transport`](crates/drydock-transport) implemented; language hosts, providers, and the agent are next.
+Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace, [`drydock-transport`](crates/drydock-transport), and the [Rust reference host](crates/drydock-host) implemented; vendor modules and the agent are next.
 
 See the [transport guide](crates/drydock-transport/README.md) for the API, wire format, lifecycle, and transport test instructions.
 
 Project contents and roadmap:
 
 - the protocol crate: Rust types, the generated OpenAPI document and a drift test;
-- language hosts for TypeScript and Python, each with its own version of the provider interface;
-- provider modules, Namespace first;
+- the Rust reference host and in-memory module; TypeScript and Python hosts follow, each with its own provider interface;
+- provider modules, Daytona first in Rust, and Namespace through the TypeScript SDK;
 - a conformance suite runnable against any language host or built-in provider.
 
 Licensed under either of Apache License 2.0 or MIT, at your option.
@@ -39,9 +39,9 @@ validates the document against OpenAPI 3.1.
 Wire conventions chosen for this first protocol version:
 
 - Names follow the ADR amendment: configured `providers` load `modules`;
-  sandbox `id` is opaque and `label` is the client's environment ID. Provision
+  environment `id` is opaque and `label` is the client's environment ID. Provision
   repeats by label return 200; new creations return 201. Inspect and destroy
-  use IDs even when a sandbox has no label. Destroying an absent ID succeeds.
+  use IDs even when a environment has no label. Destroying an absent ID succeeds.
 - Configuration contains non-secret settings and credential references or proxy
   placeholders. Direct credential values are sent separately through the
   authenticated credential refresh route, including initial delivery.
@@ -84,8 +84,10 @@ handshake's `PROTOCOL_VERSION`; it is a wire version, not a Cargo package versio
 Hosts perform semantic validation: CPUs must be finite and strictly positive;
 memory/disk sizes and usage hours must be nonnegative, and hours and reported
 credits must be finite. Credits may be negative when a vendor reports a debt.
-Timestamp formats are schema hints; hosts validate RFC 3339 timestamps, ordered
-periods, destination syntax and provider-specific bounds before vendor calls.
+The protocol's validated HostAddress, Cidr, Port, Timestamp and Period types enforce
+destination syntax and ordered RFC 3339 periods. The generated schema carries the
+same patterns, formats, bounds and period invariant for other hosts. Providers
+validate their own resource bounds before vendor calls.
 
 `Secret` redacts Debug output, including nested credential and reach recipes,
 but deliberately serializes the original string for transport. Never log their

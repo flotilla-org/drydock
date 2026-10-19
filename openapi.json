@@ -28,15 +28,29 @@
           "204": {
             "description": "Success"
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -67,15 +81,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -95,15 +123,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -137,15 +179,29 @@
           "204": {
             "description": "Success"
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -173,21 +229,35 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/Sandbox"
+                    "$ref": "#/components/schemas/Environment"
                   }
                 }
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       },
@@ -221,7 +291,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Sandbox"
+                  "$ref": "#/components/schemas/Environment"
                 }
               }
             }
@@ -231,20 +301,34 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Sandbox"
+                  "$ref": "#/components/schemas/Environment"
                 }
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -279,20 +363,34 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Sandbox"
+                  "$ref": "#/components/schemas/Environment"
                 }
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       },
@@ -323,15 +421,29 @@
           "204": {
             "description": "Success; destroying an already absent resource succeeds"
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -388,15 +500,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -436,15 +562,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -484,15 +624,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -539,15 +693,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -590,15 +758,29 @@
           "204": {
             "description": "Success"
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -638,15 +820,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -687,15 +883,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -726,15 +936,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -759,7 +983,7 @@
             "description": "RFC 3339 period start",
             "required": true,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/Timestamp"
             }
           },
           {
@@ -768,7 +992,7 @@
             "description": "RFC 3339 period end",
             "required": true,
             "schema": {
-              "type": "string"
+              "$ref": "#/components/schemas/Timestamp"
             }
           }
         ],
@@ -783,15 +1007,29 @@
               }
             }
           },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
           }
         }
       }
@@ -867,6 +1105,11 @@
           "clone_in_vessel"
         ]
       },
+      "Cidr": {
+        "type": "string",
+        "description": "A validated IPv4/IPv6 CIDR, preserving the caller's wire spelling.",
+        "pattern": "^(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:[0-9]|[12][0-9]|3[0-2])|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
+      },
       "CredentialMode": {
         "oneOf": [
           {
@@ -919,7 +1162,9 @@
         ],
         "properties": {
           "value": {
-            "$ref": "#/components/schemas/Secret"
+            "type": "string",
+            "format": "password",
+            "minLength": 1
           }
         }
       },
@@ -934,7 +1179,7 @@
             ],
             "properties": {
               "host": {
-                "type": "string"
+                "$ref": "#/components/schemas/HostAddress"
               },
               "kind": {
                 "type": "string",
@@ -943,9 +1188,7 @@
                 ]
               },
               "port": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
+                "$ref": "#/components/schemas/Port"
               }
             }
           },
@@ -957,7 +1200,7 @@
             ],
             "properties": {
               "cidr": {
-                "type": "string"
+                "$ref": "#/components/schemas/Cidr"
               },
               "kind": {
                 "type": "string",
@@ -1042,6 +1285,46 @@
           "advisory"
         ]
       },
+      "Environment": {
+        "type": "object",
+        "required": [
+          "id",
+          "provider",
+          "state",
+          "egress"
+        ],
+        "properties": {
+          "egress": {
+            "$ref": "#/components/schemas/Enforcement"
+          },
+          "granted_size": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Size"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Unlabelled resources are listable, inspectable and destroyable."
+          },
+          "provider": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/Observation"
+          }
+        }
+      },
       "Event": {
         "type": "object",
         "required": [
@@ -1073,8 +1356,7 @@
             "type": "string"
           },
           "timestamp": {
-            "type": "string",
-            "format": "date-time",
+            "$ref": "#/components/schemas/Timestamp",
             "description": "RFC 3339 timestamp."
           },
           "timestamp_source": {
@@ -1197,7 +1479,14 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "prefixItems": [
+              {
+                "type": "string",
+                "minLength": 1
+              }
+            ],
+            "minItems": 1
           }
         }
       },
@@ -1291,7 +1580,7 @@
           },
           {
             "type": "object",
-            "description": "A previously known sandbox is absent from an authoritative complete list.",
+            "description": "A previously known environment is absent from an authoritative complete list.",
             "required": [
               "kind"
             ],
@@ -1349,6 +1638,12 @@
             }
           }
         }
+      },
+      "HostAddress": {
+        "type": "string",
+        "description": "A validated DNS name or IP literal. Schema uses the exact decoder pattern.",
+        "maxLength": 253,
+        "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\\.?|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|\\[(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))\\])$"
       },
       "HostConfiguration": {
         "type": "object",
@@ -1505,17 +1800,17 @@
             "type": "object",
             "required": [
               "cursor",
-              "sandboxes",
+              "environments",
               "type"
             ],
             "properties": {
               "cursor": {
                 "type": "string"
               },
-              "sandboxes": {
+              "environments": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/Sandbox"
+                  "$ref": "#/components/schemas/Environment"
                 }
               },
               "type": {
@@ -1531,20 +1826,29 @@
       },
       "Period": {
         "type": "object",
+        "description": "RFC 3339 endpoints; start must be <= end (equal endpoints are an empty interval).",
         "required": [
           "start",
           "end"
         ],
         "properties": {
           "end": {
-            "type": "string",
-            "format": "date-time"
+            "$ref": "#/components/schemas/Timestamp"
           },
           "start": {
-            "type": "string",
-            "format": "date-time"
+            "$ref": "#/components/schemas/Timestamp"
           }
-        }
+        },
+        "x-drydock-invariants": [
+          "start <= end"
+        ]
+      },
+      "Port": {
+        "type": "integer",
+        "format": "int32",
+        "description": "Zero is not a destination port.",
+        "maximum": 65535,
+        "minimum": 1
       },
       "PrepareRequest": {
         "type": "object",
@@ -1555,10 +1859,12 @@
         ],
         "properties": {
           "image_digest": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "tools_digest": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         }
       },
@@ -1575,18 +1881,56 @@
             "type": "string"
           },
           "image_digest": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "provider": {
             "type": "string"
           },
           "tools_digest": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         }
       },
       "ProtocolError": {
         "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "not_found"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "method_not_allowed"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
           {
             "type": "object",
             "required": [
@@ -1708,7 +2052,7 @@
                 ]
               },
               "provider_error": {
-                "type": "string",
+                "$ref": "#/components/schemas/Secret",
                 "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
               },
               "reason": {
@@ -1779,7 +2123,7 @@
       },
       "ProvisionRequest": {
         "type": "object",
-        "description": "Repeated creation with the same label returns the existing sandbox (200).\nPrepared forms belong to one provider; cross-provider use is Refused.",
+        "description": "Repeated creation with the same label returns the existing environment (200).\nPrepared forms belong to one provider; cross-provider use is Refused.",
         "required": [
           "label",
           "prepared",
@@ -1790,7 +2134,8 @@
             "$ref": "#/components/schemas/EgressRequest"
           },
           "label": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "prepared": {
             "$ref": "#/components/schemas/Prepared"
@@ -1901,8 +2246,7 @@
             ],
             "properties": {
               "expires_at": {
-                "type": "string",
-                "format": "date-time"
+                "$ref": "#/components/schemas/Timestamp"
               },
               "kind": {
                 "type": "string",
@@ -2039,46 +2383,6 @@
           }
         }
       },
-      "Sandbox": {
-        "type": "object",
-        "required": [
-          "id",
-          "provider",
-          "state",
-          "egress"
-        ],
-        "properties": {
-          "egress": {
-            "$ref": "#/components/schemas/Enforcement"
-          },
-          "granted_size": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Size"
-              }
-            ]
-          },
-          "id": {
-            "type": "string"
-          },
-          "label": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Unlabelled resources are listable, inspectable and destroyable."
-          },
-          "provider": {
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/Observation"
-          }
-        }
-      },
       "Secret": {
         "type": "string",
         "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value.\nPartialEq is for wire-value comparisons, NOT constant-time authentication.\nAuthentication belongs to hosts, which must use constant-time token comparison.\nThis type does not promise secure erasure of strings or serialization buffers."
@@ -2093,7 +2397,8 @@
         "properties": {
           "cpus": {
             "type": "number",
-            "format": "double"
+            "format": "double",
+            "exclusiveMinimum": 0
           },
           "disk_bytes": {
             "type": "integer",
@@ -2131,6 +2436,11 @@
           "guest_halted"
         ]
       },
+      "Timestamp": {
+        "type": "string",
+        "format": "date-time",
+        "description": "A typed UTC instant, encoded as RFC3339. Equivalent offsets compare equally."
+      },
       "TimestampSource": {
         "type": "string",
         "enum": [
@@ -2150,16 +2460,257 @@
         "type": "object",
         "required": [
           "period",
-          "sandbox_hours"
+          "environment_hours"
         ],
         "properties": {
-          "period": {
-            "$ref": "#/components/schemas/Period"
-          },
-          "sandbox_hours": {
+          "environment_hours": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SizeUsage"
+            }
+          },
+          "period": {
+            "$ref": "#/components/schemas/Period"
+          }
+        }
+      }
+    },
+    "responses": {
+      "Error402": {
+        "description": "QuotaExhausted",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "quota_exhausted"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error404": {
+        "description": "NotFound: route, provider or environment does not exist",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "not_found"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error405": {
+        "description": "MethodNotAllowed",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "method_not_allowed"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error422": {
+        "description": "Refused: request cannot be met",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "refused"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error429": {
+        "description": "RateLimited: retry_after is whole seconds",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Optional whole seconds until retry; adaptors do not retry automatically"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "rate_limited"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "retry_after": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error500": {
+        "description": "Internal: sensitive provider error for supervisor diagnostics",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "provider_error",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "internal"
+                  ]
+                },
+                "provider_error": {
+                  "$ref": "#/components/schemas/Secret",
+                  "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error502": {
+        "description": "CredentialRejected: vendor rejected delivered credentials",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "credential_rejected"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error503": {
+        "description": "Unavailable: provider not ready or temporarily unavailable",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Optional whole seconds until retry; adaptors do not retry automatically"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "reason",
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "unavailable"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "retry_after": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
             }
           }
         }

@@ -1,0 +1,33 @@
+[package]
+name = "drydock-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drydock-protocol = { path = "../drydock-protocol" }
+rigging-http-client.workspace = true
+rigging-http-serve.workspace = true
+rigging-stream.workspace = true
+async-trait = "0.1"
+axum = "0.8"
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
+hyper = { version = "1", features = ["http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+async-stream = "0.3"
+chrono = "0.4"
+libc = "0.2"
+url = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["process"] }
+rigging-tls.workspace = true
+rigging-replay-testkit.workspace = true
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query"] }
+futures = "0.3"
+hegeltest = "=0.48.1"

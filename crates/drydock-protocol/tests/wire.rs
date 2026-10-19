@@ -39,7 +39,7 @@ fn tagged_wire_fixtures() {
     ] {
         fixture::<CredentialMode>(value);
     }
-    fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"","sandboxes":[]}));
+    fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"","environments":[]}));
     for event in [
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
@@ -60,7 +60,7 @@ fn secret_debug_redacts_without_changing_wire() {
     let secret = Secret::new(value);
     let refresh = CredentialRefresh { value: secret.clone() };
     let credential = CredentialMode::Proxied { placeholder_token: secret.clone(), proxy_url: "http://localhost".into() };
-    let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), expires_at: "time".into() };
+    let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), expires_at: "2026-10-19T00:00:00Z".parse().unwrap() };
     let resume = ResumeToken { token: secret };
     for debug in [format!("{refresh:?}"), format!("{credential:?}"), format!("{reach:?}"), format!("{resume:?}")] {
         assert!(!debug.contains(value));

@@ -29,7 +29,7 @@ fn errors_round_trip() {
             ProtocolError::Refused { reason: reason.clone() },
             ProtocolError::QuotaExhausted { reason: reason.clone() },
             ProtocolError::CredentialRejected { reason: reason.clone() },
-            ProtocolError::Internal { reason: reason.clone(), provider_error: reason.clone() },
+            ProtocolError::Internal { reason: reason.clone(), provider_error: Secret::new(reason.clone()) },
         ];
         for retry_after in [None, Some(0), Some(u64::MAX)] {
             errors.push(ProtocolError::Unavailable { reason: reason.clone(), retry_after });
