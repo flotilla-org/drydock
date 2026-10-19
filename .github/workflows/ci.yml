@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The remaining steps skip until the first crate lands (drydock#7).
+      - name: Check for a Cargo workspace
+        id: workspace
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Install pinned Rust
+        if: steps.workspace.outputs.present == 'true'
+        run: rustup show
+      - if: steps.workspace.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+      - if: steps.workspace.outputs.present == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: steps.workspace.outputs.present == 'true'
+        run: cargo test --workspace --locked
+      - if: steps.workspace.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate OpenAPI 3.1
+        if: steps.workspace.outputs.present == 'true'
+        run: |
+          python -m pip install openapi-spec-validator==0.7.2
+          python -m openapi_spec_validator openapi.json
