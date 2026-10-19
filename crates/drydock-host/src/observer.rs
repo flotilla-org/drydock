@@ -9,9 +9,14 @@ pub(super) fn poll_interval(
     let ObservationMode::Poll { mut interval } = mode else {
         return Ok(None);
     };
+    // Limits are cached at configuration time; credential refresh does not change them.
     // A poll never consumes more than its share of a declared list/global budget.
     for limit in limits {
         if limit.operation == "list" || limit.operation == "*" {
+            // Configure validates these too; keep this helper safe in isolation.
+            if limit.requests == 0 || limit.period_seconds == 0 {
+                return Err(refused("invalid polling rate limit"));
+            }
             let nanos = (u128::from(limit.period_seconds) * 1_000_000_000)
                 .div_ceil(u128::from(limit.requests));
             interval = interval.max(Duration::new(
@@ -139,5 +144,6 @@ fn reconcile(
         }
     }
     destroyed.clear();
+    // Replace the inventory, pruning every row no longer returned, including Gone.
     *seen = current;
 }
