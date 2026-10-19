@@ -49,7 +49,7 @@ Wire conventions chosen for this first protocol version:
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
   unsupported destinations are refused, never widened. The result records
   enforced versus advisory protection.
-- `/v1/observe` is one host-wide NDJSON stream. Each line is an `ObserveRecord`.
+- `/v1/events` is one host-wide NDJSON stream. Each line is an `ObserveRecord`.
   `since` is an opaque exclusive cursor. A host unable to replay emits a complete
   list snapshot with a new cursor, marking a metering gap. Event times are RFC
   3339 with explicit provider/adaptor provenance; running events carry granted size.
@@ -64,9 +64,13 @@ Wire conventions chosen for this first protocol version:
 
 ### Compatibility and validation
 
-Provider-level prepare, credential, usage and quota routes live at
-`/v1/{operation}/{provider}`. They cannot shadow opaque sandbox IDs under
-`/v1/providers/{provider}/{id}` (including IDs such as `usage` and `quota`).
+Per-environment routes use `/v1/providers/{provider}/environments`: POST provisions,
+GET lists, and GET/DELETE on `/{id}` inspect/destroy. Reach (POST), relay (GET),
+suspend/resume/exec/export (POST) append their operation after `/{id}`.
+Provider-level prepare, credential, usage and quota stay directly under
+`/v1/providers/{provider}`. IDs such as `usage` and `quota` therefore remain opaque
+without colliding with provider-level operations. There are no route aliases.
+Host configuration is `PUT /v1/config`; the host-wide stream is `GET /v1/events`.
 
 Optional fields serialize as explicit `null`; absent optional fields are accepted
 as `None`. Unknown object fields are ignored for additive compatibility. Unknown
@@ -92,7 +96,8 @@ must count both as non-running rather than infer loss. `MissingOnList` records
 absence from an authoritative complete list; `DestroyedByRequest` records a
 confirmed client deletion, matching ADR 0058's loss vocabulary.
 
-Relay and exec clients send `Connection: Upgrade` and `Upgrade: drydock-stream`;
+Relay and exec clients send `Connection: Upgrade` and respectively
+`Upgrade: drydock-relay` or `Upgrade: drydock-stream`;
 a successful 101 response echoes both headers before the raw byte stream begins.
 
 `Hello::is_compatible()` performs exact wire-version comparison; callers still

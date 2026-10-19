@@ -104,22 +104,58 @@ fn compatibility_policy() {
     );
 }
 
-// Provider-wide operations must not shadow opaque sandbox IDs; wire versions share one source.
+// Owner ruling on issue #1: environments have one collection, no aliases; IDs stay opaque.
+// Enumerating all paths/methods pins the complete routing surface independently of generation.
 #[test]
 fn route_and_version_contract() {
     let doc = serde_json::to_value(openapi::document()).unwrap();
     assert_eq!(doc["info"]["version"], PROTOCOL_VERSION);
-    for operation in ["usage", "quota", "prepare", "credential"] {
-        assert!(
-            doc["paths"]
-                .get(format!("/v1/{operation}/{{provider}}"))
-                .is_some()
-        );
-        assert!(
-            doc["paths"]
-                .get(format!("/v1/providers/{{provider}}/{operation}"))
-                .is_none()
-        );
+    let expected = [
+        ("/v1/hello", vec!["get"]),
+        ("/v1/config", vec!["put"]),
+        ("/v1/events", vec!["get"]),
+        ("/v1/providers/{provider}/credential", vec!["put"]),
+        ("/v1/providers/{provider}/prepare", vec!["post"]),
+        ("/v1/providers/{provider}/usage", vec!["get"]),
+        ("/v1/providers/{provider}/quota", vec!["get"]),
+        ("/v1/providers/{provider}/environments", vec!["get", "post"]),
+        (
+            "/v1/providers/{provider}/environments/{id}",
+            vec!["delete", "get"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/reach",
+            vec!["post"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/relay",
+            vec!["get"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/suspend",
+            vec!["post"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/resume",
+            vec!["post"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/exec",
+            vec!["post"],
+        ),
+        (
+            "/v1/providers/{provider}/environments/{id}/export",
+            vec!["post"],
+        ),
+    ];
+    let paths = doc["paths"].as_object().unwrap();
+    assert_eq!(paths.len(), expected.len());
+    for (path, methods) in expected {
+        let operations = paths[path].as_object().unwrap();
+        assert_eq!(operations.len(), methods.len());
+        for method in methods {
+            assert!(operations.contains_key(method), "{method} {path}");
+        }
     }
 }
 

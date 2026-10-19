@@ -10,7 +10,7 @@
     "version": "1"
   },
   "paths": {
-    "/v1/configuration": {
+    "/v1/config": {
       "put": {
         "tags": [],
         "operationId": "configure",
@@ -41,34 +41,31 @@
         }
       }
     },
-    "/v1/credential/{provider}": {
-      "put": {
+    "/v1/events": {
+      "get": {
         "tags": [],
-        "operationId": "refresh_credential",
+        "operationId": "observe",
         "parameters": [
           {
-            "name": "provider",
-            "in": "path",
-            "description": "Opaque provider",
-            "required": true,
+            "name": "since",
+            "in": "query",
+            "description": "Exclusive last-seen cursor; absent starts with a snapshot",
+            "required": false,
             "schema": {
               "type": "string"
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CredentialRefresh"
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObserveRecord"
+                }
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Success"
           },
           "default": {
             "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
@@ -111,49 +108,10 @@
         }
       }
     },
-    "/v1/observe": {
-      "get": {
+    "/v1/providers/{provider}/credential": {
+      "put": {
         "tags": [],
-        "operationId": "observe",
-        "parameters": [
-          {
-            "name": "since",
-            "in": "query",
-            "description": "Exclusive last-seen cursor; absent starts with a snapshot",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/x-ndjson": {
-                "schema": {
-                  "$ref": "#/components/schemas/ObserveRecord"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/prepare/{provider}": {
-      "post": {
-        "tags": [],
-        "operationId": "prepare",
+        "operationId": "refresh_credential",
         "parameters": [
           {
             "name": "provider",
@@ -169,22 +127,15 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PrepareRequest"
+                "$ref": "#/components/schemas/CredentialRefresh"
               }
             }
           },
           "required": true
         },
         "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Prepared"
-                }
-              }
-            }
+          "204": {
+            "description": "Success"
           },
           "default": {
             "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
@@ -199,7 +150,7 @@
         }
       }
     },
-    "/v1/providers/{provider}": {
+    "/v1/providers/{provider}/environments": {
       "get": {
         "tags": [],
         "operationId": "list",
@@ -298,7 +249,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}": {
+    "/v1/providers/{provider}/environments/{id}": {
       "get": {
         "tags": [],
         "operationId": "inspect",
@@ -385,7 +336,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/exec": {
+    "/v1/providers/{provider}/environments/{id}/exec": {
       "post": {
         "tags": [],
         "operationId": "exec",
@@ -450,7 +401,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/export": {
+    "/v1/providers/{provider}/environments/{id}/export": {
       "post": {
         "tags": [],
         "operationId": "export",
@@ -498,8 +449,8 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/reach": {
-      "get": {
+    "/v1/providers/{provider}/environments/{id}/reach": {
+      "post": {
         "tags": [],
         "operationId": "reach",
         "parameters": [
@@ -546,7 +497,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/relay": {
+    "/v1/providers/{provider}/environments/{id}/relay": {
       "get": {
         "tags": [],
         "operationId": "relay",
@@ -572,7 +523,7 @@
         ],
         "responses": {
           "101": {
-            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream",
+            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-relay",
             "headers": {
               "Connection": {
                 "schema": {
@@ -584,7 +535,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "drydock-stream"
+                "description": "drydock-relay"
               }
             }
           },
@@ -601,7 +552,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/resume": {
+    "/v1/providers/{provider}/environments/{id}/resume": {
       "post": {
         "tags": [],
         "operationId": "resume",
@@ -652,7 +603,7 @@
         }
       }
     },
-    "/v1/providers/{provider}/{id}/suspend": {
+    "/v1/providers/{provider}/environments/{id}/suspend": {
       "post": {
         "tags": [],
         "operationId": "suspend",
@@ -700,7 +651,56 @@
         }
       }
     },
-    "/v1/quota/{provider}": {
+    "/v1/providers/{provider}/prepare": {
+      "post": {
+        "tags": [],
+        "operationId": "prepare",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Prepared"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}/quota": {
       "get": {
         "tags": [],
         "operationId": "quota",
@@ -739,7 +739,7 @@
         }
       }
     },
-    "/v1/usage/{provider}": {
+    "/v1/providers/{provider}/usage": {
       "get": {
         "tags": [],
         "operationId": "usage",

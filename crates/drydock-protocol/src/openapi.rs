@@ -15,102 +15,102 @@ responses((status = 200, description = "Success", body = Hello), ErrorResponses)
 )]
 fn hello() {}
 
-#[utoipa::path(put, path = "/v1/configuration",
+#[utoipa::path(put, path = "/v1/config",
 request_body = HostConfiguration,
 responses((status = 204, description = "Success"), ErrorResponses)
 )]
 fn configure() {}
 
-#[utoipa::path(put, path = "/v1/credential/{provider}",
+#[utoipa::path(put, path = "/v1/providers/{provider}/credential",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = CredentialRefresh,
 responses((status = 204, description = "Success"), ErrorResponses)
 )]
 fn refresh_credential() {}
 
-#[utoipa::path(post, path = "/v1/prepare/{provider}",
+#[utoipa::path(post, path = "/v1/providers/{provider}/prepare",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = PrepareRequest,
 responses((status = 200, description = "Success", body = Prepared), ErrorResponses)
 )]
 fn prepare() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = ProvisionRequest,
 responses((status = 200, description = "Success", body = Sandbox), (status = 201, description = "Created; repeats by label return 200", body = Sandbox), ErrorResponses)
 )]
 fn provision() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}",
+#[utoipa::path(get, path = "/v1/providers/{provider}/environments",
 params(("provider" = String, Path, description = "Opaque provider")),
 responses((status = 200, description = "Success", body = Vec<Sandbox>), ErrorResponses)
 )]
 fn list() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}/{id}",
+#[utoipa::path(get, path = "/v1/providers/{provider}/environments/{id}",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 200, description = "Success", body = Sandbox), ErrorResponses)
 )]
 fn inspect() {}
 
-#[utoipa::path(delete, path = "/v1/providers/{provider}/{id}",
+#[utoipa::path(delete, path = "/v1/providers/{provider}/environments/{id}",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 204, description = "Success; destroying an already absent resource succeeds"), ErrorResponses)
 )]
 fn destroy() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}/{id}/reach",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments/{id}/reach",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 200, description = "Success", body = Reach), ErrorResponses)
 )]
 fn reach() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}/{id}/relay",
+#[utoipa::path(get, path = "/v1/providers/{provider}/environments/{id}/relay",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
+responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-relay", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-relay"))), ErrorResponses)
 )]
 fn relay() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}/{id}/exec",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments/{id}/exec",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 request_body = ExecRequest,
 responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
 )]
 fn exec() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}/{id}/suspend",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments/{id}/suspend",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 200, description = "Success", body = ResumeToken), ErrorResponses)
 )]
 fn suspend() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}/{id}/resume",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments/{id}/resume",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 request_body = ResumeToken,
 responses((status = 204, description = "Success"), ErrorResponses)
 )]
 fn resume() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}/{id}/export",
+#[utoipa::path(post, path = "/v1/providers/{provider}/environments/{id}/export",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 200, description = "Success", body = Export), ErrorResponses)
 )]
 fn export() {}
 
-#[utoipa::path(get, path = "/v1/observe",
+#[utoipa::path(get, path = "/v1/events",
 params(("since" = Option<String>, Query, description = "Exclusive last-seen cursor; absent starts with a snapshot")),
 responses((status = 200, description = "Success", body = ObserveRecord, content_type = "application/x-ndjson"), ErrorResponses)
 )]
 fn observe() {}
 
-#[utoipa::path(get, path = "/v1/usage/{provider}",
+#[utoipa::path(get, path = "/v1/providers/{provider}/usage",
 params(("provider" = String, Path, description = "Opaque provider"),("start" = String, Query, description = "RFC 3339 period start"),("end" = String, Query, description = "RFC 3339 period end")),
 responses((status = 200, description = "Success", body = Usage), ErrorResponses)
 )]
 fn usage() {}
 
-#[utoipa::path(get, path = "/v1/quota/{provider}",
+#[utoipa::path(get, path = "/v1/providers/{provider}/quota",
 params(("provider" = String, Path, description = "Opaque provider")),
 responses((status = 200, description = "Success", body = Quota), ErrorResponses)
 )]
