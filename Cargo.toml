@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flotilla-org/drydock"
 
 [workspace.dependencies]
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "9c553b12c9922ade32ef66185884be2114c1981b" }
 rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "9c553b12c9922ade32ef66185884be2114c1981b" }
 rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "9c553b12c9922ade32ef66185884be2114c1981b" }
 rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "9c553b12c9922ade32ef66185884be2114c1981b" }

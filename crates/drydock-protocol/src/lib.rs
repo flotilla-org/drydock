@@ -64,6 +64,8 @@ pub enum CredentialMode {
 /// Delivered in memory over the authenticated host connection; never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct CredentialRefresh {
+    #[serde(deserialize_with = "validation::nonempty_secret")]
+    #[schema(value_type = String, format = Password, min_length = 1)]
     pub value: Secret,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -185,26 +187,38 @@ pub enum Destination {
 /// Preparation is look-up-or-build at the provider, keyed by both digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
+    #[serde(deserialize_with = "validation::nonempty_string")]
+    #[schema(min_length = 1)]
     pub image_digest: String,
+    #[serde(deserialize_with = "validation::nonempty_string")]
+    #[schema(min_length = 1)]
     pub tools_digest: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Prepared {
     pub provider: String,
     pub id: String,
+    #[serde(deserialize_with = "validation::nonempty_string")]
+    #[schema(min_length = 1)]
     pub image_digest: String,
+    #[serde(deserialize_with = "validation::nonempty_string")]
+    #[schema(min_length = 1)]
     pub tools_digest: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Size {
+    #[serde(deserialize_with = "validation::positive_cpus")]
+    #[schema(exclusive_minimum = 0)]
     pub cpus: f64,
     pub memory_bytes: u64,
     pub disk_bytes: u64,
 }
-/// Repeated creation with the same label returns the existing sandbox (200).
+/// Repeated creation with the same label returns the existing environment (200).
 /// Prepared forms belong to one provider; cross-provider use is Refused.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ProvisionRequest {
+    #[serde(deserialize_with = "validation::nonempty_string")]
+    #[schema(min_length = 1)]
     pub label: String,
     pub prepared: Prepared,
     pub size: Size,
@@ -213,7 +227,7 @@ pub struct ProvisionRequest {
     pub ssh_public_key: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct Sandbox {
+pub struct Environment {
     pub id: String,
     /// Unlabelled resources are listable, inspectable and destroyable.
     pub label: Option<String>,
@@ -234,7 +248,7 @@ pub enum Reach {
         url: String,
         token: Secret,
         #[schema(format = DateTime)]
-        expires_at: String,
+        expires_at: Timestamp,
     },
     Relay {
         path: String,
@@ -265,7 +279,7 @@ pub enum GoneCause {
         code: i32,
     },
     GuestPoweredOff,
-    /// A previously known sandbox is absent from an authoritative complete list.
+    /// A previously known environment is absent from an authoritative complete list.
     MissingOnList,
     /// The provider confirmed deletion requested by the client.
     DestroyedByRequest,
@@ -292,7 +306,7 @@ pub struct Event {
     pub label: Option<String>,
     /// RFC 3339 timestamp.
     #[schema(format = DateTime)]
-    pub timestamp: String,
+    pub timestamp: Timestamp,
     pub timestamp_source: TimestampSource,
     pub event: EventKind,
 }
@@ -320,7 +334,7 @@ pub enum EventKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObserveRecord {
     Event { event: Event },
-    Snapshot { cursor: String, sandboxes: Vec<Sandbox> },
+    Snapshot { cursor: String, environments: Vec<Environment> },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(try_from = "UncheckedPeriod")]
@@ -333,7 +347,7 @@ pub struct Period {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub period: Period,
-    pub sandbox_hours: Vec<SizeUsage>,
+    pub environment_hours: Vec<SizeUsage>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SizeUsage {
@@ -349,6 +363,8 @@ pub struct Quota {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ExecRequest {
+    #[serde(deserialize_with = "validation::command")]
+    #[schema(min_items = 1)]
     pub command: Vec<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -363,6 +379,12 @@ pub struct Export {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProtocolError {
+    NotFound {
+        reason: String,
+    },
+    MethodNotAllowed {
+        reason: String,
+    },
     Refused {
         reason: String,
     },
@@ -383,7 +405,7 @@ pub enum ProtocolError {
     Internal {
         reason: String,
         /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
-        provider_error: String,
+        provider_error: Secret,
     },
 }
 
@@ -395,19 +417,30 @@ struct UncheckedPeriod {
 impl TryFrom<UncheckedPeriod> for Period {
     type Error = &'static str;
     fn try_from(raw: UncheckedPeriod) -> Result<Self, Self::Error> {
-        let value = Self {
-            start: raw.start,
-            end: raw.end,
-        };
-        value.validate()?;
-        Ok(value)
+        Self::new(raw.start, raw.end)
     }
 }
 impl ProtocolError {
+    /// Static diagnostics label; never exposes vendor error text.
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::NotFound { .. } => "not_found",
+            Self::MethodNotAllowed { .. } => "method_not_allowed",
+            Self::Refused { .. } => "refused",
+            Self::Unavailable { .. } => "unavailable",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::QuotaExhausted { .. } => "quota_exhausted",
+            Self::CredentialRejected { .. } => "credential_rejected",
+            Self::Internal { .. } => "internal",
+        }
+    }
+
     /// HTTP status is part of the shared wire contract, independent of a host framework.
     pub const fn status(&self) -> u16 {
         match self {
             Self::Refused { .. } => 422,
+            Self::NotFound { .. } => 404,
+            Self::MethodNotAllowed { .. } => 405,
             Self::Unavailable { .. } => 503,
             Self::RateLimited { .. } => 429,
             Self::QuotaExhausted { .. } => 402,
@@ -417,9 +450,7 @@ impl ProtocolError {
     }
     pub const fn retry_after(&self) -> Option<u64> {
         match self {
-            Self::Unavailable { retry_after, .. } | Self::RateLimited { retry_after, .. } => {
-                *retry_after
-            }
+            Self::Unavailable { retry_after, .. } | Self::RateLimited { retry_after, .. } => *retry_after,
             _ => None,
         }
     }

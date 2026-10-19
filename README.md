@@ -39,9 +39,9 @@ validates the document against OpenAPI 3.1.
 Wire conventions chosen for this first protocol version:
 
 - Names follow the ADR amendment: configured `providers` load `modules`;
-  sandbox `id` is opaque and `label` is the client's environment ID. Provision
+  environment `id` is opaque and `label` is the client's environment ID. Provision
   repeats by label return 200; new creations return 201. Inspect and destroy
-  use IDs even when a sandbox has no label. Destroying an absent ID succeeds.
+  use IDs even when a environment has no label. Destroying an absent ID succeeds.
 - Configuration contains non-secret settings and credential references or proxy
   placeholders. Direct credential values are sent separately through the
   authenticated credential refresh route, including initial delivery.

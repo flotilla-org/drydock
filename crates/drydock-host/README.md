@@ -16,7 +16,7 @@ Rigging owns socket binding, peer credentials, token-file creation, constant-tim
 comparison, and Host/Origin enforcement. TCP is loopback only and uses the numeric
 bound authority in Host. The host selects bearer-only TCP and the supervisor UID
 through small caller-policy layers pending shared Rigging policy options (#20).
-Ctrl-C and SIGTERM stop observers, drain event/upgrade streams and unlink the
+Ctrl-C and SIGTERM signal and await observers, close event bodies and upgraded streams, and unlink the
 owned Unix socket. Restart rotates the TCP token.
 
 ## Configuration and module interface
@@ -58,9 +58,9 @@ MissingCredential until refresh. A stale rejection cannot undo a newer credentia
 generation. Hello reads cached declarations without waiting on vendor I/O.
 
 Provision returns a typed Created/Existing result; the host chooses 201/200.
-The same label with a valid changed body returns the existing sandbox, not an
+The same label with a valid changed body returns the existing environment, not an
 update. Reach returns a module connection recipe; Relay is a marker and the host
-builds its escaped route. Streams reuse `drydock-transport::ByteStream`.
+builds its escaped route. Streams reuse `rigging_stream::ByteStream`.
 
 ## Credentials and HTTP transport
 
@@ -84,13 +84,16 @@ bodies, or raw vendor errors. Proxied providers refuse Direct refreshes.
 
 A provider declares `ObservationMode::Poll { interval }` or Push. For Poll the
 host owns one list loop, last-seen state and diffing. It stretches the interval
-within declared list/global limits, shares the budget with route calls, and
-skips missed ticks. Failed or unready lists preserve prior state and never report
+within declared list/global limits and skips missed ticks. Observation gets at
+most half the long-run list/global rate and max(1, requests/2) slots per window;
+route calls share the total budget and can use the remaining slots. An indivisible
+one-request window is polled at most every two windows: a route immediately after
+that single poll can still receive 429 until the shared window expires. Failed or unready lists preserve prior state and never report
 resources gone. Successful complete lists emit Created/Running, Stopped/Paused,
 Resumed/Running, size changes, and Gone transitions. Confirmed requested deletions
 use DestroyedByRequest; unexplained absence uses MissingOnList.
 
-Modules return `ObservedSandbox` from list/inspect: the sandbox plus an optional
+Modules return `ObservedEnvironment` from list/inspect: the environment plus an optional
 typed provider timestamp. Polling uses that time, including matching inspect
 metadata when list has none; otherwise the host stamps first observation with
 TimestampSource::Adaptor. Push modules publish through EventSink with an optional
@@ -98,21 +101,43 @@ typed timestamp. Some means Provider provenance; None asks the host to stamp
 Adaptor time. Modules never format event times. The reference declares Poll and
 publishes no events itself, so its lifecycle tests exercise the host poller.
 
-The host retains 1024 host-wide events in memory. `GET /v1/events` starts with a
-complete snapshot; `?since=` resumes exclusively at retained cursors. Unknown,
-expired and previous-process cursors produce a new complete gap snapshot. Snapshot
-cursors precede listing: background observations may appear in both rows and later
-events. Reconcile rows by provider/ID, then apply events in cursor order; snapshot
-rows mark a metering gap and are not extra billing transitions. ADR 0070 leaves
-this concurrent cut unspecified; the host chooses overlap over losing a change.
+The host retains `EVENT_HISTORY_CAPACITY` host-wide events in memory (1024).
+`GET /v1/events` starts with a complete snapshot; `?since=` resumes exclusively at
+retained cursors. Unknown, expired and previous-process cursors produce a complete
+gap snapshot. Poll snapshots use the last successful host-owned inventory, never
+another vendor list request. A poll commits its inventory and transition events
+under the same log lock, so a poll-only snapshot cursor identifies that exact cut.
+Before a provider's first successful poll, a snapshot waits for observation or
+returns its typed failure. Later transient poll failures retain the inventory.
+Push snapshot cursors precede provider listing to replay overlapping events.
+Snapshot rows mark a metering gap and do not create extra billing transitions.
 
 An unready provider blocks a complete snapshot rather than silently omitting its
-resources. Retained-cursor replay does not list. Recovery lists sequentially and
-may wait for vendor calls themselves, but not for an unrelated prepare on the
-same provider. Initial failures are typed HTTP errors; later recovery failures
-fail the HTTP body instead of clean EOF. V1 defines no terminal NDJSON error
-record. Polling naturally cannot report transitions that occur entirely between
-samples; modules with event streams declare Push.
+resources. Retained-cursor replay does not list. Initial snapshot failures are typed
+HTTP errors; later recovery failures fail the HTTP body instead of clean EOF.
+V1 defines no terminal NDJSON error record. Polling cannot report transitions hidden
+entirely between samples; modules with event streams declare Push.
+
+Push observers receive `Provider::run(PushContext)` only after configuration commits.
+The context carries a provider-scoped sink, a credential watch, and a stop watch.
+On shutdown the host signals, awaits cleanup for up to five seconds per observer,
+then aborts an unresponsive observer and releases instances. Poll factories receive
+no sink and do not start background work. Upgraded streams close on shutdown; they
+are not drained to completion.
+
+## Diagnostics and readiness
+
+The library emits structured tracing events with route/provider/environment identity,
+static error classes and readiness statuses; it never installs a subscriber or logs
+request bodies, credentials or vendor error text. The binary installs a plain-text
+stderr subscriber using `RUST_LOG`, defaulting to `info`. Embedders choose a subscriber.
+
+One policy derives readiness and call admission from module readiness plus host
+credential state. Direct rejection is sticky until a new refresh. A rejection also
+invalidates older calls, so a stale success cannot repair it. Proxied rejection
+reports Unknown while allowing subsequent probes; a successful post-rejection
+probe restores readiness after the supervisor repairs the proxy. Direct credential
+refresh is still refused for Proxied providers.
 
 ## Routes and validation
 
@@ -121,8 +146,12 @@ sanitized Refused errors without echoing diagnostics; no status-rewriting layer
 is used. `ProtocolError::status` and every OpenAPI route carry the shared status
 contract. Destination host/IP/CIDR parsing and ordered RFC3339 periods are validated
 by protocol deserialization, and their patterns/formats/invariants appear in the
-schema for other language hosts. Host-specific checks retain provider ownership,
-label semantics and module capability gates.
+schema for other language hosts. Positive CPU counts, nonempty labels/digests/credential values and executable
+commands are also protocol/schema constraints. Times are typed instants throughout
+module and wire types. Unknown routes/providers/environments use NotFound (404);
+wrong HTTP methods use MethodNotAllowed (405). Other statuses have shared,
+status-specific OpenAPI responses, including Retry-After. Host checks retain
+prepared-provider ownership and capability gates.
 
 Relay requests send `Connection: Upgrade` and `Upgrade: drydock-relay`. Exec uses
 POST, typed JSON `ExecRequest`, and `Upgrade: drydock-stream`; its upgrade extractor
@@ -144,4 +173,5 @@ Tests drive real Unix/TCP endpoints, a generated label lifecycle, host polling,
 provider/inspect timestamp provenance, replay/eviction, concurrent same-provider
 calls, credential rotation, Rigging replay injection, raw upgrades, rate limits,
 auth and shutdown. Shared protocol properties compare decoding with schema rules.
-Endpoint-driven reuse across language hosts is tracked in #21.
+Endpoint-driven reuse across language hosts and remaining forwarding/fixture-helper
+consolidation are tracked in #21.

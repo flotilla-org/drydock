@@ -12,7 +12,7 @@ serde_json.workspace = true
 utoipa.workspace = true
 chrono = "0.4"
 ipnet = "2"
-regex = "1"
 
 [dev-dependencies]
+regex = "1"
 hegeltest = "=0.48.1"

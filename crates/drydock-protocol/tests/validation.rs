@@ -6,9 +6,7 @@ use serde_json::json;
 #[hegel::test]
 fn generated_destinations_share_schema_rules(tc: hegel::TestCase) {
     use hegel::generators as gs;
-    let octets: Vec<_> = (0..4)
-        .map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(255)))
-        .collect();
+    let octets: Vec<_> = (0..4).map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(255))).collect();
     let ip = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
     let tail = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
     let v6 = format!("2001:db8::{tail:x}");
@@ -27,38 +25,17 @@ fn generated_destinations_share_schema_rules(tc: hegel::TestCase) {
         "-invalid".into(),
         "bad/path".into(),
     ] {
-        let decoded = serde_json::from_value::<Destination>(
-            json!({"kind":"host_port","host":host,"port":port}),
-        );
+        let decoded = serde_json::from_value::<Destination>(json!({"kind":"host_port","host":host,"port":port}));
         assert_eq!(
             decoded.is_ok(),
-            port > 0
-                && host.len() <= host_schema["maxLength"].as_u64().unwrap() as usize
-                && host_regex.is_match(&host)
+            port > 0 && host.len() <= host_schema["maxLength"].as_u64().unwrap() as usize && host_regex.is_match(&host)
         );
     }
     let bits = tc.draw(gs::integers::<u8>().min_value(0).max_value(34));
-    assert!(
-        serde_json::from_value::<Destination>(
-            json!({"kind":"cidr","cidr":format!("::ffff:{ip}/128")})
-        )
-        .is_ok()
-    );
-    assert_eq!(
-        serde_json::from_value::<Destination>(json!({"kind":"cidr","cidr":format!("{ip}/{bits}")}))
-            .is_ok(),
-        bits <= 32
-    );
-    for (cidr, valid) in [
-        ("::/0", true),
-        ("2001:db8::/128", true),
-        ("::/129", false),
-        ("1.2.3.999/2", false),
-    ] {
-        assert_eq!(
-            serde_json::from_value::<Destination>(json!({"kind":"cidr","cidr":cidr})).is_ok(),
-            valid
-        );
+    assert!(serde_json::from_value::<Destination>(json!({"kind":"cidr","cidr":format!("::ffff:{ip}/128")})).is_ok());
+    assert_eq!(serde_json::from_value::<Destination>(json!({"kind":"cidr","cidr":format!("{ip}/{bits}")})).is_ok(), bits <= 32);
+    for (cidr, valid) in [("::/0", true), ("2001:db8::/128", true), ("::/129", false), ("1.2.3.999/2", false)] {
+        assert_eq!(serde_json::from_value::<Destination>(json!({"kind":"cidr","cidr":cidr})).is_ok(), valid);
     }
 }
 
@@ -69,21 +46,11 @@ fn generated_period_ordering(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let start = tc.draw(gs::integers::<i64>().min_value(-60).max_value(60));
     let delta = tc.draw(gs::integers::<i64>().min_value(-1).max_value(120));
-    let timestamp = |seconds| {
-        chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0)
-            .unwrap()
-            .to_rfc3339()
-    };
+    let timestamp = |seconds| chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap().to_rfc3339();
     let value = json!({"start":timestamp(start),"end":timestamp(start+delta)});
-    assert!(
-        serde_json::from_value::<Period>(json!({"start":timestamp(start),"end":timestamp(start)}))
-            .is_ok()
-    );
+    assert!(serde_json::from_value::<Period>(json!({"start":timestamp(start),"end":timestamp(start)})).is_ok());
     assert_eq!(serde_json::from_value::<Period>(value).is_ok(), delta >= 0);
-    assert!(
-        serde_json::from_value::<Period>(json!({"start":"bad","end":"2026-01-01T00:00:00Z"}))
-            .is_err()
-    );
+    assert!(serde_json::from_value::<Period>(json!({"start":"bad","end":"2026-01-01T00:00:00Z"})).is_err());
 }
 
 // Every route documents the same error/status mapping as ProtocolError::status;
@@ -91,46 +58,68 @@ fn generated_period_ordering(tc: hegel::TestCase) {
 #[test]
 fn every_route_carries_typed_error_statuses() {
     let errors = [
+        ProtocolError::NotFound { reason: "r".into() },
+        ProtocolError::MethodNotAllowed { reason: "r".into() },
         ProtocolError::Refused { reason: "r".into() },
-        ProtocolError::Unavailable {
-            reason: "r".into(),
-            retry_after: None,
-        },
-        ProtocolError::RateLimited {
-            reason: "r".into(),
-            retry_after: Some(2),
-        },
+        ProtocolError::Unavailable { reason: "r".into(), retry_after: None },
+        ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },
         ProtocolError::QuotaExhausted { reason: "r".into() },
         ProtocolError::CredentialRejected { reason: "r".into() },
-        ProtocolError::Internal {
-            reason: "r".into(),
-            provider_error: "sensitive".into(),
-        },
+        ProtocolError::Internal { reason: "r".into(), provider_error: Secret::new("sensitive") },
     ];
-    assert_eq!(
-        errors.iter().map(ProtocolError::status).collect::<Vec<_>>(),
-        [422, 503, 429, 402, 502, 500]
-    );
+    assert_eq!(errors.iter().map(ProtocolError::status).collect::<Vec<_>>(), [404, 405, 422, 503, 429, 402, 502, 500]);
     let document = serde_json::to_value(openapi::document()).unwrap();
     for path in document["paths"].as_object().unwrap().values() {
         for operation in path.as_object().unwrap().values() {
             for error in &errors {
-                assert_eq!(
-                    operation["responses"][error.status().to_string()]["content"]["application/json"]
-                        ["schema"]["$ref"],
-                    "#/components/schemas/ProtocolError"
-                );
+                let name = format!("Error{}", error.status());
+                assert_eq!(operation["responses"][error.status().to_string()]["$ref"], format!("#/components/responses/{name}"));
+                let body = &document["components"]["responses"][&name]["content"]["application/json"]["schema"];
+                assert_eq!(body["properties"]["kind"]["enum"], json!([error.class()]));
+                if error.retry_after().is_some() || error.status() == 503 {
+                    assert!(document["components"]["responses"][&name]["headers"]["Retry-After"].is_object());
+                }
             }
         }
     }
-    assert_eq!(
-        document["components"]["schemas"]["Timestamp"]["format"],
-        "date-time"
-    );
-    assert!(
-        document["components"]["schemas"]["Period"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("start must be <= end")
-    );
+    assert_eq!(document["components"]["schemas"]["Timestamp"]["format"], "date-time");
+    assert!(document["components"]["schemas"]["Period"]["description"].as_str().unwrap().contains("start must be <= end"));
+}
+
+// Typed instants compare by time, reject invalid wire dates, and never require
+// modules to format strings. Schema constraints must survive generated renames.
+#[test]
+fn instants_and_shared_constraints() {
+    assert_eq!("2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap(), "2026-01-01T01:00:00+01:00".parse::<Timestamp>().unwrap());
+    assert!(serde_json::from_value::<Reach>(json!({"kind":"dial","url":"x","token":"x","expires_at":"bad"})).is_err());
+    let schemas = serde_json::to_value(openapi::document()).unwrap()["components"]["schemas"].clone();
+    assert_eq!(schemas["Port"]["minimum"], 1);
+    assert_eq!(schemas["Port"]["maximum"], 65535);
+    assert_eq!(schemas["Cidr"]["pattern"], drydock_protocol::validation::cidr_pattern());
+    assert_eq!(schemas["HostAddress"]["pattern"], drydock_protocol::validation::host_pattern());
+    assert_eq!(schemas["HostAddress"]["maxLength"], 253);
+    assert_eq!(schemas["Size"]["properties"]["cpus"]["exclusiveMinimum"], 0);
+    assert_eq!(schemas["ProvisionRequest"]["properties"]["label"]["minLength"], 1);
+    assert_eq!(schemas["CredentialRefresh"]["properties"]["value"]["minLength"], 1);
+    assert_eq!(schemas["PrepareRequest"]["properties"]["image_digest"]["minLength"], 1);
+    assert_eq!(schemas["ExecRequest"]["properties"]["command"]["prefixItems"][0]["minLength"], 1);
+    assert_eq!(schemas["ExecRequest"]["properties"]["command"]["minItems"], 1);
+    let error = ProtocolError::Internal { reason: "safe".into(), provider_error: Secret::new("sensitive-value") };
+    assert!(!format!("{error:?}").contains("sensitive-value"));
+    assert_eq!(serde_json::to_value(error).unwrap()["provider_error"], "sensitive-value");
+}
+
+// Generate across non-positive/positive CPUs and empty/nonempty strings. Decoding
+// rejects invalid semantic requests before any module or language host runs them.
+#[hegel::test]
+fn generated_request_semantics(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let cpus = tc.draw(gs::integers::<i32>().min_value(-2).max_value(2));
+    assert_eq!(serde_json::from_value::<Size>(json!({"cpus":cpus,"memory_bytes":0,"disk_bytes":0})).is_ok(), cpus > 0);
+    let nonempty = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) != 0;
+    let text = if nonempty { "ok" } else { "" };
+    assert_eq!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":text,"tools_digest":"tools"})).is_ok(), nonempty);
+    assert_eq!(serde_json::from_value::<CredentialRefresh>(json!({"value":text})).is_ok(), nonempty);
+    assert_eq!(serde_json::from_value::<ExecRequest>(json!({"command":[text,""]})).is_ok(), nonempty);
+    assert!(serde_json::from_value::<ExecRequest>(json!({"command":[]})).is_err());
 }
