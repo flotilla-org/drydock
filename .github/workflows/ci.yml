@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    # Skips until the first crate lands (drydock#7).
+    if: hashFiles('Cargo.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup show
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate OpenAPI 3.1
+        run: |
+          python -m pip install openapi-spec-validator==0.7.2
+          python -m openapi_spec_validator openapi.json
