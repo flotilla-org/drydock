@@ -61,3 +61,36 @@ Wire conventions chosen for this first protocol version:
   URLs and an expiring token; SSH carries endpoint, user and host key. Transport
   setup, authentication enforcement, semantic input validation and idempotency
   behaviour belong to hosts and their future conformance suite.
+
+### Compatibility and validation
+
+Provider-level prepare, credential, usage and quota routes live at
+`/v1/{operation}/{provider}`. They cannot shadow opaque sandbox IDs under
+`/v1/providers/{provider}/{id}` (including IDs such as `usage` and `quota`).
+
+Optional fields serialize as explicit `null`; absent optional fields are accepted
+as `None`. Unknown object fields are ignored for additive compatibility. Unknown
+enum variants are rejected, including readiness and loss causes: hosts must
+negotiate the protocol version and report mismatches as not ready. Incompatible
+new variants require a protocol version bump. OpenAPI info.version equals the
+handshake's `PROTOCOL_VERSION`; it is a wire version, not a Cargo package version.
+
+Hosts perform semantic validation: CPUs must be finite and strictly positive;
+memory/disk sizes and usage hours must be nonnegative, and hours and reported
+credits must be finite. Credits may be negative when a vendor reports a debt.
+Timestamp formats are schema hints; hosts validate RFC 3339 timestamps, ordered
+periods, destination syntax and provider-specific bounds before vendor calls.
+
+`Secret` redacts Debug output, including nested credential and reach recipes,
+but deliberately serializes the original string for transport. Never log their
+serialized JSON. Raw `Internal.provider_error` is sensitive, untrusted vendor
+text: do not log it at info level or forward it to end users.
+
+Paused is an explicit billing transition; Stopped is the general stopped event
+and observation, whose `PausedByProvider` cause is valid under ADR 0058. Consumers
+must count both as non-running rather than infer loss. `MissingOnList` records
+absence from an authoritative complete list; `DestroyedByRequest` records a
+confirmed client deletion, matching ADR 0058's loss vocabulary.
+
+Relay and exec clients send `Connection: Upgrade` and `Upgrade: drydock-stream`;
+a successful 101 response echoes both headers before the raw byte stream begins.

@@ -1,132 +1,124 @@
 //! OpenAPI route descriptions; these functions are documentation, not HTTP handlers.
+#![allow(dead_code)]
 use crate::*;
 use utoipa::OpenApi;
 
-#[utoipa::path(get, path = "/v1/hello",
-responses((status = 200, description = "Success", body = Hello), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+#[derive(utoipa::IntoResponses)]
+#[response(
+    status = "default",
+    description = "Typed adaptor error; no automatic retries. retry_after is seconds."
 )]
-#[allow(dead_code)]
+struct ErrorResponses(ProtocolError);
+
+#[utoipa::path(get, path = "/v1/hello",
+responses((status = 200, description = "Success", body = Hello), ErrorResponses)
+)]
 fn hello() {}
 
 #[utoipa::path(put, path = "/v1/configuration",
 request_body = HostConfiguration,
-responses((status = 204, description = "Success"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 204, description = "Success"), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn configure() {}
 
-#[utoipa::path(put, path = "/v1/providers/{provider}/credential",
+#[utoipa::path(put, path = "/v1/credential/{provider}",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = CredentialRefresh,
-responses((status = 204, description = "Success"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 204, description = "Success"), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn refresh_credential() {}
 
-#[utoipa::path(post, path = "/v1/providers/{provider}/prepare",
+#[utoipa::path(post, path = "/v1/prepare/{provider}",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = PrepareRequest,
-responses((status = 200, description = "Success", body = Prepared), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Prepared), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn prepare() {}
 
 #[utoipa::path(post, path = "/v1/providers/{provider}",
 params(("provider" = String, Path, description = "Opaque provider")),
 request_body = ProvisionRequest,
-responses((status = 200, description = "Success", body = Sandbox), (status = 201, description = "Created; repeats by label return 200", body = Sandbox), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Sandbox), (status = 201, description = "Created; repeats by label return 200", body = Sandbox), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn provision() {}
 
 #[utoipa::path(get, path = "/v1/providers/{provider}",
 params(("provider" = String, Path, description = "Opaque provider")),
-responses((status = 200, description = "Success", body = Vec<Sandbox>), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Vec<Sandbox>), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn list() {}
 
 #[utoipa::path(get, path = "/v1/providers/{provider}/{id}",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 200, description = "Success", body = Sandbox), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Sandbox), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn inspect() {}
 
 #[utoipa::path(delete, path = "/v1/providers/{provider}/{id}",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 204, description = "Success; destroying an already absent resource succeeds"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 204, description = "Success; destroying an already absent resource succeeds"), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn destroy() {}
 
 #[utoipa::path(get, path = "/v1/providers/{provider}/{id}/reach",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 200, description = "Success", body = Reach), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Reach), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn reach() {}
 
 #[utoipa::path(get, path = "/v1/providers/{provider}/{id}/relay",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 101, description = "Raw byte-stream upgrade"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn relay() {}
 
 #[utoipa::path(post, path = "/v1/providers/{provider}/{id}/exec",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 request_body = ExecRequest,
-responses((status = 101, description = "Raw byte-stream upgrade"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn exec() {}
 
 #[utoipa::path(post, path = "/v1/providers/{provider}/{id}/suspend",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 200, description = "Success", body = ResumeToken), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = ResumeToken), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn suspend() {}
 
 #[utoipa::path(post, path = "/v1/providers/{provider}/{id}/resume",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 request_body = ResumeToken,
-responses((status = 204, description = "Success"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 204, description = "Success"), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn resume() {}
 
 #[utoipa::path(post, path = "/v1/providers/{provider}/{id}/export",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
-responses((status = 200, description = "Success", body = Export), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Export), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn export() {}
 
 #[utoipa::path(get, path = "/v1/observe",
 params(("since" = Option<String>, Query, description = "Exclusive last-seen cursor; absent starts with a snapshot")),
-responses((status = 200, description = "Success", body = ObserveRecord, content_type = "application/x-ndjson"), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = ObserveRecord, content_type = "application/x-ndjson"), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn observe() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}/usage",
+#[utoipa::path(get, path = "/v1/usage/{provider}",
 params(("provider" = String, Path, description = "Opaque provider"),("start" = String, Query, description = "RFC 3339 period start"),("end" = String, Query, description = "RFC 3339 period end")),
-responses((status = 200, description = "Success", body = Usage), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Usage), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn usage() {}
 
-#[utoipa::path(get, path = "/v1/providers/{provider}/quota",
+#[utoipa::path(get, path = "/v1/quota/{provider}",
 params(("provider" = String, Path, description = "Opaque provider")),
-responses((status = 200, description = "Success", body = Quota), (status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.", body = ProtocolError))
+responses((status = 200, description = "Success", body = Quota), ErrorResponses)
 )]
-#[allow(dead_code)]
 fn quota() {}
 
 #[derive(OpenApi)]
 #[openapi(
+    components(schemas(ProtocolError)),
     info(
         title = "Drydock adaptor protocol",
         version = "1.0.0",
@@ -156,7 +148,9 @@ struct Document;
 
 /// Generate the checked-in OpenAPI 3.1 document deterministically.
 pub fn document() -> utoipa::openapi::OpenApi {
-    Document::openapi()
+    let mut document = Document::openapi();
+    document.info.version = PROTOCOL_VERSION.to_owned();
+    document
 }
 
 /// Stable JSON presentation shared by the generator and drift test.

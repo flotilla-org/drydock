@@ -9,6 +9,18 @@ pub mod openapi;
 /// Increment when making an incompatible wire change. A mismatch is not ready.
 pub const PROTOCOL_VERSION: &str = "1";
 
+/// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
+#[derive(Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(transparent)]
+#[schema(value_type = String)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct HostConfiguration {
     pub modules: Vec<ModuleConfiguration>,
@@ -34,14 +46,14 @@ pub enum CredentialMode {
         credential_reference: String,
     },
     Proxied {
-        placeholder_token: String,
+        placeholder_token: Secret,
         proxy_url: String,
     },
 }
 /// Delivered in memory over the authenticated host connection; never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct CredentialRefresh {
-    pub value: String,
+    pub value: Secret,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Hello {
@@ -201,7 +213,8 @@ pub enum Reach {
     },
     Dial {
         url: String,
-        token: String,
+        token: Secret,
+        #[schema(format = DateTime)]
         expires_at: String,
     },
     Relay {
@@ -229,9 +242,13 @@ pub enum GoneCause {
     LifetimeCapReached,
     EvictedByProvider,
     HostOutOfMemory,
-    VmmExited { code: i32 },
+    VmmExited {
+        code: i32,
+    },
     GuestPoweredOff,
+    /// A previously known sandbox is absent from an authoritative complete list.
     MissingOnList,
+    /// The provider confirmed deletion requested by the client.
     DestroyedByRequest,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -264,11 +281,20 @@ pub struct Event {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
     Created,
-    Running { granted_size: Size },
-    Stopped { cause: StopCause },
-    Paused { cause: StopCause },
+    Running {
+        granted_size: Size,
+    },
+    Stopped {
+        cause: StopCause,
+    },
+    /// Explicit pause transition, distinct from the more general stopped observation.
+    Paused {
+        cause: StopCause,
+    },
     Resumed,
-    Gone { cause: GoneCause },
+    Gone {
+        cause: GoneCause,
+    },
 }
 /// Hosts unable to replay emit one complete list snapshot, explicitly marking the gap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -312,7 +338,7 @@ pub struct ExecRequest {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ResumeToken {
-    pub token: String,
+    pub token: Secret,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Export {
@@ -341,6 +367,7 @@ pub enum ProtocolError {
     },
     Internal {
         reason: String,
+        /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
         provider_error: String,
     },
 }

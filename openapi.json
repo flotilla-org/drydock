@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "1.0.0"
+    "version": "1"
   },
   "paths": {
     "/v1/configuration": {
@@ -19,6 +19,48 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/HostConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/credential/{provider}": {
+      "put": {
+        "tags": [],
+        "operationId": "refresh_credential",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialRefresh"
               }
             }
           },
@@ -91,6 +133,55 @@
               "application/x-ndjson": {
                 "schema": {
                   "$ref": "#/components/schemas/ObserveRecord"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/prepare/{provider}": {
+      "post": {
+        "tags": [],
+        "operationId": "prepare",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Prepared"
                 }
               }
             }
@@ -190,193 +281,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Sandbox"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/providers/{provider}/credential": {
-      "put": {
-        "tags": [],
-        "operationId": "refresh_credential",
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "description": "Opaque provider",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CredentialRefresh"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Success"
-          },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/providers/{provider}/prepare": {
-      "post": {
-        "tags": [],
-        "operationId": "prepare",
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "description": "Opaque provider",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PrepareRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Prepared"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/providers/{provider}/quota": {
-      "get": {
-        "tags": [],
-        "operationId": "quota",
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "description": "Opaque provider",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Quota"
-                }
-              }
-            }
-          },
-          "default": {
-            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProtocolError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/providers/{provider}/usage": {
-      "get": {
-        "tags": [],
-        "operationId": "usage",
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "description": "Opaque provider",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "start",
-            "in": "query",
-            "description": "RFC 3339 period start",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "end",
-            "in": "query",
-            "description": "RFC 3339 period end",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Usage"
                 }
               }
             }
@@ -517,7 +421,21 @@
         },
         "responses": {
           "101": {
-            "description": "Raw byte-stream upgrade"
+            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Upgrade"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "drydock-stream"
+              }
+            }
           },
           "default": {
             "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
@@ -654,7 +572,21 @@
         ],
         "responses": {
           "101": {
-            "description": "Raw byte-stream upgrade"
+            "description": "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Upgrade"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "drydock-stream"
+              }
+            }
           },
           "default": {
             "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
@@ -751,6 +683,102 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ResumeToken"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/quota/{provider}": {
+      "get": {
+        "tags": [],
+        "operationId": "quota",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Quota"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Typed adaptor error; no automatic retries. retry_after is seconds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/usage/{provider}": {
+      "get": {
+        "tags": [],
+        "operationId": "usage",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "description": "RFC 3339 period start",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "description": "RFC 3339 period end",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Usage"
                 }
               }
             }
@@ -874,7 +902,7 @@
                 ]
               },
               "placeholder_token": {
-                "type": "string"
+                "$ref": "#/components/schemas/Secret"
               },
               "proxy_url": {
                 "type": "string"
@@ -891,7 +919,7 @@
         ],
         "properties": {
           "value": {
-            "type": "string"
+            "$ref": "#/components/schemas/Secret"
           }
         }
       },
@@ -1108,6 +1136,7 @@
           },
           {
             "type": "object",
+            "description": "Explicit pause transition, distinct from the more general stopped observation.",
             "required": [
               "cause",
               "kind"
@@ -1262,6 +1291,7 @@
           },
           {
             "type": "object",
+            "description": "A previously known sandbox is absent from an authoritative complete list.",
             "required": [
               "kind"
             ],
@@ -1276,6 +1306,7 @@
           },
           {
             "type": "object",
+            "description": "The provider confirmed deletion requested by the client.",
             "required": [
               "kind"
             ],
@@ -1677,7 +1708,8 @@
                 ]
               },
               "provider_error": {
-                "type": "string"
+                "type": "string",
+                "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
               },
               "reason": {
                 "type": "string"
@@ -1869,7 +1901,8 @@
             ],
             "properties": {
               "expires_at": {
-                "type": "string"
+                "type": "string",
+                "format": "date-time"
               },
               "kind": {
                 "type": "string",
@@ -1878,7 +1911,7 @@
                 ]
               },
               "token": {
-                "type": "string"
+                "$ref": "#/components/schemas/Secret"
               },
               "url": {
                 "type": "string"
@@ -2002,7 +2035,7 @@
         ],
         "properties": {
           "token": {
-            "type": "string"
+            "$ref": "#/components/schemas/Secret"
           }
         }
       },
@@ -2045,6 +2078,10 @@
             "$ref": "#/components/schemas/Observation"
           }
         }
+      },
+      "Secret": {
+        "type": "string",
+        "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value."
       },
       "Size": {
         "type": "object",
