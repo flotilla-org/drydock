@@ -48,10 +48,8 @@ fn tagged_wire_fixtures() {
         json!({"kind":"resumed"}),
         json!({"kind":"gone","cause":{"kind":"destroyed_by_request"}}),
     ] {
-        fixture::<ObserveRecord>(
-            json!({"type":"event","event":{"cursor":"c","id":"usage","provider":"p","label":null,
-            "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"provider","event":event}}),
-        );
+        fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"usage","provider":"p","label":null,
+            "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"provider","event":event}}));
     }
 }
 
@@ -60,32 +58,15 @@ fn tagged_wire_fixtures() {
 fn secret_debug_redacts_without_changing_wire() {
     let value = "sensitive-token";
     let secret = Secret::new(value);
-    let refresh = CredentialRefresh {
-        value: secret.clone(),
-    };
-    let credential = CredentialMode::Proxied {
-        placeholder_token: secret.clone(),
-        proxy_url: "http://localhost".into(),
-    };
-    let reach = Reach::Dial {
-        url: "tcp://h".into(),
-        token: secret.clone(),
-        expires_at: "time".into(),
-    };
+    let refresh = CredentialRefresh { value: secret.clone() };
+    let credential = CredentialMode::Proxied { placeholder_token: secret.clone(), proxy_url: "http://localhost".into() };
+    let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), expires_at: "time".into() };
     let resume = ResumeToken { token: secret };
-    for debug in [
-        format!("{refresh:?}"),
-        format!("{credential:?}"),
-        format!("{reach:?}"),
-        format!("{resume:?}"),
-    ] {
+    for debug in [format!("{refresh:?}"), format!("{credential:?}"), format!("{reach:?}"), format!("{resume:?}")] {
         assert!(!debug.contains(value));
         assert!(debug.contains("[REDACTED]"));
     }
-    assert_eq!(
-        serde_json::to_value(refresh).unwrap(),
-        json!({"value":value})
-    );
+    assert_eq!(serde_json::to_value(refresh).unwrap(), json!({"value":value}));
 }
 
 // Additive unknown fields are accepted, but unknown enum variants fail closed at version skew.
@@ -95,13 +76,7 @@ fn compatibility_policy() {
     assert_eq!(value, Readiness::Ready);
     assert!(serde_json::from_value::<Readiness>(json!({"status":"future"})).is_err());
     assert!(serde_json::from_value::<GoneCause>(json!({"kind":"future"})).is_err());
-    assert_eq!(
-        serde_json::from_value::<ResumeToken>(json!({"token":"a","future":true}))
-            .unwrap()
-            .token
-            .expose(),
-        "a"
-    );
+    assert_eq!(serde_json::from_value::<ResumeToken>(json!({"token":"a","future":true})).unwrap().token.expose(), "a");
 }
 
 // Owner ruling on issue #1: environments have one collection, no aliases; IDs stay opaque.
@@ -119,34 +94,13 @@ fn route_and_version_contract() {
         ("/v1/providers/{provider}/usage", vec!["get"]),
         ("/v1/providers/{provider}/quota", vec!["get"]),
         ("/v1/providers/{provider}/environments", vec!["get", "post"]),
-        (
-            "/v1/providers/{provider}/environments/{id}",
-            vec!["delete", "get"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/reach",
-            vec!["post"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/relay",
-            vec!["get"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/suspend",
-            vec!["post"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/resume",
-            vec!["post"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/exec",
-            vec!["post"],
-        ),
-        (
-            "/v1/providers/{provider}/environments/{id}/export",
-            vec!["post"],
-        ),
+        ("/v1/providers/{provider}/environments/{id}", vec!["delete", "get"]),
+        ("/v1/providers/{provider}/environments/{id}/reach", vec!["post"]),
+        ("/v1/providers/{provider}/environments/{id}/relay", vec!["get"]),
+        ("/v1/providers/{provider}/environments/{id}/suspend", vec!["post"]),
+        ("/v1/providers/{provider}/environments/{id}/resume", vec!["post"]),
+        ("/v1/providers/{provider}/environments/{id}/exec", vec!["post"]),
+        ("/v1/providers/{provider}/environments/{id}/export", vec!["post"]),
     ];
     let paths = doc["paths"].as_object().unwrap();
     assert_eq!(paths.len(), expected.len());
@@ -163,12 +117,7 @@ fn route_and_version_contract() {
 #[test]
 fn hello_requires_exact_protocol_version() {
     for version in [PROTOCOL_VERSION, "", "0", "2", "1.0.0", "1 "] {
-        let hello = Hello {
-            protocol_version: version.into(),
-            host_version: "test".into(),
-            modules: vec![],
-            providers: vec![],
-        };
+        let hello = Hello { protocol_version: version.into(), host_version: "test".into(), modules: vec![], providers: vec![] };
         assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
 }

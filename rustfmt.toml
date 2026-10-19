@@ -1,0 +1,6 @@
+# Formatting uses the stable compiler pin in rust-toolchain.toml: `cargo fmt`.
+# Wider lines, fewer chain/arg explosions.
+max_width = 140
+# "Max" sets all sub-widths (chain, fn_call, attr, array, struct_lit,
+# single_line_if_else) equal to max_width.
+use_small_heuristics = "Max"

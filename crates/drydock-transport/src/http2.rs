@@ -14,10 +14,7 @@ use std::{io, time::Duration};
 pub type Client<B = Full<Bytes>> = http2::SendRequest<B>;
 
 /// Caller owns the returned connection task and should abort it on shutdown.
-pub async fn connect(
-    opener: &Opener,
-    purpose: Purpose,
-) -> io::Result<(Client, tokio::task::JoinHandle<Result<(), hyper::Error>>)> {
+pub async fn connect(opener: &Opener, purpose: Purpose) -> io::Result<(Client, tokio::task::JoinHandle<Result<(), hyper::Error>>)> {
     connect_with_body::<Full<Bytes>>(opener, purpose).await
 }
 
@@ -60,10 +57,7 @@ async fn serve_stream(stream: ByteStream, router: Router) -> io::Result<()> {
 }
 fn require_link(purpose: &Purpose) -> io::Result<()> {
     if !matches!(purpose, Purpose::Control | Purpose::Router) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "HTTP/2 requires a link purpose",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP/2 requires a link purpose"));
     }
     Ok(())
 }

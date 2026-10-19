@@ -37,17 +37,12 @@ fn invalid(message: &'static str) -> io::Error {
 }
 fn validate_text(text: &str) -> io::Result<()> {
     if text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control) {
-        return Err(invalid(
-            "stream target must be 1..=1024 UTF-8 bytes without control characters",
-        ));
+        return Err(invalid("stream target must be 1..=1024 UTF-8 bytes without control characters"));
     }
     Ok(())
 }
 
-pub(crate) async fn write_connection_kind<W: AsyncWrite + Unpin>(
-    s: &mut W,
-    kind: ConnectionKind,
-) -> io::Result<()> {
+pub(crate) async fn write_connection_kind<W: AsyncWrite + Unpin>(s: &mut W, kind: ConnectionKind) -> io::Result<()> {
     s.write_all(match kind {
         ConnectionKind::Single => b"DDT\x01\x00",
         ConnectionKind::Yamux => b"DDT\x01\x01",
@@ -68,10 +63,7 @@ pub async fn read_connection_kind<R: AsyncRead + Unpin>(s: &mut R) -> io::Result
         _ => Err(invalid("unknown connection kind")),
     }
 }
-pub(crate) async fn write_purpose<W: AsyncWrite + Unpin>(
-    s: &mut W,
-    purpose: &Purpose,
-) -> io::Result<()> {
+pub(crate) async fn write_purpose<W: AsyncWrite + Unpin>(s: &mut W, purpose: &Purpose) -> io::Result<()> {
     purpose.validate()?;
     let (tag, text) = match purpose {
         Purpose::Control => (0, ""),
@@ -101,16 +93,8 @@ pub(crate) async fn read_purpose<R: AsyncRead + Unpin>(s: &mut R) -> io::Result<
             }
             let mut text = vec![0; len];
             s.read_exact(&mut text).await?;
-            let text =
-                String::from_utf8(text).map_err(|_| invalid("stream target is not UTF-8"))?;
-            if tag == 2 {
-                Purpose::CleatAttach { session: text }
-            } else {
-                Purpose::PortForward {
-                    host: text,
-                    port: s.read_u16().await?,
-                }
-            }
+            let text = String::from_utf8(text).map_err(|_| invalid("stream target is not UTF-8"))?;
+            if tag == 2 { Purpose::CleatAttach { session: text } } else { Purpose::PortForward { host: text, port: s.read_u16().await? } }
         }
         _ => return Err(invalid("unknown stream purpose")),
     };
@@ -130,40 +114,22 @@ mod tests {
         for (purpose, expected) in [
             (Purpose::Control, vec![0]),
             (Purpose::Router, vec![1]),
-            (
-                Purpose::CleatAttach {
-                    session: "x".into(),
-                },
-                vec![2, 0, 1, b'x'],
-            ),
-            (
-                Purpose::PortForward {
-                    host: "h".into(),
-                    port: 258,
-                },
-                vec![3, 0, 1, b'h', 1, 2],
-            ),
+            (Purpose::CleatAttach { session: "x".into() }, vec![2, 0, 1, b'x']),
+            (Purpose::PortForward { host: "h".into(), port: 258 }, vec![3, 0, 1, b'h', 1, 2]),
         ] {
             let mut encoded = Vec::new();
-            write_connection_kind(&mut encoded, ConnectionKind::Single)
-                .await
-                .unwrap();
+            write_connection_kind(&mut encoded, ConnectionKind::Single).await.unwrap();
             write_purpose(&mut encoded, &purpose).await.unwrap();
             assert_eq!(&encoded[..5], b"DDT\x01\x00");
             assert_eq!(&encoded[5..], expected);
             encoded.extend_from_slice(b"payload");
             let mut input = encoded.as_slice();
-            assert_eq!(
-                read_connection_kind(&mut input).await.unwrap(),
-                ConnectionKind::Single
-            );
+            assert_eq!(read_connection_kind(&mut input).await.unwrap(), ConnectionKind::Single);
             assert_eq!(read_purpose(&mut input).await.unwrap(), purpose);
             assert_eq!(input, b"payload");
         }
         let mut encoded = Vec::new();
-        write_connection_kind(&mut encoded, ConnectionKind::Yamux)
-            .await
-            .unwrap();
+        write_connection_kind(&mut encoded, ConnectionKind::Yamux).await.unwrap();
         assert_eq!(encoded, b"DDT\x01\x01");
     }
 
@@ -186,49 +152,32 @@ mod tests {
             2 => Purpose::CleatAttach { session: text },
             _ => Purpose::PortForward { host: text, port },
         };
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let mut bytes = Vec::new();
-                let result = write_purpose(&mut bytes, &purpose).await;
-                assert_eq!(result.is_ok(), expected_valid);
-                if expected_valid {
-                    assert_eq!(read_purpose(&mut bytes.as_slice()).await.unwrap(), purpose);
-                } else {
-                    assert!(bytes.is_empty());
-                }
-            });
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut bytes = Vec::new();
+            let result = write_purpose(&mut bytes, &purpose).await;
+            assert_eq!(result.is_ok(), expected_valid);
+            if expected_valid {
+                assert_eq!(read_purpose(&mut bytes.as_slice()).await.unwrap(), purpose);
+            } else {
+                assert!(bytes.is_empty());
+            }
+        });
     }
 
     // Invalid magic/version/mode, unknown tags, malformed UTF-8, oversized and
     // truncated targets are rejected without allocating the claimed wire size.
     #[tokio::test]
     async fn rejects_invalid_and_truncated_headers() {
-        for bytes in [
-            b"BAD\x01\x00".as_slice(),
-            b"DDT\x02\x00",
-            b"DDT\x01\x02",
-            b"DD",
-        ] {
+        for bytes in [b"BAD\x01\x00".as_slice(), b"DDT\x02\x00", b"DDT\x01\x02", b"DD"] {
             assert!(read_connection_kind(&mut &bytes[..]).await.is_err());
         }
-        for bytes in [
-            vec![4],
-            vec![2, 0, 0],
-            vec![2, 4, 1],
-            vec![2, 0, 1, 255],
-            vec![2, 0, 2, b'x'],
-            vec![3, 0, 1, b'h', 0, 0],
-            vec![2, 0, 1, 0],
-        ] {
+        for bytes in
+            [vec![4], vec![2, 0, 0], vec![2, 4, 1], vec![2, 0, 1, 255], vec![2, 0, 2, b'x'], vec![3, 0, 1, b'h', 0, 0], vec![2, 0, 1, 0]]
+        {
             assert!(read_purpose(&mut bytes.as_slice()).await.is_err());
         }
         for len in [1, 1024] {
-            let purpose = Purpose::CleatAttach {
-                session: "x".repeat(len),
-            };
+            let purpose = Purpose::CleatAttach { session: "x".repeat(len) };
             let mut bytes = Vec::new();
             write_purpose(&mut bytes, &purpose).await.unwrap();
             for cut in 0..bytes.len() {

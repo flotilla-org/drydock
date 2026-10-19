@@ -26,29 +26,14 @@ fn errors_round_trip() {
     for reason in ["", "vendor failed: ü\n"] {
         let reason = reason.to_owned();
         let mut errors = vec![
-            ProtocolError::Refused {
-                reason: reason.clone(),
-            },
-            ProtocolError::QuotaExhausted {
-                reason: reason.clone(),
-            },
-            ProtocolError::CredentialRejected {
-                reason: reason.clone(),
-            },
-            ProtocolError::Internal {
-                reason: reason.clone(),
-                provider_error: reason.clone(),
-            },
+            ProtocolError::Refused { reason: reason.clone() },
+            ProtocolError::QuotaExhausted { reason: reason.clone() },
+            ProtocolError::CredentialRejected { reason: reason.clone() },
+            ProtocolError::Internal { reason: reason.clone(), provider_error: reason.clone() },
         ];
         for retry_after in [None, Some(0), Some(u64::MAX)] {
-            errors.push(ProtocolError::Unavailable {
-                reason: reason.clone(),
-                retry_after,
-            });
-            errors.push(ProtocolError::RateLimited {
-                reason: reason.clone(),
-                retry_after,
-            });
+            errors.push(ProtocolError::Unavailable { reason: reason.clone(), retry_after });
+            errors.push(ProtocolError::RateLimited { reason: reason.clone(), retry_after });
         }
         for error in errors {
             let json = serde_json::to_string(&error).unwrap();

@@ -48,29 +48,17 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         || config.port == 0
         || config.host_key.contains(['\n', '\r'])
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid SSH reach recipe",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid SSH reach recipe"));
     }
     // Unix-only adapter, validated on Linux. Keep socket paths below sun_path
     // limits even with a long TMPDIR; Windows hosts are not supported.
-    let dir = tokio::task::spawn_blocking(|| {
-        tempfile::Builder::new()
-            .prefix("dd-ssh-")
-            .tempdir_in("/tmp")
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let dir =
+        tokio::task::spawn_blocking(|| tempfile::Builder::new().prefix("dd-ssh-").tempdir_in("/tmp")).await.map_err(io::Error::other)??;
     let incoming_path = dir.path().join("in");
     let outgoing_path = dir.path().join("out");
     let listener = UnixListener::bind(&incoming_path)?;
     let known_hosts = dir.path().join("known_hosts");
-    tokio::fs::write(
-        &known_hosts,
-        format!("drydock-vessel {}\n", config.host_key),
-    )
-    .await?;
+    tokio::fs::write(&known_hosts, format!("drydock-vessel {}\n", config.host_key)).await?;
     let control = dir.path().join("master");
     let local = forward(&outgoing_path, &config.agent_socket)?;
     let remote = forward(&config.reverse_socket, &incoming_path)?;
@@ -107,10 +95,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         .arg("-o")
         .arg(format!(
             "ConnectTimeout={}",
-            config
-                .connect_timeout
-                .as_secs()
-                .saturating_add(u64::from(config.connect_timeout.subsec_nanos() != 0))
+            config.connect_timeout.as_secs().saturating_add(u64::from(config.connect_timeout.subsec_nanos() != 0))
         ))
         .arg("-i")
         .arg(&config.identity_file)
@@ -128,20 +113,13 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         .kill_on_drop(true)
         .spawn()?;
     let stderr = StderrTail::drain(child.stderr.take().unwrap());
-    let mut setup = SetupGuard {
-        child: Some(child),
-        dir: Some(dir),
-        stderr: Some(stderr),
-    };
+    let mut setup = SetupGuard { child: Some(child), dir: Some(dir), stderr: Some(stderr) };
     let child = setup.child.as_mut().unwrap();
     let stderr = setup.stderr.as_ref().unwrap();
     tokio::time::timeout(config.connect_timeout, async {
         loop {
             if let Some(status) = child.try_wait()? {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    format!("SSH exited ({status}): {}", stderr.text()),
-                ));
+                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("SSH exited ({status}): {}", stderr.text())));
             }
             if tokio::fs::try_exists(&control).await? {
                 // The multiplexing control command waits for the remote forward
@@ -161,10 +139,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
                 if !output.status.success() {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
-                        format!(
-                            "SSH forwarding rejected: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        ),
+                        format!("SSH forwarding rejected: {}", String::from_utf8_lossy(&output.stderr)),
                     ));
                 }
                 return Ok(());
@@ -190,26 +165,16 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         // Reap the owned child before removing its private socket directory.
         let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
     });
-    let connections = SshConnections {
-        native: UnixConnections::new(listener, outgoing_path),
-        status,
-        stop: Some(stop),
-    };
+    let connections = SshConnections { native: UnixConnections::new(listener, outgoing_path), status, stop: Some(stop) };
     Transport::native(Arc::new(connections), limits)
 }
 fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<String> {
     // OpenSSH parses ':' separators itself; reject ambiguous relative paths and
     // metacharacters rather than allowing the recipe to change forwarding kind.
     let path = |p: &std::path::Path| -> io::Result<String> {
-        let p = p
-            .to_str()
-            .filter(|p| p.starts_with('/') && !p.contains([':', '\n', '\r', ' ', '\t']))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "SSH socket paths must be absolute without separators or whitespace",
-                )
-            })?;
+        let p = p.to_str().filter(|p| p.starts_with('/') && !p.contains([':', '\n', '\r', ' ', '\t'])).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "SSH socket paths must be absolute without separators or whitespace")
+        })?;
         Ok(p.to_owned())
     };
     Ok(format!("{}:{}", path(local)?, path(remote)?))
@@ -230,10 +195,7 @@ impl Drop for SshConnections {
 impl Connections for SshConnections {
     async fn connect(&self) -> io::Result<ByteStream> {
         if *self.status.borrow() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "SSH disconnected",
-            ));
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected"));
         }
         self.native.connect().await
     }
@@ -289,10 +251,7 @@ impl StderrTail {
                 tail.extend(&chunk[..n]);
             }
         });
-        Self {
-            bytes,
-            task: task.abort_handle(),
-        }
+        Self { bytes, task: task.abort_handle() }
     }
     fn text(&self) -> String {
         let bytes: Vec<_> = self.bytes.lock().unwrap().iter().copied().collect();
@@ -308,20 +267,11 @@ impl Drop for StderrTail {
 fn validate_host_key(key: &str) -> io::Result<()> {
     let mut fields = key.split_whitespace();
     let kind = fields.next().unwrap_or_default();
-    let supported = matches!(
-        kind,
-        "ssh-ed25519"
-            | "ssh-rsa"
-            | "ecdsa-sha2-nistp256"
-            | "ecdsa-sha2-nistp384"
-            | "ecdsa-sha2-nistp521"
-    );
+    let supported = matches!(kind, "ssh-ed25519" | "ssh-rsa" | "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521");
     let blob = fields.next().unwrap_or_default();
     if !supported
         || blob.is_empty()
-        || !blob
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
+        || !blob.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b))
         || key.contains(['\n', '\r'])
     {
         return Err(io::Error::new(
@@ -342,17 +292,9 @@ mod tests {
     async fn cancelled_setup_reaps_before_removing_directory() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_owned();
-        let child = Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
+        let child = Command::new("sleep").arg("60").kill_on_drop(true).spawn().unwrap();
         let pid = child.id().unwrap();
-        drop(SetupGuard {
-            child: Some(child),
-            dir: Some(dir),
-            stderr: None,
-        });
+        drop(SetupGuard { child: Some(child), dir: Some(dir), stderr: None });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while tokio::fs::try_exists(&path).await.unwrap() {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -360,10 +302,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "child must be reaped before its directory disappears"
-        );
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "child must be reaped before its directory disappears");
     }
     // Long-lived SSH diagnostics must drain without pipe backpressure or disk
     // growth, retaining only the documented 8 KiB suffix for error reporting.
