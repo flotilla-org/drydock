@@ -72,7 +72,13 @@ after provider outcomes and credential changes.
 `EventSink` assigns host-wide cursors and provider identity. Modules publish all
 billing transitions, with RFC 3339 times and their provenance. Background
 observations can publish through a cloned sink. A snapshot records its cursor
-before listing so concurrent observations are replayed rather than lost.
+before listing so concurrent observations are replayed rather than lost. This is
+not an atomic vendor snapshot: a background change can appear in both its rows
+and an event replayed after its cursor. Consumers reconcile snapshot rows by
+provider/ID, then apply events in cursor order. A snapshot marks a metering gap;
+its rows do not create extra billing transitions. Event cursors still resume
+exclusively. ADR 0070 does not prescribe an atomic cut between list and events;
+this host chooses overlap over dropping a concurrent observation.
 
 The host retains the latest 1024 events in memory. `GET /v1/events` starts with a
 complete snapshot. `?since=` resumes exclusively at a retained cursor, including
@@ -80,7 +86,9 @@ the boundary immediately before the oldest retained event. Unknown, expired or
 previous-process cursors produce a complete snapshot that marks a metering gap.
 Slow readers also recover through snapshots. Streams stay open for new events;
 an unready provider is never called for a snapshot. A complete snapshot cannot
-omit providers, so an initial snapshot failure returns its typed error. A later
+omit providers, so an initial snapshot failure returns its typed error. One
+unready provider therefore blocks initial/recovery snapshots for all providers;
+replay from a retained cursor continues without listing providers. A later
 recovery failure fails the HTTP body (rather than clean EOF), allowing the client
 to reconnect. Protocol v1 defines no terminal error record. History is deliberately not persisted.
 

@@ -900,6 +900,10 @@ struct Control {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     list_error: std::sync::atomic::AtomicBool,
+    hold_list: std::sync::atomic::AtomicBool,
+    list_entered: tokio::sync::Notify,
+    list_release: tokio::sync::Notify,
+    snapshot_row: std::sync::Mutex<Option<Sandbox>>,
     list_calls: std::sync::atomic::AtomicUsize,
     sink: std::sync::Mutex<Option<drydock_host::EventSink>>,
 }
@@ -967,7 +971,15 @@ impl drydock_host::module::Provider for ControlledProvider {
                 retry_after: None,
             });
         }
-        self.inner.list(c).await
+        if self.control.hold_list.load(SeqCst) {
+            self.control.list_entered.notify_one();
+            self.control.list_release.notified().await;
+        }
+        let mut rows = self.inner.list(c).await?;
+        if let Some(row) = self.control.snapshot_row.lock().unwrap().clone() {
+            rows.push(row);
+        }
+        Ok(rows)
     }
     async fn inspect(
         &mut self,
@@ -1229,4 +1241,60 @@ async fn size_boundaries_zero_period_and_empty_credentials() {
         .await
         .unwrap();
     assert_eq!(repeat, original);
+}
+
+// Snapshot cursors precede listing. A concurrent background observation can appear
+// in both the snapshot rows and subsequent events, but its event is never skipped.
+#[tokio::test]
+async fn snapshot_overlap_replays_background_observation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    control.hold_list.store(true, SeqCst);
+    let client = h.client.clone();
+    let response = tokio::spawn(async move {
+        client
+            .get("http://localhost/v1/events")
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(2), control.list_entered.notified())
+        .await
+        .unwrap();
+    let sandbox = Sandbox {
+        id: "background".into(),
+        label: Some("new".into()),
+        provider: "a".into(),
+        state: Observation::Running,
+        granted_size: None,
+        egress: Enforcement::Advisory,
+    };
+    *control.snapshot_row.lock().unwrap() = Some(sandbox.clone());
+    control.sink.lock().unwrap().as_ref().unwrap().publish(
+        sandbox.id.clone(),
+        sandbox.label.clone(),
+        "2026-10-19T00:00:00Z".into(),
+        TimestampSource::Adaptor,
+        EventKind::Created,
+    );
+    control.list_release.notify_one();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut records = Records {
+        stream: response.bytes_stream().boxed(),
+        buffer: vec![],
+    };
+    let snapshot = records.next().await;
+    assert!(
+        matches!(&snapshot,ObserveRecord::Snapshot {sandboxes,..} if sandboxes==std::slice::from_ref(&sandbox))
+    );
+    let event = records.next().await;
+    assert!(
+        matches!(&event,ObserveRecord::Event {event} if event.id==sandbox.id && matches!(event.event,EventKind::Created))
+    );
+    assert_ne!(cursor(&snapshot), cursor(&event));
+    let mut replay = h.stream(Some(cursor(&snapshot))).await;
+    assert_eq!(replay.next().await, event);
 }
