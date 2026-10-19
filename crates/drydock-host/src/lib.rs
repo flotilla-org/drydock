@@ -71,6 +71,7 @@ struct Authentication {
 struct Instance {
     config: ProviderConfiguration,
     provider: Arc<AsyncMutex<Box<dyn Provider>>>,
+    // Short synchronous access only: release this guard before every await.
     auth: Mutex<Authentication>,
     capabilities: Capabilities,
     rate_limits: Vec<RateLimit>,
