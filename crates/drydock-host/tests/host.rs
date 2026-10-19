@@ -199,6 +199,23 @@ async fn hello_configuration_credentials_and_atomic_rejection() {
     );
     h.ok(Method::GET, "/providers/a/environments", Value::Null, 502)
         .await;
+    h.ok(
+        Method::PUT,
+        "/providers/a/credential",
+        json!({"value":""}),
+        422,
+    )
+    .await;
+    let still_missing: Hello = h
+        .ok(Method::GET, "/hello", Value::Null, 200)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert!(matches!(
+        still_missing.providers[0].readiness,
+        Readiness::MissingCredential { .. }
+    ));
     h.credential("a", "TOP_SECRET").await;
     let prepared = h.prepared("a").await;
     let s = h.provision("a", "label", &prepared, 201).await;
@@ -1255,7 +1272,7 @@ async fn snapshot_overlap_replays_background_observation() {
     let client = h.client.clone();
     let response = tokio::spawn(async move {
         client
-            .get("http://localhost/v1/events")
+            .get("http://localhost/v1/events?since=expired-cursor")
             .send()
             .await
             .unwrap()
@@ -1297,4 +1314,39 @@ async fn snapshot_overlap_replays_background_observation() {
     assert_ne!(cursor(&snapshot), cursor(&event));
     let mut replay = h.stream(Some(cursor(&snapshot))).await;
     assert_eq!(replay.next().await, event);
+}
+
+// An authenticated client that never completes its exec JSON cannot retain a task
+// indefinitely: the bounded body-read deadline returns a typed refusal before exec.
+#[tokio::test]
+async fn incomplete_exec_body_has_deadline() {
+    let h = Harness::start().await;
+    h.normal().await;
+    let prepared = h.prepared("a").await;
+    let sandbox = h.provision("a", "slow-body", &prepared, 201).await;
+    let mut socket = tokio::net::UnixStream::connect(&h.path).await.unwrap();
+    socket.write_all(format!("POST /v1/providers/a/environments/{}/exec HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-stream\r\nContent-Length: 100\r\n\r\n{{",sandbox.id).as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(socket);
+    let mut status = String::new();
+    tokio::time::timeout(Duration::from_secs(8), reader.read_line(&mut status))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.starts_with("HTTP/1.1 422"), "{status}");
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; length.unwrap()];
+    reader.read_exact(&mut body).await.unwrap();
+    assert!(
+        matches!(serde_json::from_slice::<ProtocolError>(&body).unwrap(),ProtocolError::Refused {reason} if reason=="exec body deadline exceeded")
+    );
 }

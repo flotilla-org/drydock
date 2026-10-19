@@ -1,7 +1,8 @@
 # Rust reference host
 
 `drydock-host` serves protocol v1 directly from `drydock-protocol`. Its binary
-registers the `reference` module. Embedders register additional Rust factories in
+registers the `reference` module. The crate and binary require Unix (tested on
+Linux): they use Unix sockets, kernel peer credentials, and Unix shutdown signals. Embedders register additional Rust factories in
 `module::Registry` and use the same `Host` router and listeners. The configuration's
 `entrypoint` selects a registered factory, not a shared-library path: Rust's ABI
 is not a plugin ABI. One factory can configure several independent providers.
@@ -38,7 +39,11 @@ Send this document to `PUT /v1/config`, then send `{"value":"example-secret"}`
 to `PUT /v1/providers/test/credential`. Direct values live only in memory;
 configuration holds a reference, never the resolved value. Send the credential
 route again to rotate it. A module's CredentialRejected error marks the provider
-not ready until refresh. The host does not resolve references itself.
+not ready until refresh. The host does not resolve references itself. `Credentials::new` initializes Direct
+mode with no value, never an empty secret; the refresh route is its only delivery
+path and refuses empty strings. Refresh repairs missing-credential readiness.
+Missing-tool, version-mismatch and unknown states remain unchanged; restart those
+modules after correcting their external prerequisites.
 
 Exact repeated configuration preserves provider state and credentials. New providers
 can be added atomically; replacing or removing a configured provider requires a
@@ -88,14 +93,20 @@ Slow readers also recover through snapshots. Streams stay open for new events;
 an unready provider is never called for a snapshot. A complete snapshot cannot
 omit providers, so an initial snapshot failure returns its typed error. One
 unready provider therefore blocks initial/recovery snapshots for all providers;
-replay from a retained cursor continues without listing providers. A later
+replay from a retained cursor continues without listing providers. Recovery lists
+providers sequentially and waits for their operation locks, so its latency can
+include in-flight vendor calls plus each list round trip. Configure request timeouts
+accordingly; the supplied HTTP client bounds each vendor request at 30 seconds.
+Modules must bound any other vendor I/O they perform. A later
 recovery failure fails the HTTP body (rather than clean EOF), allowing the client
 to reconnect. Protocol v1 defines no terminal error record. History is deliberately not persisted.
 
 Relay clients use `Connection: Upgrade` and `Upgrade: drydock-relay`; exec uses
 POST with a JSON `ExecRequest` and `Upgrade: drydock-stream`. Responses echo both
 headers with 101, then bridge raw bytes with half-close propagation. Modules must
-return a connected stream only after checking the environment and command.
+return a connected stream only after checking the environment and command. Exec
+request bodies are limited to 1 MiB and must arrive within five seconds; timeout
+is a typed Refused error before any provider operation starts.
 
 The reference module implements preparation, concurrent label idempotency,
 list/inspect/destroy, reach/relay, suspend/resume, export, exec, usage and quota.

@@ -20,6 +20,7 @@ use std::{
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, watch};
 
 const EVENT_HISTORY_CAPACITY: usize = 1024;
+const EXEC_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct EventSink {
@@ -520,6 +521,8 @@ async fn credential(
     }
     auth.credentials.value = Some(refresh.value);
     auth.generation += 1;
+    // Refresh repairs authentication only. Tool/version/unknown readiness stays
+    // unchanged; these modules require restart after their external prerequisites change.
     if matches!(auth.readiness, Readiness::MissingCredential { .. }) {
         auth.readiness = Readiness::Ready;
     }
@@ -817,8 +820,9 @@ async fn exec(
 ) -> ApiResult<Response> {
     validate_upgrade(&request, "drydock-stream")?;
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024)
+    let bytes = tokio::time::timeout(EXEC_BODY_TIMEOUT, axum::body::to_bytes(body, 1024 * 1024))
         .await
+        .map_err(|_| refused("exec body deadline exceeded"))?
         .map_err(|_| refused("exec body too large"))?;
     let command: ExecRequest = decode(&bytes)?;
     if command.command.is_empty() {
