@@ -56,13 +56,8 @@ pub struct ProviderConfiguration {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CredentialMode {
-    Direct {
-        credential_reference: String,
-    },
-    Proxied {
-        placeholder_token: Secret,
-        proxy_url: String,
-    },
+    Direct { credential_reference: String },
+    Proxied { placeholder_token: Secret, proxy_url: String },
 }
 /// Delivered in memory over the authenticated host connection; never persisted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -322,13 +317,8 @@ pub enum EventKind {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObserveRecord {
-    Event {
-        event: Event,
-    },
-    Snapshot {
-        cursor: String,
-        sandboxes: Vec<Sandbox>,
-    },
+    Event { event: Event },
+    Snapshot { cursor: String, sandboxes: Vec<Sandbox> },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Period {

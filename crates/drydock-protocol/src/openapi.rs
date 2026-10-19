@@ -4,10 +4,7 @@ use crate::*;
 use utoipa::OpenApi;
 
 #[derive(utoipa::IntoResponses)]
-#[response(
-    status = "default",
-    description = "Typed adaptor error; no automatic retries. retry_after is seconds."
-)]
+#[response(status = "default", description = "Typed adaptor error; no automatic retries. retry_after is seconds.")]
 struct ErrorResponses(ProtocolError);
 
 #[utoipa::path(get, path = "/v1/hello",
@@ -155,8 +152,5 @@ pub fn document() -> utoipa::openapi::OpenApi {
 
 /// Stable JSON presentation shared by the generator and drift test.
 pub fn to_json() -> String {
-    format!(
-        "{}\n",
-        document().to_pretty_json().expect("OpenAPI serializes")
-    )
+    format!("{}\n", document().to_pretty_json().expect("OpenAPI serializes"))
 }

@@ -1,6 +1,4 @@
-use crate::{
-    AcceptError, ByteStream, Driver, ErrorScope, Limits, Open, Opener, Transport, receive,
-};
+use crate::{AcceptError, ByteStream, Driver, ErrorScope, Limits, Open, Opener, Transport, receive};
 use async_trait::async_trait;
 use futures::future::poll_fn;
 use std::{io, sync::Arc};
@@ -25,13 +23,8 @@ fn closed() -> io::Error {
 }
 impl Transport {
     pub(crate) fn yamux_after_preface(stream: ByteStream, initiator: bool, limits: Limits) -> Self {
-        let mode = if initiator {
-            yamux::Mode::Client
-        } else {
-            yamux::Mode::Server
-        };
-        let mut connection =
-            yamux::Connection::new(stream.compat(), yamux::Config::default(), mode);
+        let mode = if initiator { yamux::Mode::Client } else { yamux::Mode::Server };
+        let mut connection = yamux::Connection::new(stream.compat(), yamux::Config::default(), mode);
         let (requests, mut opens) = mpsc::channel::<Reply>(limits.queue);
         let (tx, incoming) = mpsc::channel(limits.queue);
         let timeout = limits.header_timeout;
@@ -81,13 +74,6 @@ impl Transport {
                 }
             }
         });
-        Self {
-            opener: Opener {
-                inner: Arc::new(MuxOpen(requests)),
-                _driver: Arc::new(Driver(task.abort_handle())),
-                timeout,
-            },
-            incoming,
-        }
+        Self { opener: Opener { inner: Arc::new(MuxOpen(requests)), _driver: Arc::new(Driver(task.abort_handle())), timeout }, incoming }
     }
 }

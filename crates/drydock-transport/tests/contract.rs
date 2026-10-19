@@ -46,10 +46,8 @@ async fn pair(kind: Kind) -> Pair {
             let hl = UnixListener::bind(&hp).unwrap();
             let gl = UnixListener::bind(&gp).unwrap();
             (
-                Transport::native(Arc::new(UnixConnections::new(hl, &gp)), Limits::default())
-                    .unwrap(),
-                Transport::native(Arc::new(UnixConnections::new(gl, &hp)), Limits::default())
-                    .unwrap(),
+                Transport::native(Arc::new(UnixConnections::new(hl, &gp)), Limits::default()).unwrap(),
+                Transport::native(Arc::new(UnixConnections::new(gl, &hp)), Limits::default()).unwrap(),
             )
         }
         Kind::Ssh => {
@@ -62,32 +60,16 @@ async fn pair(kind: Kind) -> Pair {
                 let _ = child.wait().await;
             }));
             let host = ssh::connect(config, Limits::default()).await.unwrap();
-            assert!(
-                std::path::Path::new(&rp).exists(),
-                "connect must confirm the remote forward before returning"
-            );
-            let guest = Transport::native(
-                Arc::new(UnixConnections::new(listener, rp)),
-                Limits::default(),
-            )
-            .unwrap();
+            assert!(std::path::Path::new(&rp).exists(), "connect must confirm the remote forward before returning");
+            let guest = Transport::native(Arc::new(UnixConnections::new(listener, rp)), Limits::default()).unwrap();
             (host, guest)
         }
     };
-    Pair {
-        host,
-        guest,
-        _dir: dir,
-        tasks,
-    }
+    Pair { host, guest, _dir: dir, tasks }
 }
 // Real OpenSSH test server at the provider boundary, with disposable host and
 // user keys. It runs as the current user and never reads ambient SSH config.
-async fn ssh_server(
-    dir: &std::path::Path,
-    guest: &str,
-    reverse: &str,
-) -> (ssh::SshConfig, tokio::process::Child) {
+async fn ssh_server(dir: &std::path::Path, guest: &str, reverse: &str) -> (ssh::SshConfig, tokio::process::Child) {
     use std::process::Stdio;
     use tokio::process::Command;
     for name in ["host_key", "user_key"] {
@@ -119,15 +101,8 @@ async fn ssh_server(
         .expect("install openssh-server or set DRYDOCK_TEST_SSHD");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "sshd exited: {}",
-                std::fs::read_to_string(dir.join("sshd.log")).unwrap()
-            );
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
+            assert!(child.try_wait().unwrap().is_none(), "sshd exited: {}", std::fs::read_to_string(dir.join("sshd.log")).unwrap());
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -141,10 +116,7 @@ async fn ssh_server(
             host: "127.0.0.1".into(),
             port,
             user,
-            host_key: std::fs::read_to_string(dir.join("host_key.pub"))
-                .unwrap()
-                .trim()
-                .into(),
+            host_key: std::fs::read_to_string(dir.join("host_key.pub")).unwrap().trim().into(),
             identity_file: dir.join("user_key"),
             agent_socket: guest.into(),
             reverse_socket: reverse.into(),
@@ -156,13 +128,8 @@ fn purposes() -> Vec<Purpose> {
     vec![
         Purpose::Control,
         Purpose::Router,
-        Purpose::CleatAttach {
-            session: "crew/α".into(),
-        },
-        Purpose::PortForward {
-            host: "::1".into(),
-            port: 65535,
-        },
+        Purpose::CleatAttach { session: "crew/α".into() },
+        Purpose::PortForward { host: "::1".into(), port: 65535 },
     ]
 }
 async fn transfer(from: &Transport, to: &mut Transport, purpose: Purpose, payload: &[u8]) {
@@ -187,13 +154,7 @@ async fn transfer(from: &Transport, to: &mut Transport, purpose: Purpose, payloa
 async fn routing_contract(kind: Kind) {
     let mut p = pair(kind).await;
     for purpose in purposes().into_iter().chain(purposes()) {
-        transfer(
-            &p.host,
-            &mut p.guest,
-            purpose.clone(),
-            b"\0arbitrary\xffpayload",
-        )
-        .await;
+        transfer(&p.host, &mut p.guest, purpose.clone(), b"\0arbitrary\xffpayload").await;
         transfer(&p.guest, &mut p.host, purpose, b"").await;
     }
 }
@@ -203,55 +164,28 @@ async fn routing_contract(kind: Kind) {
 async fn isolation_contract(kind: Kind) {
     for reverse in [false, true] {
         let mut p = pair(kind).await;
-        let purpose = Purpose::CleatAttach {
-            session: "slow".into(),
-        };
-        let mut raw = if reverse {
-            p.guest.open(purpose).await.unwrap()
-        } else {
-            p.host.open(purpose).await.unwrap()
-        };
-        let _unread = if reverse {
-            p.host.accept().await.unwrap().unwrap()
-        } else {
-            p.guest.accept().await.unwrap().unwrap()
-        };
+        let purpose = Purpose::CleatAttach { session: "slow".into() };
+        let mut raw = if reverse { p.guest.open(purpose).await.unwrap() } else { p.host.open(purpose).await.unwrap() };
+        let _unread = if reverse { p.host.accept().await.unwrap().unwrap() } else { p.guest.accept().await.unwrap().unwrap() };
         let writer = tokio::spawn(async move { raw.write_all(&vec![7; 16 * 1024 * 1024]).await });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !writer.is_finished(),
-            "fixture must actually backpressure the raw stream"
-        );
+        assert!(!writer.is_finished(), "fixture must actually backpressure the raw stream");
         let host_opener = p.host.opener.clone();
         let guest_opener = p.guest.opener.clone();
-        for (from, to, purpose) in [
-            (host_opener, &mut p.guest, Purpose::Control),
-            (guest_opener, &mut p.host, Purpose::Router),
-        ] {
+        for (from, to, purpose) in [(host_opener, &mut p.guest, Purpose::Control), (guest_opener, &mut p.host, Purpose::Router)] {
             let (client, driver) = http2::connect(&from, purpose).await.unwrap();
             let incoming = to.accept().await.unwrap().unwrap();
-            let server = tokio::spawn(http2::serve(
-                incoming,
-                Router::new().route("/hello", get(|| async { "hello" })),
-            ));
+            let server = tokio::spawn(http2::serve(incoming, Router::new().route("/hello", get(|| async { "hello" }))));
             let mut calls = JoinSet::new();
             for _ in 0..12 {
                 let mut client = client.clone();
                 calls.spawn(async move {
                     let response = client
-                        .send_request(
-                            hyper::Request::builder()
-                                .uri("http://agent/hello")
-                                .body(Full::new(Bytes::new()))
-                                .unwrap(),
-                        )
+                        .send_request(hyper::Request::builder().uri("http://agent/hello").body(Full::new(Bytes::new())).unwrap())
                         .await
                         .unwrap();
                     assert_eq!(response.version(), hyper::Version::HTTP_2);
-                    assert_eq!(
-                        response.into_body().collect().await.unwrap().to_bytes(),
-                        "hello"
-                    );
+                    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "hello");
                 });
             }
             while let Some(call) = calls.join_next().await {
@@ -268,9 +202,7 @@ macro_rules! contract {
     ($name:ident, $kind:expr, $contract:ident) => {
         #[tokio::test]
         async fn $name() {
-            tokio::time::timeout(Duration::from_secs(20), $contract($kind))
-                .await
-                .expect("contract timed out");
+            tokio::time::timeout(Duration::from_secs(20), $contract($kind)).await.expect("contract timed out");
         }
     };
 }
@@ -296,28 +228,24 @@ fn generated_bidirectional_routes(tc: hegel::TestCase) {
             )
         })
         .collect();
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(20), async {
-                for kind in [Kind::Unix, Kind::Ssh, Kind::Yamux] {
-                    let mut p = pair(kind).await;
-                    for &(reverse, tag, length) in &operations {
-                        let purpose = purposes()[tag].clone();
-                        let data: Vec<_> = (0..length).map(|i| i as u8).collect();
-                        if reverse {
-                            transfer(&p.guest, &mut p.host, purpose, &data).await;
-                        } else {
-                            transfer(&p.host, &mut p.guest, purpose, &data).await;
-                        }
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for kind in [Kind::Unix, Kind::Ssh, Kind::Yamux] {
+                let mut p = pair(kind).await;
+                for &(reverse, tag, length) in &operations {
+                    let purpose = purposes()[tag].clone();
+                    let data: Vec<_> = (0..length).map(|i| i as u8).collect();
+                    if reverse {
+                        transfer(&p.guest, &mut p.host, purpose, &data).await;
+                    } else {
+                        transfer(&p.host, &mut p.guest, purpose, &data).await;
                     }
                 }
-            })
-            .await
-            .unwrap();
-        });
+            }
+        })
+        .await
+        .unwrap();
+    });
 }
 
 // Native negotiation is per connection: an unfinished or malformed preface
@@ -325,23 +253,10 @@ fn generated_bidirectional_routes(tc: hegel::TestCase) {
 #[tokio::test]
 async fn native_partial_header_and_cancelled_accept() {
     let mut p = pair(Kind::Unix).await;
-    let _partial = UnixStream::connect(p._dir.path().join("guest"))
-        .await
-        .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), p.guest.accept())
-            .await
-            .is_err()
-    );
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        transfer(&p.host, &mut p.guest, Purpose::Control, b"ok"),
-    )
-    .await
-    .unwrap();
-    let mut invalid = UnixStream::connect(p._dir.path().join("guest"))
-        .await
-        .unwrap();
+    let _partial = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(10), p.guest.accept()).await.is_err());
+    tokio::time::timeout(Duration::from_secs(2), transfer(&p.host, &mut p.guest, Purpose::Control, b"ok")).await.unwrap();
+    let mut invalid = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
     invalid.write_all(b"wrong").await.unwrap();
     let error = p.guest.accept().await.err().unwrap();
     assert_eq!(error.scope, drydock_transport::ErrorScope::Connection);
@@ -353,12 +268,8 @@ async fn native_partial_header_and_cancelled_accept() {
 // preface detection and purpose routing as direct single-stream connections.
 async fn fallback_contract() {
     let mut p = pair(Kind::Unix).await;
-    let stream = UnixStream::connect(p._dir.path().join("guest"))
-        .await
-        .unwrap();
-    let mut mux = Transport::yamux(Box::new(stream), true, Limits::default())
-        .await
-        .unwrap();
+    let stream = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
+    let mut mux = Transport::yamux(Box::new(stream), true, Limits::default()).await.unwrap();
     for purpose in purposes() {
         transfer(&mux, &mut p.guest, purpose.clone(), b"fallback").await;
         transfer(&p.guest, &mut mux, purpose, b"reverse fallback").await;
@@ -376,13 +287,7 @@ async fn concurrent_contract(kind: Kind) {
             for i in 0..16u8 {
                 let opener = opener.clone();
                 writers.spawn(async move {
-                    let mut stream = opener
-                        .open(Purpose::PortForward {
-                            host: "localhost".into(),
-                            port: 1000 + i as u16,
-                        })
-                        .await
-                        .unwrap();
+                    let mut stream = opener.open(Purpose::PortForward { host: "localhost".into(), port: 1000 + i as u16 }).await.unwrap();
                     stream.write_all(&[i]).await.unwrap();
                     stream.shutdown().await.unwrap();
                 });
@@ -399,13 +304,7 @@ async fn concurrent_contract(kind: Kind) {
             let mut bytes = Vec::new();
             incoming.stream.read_to_end(&mut bytes).await.unwrap();
             assert_eq!(bytes.len(), 1);
-            assert_eq!(
-                incoming.purpose,
-                Purpose::PortForward {
-                    host: "localhost".into(),
-                    port: 1000 + bytes[0] as u16
-                }
-            );
+            assert_eq!(incoming.purpose, Purpose::PortForward { host: "localhost".into(), port: 1000 + bytes[0] as u16 });
             seen.push(bytes[0]);
         }
         seen.sort();
@@ -427,26 +326,15 @@ async fn ssh_rejects_wrong_host_and_identity_keys() {
         let dir = tempfile::tempdir().unwrap();
         let guest = dir.path().join("guest");
         let reverse = dir.path().join("reverse");
-        let (mut config, mut child) = ssh_server(
-            dir.path(),
-            guest.to_str().unwrap(),
-            reverse.to_str().unwrap(),
-        )
-        .await;
+        let (mut config, mut child) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
         if wrong_host {
-            config.host_key = std::fs::read_to_string(dir.path().join("user_key.pub"))
-                .unwrap()
-                .trim()
-                .into();
+            config.host_key = std::fs::read_to_string(dir.path().join("user_key.pub")).unwrap().trim().into();
         } else {
             config.identity_file = dir.path().join("host_key");
         }
         let result = ssh::connect(config, Limits::default()).await;
         assert!(result.is_err());
-        assert_eq!(
-            result.err().unwrap().kind(),
-            io::ErrorKind::ConnectionAborted
-        );
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::ConnectionAborted);
         child.kill().await.unwrap();
     }
 }
@@ -458,12 +346,7 @@ async fn ssh_transport_drop_closes_session() {
     let dir = tempfile::tempdir().unwrap();
     let guest = dir.path().join("guest");
     let reverse = dir.path().join("reverse");
-    let (config, mut child) = ssh_server(
-        dir.path(),
-        guest.to_str().unwrap(),
-        reverse.to_str().unwrap(),
-    )
-    .await;
+    let (config, mut child) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
     let transport = ssh::connect(config, Limits::default()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !reverse.exists() {
@@ -491,22 +374,10 @@ async fn ssh_transport_drop_closes_session() {
 #[tokio::test]
 async fn refuses_zero_limits() {
     for limits in [
-        Limits {
-            queue: 0,
-            ..Limits::default()
-        },
-        Limits {
-            pending_headers: 0,
-            ..Limits::default()
-        },
-        Limits {
-            max_sessions: 0,
-            ..Limits::default()
-        },
-        Limits {
-            header_timeout: Duration::ZERO,
-            ..Limits::default()
-        },
+        Limits { queue: 0, ..Limits::default() },
+        Limits { pending_headers: 0, ..Limits::default() },
+        Limits { max_sessions: 0, ..Limits::default() },
+        Limits { header_timeout: Duration::ZERO, ..Limits::default() },
     ] {
         let (a, _b) = tokio::io::duplex(8);
         let result = Transport::yamux(Box::new(a), true, limits).await;
@@ -516,9 +387,7 @@ async fn refuses_zero_limits() {
 
 #[tokio::test]
 async fn yamux_fallback_on_native_listener() {
-    tokio::time::timeout(Duration::from_secs(2), fallback_contract())
-        .await
-        .expect("native listener must use yamux for reverse opens");
+    tokio::time::timeout(Duration::from_secs(2), fallback_contract()).await.expect("native listener must use yamux for reverse opens");
 }
 
 // Socket-boundary fault injection: all successful accepts still use the real
@@ -561,11 +430,7 @@ async fn transient_accept_errors_recover_and_terminal_errors_end() {
     }
     let mut stream = UnixStream::connect(&path).await.unwrap();
     stream.write_all(b"DDT\x01\x00\x00").await.unwrap();
-    let incoming = tokio::time::timeout(Duration::from_secs(2), transport.accept())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let incoming = tokio::time::timeout(Duration::from_secs(2), transport.accept()).await.unwrap().unwrap().unwrap();
     assert_eq!(incoming.purpose, Purpose::Control);
     let fatal_path = dir.path().join("fatal");
     let fatal = FaultyAccept {
@@ -573,10 +438,7 @@ async fn transient_accept_errors_recover_and_terminal_errors_end() {
         failures: tokio::sync::Mutex::new(vec![io::Error::from(io::ErrorKind::BrokenPipe)].into()),
     };
     let mut transport = Transport::native(Arc::new(fatal), Limits::default()).unwrap();
-    assert_eq!(
-        transport.accept().await.err().unwrap().scope,
-        ErrorScope::Terminal
-    );
+    assert_eq!(transport.accept().await.err().unwrap().scope, ErrorScope::Terminal);
     assert!(transport.accept().await.unwrap().is_none());
 }
 
@@ -588,35 +450,21 @@ async fn established_yamux_sessions_release_header_slots() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("listen");
         let mut transport = Transport::native(
-            Arc::new(UnixConnections::new(
-                UnixListener::bind(&path).unwrap(),
-                dir.path().join("unreachable"),
-            )),
-            Limits {
-                pending_headers: 1,
-                ..Limits::default()
-            },
+            Arc::new(UnixConnections::new(UnixListener::bind(&path).unwrap(), dir.path().join("unreachable"))),
+            Limits { pending_headers: 1, ..Limits::default() },
         )
         .unwrap();
         let mut sessions = Vec::new();
         for _ in 0..3 {
             let stream = UnixStream::connect(&path).await.unwrap();
-            let mux = Transport::yamux(Box::new(stream), true, Limits::default())
-                .await
-                .unwrap();
+            let mux = Transport::yamux(Box::new(stream), true, Limits::default()).await.unwrap();
             let _stream = mux.open(Purpose::Control).await.unwrap();
-            assert_eq!(
-                transport.accept().await.unwrap().unwrap().purpose,
-                Purpose::Control
-            );
+            assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
             sessions.push(mux);
         }
         let mut raw = UnixStream::connect(&path).await.unwrap();
         raw.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Router
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
     })
     .await
     .expect("live mux sessions must not consume unfinished-header slots");
@@ -629,20 +477,13 @@ async fn ssh_reconnect_replaces_stale_remote_socket() {
     let dir = tempfile::tempdir().unwrap();
     let guest = dir.path().join("guest");
     let reverse = dir.path().join("reverse");
-    let (config, mut server) = ssh_server(
-        dir.path(),
-        guest.to_str().unwrap(),
-        reverse.to_str().unwrap(),
-    )
-    .await;
+    let (config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
     for _ in 0..2 {
         if reverse.exists() {
             std::fs::remove_file(&reverse).unwrap();
         }
         drop(UnixListener::bind(&reverse).unwrap());
-        let transport = ssh::connect(config.clone(), Limits::default())
-            .await
-            .unwrap();
+        let transport = ssh::connect(config.clone(), Limits::default()).await.unwrap();
         assert!(UnixStream::connect(&reverse).await.is_ok());
         drop(transport);
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -661,37 +502,15 @@ async fn ssh_reconnect_replaces_stale_remote_socket() {
 #[tokio::test]
 async fn http2_streaming_request_body() {
     let mut p = pair(Kind::Yamux).await;
-    let (mut client, driver) = http2::connect_with_body(&p.host.opener, Purpose::Control)
-        .await
-        .unwrap();
+    let (mut client, driver) = http2::connect_with_body(&p.host.opener, Purpose::Control).await.unwrap();
     let incoming = p.guest.accept().await.unwrap().unwrap();
-    let server = tokio::spawn(http2::serve(
-        incoming,
-        Router::new().route(
-            "/upload",
-            axum::routing::post(|body: Bytes| async move { body }),
-        ),
-    ));
-    let frames = ["first", "second"].map(|s| {
-        Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from_static(
-            s.as_bytes(),
-        )))
-    });
+    let server =
+        tokio::spawn(http2::serve(incoming, Router::new().route("/upload", axum::routing::post(|body: Bytes| async move { body }))));
+    let frames = ["first", "second"].map(|s| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from_static(s.as_bytes()))));
     let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
-    let response = client
-        .send_request(
-            hyper::Request::builder()
-                .method("POST")
-                .uri("http://agent/upload")
-                .body(body)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.into_body().collect().await.unwrap().to_bytes(),
-        "firstsecond"
-    );
+    let response =
+        client.send_request(hyper::Request::builder().method("POST").uri("http://agent/upload").body(body).unwrap()).await.unwrap();
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "firstsecond");
     driver.abort();
     server.abort();
 }
@@ -701,17 +520,12 @@ async fn http2_streaming_request_body() {
 #[tokio::test(start_paused = true)]
 async fn http2_keepalive_detects_silent_peer() {
     let mut p = pair(Kind::Yamux).await;
-    let (mut client, driver) = http2::connect(&p.host.opener, Purpose::Control)
-        .await
-        .unwrap();
+    let (mut client, driver) = http2::connect(&p.host.opener, Purpose::Control).await.unwrap();
     let incoming = p.guest.accept().await.unwrap().unwrap();
     let (pause, paused) = tokio::sync::oneshot::channel();
     let (ack, received) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let serve = http2::serve(
-            incoming,
-            Router::new().route("/hello", get(|| async { "hello" })),
-        );
+        let serve = http2::serve(incoming, Router::new().route("/hello", get(|| async { "hello" })));
         tokio::pin!(serve);
         tokio::select! {
             result = &mut serve => { result.unwrap(); }
@@ -722,29 +536,13 @@ async fn http2_keepalive_detects_silent_peer() {
             }
         }
     });
-    let response = client
-        .send_request(
-            hyper::Request::builder()
-                .uri("http://agent/hello")
-                .body(Full::new(Bytes::new()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response.into_body().collect().await.unwrap().to_bytes(),
-        "hello"
-    );
+    let response =
+        client.send_request(hyper::Request::builder().uri("http://agent/hello").body(Full::new(Bytes::new())).unwrap()).await.unwrap();
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "hello");
     pause.send(()).unwrap();
     received.await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(60), driver)
-        .await
-        .expect("silent link must not hang indefinitely")
-        .unwrap();
-    assert!(
-        result.is_err(),
-        "missing ping acknowledgement must fail the link"
-    );
+    let result = tokio::time::timeout(Duration::from_secs(60), driver).await.expect("silent link must not hang indefinitely").unwrap();
+    assert!(result.is_err(), "missing ping acknowledgement must fail the link");
     server.abort();
 }
 
@@ -756,50 +554,20 @@ async fn fallback_session_limit_preserves_native_accepts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("listen");
         let mut transport = Transport::native(
-            Arc::new(UnixConnections::new(
-                UnixListener::bind(&path).unwrap(),
-                dir.path().join("peer"),
-            )),
-            Limits {
-                max_sessions: 1,
-                ..Limits::default()
-            },
+            Arc::new(UnixConnections::new(UnixListener::bind(&path).unwrap(), dir.path().join("peer"))),
+            Limits { max_sessions: 1, ..Limits::default() },
         )
         .unwrap();
-        let first = Transport::yamux(
-            Box::new(UnixStream::connect(&path).await.unwrap()),
-            true,
-            Limits::default(),
-        )
-        .await
-        .unwrap();
+        let first = Transport::yamux(Box::new(UnixStream::connect(&path).await.unwrap()), true, Limits::default()).await.unwrap();
         let _stream = first.open(Purpose::Control).await.unwrap();
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Control
-        );
-        let _excess = Transport::yamux(
-            Box::new(UnixStream::connect(&path).await.unwrap()),
-            true,
-            Limits::default(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            transport.accept().await.err().unwrap().scope,
-            drydock_transport::ErrorScope::Connection
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
+        let _excess = Transport::yamux(Box::new(UnixStream::connect(&path).await.unwrap()), true, Limits::default()).await.unwrap();
+        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Connection);
         let mut raw = UnixStream::connect(&path).await.unwrap();
         raw.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Router
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
         let _stream = first.open(Purpose::Control).await.unwrap();
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Control
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
     })
     .await
     .unwrap();
@@ -809,8 +577,7 @@ async fn fallback_session_limit_preserves_native_accepts() {
 // A full application queue must not prevent the listener from requesting the
 // next connection; dropping a transient diagnostic is safe under overload.
 struct ScriptedAccept {
-    incoming:
-        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<io::Result<drydock_transport::ByteStream>>>,
+    incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<io::Result<drydock_transport::ByteStream>>>,
     attempts: std::sync::atomic::AtomicUsize,
 }
 #[async_trait::async_trait]
@@ -819,64 +586,33 @@ impl drydock_transport::Connections for ScriptedAccept {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
     async fn accept(&self) -> io::Result<drydock_transport::ByteStream> {
-        self.attempts
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.incoming
-            .lock()
-            .await
-            .recv()
-            .await
-            .unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.incoming.lock().await.recv().await.unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::BrokenPipe)))
     }
 }
 #[tokio::test]
 async fn full_queue_does_not_block_transient_accept_recovery() {
     tokio::time::timeout(Duration::from_secs(2), async {
         let (send, incoming) = tokio::sync::mpsc::channel(4);
-        let source = Arc::new(ScriptedAccept {
-            incoming: tokio::sync::Mutex::new(incoming),
-            attempts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let mut transport = Transport::native(
-            source.clone(),
-            Limits {
-                queue: 1,
-                pending_headers: 1,
-                ..Limits::default()
-            },
-        )
-        .unwrap();
+        let source =
+            Arc::new(ScriptedAccept { incoming: tokio::sync::Mutex::new(incoming), attempts: std::sync::atomic::AtomicUsize::new(0) });
+        let mut transport = Transport::native(source.clone(), Limits { queue: 1, pending_headers: 1, ..Limits::default() }).unwrap();
         let (mut client, accepted) = tokio::io::duplex(32);
-        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream))
-            .await
-            .ok()
-            .unwrap();
+        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream)).await.ok().unwrap();
         client.write_all(b"DDT\x01\x00\x00").await.unwrap();
         while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         // pending_headers=1 means the first stream is already queued here.
-        send.send(Err(io::Error::from_raw_os_error(libc::EMFILE)))
-            .await
-            .ok()
-            .unwrap();
+        send.send(Err(io::Error::from_raw_os_error(libc::EMFILE))).await.ok().unwrap();
         while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 3 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Control
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
         let (mut next, accepted) = tokio::io::duplex(32);
-        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream))
-            .await
-            .ok()
-            .unwrap();
+        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream)).await.ok().unwrap();
         next.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(
-            transport.accept().await.unwrap().unwrap().purpose,
-            Purpose::Router
-        );
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
     })
     .await
     .expect("a dropped transient notice must not stall a full incoming queue");
@@ -887,28 +623,20 @@ async fn full_queue_does_not_block_transient_accept_recovery() {
 #[tokio::test(start_paused = true)]
 async fn accept_backoff_distinguishes_resource_exhaustion_and_churn() {
     let dir = tempfile::tempdir().unwrap();
-    let mut errors: Vec<_> = (0..6)
-        .map(|_| io::Error::from_raw_os_error(libc::EMFILE))
-        .collect();
+    let mut errors: Vec<_> = (0..6).map(|_| io::Error::from_raw_os_error(libc::EMFILE)).collect();
     errors.extend([
         io::Error::from(io::ErrorKind::ConnectionAborted),
         io::Error::from(io::ErrorKind::ConnectionReset),
         io::Error::from_raw_os_error(libc::ENFILE),
     ]);
     let source = FaultyAccept {
-        native: UnixConnections::new(
-            UnixListener::bind(dir.path().join("listen")).unwrap(),
-            dir.path().join("peer"),
-        ),
+        native: UnixConnections::new(UnixListener::bind(dir.path().join("listen")).unwrap(), dir.path().join("peer")),
         failures: tokio::sync::Mutex::new(errors.into()),
     };
     let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
     let mut previous = tokio::time::Instant::now();
     for delay in [0, 100, 200, 400, 800, 1000, 1000, 0, 0] {
-        assert_eq!(
-            transport.accept().await.err().unwrap().scope,
-            drydock_transport::ErrorScope::Retrying
-        );
+        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Retrying);
         assert_eq!(previous.elapsed(), Duration::from_millis(delay));
         previous = tokio::time::Instant::now();
     }
@@ -936,16 +664,7 @@ async fn ssh_rejects_host_key_options_and_markers() {
             agent_socket: "/tmp/unused-agent".into(),
             reverse_socket: "/tmp/unused-reverse".into(),
         };
-        let error = ssh::connect(
-            config,
-            Limits {
-                header_timeout: Duration::from_millis(20),
-                ..Limits::default()
-            },
-        )
-        .await
-        .err()
-        .unwrap();
+        let error = ssh::connect(config, Limits { header_timeout: Duration::from_millis(20), ..Limits::default() }).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
@@ -957,21 +676,9 @@ async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
     let dir = tempfile::tempdir().unwrap();
     let guest = dir.path().join("guest");
     let reverse = dir.path().join("reverse");
-    let (mut config, mut server) = ssh_server(
-        dir.path(),
-        guest.to_str().unwrap(),
-        reverse.to_str().unwrap(),
-    )
-    .await;
+    let (mut config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
     config.reverse_socket = dir.path().join("missing-directory/reverse");
-    assert_eq!(
-        ssh::connect(config.clone(), Limits::default())
-            .await
-            .err()
-            .unwrap()
-            .kind(),
-        io::ErrorKind::ConnectionAborted
-    );
+    assert_eq!(ssh::connect(config.clone(), Limits::default()).await.err().unwrap().kind(), io::ErrorKind::ConnectionAborted);
     config.reverse_socket = reverse.clone();
     let transport = ssh::connect(config, Limits::default()).await.unwrap();
     assert!(UnixStream::connect(reverse).await.is_ok());
@@ -985,23 +692,13 @@ async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
 async fn persistent_connection_churn_has_a_floor_delay() {
     let dir = tempfile::tempdir().unwrap();
     let source = FaultyAccept {
-        native: UnixConnections::new(
-            UnixListener::bind(dir.path().join("listen")).unwrap(),
-            dir.path().join("peer"),
-        ),
-        failures: tokio::sync::Mutex::new(
-            (0..10)
-                .map(|_| io::Error::from(io::ErrorKind::ConnectionReset))
-                .collect(),
-        ),
+        native: UnixConnections::new(UnixListener::bind(dir.path().join("listen")).unwrap(), dir.path().join("peer")),
+        failures: tokio::sync::Mutex::new((0..10).map(|_| io::Error::from(io::ErrorKind::ConnectionReset)).collect()),
     };
     let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
     let start = tokio::time::Instant::now();
     for _ in 0..10 {
-        assert_eq!(
-            transport.accept().await.err().unwrap().scope,
-            drydock_transport::ErrorScope::Retrying
-        );
+        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Retrying);
     }
     assert_eq!(start.elapsed(), Duration::from_millis(2));
 }
@@ -1013,44 +710,17 @@ async fn ssh_setup_timeout_is_independent_of_raw_headers() {
     let dir = tempfile::tempdir().unwrap();
     let guest = dir.path().join("guest");
     let reverse = dir.path().join("reverse");
-    let (mut config, mut server) = ssh_server(
-        dir.path(),
-        guest.to_str().unwrap(),
-        reverse.to_str().unwrap(),
-    )
-    .await;
+    let (mut config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
     let mut invalid = config.clone();
     invalid.connect_timeout = Duration::ZERO;
-    assert_eq!(
-        ssh::connect(invalid, Limits::default())
-            .await
-            .err()
-            .unwrap()
-            .kind(),
-        io::ErrorKind::InvalidInput
-    );
-    let transport = ssh::connect(
-        config.clone(),
-        Limits {
-            header_timeout: Duration::from_nanos(1),
-            ..Limits::default()
-        },
-    )
-    .await
-    .unwrap();
+    assert_eq!(ssh::connect(invalid, Limits::default()).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+    let transport = ssh::connect(config.clone(), Limits { header_timeout: Duration::from_nanos(1), ..Limits::default() }).await.unwrap();
     assert!(reverse.exists());
     drop(transport);
     let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.port = silent.local_addr().unwrap().port();
     config.connect_timeout = Duration::from_millis(50);
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        ssh::connect(config, Limits::default()),
-    )
-    .await
-    .unwrap()
-    .err()
-    .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), ssh::connect(config, Limits::default())).await.unwrap().err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     server.kill().await.unwrap();
 }

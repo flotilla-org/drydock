@@ -11,10 +11,7 @@ pub struct UnixConnections {
 }
 impl UnixConnections {
     pub fn new(listener: UnixListener, peer: impl Into<PathBuf>) -> Self {
-        Self {
-            listener,
-            peer: peer.into(),
-        }
+        Self { listener, peer: peer.into() }
     }
 }
 #[async_trait]
@@ -42,9 +39,7 @@ impl VsockConnections {
 #[async_trait]
 impl Connections for VsockConnections {
     async fn connect(&self) -> io::Result<ByteStream> {
-        Ok(Box::new(
-            tokio_vsock::VsockStream::connect(self.peer).await?,
-        ))
+        Ok(Box::new(tokio_vsock::VsockStream::connect(self.peer).await?))
     }
     async fn accept(&self) -> io::Result<ByteStream> {
         Ok(Box::new(self.listener.accept().await?.0))

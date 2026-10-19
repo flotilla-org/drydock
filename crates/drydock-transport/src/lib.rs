@@ -99,25 +99,13 @@ pub struct Limits {
 }
 impl Default for Limits {
     fn default() -> Self {
-        Self {
-            queue: 64,
-            pending_headers: 64,
-            max_sessions: 64,
-            header_timeout: Duration::from_secs(10),
-        }
+        Self { queue: 64, pending_headers: 64, max_sessions: 64, header_timeout: Duration::from_secs(10) }
     }
 }
 impl Limits {
     fn validate(&self) -> io::Result<()> {
-        if self.queue == 0
-            || self.pending_headers == 0
-            || self.max_sessions == 0
-            || self.header_timeout.is_zero()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "transport limits must be nonzero",
-            ));
+        if self.queue == 0 || self.pending_headers == 0 || self.max_sessions == 0 || self.header_timeout.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "transport limits must be nonzero"));
         }
         Ok(())
     }
@@ -258,10 +246,7 @@ impl Transport {
         });
         Ok(Self {
             opener: Opener {
-                inner: Arc::new(NativeOpen {
-                    connections,
-                    preferred,
-                }),
+                inner: Arc::new(NativeOpen { connections, preferred }),
                 _driver: Arc::new(Driver(task.abort_handle())),
                 timeout: limits.header_timeout,
             },
@@ -271,11 +256,7 @@ impl Transport {
 
     /// Dial/Relay (or native fallback). The initiator writes the connection
     /// preface. The acceptor reads and validates it before starting yamux.
-    pub async fn yamux(
-        mut stream: ByteStream,
-        initiator: bool,
-        limits: Limits,
-    ) -> io::Result<Self> {
+    pub async fn yamux(mut stream: ByteStream, initiator: bool, limits: Limits) -> io::Result<Self> {
         limits.validate()?;
         tokio::time::timeout(limits.header_timeout, async {
             if initiator {
@@ -283,10 +264,7 @@ impl Transport {
             } else if read_connection_kind(&mut stream).await? == ConnectionKind::Yamux {
                 Ok(())
             } else {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected yamux connection",
-                ))
+                Err(io::Error::new(io::ErrorKind::InvalidData, "expected yamux connection"))
             }
         })
         .await
@@ -303,12 +281,7 @@ struct NativeOpen {
 #[async_trait]
 impl Open for NativeOpen {
     async fn open(&self) -> io::Result<ByteStream> {
-        let fallback = self
-            .preferred
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(Weak::upgrade);
+        let fallback = self.preferred.read().unwrap().as_ref().and_then(Weak::upgrade);
         if let Some(fallback) = fallback {
             return fallback.open().await;
         }
@@ -318,20 +291,11 @@ impl Open for NativeOpen {
     }
 }
 
-async fn receive(
-    mut stream: ByteStream,
-    tx: mpsc::Sender<Result<Incoming, AcceptError>>,
-    timeout: Duration,
-) {
+async fn receive(mut stream: ByteStream, tx: mpsc::Sender<Result<Incoming, AcceptError>>, timeout: Duration) {
     let result = match tokio::time::timeout(timeout, wire::read_purpose(&mut stream)).await {
         Ok(Ok(purpose)) => Ok(Incoming { purpose, stream }),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "stream purpose header",
-        )),
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "stream purpose header")),
     };
-    let _ = tx
-        .send(result.map_err(|e| AcceptError::new(ErrorScope::Connection, e)))
-        .await;
+    let _ = tx.send(result.map_err(|e| AcceptError::new(ErrorScope::Connection, e))).await;
 }
