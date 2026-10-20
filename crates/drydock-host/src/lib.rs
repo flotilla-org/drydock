@@ -112,6 +112,7 @@ struct Instance {
     credential_changes: watch::Sender<Credentials>,
     destroyed: Mutex<BTreeMap<String, DestroyState>>,
     inspected: Mutex<BTreeMap<String, ObservedEnvironment>>,
+    observation_generation: Mutex<u64>,
     egress_measured_at: Mutex<BTreeMap<String, tokio::time::Instant>>,
 }
 #[derive(Default)]
@@ -773,6 +774,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
                 budget: Mutex::new(BTreeMap::new()),
                 destroyed: Mutex::new(BTreeMap::new()),
                 inspected: Mutex::new(BTreeMap::new()),
+                observation_generation: Mutex::new(0),
                 egress_measured_at: Mutex::new(BTreeMap::new()),
             }),
         );
@@ -840,9 +842,10 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
         return Err(refused("invalid size, label or prepared provider").into());
     }
     let instance = h.instance(&p).await?;
+    let generation = *instance.observation_generation.recover();
     let result = h.call(&p, Gate::Provision, |p, c| async move { p.provision(r, &c).await }).await?;
     let (Provisioned::Created(row) | Provisioned::Existing(row)) = &result;
-    cache_observation(&instance, row);
+    cache_observation(&instance, row, generation);
     Ok(match result {
         Provisioned::Created(s) => (StatusCode::CREATED, Json(s.environment)),
         Provisioned::Existing(s) => (StatusCode::OK, Json(s.environment)),
@@ -853,11 +856,16 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
 // documented in the provider README. Cheap inventory never extends it.
 const EGRESS_EVIDENCE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn cache_observation(instance: &Instance, row: &ObservedEnvironment) {
+fn cache_observation(instance: &Instance, row: &ObservedEnvironment, generation: u64) {
     if instance.poll_interval.is_none() {
         return;
     }
-    // Lock order for both caches is always inspected, then egress_measured_at.
+    // Lock order: observation_generation -> inspected -> egress_measured_at.
+    // Hold the generation through the write, so eviction cannot race the check.
+    let current = instance.observation_generation.recover();
+    if *current != generation {
+        return;
+    }
     let mut inspected = instance.inspected.recover();
     let mut times = instance.egress_measured_at.recover();
     if row.egress_measured {
@@ -868,6 +876,9 @@ fn cache_observation(instance: &Instance, row: &ObservedEnvironment) {
     inspected.insert(row.environment.id.clone(), row.clone());
 }
 fn evict_observation(instance: &Instance, id: &str) {
+    // Invalidate overlapping cache writes without retaining per-ID tombstones.
+    let mut generation = instance.observation_generation.recover();
+    *generation = generation.wrapping_add(1);
     let mut inspected = instance.inspected.recover();
     let mut times = instance.egress_measured_at.recover();
     inspected.remove(id);
@@ -875,17 +886,27 @@ fn evict_observation(instance: &Instance, id: &str) {
 }
 // Only explicit measurements replace a measured claim. Cheap inventory carries
 // the last claim while running; stopped/gone rows invalidate it.
-fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
+fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generation: u64) {
     if instance.poll_interval.is_none() {
         return;
     }
-    // Same inspected -> egress_measured_at lock order as cache/eviction.
+    // Same generation -> inspected -> egress_measured_at order as cache/eviction.
+    let current = instance.observation_generation.recover();
+    if *current != generation {
+        return;
+    }
     let mut measured = instance.inspected.recover();
     let mut times = instance.egress_measured_at.recover();
+    // Both callers supply authoritative complete lists. Prune absent IDs here,
+    // including out-of-band deletion, rather than only during poll reconciliation.
+    let listed: std::collections::BTreeSet<_> = rows.iter().map(|r| r.environment.id.as_str()).collect();
+    measured.retain(|id, _| listed.contains(id.as_str()));
     times.retain(|id, _| measured.contains_key(id));
     for row in rows {
         if row.egress_measured {
             times.insert(row.environment.id.clone(), tokio::time::Instant::now());
+            // This cache also preserves a matching inspect's provider timestamp
+            // when a later list supplies no timestamp of its own.
             if row.timestamp.is_none() {
                 row.timestamp =
                     measured.get(&row.environment.id).filter(|old| old.environment == row.environment).and_then(|old| old.timestamp);
@@ -906,14 +927,16 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
 }
 async fn list(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Vec<Environment>>> {
     let instance = h.instance(&p).await?;
+    let generation = *instance.observation_generation.recover();
     let mut rows = instance.call(Gate::List, |p, c| async move { p.list(&c).await }).await?;
-    carry_egress(&instance, &mut rows);
+    carry_egress(&instance, &mut rows, generation);
     Ok(Json(rows.into_iter().map(|r| r.environment).collect()))
 }
 async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Environment>> {
     let instance = h.instance(&p).await?;
+    let generation = *instance.observation_generation.recover();
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&id, &c).await }).await?;
-    cache_observation(&instance, &row);
+    cache_observation(&instance, &row, generation);
     Ok(Json(row.environment))
 }
 async fn destroy(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<StatusCode> {
@@ -950,9 +973,10 @@ async fn resume(
 ) -> ApiResult<StatusCode> {
     let instance = h.instance(&p).await?;
     let inspect_id = id.clone();
+    let generation = *instance.observation_generation.recover();
     instance.call(Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&inspect_id, &c).await }).await?;
-    cache_observation(&instance, &row);
+    cache_observation(&instance, &row, generation);
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {
@@ -1406,20 +1430,34 @@ mod operation_tests {
                 timestamp: None,
                 egress_measured: true,
             };
-            cache_observation(i, &row);
+            let generation = *i.observation_generation.recover();
+            cache_observation(i, &row, generation);
             assert_eq!(i.egress_measured_at.recover().contains_key("e"), polling);
             tokio::time::advance(EGRESS_EVIDENCE_MAX_AGE).await;
             row.egress_measured = false;
-            cache_observation(i, &row);
+            let generation = *i.observation_generation.recover();
+            cache_observation(i, &row, generation);
             assert!(!i.egress_measured_at.recover().contains_key("e"));
             let mut cheap = row.clone();
             cheap.environment.egress = Enforcement::Advisory;
-            carry_egress(i, std::slice::from_mut(&mut cheap));
+            carry_egress(i, std::slice::from_mut(&mut cheap), generation);
             assert_eq!(cheap.environment.egress, Enforcement::Advisory);
             assert_eq!(i.inspected.recover().contains_key("e"), polling);
             row.egress_measured = true;
-            cache_observation(i, &row);
+            let generation = *i.observation_generation.recover();
+            cache_observation(i, &row, generation);
             evict_observation(i, "e");
+            assert!(i.inspected.recover().is_empty());
+            assert!(i.egress_measured_at.recover().is_empty());
+            // A response begun before deletion cannot repopulate either cache.
+            cache_observation(i, &row, generation);
+            assert!(i.inspected.recover().is_empty());
+            assert!(i.egress_measured_at.recover().is_empty());
+            let generation = *i.observation_generation.recover();
+            cache_observation(i, &row, generation);
+            assert_eq!(i.inspected.recover().contains_key("e"), polling);
+            // A complete empty inventory also forgets out-of-band deletions.
+            carry_egress(i, &mut [], generation);
             assert!(i.inspected.recover().is_empty());
             assert!(i.egress_measured_at.recover().is_empty());
         }
