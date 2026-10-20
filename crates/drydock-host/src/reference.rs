@@ -28,6 +28,8 @@ impl Module for ReferenceModule {
 struct ReferenceSettings {
     #[serde(default)]
     fault: Option<ProtocolError>,
+    #[serde(default)]
+    rate_limits: Vec<RateLimit>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
 }
@@ -63,6 +65,9 @@ impl Reference {
 }
 #[async_trait]
 impl Provider for Reference {
+    fn rate_limits(&self) -> Vec<RateLimit> {
+        self.settings.rate_limits.clone()
+    }
     fn observation(&self) -> ObservationMode {
         ObservationMode::Poll { interval: Duration::from_millis(self.settings.poll_interval_ms) }
     }
