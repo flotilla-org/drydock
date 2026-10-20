@@ -40,6 +40,9 @@ fn tagged_wire_fixtures() {
         fixture::<CredentialMode>(value);
     }
     fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"","environments":[]}));
+    // Partial snapshots explicitly mark unavailable providers; legacy complete snapshots omit the map.
+    fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"c","environments":[],
+        "unavailable_providers":{"a":{"kind":"unavailable","reason":"not ready","retry_after":null}}}));
     for event in [
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),

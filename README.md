@@ -52,9 +52,12 @@ Wire conventions chosen for this first protocol version:
   unsupported destinations are refused, never widened. The result records
   enforced versus advisory protection.
 - `/v1/events` is one host-wide NDJSON stream. Each line is an `ObserveRecord`.
-  `since` is an opaque exclusive cursor. A host unable to replay emits a complete
-  list snapshot with a new cursor, marking a metering gap. Event times are RFC
-  3339 with explicit provider/adaptor provenance; running events carry granted size.
+  `since` is an opaque exclusive cursor. A host unable to replay emits a
+  list snapshot with a new cursor, marking a metering gap. An optional
+  `unavailable_providers` map names providers whose inventory is omitted, with
+  typed errors; consumers preserve their previous rows rather than infer deletion.
+  Event times are RFC 3339 with explicit provider/adaptor provenance; running
+  events carry granted size.
 - Retry hints are whole seconds. Modules do not retry. Capability flags govern
   optional suspend/resume, export, exec, usage and quota operations. A resume
   token is valid only at the same provider. Usage periods are RFC 3339 start/end;

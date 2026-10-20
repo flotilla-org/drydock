@@ -16,6 +16,8 @@ pub fn refused(reason: impl Into<String>) -> ProtocolError {
 #[async_trait]
 pub trait Module: Send + Sync {
     fn version(&self) -> &str;
+    /// Cancelled when the host stops. Dropping the future must release uncommitted
+    /// resources; factories must yield while waiting on external work.
     async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
 }
 #[derive(Clone)]

@@ -108,27 +108,35 @@ Adaptor time. Modules never format event times. The reference declares Poll and
 publishes no events itself, so its lifecycle tests exercise the host poller.
 
 The host retains `EVENT_HISTORY_CAPACITY` host-wide events in memory (1024).
-`GET /v1/events` starts with a complete snapshot; `?since=` resumes exclusively at
-retained cursors. Unknown, expired and previous-process cursors produce a complete
+`GET /v1/events` starts with a snapshot; `?since=` resumes exclusively at
+retained cursors. Unknown, expired and previous-process cursors produce a
 gap snapshot. Poll snapshots use the last successful host-owned inventory, never
 another vendor list request. A poll commits its inventory and transition events
 under the same log lock, so a poll-only snapshot cursor identifies that exact cut.
 Before a provider's first successful poll, a snapshot waits for observation or
-returns its typed failure. Later transient poll failures retain the inventory.
+marks that provider's typed failure. Later transient poll failures retain the inventory.
 Push snapshot cursors precede provider listing to replay overlapping events.
 Snapshot rows mark a metering gap and do not create extra billing transitions.
 
-An unready provider blocks a complete snapshot rather than silently omitting its
-resources. Retained-cursor replay does not list. Initial snapshot failures are typed
-HTTP errors; later recovery failures fail the HTTP body instead of clean EOF.
-V1 defines no terminal NDJSON error record. Polling cannot report transitions hidden
-entirely between samples; modules with event streams declare Push.
+Snapshots omit inventory for unready providers and failed push lists, reporting
+those providers in an optional `unavailable_providers` map of name to typed error.
+The map is absent for a complete snapshot. Consumers must preserve previous inventory
+for marked providers: missing rows are not evidence of deletion or a billing transition.
+Healthy providers continue streaming. Push lists use the normal call gate, so a
+successful list repairs a proxied rejection without requiring a separate route call.
+Direct credentials still require refresh. Poll providers repair through normal polling.
+Retained-cursor replay does not list. Host stopping still returns an initial typed
+HTTP error or ends an existing stream. V1 defines no terminal NDJSON error record.
+Polling cannot report transitions hidden entirely between samples; modules with
+event streams declare Push.
 
 Push observers receive `Provider::run(PushContext)` only after configuration commits.
 The context carries a provider-scoped sink, a credential watch, and a stop watch.
-On shutdown the host signals, awaits cleanup for up to five seconds per observer,
-then aborts an unresponsive observer and releases instances. Poll factories receive
-no sink and do not start background work. Upgraded streams close on shutdown; they
+On shutdown the host signals and cancels pending configuration, then awaits observer
+cleanup against one shared five-second deadline. It aborts remaining observers without
+awaiting cooperative cancellation and releases instances. Module factories must be
+cancellation safe; configuration remains transactional until commit. Poll factories
+receive no sink and do not start background work. Upgraded streams close on shutdown; they
 are not drained to completion.
 
 ## Diagnostics and readiness

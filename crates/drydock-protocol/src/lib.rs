@@ -329,12 +329,22 @@ pub enum EventKind {
         cause: GoneCause,
     },
 }
-/// Hosts unable to replay emit one complete list snapshot, explicitly marking the gap.
+/// Hosts unable to replay emit a snapshot marking the gap. Inventory is complete
+/// only for providers absent from `unavailable_providers`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ObserveRecord {
-    Event { event: Event },
-    Snapshot { cursor: String, environments: Vec<Environment> },
+    Event {
+        event: Event,
+    },
+    Snapshot {
+        cursor: String,
+        environments: Vec<Environment>,
+        /// Providers omitted from this snapshot. Preserve their previous inventory;
+        /// omission must not be interpreted as deletion or a billing transition.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        unavailable_providers: BTreeMap<String, ProtocolError>,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(try_from = "UncheckedPeriod")]

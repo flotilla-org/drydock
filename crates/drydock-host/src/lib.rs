@@ -433,13 +433,15 @@ impl Host {
         async move {
             signal.await;
             host.stopping.send_replace(true);
-            let _transaction = host.configuring.lock().await;
+            // Configuration never holds the task registry across vendor awaits.
+            // Signalling first prevents any later observer registration.
             let tasks = std::mem::take(&mut *host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             for mut task in tasks {
-                if tokio::time::timeout(std::time::Duration::from_secs(5), &mut task).await.is_err() {
+                if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                     task.abort();
                     tracing::warn!(route = "shutdown", "observer did not stop within grace period");
-                    let _ = task.await;
+                    // Abort is cooperative: never await a task that may not yield.
                 }
             }
             host.config.write().await.providers.clear();
@@ -493,8 +495,15 @@ impl Host {
                 return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
             }
             let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
+            let mut unavailable_providers = BTreeMap::new();
             for instance in &instances {
-                instance.ready()?;
+                // Push list calls may repair proxied rejection; never gate them on
+                // Ready, since call() already decides whether a probe is permitted.
+                if instance.poll_interval.is_some()
+                    && let Err(error) = instance.ready()
+                {
+                    unavailable_providers.insert(instance.config.name.clone(), error);
+                }
             }
             let push_cursor = {
                 let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -505,7 +514,13 @@ impl Host {
             for instance in &instances {
                 if matches!(instance.observation, ObservationMode::Push) {
                     let rows = tokio::select! {
-                        result = instance.call(Gate::List, |p,c| async move {p.list(&c).await}) => result?,
+                        result = instance.call(Gate::List, |p,c| async move {p.list(&c).await}) => match result {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                unavailable_providers.insert(instance.config.name.clone(), error);
+                                continue;
+                            }
+                        },
                         _ = stopping.changed() => return Err(ProtocolError::Unavailable {reason: "host stopping".into(), retry_after: None}),
                     };
                     push_rows.extend(rows);
@@ -514,19 +529,32 @@ impl Host {
             {
                 // A poll's inventory and its events are committed under this same lock.
                 let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let pending = instances.iter().any(|i| i.poll_interval.is_some() && !log.inventories.contains_key(&i.config.name));
+                let pending = instances.iter().fold(false, |pending, i| {
+                    if i.poll_interval.is_none()
+                        || unavailable_providers.contains_key(&i.config.name)
+                        || log.inventories.contains_key(&i.config.name)
+                    {
+                        return pending;
+                    }
+                    if let Some(error) = i.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+                        unavailable_providers.insert(i.config.name.clone(), error);
+                        return pending;
+                    }
+                    true
+                });
                 if !pending {
-                    let mut environments: Vec<_> = log.inventories.values().flatten().map(|r| r.environment.clone()).collect();
+                    let mut environments: Vec<_> = log
+                        .inventories
+                        .iter()
+                        .filter(|(name, _)| !unavailable_providers.contains_key(*name))
+                        .flat_map(|(_, rows)| rows.iter().map(|r| r.environment.clone()))
+                        .collect();
                     environments.extend(push_rows.into_iter().map(|r| r.environment));
                     return Ok(ObserveRecord::Snapshot {
                         cursor: if has_push { push_cursor } else { format!("{}:{}", log.epoch, log.serial) },
                         environments,
+                        unavailable_providers,
                     });
-                }
-            }
-            for instance in &instances {
-                if let Some(error) = instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
-                    return Err(error);
                 }
             }
             tokio::select! {
@@ -602,7 +630,12 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
     })
 }
 async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfiguration>) -> ApiResult<StatusCode> {
-    let _transaction = host.configuring.lock().await;
+    let mut stopping = host.stopping.subscribe();
+    let _transaction = tokio::select! {
+        biased;
+        _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into()),
+        guard = host.configuring.lock() => guard,
+    };
     if *host.stopping.borrow() {
         return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
     }
@@ -650,7 +683,11 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
                 .map_err(|_| refused("invalid HTTP transport configuration"))?,
         );
         let sink = EventSink { shared: host.events.clone(), provider: p.name.clone() };
-        let provider = module.configure(p, http).await?;
+        let provider = tokio::select! {
+            biased;
+            _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into()),
+            result = module.configure(p, http) => result?,
+        };
         let (credential_changes, _) = watch::channel(credentials.clone());
         let capabilities = provider.capabilities();
         let rate_limits = provider.rate_limits();
@@ -692,10 +729,15 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
     }
     *committed = config;
     drop(committed);
+    // Serialize registration with shutdown's drain, including its stop check.
+    let mut tasks = host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *host.stopping.borrow() {
+        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+    }
     for instance in observers {
         tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner))), "provider configured");
         let task = observer::spawn(instance, host.stopping.subscribe());
-        host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(task);
+        tasks.push(task);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -950,5 +992,82 @@ mod tests {
         host.shutdown(async {}).await;
         let result = configure(State(host), ApiJson(HostConfiguration { modules: vec![], providers: vec![] })).await;
         assert!(matches!(result, Err(ApiError(ProtocolError::Unavailable { .. }))));
+    }
+    // A vendor factory that never returns must not hold shutdown behind its transaction.
+    #[tokio::test]
+    async fn shutdown_cancels_hung_configuration() {
+        struct HangingModule(Arc<tokio::sync::Notify>);
+        #[async_trait::async_trait]
+        impl module::Module for HangingModule {
+            fn version(&self) -> &str {
+                "test"
+            }
+            async fn configure(&self, _: &ProviderConfiguration, _: Arc<dyn module::HttpClient>) -> Result<Arc<dyn Provider>> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let host = Host::new(Registry::from([("hanging".into(), Arc::new(HangingModule(entered.clone())) as Arc<dyn module::Module>)]));
+        let request = serde_json::from_value(serde_json::json!({
+            "modules": [{"name":"test", "entrypoint":"hanging"}],
+            "providers": [{"name":"a", "module":"test", "settings":{}, "credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        let configuring = tokio::spawn(configure(State(host.clone()), ApiJson(request)));
+        entered.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), host.shutdown(async {}))
+            .await
+            .expect("shutdown must cancel a hung factory");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), configuring)
+            .await
+            .expect("configuration must observe shutdown")
+            .unwrap();
+        assert!(matches!(result, Err(ApiError(ProtocolError::Unavailable { .. }))));
+        assert!(host.config.read().await.providers.is_empty());
+    }
+
+    // Several uncooperative observers share one grace period, independent of count.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_observers_share_grace_period() {
+        for count in [0, 1, 4] {
+            let host = Host::new(reference::registry());
+            for _ in 0..count {
+                host.tasks.lock().unwrap().push(tokio::spawn(std::future::pending()));
+            }
+            let start = tokio::time::Instant::now();
+            host.shutdown(async {}).await;
+            assert!(start.elapsed() <= std::time::Duration::from_secs(5), "observers must share one deadline");
+        }
+    }
+    // Abort cannot force a task out of a blocking vendor poll. Shutdown returns
+    // after grace even while that observer still occupies its executor thread.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_does_not_await_aborted_non_yielding_observer() {
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        // Isolate the deliberately blocking vendor boundary from the test clock.
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            runtime.block_on(async {
+                let task = tokio::spawn(async move {
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                });
+                handle_tx.send(task).unwrap();
+                let _ = done_rx.await;
+            });
+        });
+        let host = Host::new(reference::registry());
+        host.tasks.lock().unwrap().push(handle_rx.recv().unwrap());
+        entered_rx.recv().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(6), host.shutdown(async {}))
+            .await
+            .expect("shutdown must not await abort completion");
+        drop(release_tx);
+        let _ = done_tx.send(());
+        worker.join().unwrap();
     }
 }

@@ -1818,11 +1818,21 @@
                 "enum": [
                   "snapshot"
                 ]
+              },
+              "unavailable_providers": {
+                "type": "object",
+                "description": "Providers omitted from this snapshot. Preserve their previous inventory;\nomission must not be interpreted as deletion or a billing transition.",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ProtocolError"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
               }
             }
           }
         ],
-        "description": "Hosts unable to replay emit one complete list snapshot, explicitly marking the gap."
+        "description": "Hosts unable to replay emit a snapshot marking the gap. Inventory is complete\nonly for providers absent from `unavailable_providers`."
       },
       "Period": {
         "type": "object",
