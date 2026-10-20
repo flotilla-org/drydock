@@ -30,8 +30,8 @@ def dns(address):
     packet = identifier + struct.pack("!5H", 0x100, 1, 0, 0, 0) + b"\x07example\x03com\0" + struct.pack("!2H", 1, 1)
     with socket.socket(family, socket.SOCK_DGRAM) as channel:
         channel.settimeout(3)
-        channel.connect((str(target), 53))
         try:
+            channel.connect((str(target), 53))
             channel.send(packet)
             response = channel.recv(4096)
             return response[:2] == identifier

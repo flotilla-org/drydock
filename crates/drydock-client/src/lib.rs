@@ -2,7 +2,8 @@
 //! separate from calls. Neither API stores desired state or reconciles resources.
 use drydock_protocol::*;
 use futures::{StreamExt, stream::BoxStream};
-use reqwest::{Method, Url};
+pub use reqwest::Method;
+use reqwest::Url;
 use rigging_http_client::{HttpClient, http_execute};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -51,6 +52,11 @@ impl HttpClient for SocketHttp {
     }
 }
 
+pub struct WireResponse {
+    pub status: u16,
+    pub headers: http::HeaderMap,
+    pub body: serde_json::Value,
+}
 #[derive(Clone)]
 pub struct Client {
     base: Url,
@@ -124,66 +130,66 @@ impl Client {
         }
         self.execute(request).await
     }
-    async fn execute<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
+    async fn execute_response<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<(u16, T)> {
         let request = request.timeout(self.request_timeout).build().map_err(|_| Error::InvalidRequest)?;
         let response = http_execute!(self.http, request).map_err(|_| Error::Transport)?;
-        if !response.status().is_success() {
-            return Err(Error::Protocol(serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?));
+        let status = response.status();
+        if !status.is_success() {
+            let error: ProtocolError = serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?;
+            if error.status() != status.as_u16() {
+                return Err(Error::InvalidResponse);
+            }
+            return Err(Error::Protocol(error));
         }
-        let body = if response.status() == http::StatusCode::NO_CONTENT { b"null".as_slice() } else { response.body().as_ref() };
-        serde_json::from_slice(body).map_err(|_| Error::InvalidResponse)
+        let body = if status == http::StatusCode::NO_CONTENT { b"null".as_slice() } else { response.body().as_ref() };
+        Ok((status.as_u16(), serde_json::from_slice(body).map_err(|_| Error::InvalidResponse)?))
+    }
+    async fn execute<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
+        Ok(self.execute_response(request).await?.1)
     }
     async fn get<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T> {
         self.call::<T, ()>(Method::GET, segments, None).await
     }
-    /// TCP hosts reject missing tokens and same-length tokens differing at every
-    /// position. This is a functional check, not a proof of constant-time execution.
-    /// Unix peer-credential policy must be checked by a process with another UID.
-    pub async fn authentication_check(&self) -> Result<()> {
-        let Some(token) = &self.bearer else {
-            return Ok(());
-        };
-        let mut candidates = vec![None];
-        for index in 0..token.expose().len() {
-            let mut bytes = token.expose().as_bytes().to_vec();
-            bytes[index] = if bytes[index] == b'a' { b'b' } else { b'a' };
-            if let Ok(value) = String::from_utf8(bytes) {
-                candidates.push(Some(value));
-            }
-        }
-        for candidate in candidates {
-            let mut request =
-                self.transport.get(self.base.join("v1/hello").map_err(|_| Error::InvalidRequest)?).timeout(Duration::from_secs(5));
-            if let Some(candidate) = candidate {
-                request = request.bearer_auth(candidate);
-            }
-            if request.send().await.map_err(|_| Error::Transport)?.status() != http::StatusCode::UNAUTHORIZED {
-                return Err(Error::InvalidResponse);
-            }
-        }
-        Ok(())
+    /// Replace the bearer credential while preserving the endpoint and HTTP port.
+    pub fn with_bearer(mut self, bearer: Option<Secret>) -> Self {
+        self.bearer = bearer;
+        self
+    }
+    /// The configured credential, for refresh and credential-aware callers.
+    pub fn bearer(&self) -> Option<&Secret> {
+        self.bearer.as_ref()
     }
     /// Inspect the JSON wire contract, including status and explicit null fields.
     /// Uses the same endpoint, authentication and injectable HTTP port as typed calls.
     pub async fn wire(
         &self,
-        method: &str,
+        method: Method,
         segments: &[&str],
         query: &[(&str, &str)],
         body: Option<&serde_json::Value>,
     ) -> Result<(u16, serde_json::Value)> {
-        let method = Method::from_bytes(method.as_bytes()).map_err(|_| Error::InvalidRequest)?;
+        let response = self.wire_response(method, segments, query, body).await?;
+        Ok((response.status, response.body))
+    }
+    /// Raw JSON response metadata for protocol/status/header validation.
+    pub async fn wire_response(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<WireResponse> {
         let mut request = self.request(method, segments)?.query(query).timeout(self.request_timeout);
         if let Some(body) = body {
             request = request.json(body);
         }
         let response = http_execute!(self.http, request.build().map_err(|_| Error::InvalidRequest)?).map_err(|_| Error::Transport)?;
-        let value = if response.status() == http::StatusCode::NO_CONTENT {
+        let value = if response.body().is_empty() {
             serde_json::Value::Null
         } else {
             serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?
         };
-        Ok((response.status().as_u16(), value))
+        Ok(WireResponse { status: response.status().as_u16(), headers: response.headers().clone(), body: value })
     }
     pub async fn hello(&self) -> Result<Hello> {
         let hello: Hello = self.get(&["v1", "hello"]).await?;
@@ -208,7 +214,11 @@ impl Client {
         self.get(&["v1", "providers", provider, "environments", id]).await
     }
     pub async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Environment> {
-        self.call(Method::POST, &["v1", "providers", provider, "environments"], Some(request)).await
+        Ok(self.provision_with_status(provider, request).await?.1)
+    }
+    /// Preserve creation versus re-adoption status through the common typed decoder.
+    pub async fn provision_with_status(&self, provider: &str, request: &ProvisionRequest) -> Result<(u16, Environment)> {
+        self.execute_response(self.request(Method::POST, &["v1", "providers", provider, "environments"])?.json(request)).await
     }
     pub async fn destroy(&self, provider: &str, id: &str) -> Result<()> {
         self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider, "environments", id], None).await
@@ -251,7 +261,13 @@ impl Client {
         if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
             return Err(Error::Protocol(response.json().await.map_err(|_| Error::InvalidResponse)?));
         }
-        if response.headers().get("upgrade").and_then(|h| h.to_str().ok()) != Some(protocol) {
+        if response.headers().get("upgrade").and_then(|h| h.to_str().ok()) != Some(protocol)
+            || !response
+                .headers()
+                .get("connection")
+                .and_then(|h| h.to_str().ok())
+                .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+        {
             return Err(Error::InvalidResponse);
         }
         Ok(Box::new(response.upgrade().await.map_err(|_| Error::Transport)?))

@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use drydock::{HostSpec, Supervisor, credentials::BuiltinCredentials};
-use drydock_protocol::ProvisionRequest;
+use drydock_protocol::{PrepareRequest, ProvisionRequest};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Parser)]
@@ -24,6 +24,13 @@ enum Command {
         /// Explicit consent to provision resources and incur provider charges.
         #[arg(long)]
         live: bool,
+    },
+    /// Look up or build a prepared form; stdout is the JSON used by launch/conformance.
+    Prepare {
+        host: String,
+        provider: String,
+        image_digest: String,
+        tools_digest: String,
     },
     Hosts,
     Instances,
@@ -70,7 +77,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         supervisor.request_timeout = Duration::from_secs(options.timeouts.request_seconds);
     }
     let selected = match &args.command {
-        Command::List { host, .. } | Command::Launch { host, .. } | Command::Destroy { host, .. } => Some(host),
+        Command::Prepare { host, .. } | Command::List { host, .. } | Command::Launch { host, .. } | Command::Destroy { host, .. } => {
+            Some(host)
+        }
         _ => None,
     };
     if selected.is_some_and(|name| !specs.iter().any(|s| &s.name == name)) {
@@ -116,6 +125,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if !report.passed() {
                     return Err("provider failed conformance".into());
                 }
+            }
+            Command::Prepare { provider, image_digest, tools_digest, .. } => {
+                status?;
+                instance_ready(&handle, provider)?;
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &handle
+                            .client
+                            .prepare(provider, &PrepareRequest { image_digest: image_digest.clone(), tools_digest: tools_digest.clone() })
+                            .await?
+                    )?
+                );
             }
             Command::Hosts => {
                 let current = handle.status.borrow().clone();

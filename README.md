@@ -137,10 +137,15 @@ configuration. Unix sockets, managed host binaries and authenticated loopback
 TCP hosts all use the same client and scenario list. A built-in provider can
 expose that same endpoint without a special test interface. The Rust reference
 binary and a small independent Python socket fixture run this list in CI; the
-fixture also deliberately violates each behavioural check. Existing deterministic
-polling, Unix peer-credential and TCP upgrade tests remain in the host suite.
+fixture also deliberately violates each reported check. The checked-in
+[`broken-matrix.json`](crates/drydock-host/tests/fixtures/broken-matrix.json)
+must exactly match the healthy full report: removing a verdict fails CI too.
+Endpoint scenarios own deterministic polling, lifecycle sequences, provider
+isolation, typed errors, optional operations and stream upgrades. Unix admission
+and TCP bearer scenarios use the same endpoint client; host-internal poll races
+remain implementation tests.
 
-For example, after preparing an image through the provider:
+For example, choose the image and tools digests in the request:
 
 ```json
 {
@@ -187,8 +192,11 @@ individual verdicts, elapsed resource exposure, provider-reported usage for the
 run period, before/after quota, and a credit delta when available in the same
 unit. Missing cost data is `null`, never an assertion of zero spend. These account
 figures can include concurrent workloads and delayed vendor accounting; they are
-not a monetary estimate. Preparation is explicit so the operator controls the
-image, tools and preparation spend. Live Daytona and then Namespace validation
+not a monetary estimate. The runner prepares the selected image/tools digests twice and checks
+look-up-or-build identity before provisioning; the input prepared ID is replaced.
+Operators can also obtain a complete prepared form with
+`drydock --config hosts.json prepare HOST NAME IMAGE_DIGEST TOOLS_DIGEST`.
+Preparation can incur provider charges. Live Daytona and then Namespace validation
 are operator runs once their modules and test credentials exist.
 
 For slow providers, add an optional `timeouts` object to `probe.json`. Defaults
@@ -235,12 +243,51 @@ exec can supply the probe through a guest bridge when that tooling is available;
 currently this check requires exec and cannot silently pass without it.
 
 TCP authentication checks reject absent tokens and tokens changed at each byte
-position. Constant-time execution additionally requires source review: network
-timing tests cannot prove it. The Rust host delegates to pinned
-`rigging-http-serve`, which compares fixed-length SHA-256 digests using
-`subtle::ConstantTimeEq`; the independent fixture uses `hmac.compare_digest`.
-Other hosts must provide equivalent source evidence alongside their run. Unix
-peer rejection still runs under a mismatched UID in the host tests. Explicit-null
-checks inspect raw JSON, while typed decoders check event timestamp/source,
-granted sizes and loss enums. The runner owns usage/quota range validation
-rather than trusting a successful decode of floating-point fields.
+position through the injected HTTP client and configured request timeout. A Unix
+endpoint without a bearer reports that this scenario needs a bearer fixture;
+it cannot silently pass. The separate `unix_peer_admission` endpoint scenario
+requires a client connected as an unauthorized UID.
+
+Select groups with `"scenarios": ["prepare", "lifecycle", "observation", "destroy"]`.
+The available groups are `capabilities`, `authentication`, `prepare`, `lifecycle`,
+`observation`, `semantics`, `nulls`, `reach`, `refusal`, `egress`, `destroy`,
+`metering`, and `host_fixtures`. An omitted/empty list selects the provider suite
+excluding host fixtures. Dependencies (for example provisioning for observation)
+are still run; unrelated verdicts are omitted. A capabilities-only selection
+allocates nothing. The full reference/independent-host CI profile selects all.
+
+`host_fixtures` is for disposable host validation: supply `fixture_configuration`
+with two fixture-capable providers. It exercises configuration atomicity,
+credential refresh, all typed error classes/statuses/retry headers, provider
+isolation, modelled create/delete sequences, stream upgrades, and deterministic
+poll recovery, timestamps, pause/halt billing and typed loss causes. Its exec
+control vocabulary is `drydock-fixture` plus `null_environment`, `forget`,
+`state`, `timestamp`, `inventory_error`, or `pause`. Reference settings must
+explicitly enable `fixture`; vendor providers must not enable this profile.
+
+Environment null checks require a genuinely unlabeled environment with unknown
+granted size: use the fixture profile or supply `null_environment_id`. Without
+such evidence the verdict fails. Quota nulls are checked separately. Each invalid
+CPU, memory, disk, destination and usage-period request gets its own verdict.
+Billing checks require the exact stopped cause and vendor usage facts over a
+sample window (`billing_sample_millis`, default 25); use a distinct granted size
+and an idle account so aggregate usage does not mix in another running guest.
+Providers with delayed accounting may need a longer window.
+
+Constant-time authentication has an executable evidence requirement:
+`auth_audit: ["/absolute/path/to/audit", ...]`. Missing or unsuccessful evidence
+fails `authentication_constant_time`. Network timing cannot prove constant-time
+machine execution. CI runs [`tools/auth-audit.py`](tools/auth-audit.py) against
+the exact linked Rust admission source (fixed-size SHA-256 plus
+`ConstantTimeEq`) and the Python comparator source actually loaded by its host
+(`hmac.compare_digest`). Equality mutations fail the audit; endpoint probes
+exercise the real admission path. Other language hosts supply an equivalent
+audit of their loaded comparator.
+
+CI also executes the real guest egress script, including denied UDP-connect
+handling, and real TCP, WebSocket, SSH and relay recipe exchanges. Wrong tokens,
+SSH pins and corrupt relay bytes fail the exact reach verdict. The fixture
+[`tools/recipe-probe.py`](tools/recipe-probe.py) speaks the fixture echo-agent
+protocol; production agents provide their own round-trip executable through
+`reach_probe`. Additional transport/probe fault coverage is listed in
+[`boundary-matrix.json`](crates/drydock-host/tests/fixtures/boundary-matrix.json).

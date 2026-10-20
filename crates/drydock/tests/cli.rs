@@ -32,15 +32,16 @@ async fn cli_lifecycle_against_reference_host() {
                 .output()
                 .await
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
             String::from_utf8(output.stdout).unwrap()
         }
     };
     assert!(run(vec!["hosts".into()]).await.contains("ready"));
     assert!(run(vec!["instances".into()]).await.contains("\"instance\":\"a\""));
     let client = drydock::client::Client::unix(socket).unwrap();
-    let prepared =
-        client.prepare("a", &PrepareRequest { image_digest: "sha256:image".into(), tools_digest: "sha256:tools".into() }).await.unwrap();
+    let prepared: Prepared =
+        serde_json::from_str(&run(vec!["prepare".into(), "rust".into(), "a".into(), "sha256:image".into(), "sha256:tools".into()]).await)
+            .unwrap();
     let request = dir.path().join("launch.json");
     std::fs::write(
         &request,
@@ -62,10 +63,23 @@ async fn cli_lifecycle_against_reference_host() {
         request: ProvisionRequest {
             label: "cli-conformance".into(),
             prepared: client.prepare("a", &PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }).await.unwrap(),
-            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            size: Size { cpus: 2., memory_bytes: 1024, disk_bytes: 0 },
             egress: EgressRequest::default(),
             ssh_public_key: None,
         },
+        scenarios: vec![
+            drydock::conformance::Scenario::Prepare,
+            drydock::conformance::Scenario::Lifecycle,
+            drydock::conformance::Scenario::Observation,
+            drydock::conformance::Scenario::Reach,
+            drydock::conformance::Scenario::Refusal,
+            drydock::conformance::Scenario::Destroy,
+            drydock::conformance::Scenario::Metering,
+        ],
+        fixture_configuration: None,
+        billing_sample_millis: 25,
+        null_environment_id: None,
+        auth_audit: None,
         timeouts: Default::default(),
         echo_relay: true,
         reach_probe: None,
