@@ -1,5 +1,5 @@
 //! In-memory conformance module. Relay echoes; exec supports cat/echo without a subprocess.
-use crate::module::*;
+use crate::{RecoverLock, module::*};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use std::{
@@ -51,13 +51,7 @@ struct Memory {
 
 impl Reference {
     fn find(&self, id: &str) -> Result<Environment> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .environments
-            .get(id)
-            .cloned()
-            .ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })
+        self.state.recover().environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })
     }
     fn check(&self) -> Result<()> {
         if let Some(e) = &self.settings.fault { Err(e.clone()) } else { Ok(()) }
@@ -70,6 +64,9 @@ impl Provider for Reference {
     }
     fn observation(&self) -> ObservationMode {
         ObservationMode::Poll { interval: Duration::from_millis(self.settings.poll_interval_ms) }
+    }
+    fn operations(&self) -> Operations<'_> {
+        Operations { exec: Some(self), suspend_resume: Some(self), export: Some(self), usage: Some(self), quota: Some(self) }
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -87,7 +84,7 @@ impl Provider for Reference {
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {
         self.check()?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.recover();
         let n = state.prepared.len() + 1;
         Ok(state
             .prepared
@@ -102,7 +99,7 @@ impl Provider for Reference {
     }
     async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
         self.check()?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.recover();
         if let Some(s) = state.environments.values().find(|s| s.label.as_deref() == Some(&r.label)) {
             return Ok(Provisioned::Existing(s.clone()));
         }
@@ -126,7 +123,7 @@ impl Provider for Reference {
     }
     async fn list(&self, _: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.check()?;
-        Ok(self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).environments.values().cloned().map(Into::into).collect())
+        Ok(self.state.recover().environments.values().cloned().map(Into::into).collect())
     }
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
         self.check()?;
@@ -134,7 +131,7 @@ impl Provider for Reference {
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.recover();
         state.environments.remove(id);
         state.tokens.remove(id);
         Ok(())
@@ -154,6 +151,10 @@ impl Provider for Reference {
         });
         Ok(Box::new(client))
     }
+}
+
+#[async_trait::async_trait]
+impl Exec for Reference {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
         if r.command == ["cat"] {
             return self.relay(id, c).await;
@@ -171,9 +172,13 @@ impl Provider for Reference {
         });
         Ok(Box::new(client))
     }
+}
+
+#[async_trait::async_trait]
+impl SuspendResume for Reference {
     async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
         self.check()?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.recover();
         let mut s = state.environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })?;
         if matches!(s.state, Observation::Stopped { .. }) {
             return state.tokens.get(id).cloned().ok_or_else(|| refused("missing resume token"));
@@ -186,7 +191,7 @@ impl Provider for Reference {
     }
     async fn resume(&self, id: &str, token: ResumeToken, _: &Credentials) -> Result<()> {
         self.check()?;
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.recover();
         if !state.environments.contains_key(id) {
             return Err(ProtocolError::NotFound { reason: "unknown environment".into() });
         }
@@ -197,28 +202,34 @@ impl Provider for Reference {
             Observation::Running;
         Ok(())
     }
+}
+
+#[async_trait::async_trait]
+impl ExportOperation for Reference {
     async fn export(&self, id: &str, _: &Credentials) -> Result<Export> {
         self.check()?;
         self.find(id)?;
         Ok(Export { reference: format!("memory://{}/{id}", self.name) })
     }
+}
+
+#[async_trait::async_trait]
+impl UsageOperation for Reference {
     async fn usage(&self, period: Period, _: &Credentials) -> Result<Usage> {
         self.check()?;
         Ok(Usage { period, environment_hours: vec![] })
     }
+}
+
+#[async_trait::async_trait]
+impl QuotaOperation for Reference {
     async fn quota(&self, _: &Credentials) -> Result<Quota> {
         self.check()?;
         Ok(Quota {
             credits_remaining: None,
             credit_unit: None,
             concurrency_in_use: Some(
-                self.state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .environments
-                    .values()
-                    .filter(|s| matches!(s.state, Observation::Running))
-                    .count() as u64,
+                self.state.recover().environments.values().filter(|s| matches!(s.state, Observation::Running)).count() as u64,
             ),
             concurrency_limit: None,
         })

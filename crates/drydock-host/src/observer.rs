@@ -58,15 +58,15 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             let Some(instance) = weak.upgrade() else {
                 break;
             };
-            let generation = instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner).generation;
+            let generation = instance.auth.recover().generation;
             let rows = tokio::select! {
                 result = instance.call_with_budget(Gate::List, true, |p,c| async move { p.list(&c).await }) => match result {
                     Ok(rows) => rows,
                     Err(error) => {
                         tracing::warn!(provider = %instance.config.name, route = "poll", error_class = error.class(), "poll failed; retaining inventory");
-                        let auth = instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if auth.generation == generation {
-                            *instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                        let auth = instance.auth.recover();
+                        if auth.generation == generation && !auth.rejected {
+                            *instance.poll_error.recover() = Some(error);
                         }
                         drop(auth);
                         instance.events.shared.changed.send_modify(|_| {});
@@ -75,7 +75,6 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 },
                 _ = stopping.changed() => break,
             };
-            *instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             reconcile(&instance, &mut seen, rows);
         }
     })
@@ -85,7 +84,7 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironmen
     let mut pending = vec![];
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.environment.id.clone(), row)).collect();
     {
-        let mut inspected = instance.inspected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inspected = instance.inspected.recover();
         for (id, row) in &mut current {
             if row.timestamp.is_none() {
                 row.timestamp = inspected.get(id).filter(|old| old.environment == row.environment).and_then(|old| old.timestamp);
@@ -130,7 +129,7 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironmen
             pending.push((id.clone(), s.label.clone(), row.timestamp, kind));
         }
     }
-    let mut destroyed = instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut destroyed = instance.destroyed.recover();
     let mut deferred = vec![];
     for (id, row) in seen.iter() {
         if !current.contains_key(id) && !matches!(row.environment.state, Observation::Gone { .. }) {

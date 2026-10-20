@@ -20,6 +20,17 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
+trait RecoverLock<T> {
+    fn recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> RecoverLock<T> for Mutex<T> {
+    fn recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One deadline for every push list in an initial or recovery snapshot.
+pub const PUSH_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const EVENT_HISTORY_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
@@ -41,7 +52,7 @@ struct Log {
 impl EventSink {
     /// Publish an observation. The host supplies the provider and opaque ordered cursor.
     pub fn publish(&self, id: String, label: Option<String>, timestamp: Option<chrono::DateTime<chrono::Utc>>, event: EventKind) {
-        let mut log = self.shared.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = self.shared.log.recover();
         Self::append(&mut log, &self.provider, id, label, timestamp, event);
         self.shared.changed.send_replace(log.serial);
     }
@@ -70,7 +81,7 @@ impl EventSink {
         }
     }
     fn commit(&self, rows: Vec<ObservedEnvironment>, events: Vec<PendingEvent>) {
-        let mut log = self.shared.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = self.shared.log.recover();
         log.inventories.insert(self.provider.clone(), rows);
         for (id, label, timestamp, event) in events {
             Self::append(&mut log, &self.provider, id, label, timestamp, event);
@@ -91,6 +102,7 @@ struct Instance {
     auth: Mutex<Authentication>,
     capabilities: Capabilities,
     rate_limits: Vec<RateLimit>,
+    poll_waiting: Mutex<BTreeSet<String>>,
     budget: Mutex<BTreeMap<String, VecDeque<tokio::time::Instant>>>,
     events: EventSink,
     observation: ObservationMode,
@@ -114,7 +126,7 @@ impl DestroyAttempt {
     fn begin(instance: Arc<Instance>, id: String) -> Self {
         let active = instance.poll_interval.is_some();
         if active {
-            instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(id.clone()).or_default().pending += 1;
+            instance.destroyed.recover().entry(id.clone()).or_default().pending += 1;
         }
         Self { instance, id, active }
     }
@@ -122,7 +134,7 @@ impl DestroyAttempt {
         if !self.active {
             return;
         }
-        let mut states = self.instance.destroyed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut states = self.instance.destroyed.recover();
         if let Some(state) = states.get_mut(&self.id) {
             state.pending -= 1;
             state.confirmed |= confirmed;
@@ -213,10 +225,15 @@ impl Instance {
         self.availability(auth).readiness
     }
     fn ready(&self) -> Result<()> {
-        let auth = self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let auth = self.auth.recover();
         if matches!(self.readiness(&auth), Readiness::Ready) {
             Ok(())
         } else {
+            if auth.rejected
+                && let Some(error @ ProtocolError::CredentialRejected { .. }) = self.poll_error.recover().clone()
+            {
+                return Err(error);
+            }
             Err(ProtocolError::Unavailable { reason: "provider is not ready; inspect hello".into(), retry_after: None })
         }
     }
@@ -227,7 +244,10 @@ impl Instance {
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
-        self.call_with_budget(gate, false, f).await
+        use tracing::Instrument;
+        self.call_with_budget(gate, false, f)
+            .instrument(tracing::info_span!("provider_route", provider = %self.config.name, route = gate.name()))
+            .await
     }
     /// Resolve readiness, gate cached capabilities, enforce declared budgets, invoke,
     /// and update credential rejection state once for every route and host poll.
@@ -238,7 +258,7 @@ impl Instance {
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
         let (credentials, generation) = {
-            let auth = self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let auth = self.auth.recover();
             if !self.availability(&auth).may_call {
                 return Err(ProtocolError::Unavailable { reason: "provider is not ready; inspect hello".into(), retry_after: None });
             }
@@ -252,9 +272,12 @@ impl Instance {
         if let Err(error) = &result {
             tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), "provider call failed");
         }
-        let mut auth = self.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut auth = self.auth.recover();
         let before = self.readiness(&auth);
         if auth.generation == generation {
+            if poll {
+                *self.poll_error.recover() = result.as_ref().err().cloned();
+            }
             if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
                 auth.rejected = true;
                 auth.generation += 1; // invalidate every call started before this rejection
@@ -275,11 +298,18 @@ impl Instance {
         )
     }
     fn reserve(&self, operation: &'static str, poll: bool) -> Result<()> {
-        let mut budget = self.budget.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut budget = self.budget.recover();
+        let mut waiting = self.poll_waiting.recover();
         let now = tokio::time::Instant::now();
         let limits: Vec<_> = self.rate_limits.iter().filter(|r| r.operation == operation || r.operation == "*").collect();
         for limit in &limits {
             let longest = self.longest_window(&limit.operation);
+            if !poll && limit.requests == 1 && waiting.contains(&limit.operation) {
+                return Err(ProtocolError::RateLimited {
+                    reason: "slot reserved for pending observation".into(),
+                    retry_after: Some(limit.period_seconds),
+                });
+            }
             if poll {
                 let window = std::time::Duration::from_secs(limit.period_seconds);
                 let times = budget.entry(format!("poll:{}", limit.operation)).or_default();
@@ -298,6 +328,9 @@ impl Instance {
             let window = std::time::Duration::from_secs(limit.period_seconds);
             let active: Vec<_> = times.iter().filter(|at| now.duration_since(**at) < window).collect();
             if active.len() >= limit.requests as usize {
+                if poll && limit.requests == 1 {
+                    waiting.insert(limit.operation.clone());
+                }
                 let remaining = window.saturating_sub(now.duration_since(*active[0]));
                 return Err(ProtocolError::RateLimited {
                     reason: "declared provider rate limit".into(),
@@ -308,6 +341,7 @@ impl Instance {
         let scopes: BTreeSet<_> = limits.iter().map(|limit| limit.operation.clone()).collect();
         for scope in scopes {
             if poll {
+                waiting.remove(&scope);
                 budget.entry(format!("poll:{scope}")).or_default().push_back(now);
             }
             budget.entry(scope).or_default().push_back(now);
@@ -435,7 +469,7 @@ impl Host {
             host.stopping.send_replace(true);
             // Configuration never holds the task registry across vendor awaits.
             // Signalling first prevents any later observer registration.
-            let tasks = std::mem::take(&mut *host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            let tasks = std::mem::take(&mut *host.tasks.recover());
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             for mut task in tasks {
                 if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
@@ -459,16 +493,11 @@ impl Host {
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
-        use tracing::Instrument;
-        self.instance(name)
-            .await?
-            .call(gate, f)
-            .instrument(tracing::info_span!("provider_route", provider = name, route = gate.name()))
-            .await
+        self.instance(name).await?.call(gate, f).await
     }
     async fn records(&self, cursor: Option<&str>) -> Result<Vec<ObserveRecord>> {
         let replay = {
-            let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let log = self.events.log.recover();
             cursor.and_then(|c| {
                 let serial = c.strip_prefix(&format!("{}:", log.epoch))?.parse::<u64>().ok()?;
                 let oldest = log.serial - log.records.len() as u64;
@@ -493,12 +522,42 @@ impl Host {
     async fn snapshot(&self) -> Result<ObserveRecord> {
         let mut changed = self.events.changed.subscribe();
         let mut stopping = self.stopping.subscribe();
+        if *stopping.borrow() {
+            return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
+        }
+        let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
+        let mut unavailable_providers = BTreeMap::new();
+        let push_cursor = {
+            let log = self.events.log.recover();
+            format!("{}:{}", log.epoch, log.serial)
+        };
+        let has_push = instances.iter().any(|i| matches!(i.observation, ObservationMode::Push));
+        let deadline = tokio::time::Instant::now() + PUSH_SNAPSHOT_TIMEOUT;
+        let lists = instances.iter().filter(|i| matches!(i.observation, ObservationMode::Push)).map(|instance| async move {
+            let result = tokio::time::timeout_at(deadline, instance.call(Gate::List, |p, c| async move { p.list(&c).await }))
+                .await
+                .unwrap_or_else(|_| Err(ProtocolError::Unavailable { reason: "snapshot list timed out".into(), retry_after: None }));
+            (instance.config.name.clone(), result)
+        });
+        let results = tokio::select! {
+            results = futures::future::join_all(lists) => results,
+            _ = stopping.changed() => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }),
+        };
+        let mut push_rows = vec![];
+        for (name, result) in results {
+            match result {
+                Ok(rows) => push_rows.extend(rows),
+                Err(error) => {
+                    unavailable_providers.insert(name, error);
+                }
+            }
+        }
+        let push_errors = unavailable_providers;
         loop {
             if *stopping.borrow() {
                 return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
             }
-            let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
-            let mut unavailable_providers = BTreeMap::new();
+            let mut unavailable_providers = push_errors.clone();
             for instance in &instances {
                 // Push list calls may repair proxied rejection; never gate them on
                 // Ready, since call() already decides whether a probe is permitted.
@@ -508,30 +567,9 @@ impl Host {
                     unavailable_providers.insert(instance.config.name.clone(), error);
                 }
             }
-            let push_cursor = {
-                let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                format!("{}:{}", log.epoch, log.serial)
-            };
-            let has_push = instances.iter().any(|i| matches!(i.observation, ObservationMode::Push));
-            let mut push_rows = vec![];
-            for instance in &instances {
-                if matches!(instance.observation, ObservationMode::Push) {
-                    let rows = tokio::select! {
-                        result = instance.call(Gate::List, |p,c| async move {p.list(&c).await}) => match result {
-                            Ok(rows) => rows,
-                            Err(error) => {
-                                unavailable_providers.insert(instance.config.name.clone(), error);
-                                continue;
-                            }
-                        },
-                        _ = stopping.changed() => return Err(ProtocolError::Unavailable {reason: "host stopping".into(), retry_after: None}),
-                    };
-                    push_rows.extend(rows);
-                }
-            }
             {
                 // A poll's inventory and its events are committed under this same lock.
-                let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let log = self.events.log.recover();
                 let mut pending = false;
                 for i in &instances {
                     if i.poll_interval.is_none()
@@ -540,7 +578,7 @@ impl Host {
                     {
                         continue;
                     }
-                    if let Some(error) = i.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+                    if let Some(error) = i.poll_error.recover().clone() {
                         unavailable_providers.insert(i.config.name.clone(), error);
                         continue;
                     }
@@ -553,7 +591,7 @@ impl Host {
                         .filter(|(name, _)| !unavailable_providers.contains_key(*name))
                         .flat_map(|(_, rows)| rows.iter().map(|r| r.environment.clone()))
                         .collect();
-                    environments.extend(push_rows.into_iter().map(|r| r.environment));
+                    environments.extend(push_rows.iter().map(|r| r.environment.clone()));
                     return Ok(ObserveRecord::Snapshot {
                         cursor: if has_push { push_cursor } else { format!("{}:{}", log.epoch, log.serial) },
                         environments,
@@ -627,7 +665,7 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
                 provider: name.clone(),
                 module: i.config.module.clone(),
                 capabilities: i.capabilities.clone(),
-                readiness: i.readiness(&i.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
+                readiness: i.readiness(&i.auth.recover()),
                 rate_limits: i.rate_limits.clone(),
             })
             .collect(),
@@ -677,6 +715,9 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
             continue;
         }
         let module = &host.registry[&modules[&p.module]];
+        if matches!(&p.credential, CredentialMode::Proxied { placeholder_token, .. } if placeholder_token.expose().is_empty()) {
+            return Err(refused("empty proxy placeholder token").into());
+        }
         let credentials = Credentials::new(p.credential.clone());
         let proxy = match &p.credential {
             CredentialMode::Proxied { proxy_url, .. } => Some(proxy_url.as_str()),
@@ -694,6 +735,15 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         };
         let (credential_changes, _) = watch::channel(credentials.clone());
         let capabilities = provider.capabilities();
+        let ports = provider.operations();
+        if capabilities.fallback_runner != ports.exec.is_some()
+            || capabilities.suspend_resume != ports.suspend_resume.is_some()
+            || capabilities.export != ports.export.is_some()
+            || capabilities.usage != ports.usage.is_some()
+            || capabilities.quota != ports.quota.is_some()
+        {
+            return Err(refused("capabilities must match optional operation ports").into());
+        }
         let rate_limits = provider.rate_limits();
         if rate_limits.iter().any(|r| r.requests == 0 || r.period_seconds == 0) {
             return Err(refused("invalid declared rate limit").into());
@@ -713,6 +763,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
                 poll_interval,
                 poll_error: Mutex::new(None),
                 credential_changes,
+                poll_waiting: Mutex::new(BTreeSet::new()),
                 budget: Mutex::new(BTreeMap::new()),
                 destroyed: Mutex::new(BTreeMap::new()),
                 inspected: Mutex::new(BTreeMap::new()),
@@ -734,12 +785,12 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
     *committed = config;
     drop(committed);
     // Serialize registration with shutdown's drain, including its stop check.
-    let mut tasks = host.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut tasks = host.tasks.recover();
     if *host.stopping.borrow() {
         return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
     }
     for instance in observers {
-        tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner))), "provider configured");
+        tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
         let task = observer::spawn(instance, host.stopping.subscribe());
         tasks.push(task);
     }
@@ -751,7 +802,7 @@ async fn credential(
     ApiJson(refresh): ApiJson<CredentialRefresh>,
 ) -> ApiResult<StatusCode> {
     let instance = host.instance(&p).await?;
-    let mut auth = instance.auth.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut auth = instance.auth.recover();
     if !matches!(auth.credentials.mode, CredentialMode::Direct { .. }) {
         return Err(refused("proxied provider cannot accept direct credentials").into());
     }
@@ -759,7 +810,7 @@ async fn credential(
     auth.credentials.value = Some(refresh.value);
     auth.generation += 1;
     auth.rejected = false;
-    *instance.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *instance.poll_error.recover() = None;
     instance.credential_changes.send_replace(auth.credentials.clone());
     let after = instance.readiness(&auth);
     if before != after {
@@ -789,7 +840,7 @@ async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, Strin
     let instance = h.instance(&p).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&id, &c).await }).await?;
     if row.timestamp.is_some() && instance.poll_interval.is_some() {
-        instance.inspected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(row.environment.id.clone(), row.clone());
+        instance.inspected.recover().insert(row.environment.id.clone(), row.clone());
     }
     Ok(Json(row.environment))
 }
@@ -816,18 +867,31 @@ async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
     Ok(Json(reach))
 }
 async fn suspend(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<ResumeToken>> {
-    Ok(Json(h.call(&p, Gate::Suspend, |p, c| async move { p.suspend(&id, &c).await }).await?))
+    Ok(Json(
+        h.call(
+            &p,
+            Gate::Suspend,
+            |p, c| async move { p.operations().suspend_resume.expect("validated operation port").suspend(&id, &c).await },
+        )
+        .await?,
+    ))
 }
 async fn resume(
     State(h): State<Host>,
     ApiPath((p, id)): ApiPath<(String, String)>,
     ApiJson(token): ApiJson<ResumeToken>,
 ) -> ApiResult<StatusCode> {
-    h.call(&p, Gate::Resume, |p, c| async move { p.resume(&id, token, &c).await }).await?;
+    h.call(&p, Gate::Resume, |p, c| async move {
+        p.operations().suspend_resume.expect("validated operation port").resume(&id, token, &c).await
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {
-    Ok(Json(h.call(&p, Gate::Export, |p, c| async move { p.export(&id, &c).await }).await?))
+    Ok(Json(
+        h.call(&p, Gate::Export, |p, c| async move { p.operations().export.expect("validated operation port").export(&id, &c).await })
+            .await?,
+    ))
 }
 async fn usage(
     State(h): State<Host>,
@@ -835,10 +899,13 @@ async fn usage(
     query: std::result::Result<Query<Period>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Json<Usage>> {
     let Query(period) = query.map_err(|_| refused("invalid usage period"))?;
-    Ok(Json(h.call(&p, Gate::Usage, |p, c| async move { p.usage(period, &c).await }).await?))
+    Ok(Json(
+        h.call(&p, Gate::Usage, |p, c| async move { p.operations().usage.expect("validated operation port").usage(period, &c).await })
+            .await?,
+    ))
 }
 async fn quota(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Quota>> {
-    Ok(Json(h.call(&p, Gate::Quota, |p, c| async move { p.quota(&c).await }).await?))
+    Ok(Json(h.call(&p, Gate::Quota, |p, c| async move { p.operations().quota.expect("validated operation port").quota(&c).await }).await?))
 }
 
 fn validate_upgrade(request: &Request, protocol: &str) -> Result<()> {
@@ -899,7 +966,11 @@ async fn relay(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
     Ok(upgrade(on, "drydock-relay", stream, h.stopping.subscribe()))
 }
 async fn exec(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>, request: ExecUpgrade) -> ApiResult<Response> {
-    let stream = h.call(&p, Gate::Exec, |p, c| async move { p.exec(&id, request.command, &c).await }).await?;
+    let stream =
+        h.call(&p, Gate::Exec, |p, c| async move {
+            p.operations().exec.expect("validated operation port").exec(&id, request.command, &c).await
+        })
+        .await?;
     Ok(upgrade(request.upgrade, "drydock-stream", stream, h.stopping.subscribe()))
 }
 #[derive(Deserialize)]
@@ -1109,5 +1180,144 @@ mod tests {
         assert!(host.config.read().await.providers.is_empty());
         assert!(host.tasks.lock().unwrap().is_empty());
         assert!(committed_state.await.unwrap(), "a stopping configure must never commit providers");
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+    use module::*;
+
+    // A basic adapter supplies only core operations, without optional method stubs.
+    struct Basic(Arc<dyn Provider>, bool);
+    #[async_trait::async_trait]
+    impl Provider for Basic {
+        fn observation(&self) -> ObservationMode {
+            self.0.observation()
+        }
+        fn capabilities(&self) -> Capabilities {
+            let mut c = self.0.capabilities();
+            if self.1 {
+                return c;
+            }
+            c.fallback_runner = false;
+            c.suspend_resume = false;
+            c.export = false;
+            c.usage = false;
+            c.quota = false;
+            c
+        }
+        async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+            self.0.prepare(r, c).await
+        }
+        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+            self.0.provision(r, c).await
+        }
+        async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
+            self.0.list(c).await
+        }
+        async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+            self.0.inspect(id, c).await
+        }
+        async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
+            self.0.destroy(id, c).await
+        }
+        async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
+            self.0.reach(id, c).await
+        }
+        async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
+            self.0.relay(id, c).await
+        }
+    }
+
+    struct BasicModule(bool);
+    #[async_trait::async_trait]
+    impl Module for BasicModule {
+        fn version(&self) -> &str {
+            "test"
+        }
+        async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+            Ok(Arc::new(Basic(reference::ReferenceModule.configure(config, http).await?, self.0)))
+        }
+    }
+
+    // Registration accepts a core-only module and transactionally refuses a
+    // module advertising optional capabilities without the corresponding ports.
+    #[tokio::test]
+    async fn registration_requires_matching_operation_ports() {
+        for advertise in [false, true] {
+            let host = Host::new(Registry::from([("basic".into(), Arc::new(BasicModule(advertise)) as Arc<dyn Module>)]));
+            let request = serde_json::from_value(serde_json::json!({
+                "modules": [{"name":"memory", "entrypoint":"basic"}],
+                "providers": [{"name":"a", "module":"memory", "settings":{},
+                    "credential":{"mode":"direct","credential_reference":"test"}}]
+            }))
+            .unwrap();
+            let result = configure(State(host.clone()), ApiJson(request)).await;
+            assert_eq!(result.is_ok(), !advertise);
+            assert_eq!(host.config.read().await.providers.is_empty(), advertise);
+            if advertise {
+                assert!(matches!(result, Err(ApiError(ProtocolError::Refused { .. }))));
+            }
+            host.shutdown(async {}).await;
+        }
+    }
+
+    async fn instance(operation: &str) -> Arc<Instance> {
+        let host = Host::new(reference::registry());
+        let request = serde_json::from_value(serde_json::json!({
+            "modules": [{"name":"memory", "entrypoint":"reference"}],
+            "providers": [{"name":"a", "module":"memory", "settings":{"rate_limits":[{"operation":operation,"requests":1,"period_seconds":1}]},
+                "credential":{"mode":"direct","credential_reference":"test"}}]
+        })).unwrap();
+        configure(State(host.clone()), ApiJson(request)).await.map_err(|e| e.0).unwrap();
+        // Exercise admission deterministically without the automatic observation loop.
+        for task in host.tasks.recover().drain(..) {
+            task.abort();
+        }
+        credential(State(host.clone()), ApiPath("a".into()), ApiJson(CredentialRefresh { value: Secret::new("token") }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        tokio::task::yield_now().await;
+        host.instance("a").await.unwrap()
+    }
+
+    // A denied single-slot poll reserves the next free slot, even when routes
+    // arrive first every window. Routes regain the slot after observation succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn single_slot_poll_cannot_starve() {
+        for scope in ["list", "*"] {
+            let i = instance(scope).await;
+            for _ in 0..3 {
+                assert!(i.reserve("list", false).is_ok());
+                assert!(matches!(i.reserve("list", true), Err(ProtocolError::RateLimited { .. })));
+                tokio::time::advance(std::time::Duration::from_secs(2)).await;
+                assert!(matches!(i.reserve("list", false), Err(ProtocolError::RateLimited { .. })));
+                assert!(i.reserve("list", true).is_ok());
+                tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    // The same host gate refuses absent optional operations without entering a
+    // provider. Core-only adapters remain usable through Arc<dyn Provider>.
+    #[tokio::test]
+    async fn basic_provider_needs_no_optional_stubs() {
+        let mut i = instance("list").await;
+        let i = Arc::get_mut(&mut i).unwrap();
+        i.provider = Arc::new(Basic(i.provider.clone(), false));
+        i.capabilities = i.provider.capabilities();
+        assert!(
+            i.call(Gate::Prepare, |p, c| async move {
+                p.prepare(PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }, &c).await
+            })
+            .await
+            .is_ok()
+        );
+        for gate in [Gate::Exec, Gate::Suspend, Gate::Resume, Gate::Export, Gate::Usage, Gate::Quota] {
+            let result: Result<()> = i.call(gate, |_, _| async { panic!("unsupported port must never be invoked") }).await;
+            assert!(matches!(result, Err(ProtocolError::Refused { .. })));
+        }
     }
 }

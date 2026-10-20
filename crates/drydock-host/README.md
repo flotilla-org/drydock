@@ -41,6 +41,16 @@ holds no provider operation lock.** Concurrent prepare, inspect, list, snapshot
 and credential refresh calls remain independent. Stateful modules synchronize
 only their own data; the reference uses a short internal Mutex with no await.
 
+`Provider` contains the core lifecycle and inventory operations. Optional operations
+are borrowed ports returned by `operations()`: `Exec`, `SuspendResume`,
+`ExportOperation`, `UsageOperation`, and `QuotaOperation`. The default is an empty
+`Operations`, so a basic provider implements no optional methods. Implement only
+the supported traits, returning `Some(self)` (or a separate adapter) for those ports.
+Registration refuses a mismatch between ports and capability flags. Both declarations
+must stay stable for the configured lifetime. The host remains the single capability
+gate; ports contain no unsupported defaults. All ports are object-safe, `Send + Sync`,
+and use `&self`. Push providers retain the post-commit `run(PushContext)` hook.
+
 Factories validate settings before commit and must not publish or start detached
 work while configuring. The reference parses a typed settings struct, accepts an
 optional `poll_interval_ms` (positive, default 10) and `fault: <ProtocolError>` for
@@ -90,7 +100,11 @@ within declared list/global limits and skips missed ticks. Observation gets at
 most half the long-run list/global rate and max(1, requests/2) slots per window;
 route calls share the total budget and can use the remaining slots. An indivisible
 one-request window is polled at most every two windows: a route immediately after
-that single poll can still receive 429 until the shared window expires. The first
+that single poll can still receive 429 until the shared window expires. If route
+traffic consumes a single-slot window before a due poll, the host reserves the next
+free slot for that pending observation. Routes may receive 429 until the next poll
+attempt takes the slot; this prevents steady route traffic from starving observation.
+The first
 poll is eligible immediately; Direct credential delivery wakes observation, so a
 large steady-state interval does not delay the first snapshot. Failed or unready lists preserve prior state and never report
 resources gone. Successful complete lists emit Created/Running, Stopped/Paused,
@@ -117,6 +131,13 @@ Before a provider's first successful poll, a snapshot waits for observation or
 marks that provider's typed failure. With neither cache nor a failure, it waits for
 an observation, an error, or host shutdown. Later transient poll failures retain the inventory.
 Push snapshot cursors precede provider listing to replay overlapping events.
+Independent push lists run concurrently under one shared five-second deadline
+(`PUSH_SNAPSHOT_TIMEOUT`), once per snapshot. This is a fixed host policy rather than
+provider configuration. A timed-out list is cancelled and its provider is marked
+Unavailable; healthy providers still publish inventory. Lists return complete vectors:
+no captured or unfinished response is published as authoritative. Host shutdown
+cancels the whole batch immediately. Waiting for an initial poll inventory does not
+restart the push lists or their deadline.
 Snapshot rows mark a metering gap and do not create extra billing transitions.
 
 Snapshots omit inventory for unready providers and failed push lists, reporting

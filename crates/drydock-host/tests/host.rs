@@ -560,6 +560,7 @@ struct Control {
     hold_list: std::sync::atomic::AtomicBool,
     hold_list_result: std::sync::atomic::AtomicBool,
     list_result_ready: tokio::sync::Notify,
+    list_result_release: tokio::sync::Notify,
     list_entered: tokio::sync::Notify,
     list_release: tokio::sync::Notify,
     vendor: std::sync::Mutex<VendorState>,
@@ -651,6 +652,12 @@ impl drydock_host::module::Provider for ControlledProvider {
             }]
         }
     }
+    fn operations(&self) -> drydock_host::module::Operations<'_> {
+        drydock_host::module::Operations {
+            exec: if self.control.disable_exec.load(std::sync::atomic::Ordering::SeqCst) { None } else { self.inner.operations().exec },
+            ..self.inner.operations()
+        }
+    }
     fn capabilities(&self) -> Capabilities {
         let mut capabilities = self.inner.capabilities();
         capabilities.fallback_runner = !self.control.disable_exec.load(std::sync::atomic::Ordering::SeqCst);
@@ -714,7 +721,7 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
         if self.control.hold_list_result.swap(false, SeqCst) {
             self.control.list_result_ready.notify_one();
-            self.control.list_release.notified().await;
+            self.control.list_result_release.notified().await;
         }
         Ok(rows)
     }
@@ -745,29 +752,6 @@ impl drydock_host::module::Provider for ControlledProvider {
         c: &drydock_host::module::Credentials,
     ) -> drydock_host::module::Result<drydock_host::module::ByteStream> {
         self.inner.relay(id, c).await
-    }
-    async fn exec(
-        &self,
-        id: &str,
-        r: ExecRequest,
-        c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<drydock_host::module::ByteStream> {
-        self.inner.exec(id, r, c).await
-    }
-    async fn suspend(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<ResumeToken> {
-        self.inner.suspend(id, c).await
-    }
-    async fn resume(&self, id: &str, r: ResumeToken, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<()> {
-        self.inner.resume(id, r, c).await
-    }
-    async fn export(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Export> {
-        self.inner.export(id, c).await
-    }
-    async fn usage(&self, r: Period, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Usage> {
-        self.inner.usage(r, c).await
-    }
-    async fn quota(&self, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Quota> {
-        self.inner.quota(c).await
     }
 }
 async fn controlled() -> (Harness, std::sync::Arc<Control>) {
@@ -1320,7 +1304,7 @@ async fn destroy_attribution_survives_stale_poll() {
     control.hold_list_result.store(true, SeqCst);
     tokio::time::timeout(Duration::from_secs(2), control.list_result_ready.notified()).await.unwrap();
     h.ok(Method::DELETE, &format!("/providers/a/environments/{}", environment.id), Value::Null, 204).await;
-    control.list_release.notify_one();
+    control.list_result_release.notify_one();
     assert!(matches!(events.next().await, ObserveRecord::Event { event }
         if event.id == environment.id && matches!(event.event,
             EventKind::Gone { cause: GoneCause::DestroyedByRequest })));
@@ -1384,6 +1368,9 @@ async fn poll_rejection_survives_stale_success_until_refresh() {
     })
     .await
     .unwrap();
+    let mut records = h.stream(None).await;
+    let ObserveRecord::Snapshot { unavailable_providers, .. } = records.next().await else { panic!("expected snapshot") };
+    assert!(matches!(unavailable_providers.get("a"), Some(ProtocolError::CredentialRejected { .. })));
     control.success_release.notify_one();
     assert_eq!(pending.await.unwrap().status(), 200);
     let hello: Hello = h.hello().await;
@@ -1531,4 +1518,91 @@ async fn shutdown_during_recovery_ends_with_clean_eof() {
     h.stop.take().unwrap().send(()).unwrap();
     assert!(tokio::time::timeout(Duration::from_secs(2), records.stream.next()).await.unwrap().is_none());
     tokio::time::timeout(Duration::from_secs(2), &mut h.task).await.unwrap().unwrap();
+}
+
+// Independent push lists start together. Hung calls share one deadline, omit
+// even a captured-but-unfinished response, and preserve healthy inventory/replay.
+#[tokio::test]
+async fn push_snapshot_lists_share_deadline_and_isolate_partial_results() {
+    use std::sync::{Arc, atomic::Ordering::SeqCst};
+    for count in [1, 3] {
+        let controls: Vec<_> = (0..count).map(|_| Arc::new(Control::default())).collect();
+        let healthy_control = Arc::new(Control::default());
+        let mut registry = drydock_host::module::Registry::from([(
+            "reference".into(),
+            Arc::new(ControlledModule(healthy_control.clone())) as Arc<dyn drydock_host::module::Module>,
+        )]);
+        let mut modules = vec![json!({"name":"memory", "entrypoint":"reference"})];
+        let mut providers = vec![provider("healthy", json!({}))];
+        for (n, control) in controls.iter().enumerate() {
+            let name = format!("held-{n}");
+            // Alternate a request held before listing and a complete response
+            // held before return: neither is an authoritative list at timeout.
+            control.hold_list.store(n % 2 == 0, SeqCst);
+            control.hold_list_result.store(n % 2 != 0, SeqCst);
+            control.vendor.lock().unwrap().row = Some(Environment {
+                id: "unfinished".into(),
+                provider: name.clone(),
+                label: None,
+                state: Observation::Running,
+                granted_size: None,
+                egress: Enforcement::Advisory,
+            });
+            registry.insert(name.clone(), Arc::new(ControlledModule(control.clone())));
+            modules.push(json!({"name":name,"entrypoint":name}));
+            let mut p = provider(&name, json!({}));
+            p["module"] = json!(name);
+            providers.push(p);
+        }
+        let host = Host::new(registry);
+        let h = Harness::with_host(host, unsafe { libc::geteuid() }).await;
+        h.ok(Method::PUT, "/config", json!({"modules":modules,"providers":providers}), 204).await;
+        h.credential("healthy", "token").await;
+        let prepared = h.prepared("healthy").await;
+        let row = h.provision("healthy", "visible", &prepared, 201).await;
+        for n in 0..count {
+            h.credential(&format!("held-{n}"), "token").await;
+        }
+        let client = h.client.clone();
+        let start = tokio::time::Instant::now();
+        let pending = tokio::spawn(async move { client.get("http://localhost/v1/events").send().await.unwrap() });
+        for (n, control) in controls.iter().enumerate() {
+            let entered = if n % 2 == 0 { &control.list_held } else { &control.list_result_ready };
+            tokio::time::timeout(Duration::from_secs(1), entered.notified()).await.expect("all lists must start concurrently");
+        }
+        healthy_control.sink.lock().unwrap().as_ref().unwrap().publish("overlap".into(), None, None, EventKind::Created);
+        let response = tokio::time::timeout(Duration::from_secs(6), pending).await.unwrap().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(6), "deadline must be shared, not per provider");
+        let mut records = Records { stream: response.bytes_stream().boxed(), buffer: vec![] };
+        let ObserveRecord::Snapshot { environments, unavailable_providers, .. } = records.next().await else { panic!("expected snapshot") };
+        assert_eq!(environments, vec![row]);
+        assert_eq!(unavailable_providers.len(), count);
+        assert!(matches!(records.next().await, ObserveRecord::Event { event } if event.id == "overlap"));
+        for error in unavailable_providers.values() {
+            assert!(matches!(error, ProtocolError::Unavailable { reason, .. } if reason == "snapshot list timed out"));
+        }
+    }
+}
+
+// Shutdown cancels outstanding push snapshot lists immediately, rather than
+// waiting for the vendor deadline or publishing a partial successful snapshot.
+#[tokio::test]
+async fn shutdown_cancels_held_push_snapshot() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let control = std::sync::Arc::new(Control::default());
+    control.hold_list.store(true, SeqCst);
+    let host = Host::new(drydock_host::module::Registry::from([(
+        "reference".into(),
+        std::sync::Arc::new(ControlledModule(control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>,
+    )]));
+    let mut h = Harness::with_host(host.clone(), unsafe { libc::geteuid() }).await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "token").await;
+    let client = h.client.clone();
+    let request = tokio::spawn(async move { client.get("http://localhost/v1/events").send().await.unwrap() });
+    control.list_held.notified().await;
+    h.stop.take().unwrap().send(()).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), request).await.expect("shutdown cancels snapshot").unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Unavailable { .. }));
 }
