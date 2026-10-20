@@ -98,6 +98,7 @@ impl Provider for Reference {
             checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
             workspace_root: "/workspace".into(),
             suspend_resume: true,
+            suspend_preserves_memory: Some(true),
             export: true,
             egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::Open], enforcement: Enforcement::Advisory },
             fallback_runner: true,
@@ -355,7 +356,7 @@ impl UsageOperation for Reference {
                 }
             }
         }
-        Ok(Usage { period, environment_hours })
+        Ok(Usage { period, environment_hours, totals: None })
     }
 }
 
@@ -364,6 +365,7 @@ impl QuotaOperation for Reference {
     async fn quota(&self, _: &Credentials) -> Result<Quota> {
         self.check()?;
         Ok(Quota {
+            resources: vec![],
             credits_remaining: None,
             credit_unit: None,
             concurrency_in_use: Some(

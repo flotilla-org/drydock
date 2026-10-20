@@ -228,3 +228,129 @@ consolidation are tracked in #21.
 Unix UID admission failures return a bare 403 before protocol handling, just as
 Rigging's TCP authentication failures return transport-level statuses. These are
 not module or `/v1` ProtocolError outcomes.
+
+## Daytona module
+
+The binary also registers `daytona`; embedders can register `daytona::DaytonaModule`.
+It uses the published [REST](https://www.daytona.io/docs/openapi.json),
+[toolbox](https://www.daytona.io/docs/toolbox-openapi.json) and
+[analytics](https://www.daytona.io/docs/analytics-openapi.json) contracts, checked
+2026-10-20. Configuration example (no credentials in settings):
+
+```json
+{
+  "modules": [{"name":"cloud", "entrypoint":"daytona"}],
+  "providers": [{
+    "name":"daytona-eu", "module":"cloud",
+    "settings": {
+      "organization_id":"YOUR_ORGANIZATION_ID",
+      "region":"eu", "tier":1,
+      "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
+      "agent_command":"/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock"
+    },
+    "credential":{"mode":"direct", "credential_reference":"daytona-key"}
+  }]
+}
+```
+
+Deliver the organisation API key through credential refresh. Proxied mode sends
+its placeholder as the bearer token on REST, toolbox and analytics calls, using
+the host's injected HTTP client. There are no module retries or ambient credentials.
+The key needs sandbox creation/modification/deletion, snapshot creation and billing
+read access. API-key scope is the organisation; this is not isolation between
+sandboxes in that organisation.
+
+`agent_command` is the fixed startup command of **your baked image**, not a
+per-environment argument. The example binary is illustrative; the checked-in
+Flotilla vessel agent is still a skeleton, so an image must provide a working
+agent/listener before live acceptance. Bake the tools and `flock` into the public
+image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
+prepare. A deterministic provider snapshot name tags the digest pair; subsequent
+prepare calls look it up and wait for `active`. The module sets the container
+class explicitly. No tools are uploaded. Prepare observes a build for up to four
+minutes; callers may call prepare again to continue observation of that same
+snapshot. Size requests must use whole vCPU and GiB within the default 4 vCPU,
+8 GiB RAM and 10 GiB disk cap; incompatible requests are refused rather than rounded.
+
+Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
+disables auto-stop/auto-pause and auto-delete, waits for started, then launches
+the fixed command through toolbox exec. A guest `flock` serialises bootstrap;
+bootstrap succeeds only after `/run/drydock/agent.sock` appears. The agent should
+replace that socket when it starts. Drydock subsequently pushes egress, CA and
+features over its control connection. A failed bootstrap leaves a labelled
+resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
+resource; they do not change its snapshot, size or network policy.
+
+Suspend is stop, resume is start plus bootstrap. The whole filesystem persists;
+memory and resident processes do not. `suspend_preserves_memory: false` declares
+this explicitly. There is no pause operation on the container class. Resume
+removes the old stopped process's socket before bootstrapping; repeated resume of
+an already running sandbox checks bootstrap without removing its socket.
+
+Every reach call requests a fresh five-minute SSH token. Daytona authenticates it
+as the gateway username, so `Reach::Ssh.user` now uses the redacting `Secret` type
+(the JSON is still a string). Supply the SSH gateway's host public key verified
+out of band: the mint route does not supply one. `ssh_endpoint` defaults to
+`ssh.app.daytona.io:22`; no host key is discovered through unauthenticated scanning.
+Never log or record a mint response or the serialized reach recipe.
+
+Egress always sets `networkAllowList` explicitly. Empty deny-all also sets
+`networkBlockAll: true`; Open sets `0.0.0.0/0`. CIDRs accept IPv4 only. The new
+`{"kind":"host","host":"example.com"}` destination resolves once during
+provision and pins every returned IPv4 address as `/32`; any IPv6 result or empty
+resolution refuses the request. DNS changes are **not** followed: provision a new
+label to refresh pinned addresses. Host-and-port entries are refused because
+Daytona cannot represent their port restriction.
+
+Egress is Advisory unless `egress_probe` is configured as an `ExecRequest`, e.g.
+`{"command":["/usr/local/bin/root-egress-probe"]}`. For each running restricted
+sandbox returned by provision/list/inspect, the module executes that command
+behind an explicit root UID check and requires exactly:
+
+```json
+{"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
+```
+
+The command must actually test the listed destination, an operator-controlled
+unlisted canary and raw DNS; it is trusted operator code, like the conformance
+checker's probe. **Do not substitute a command that prints constants.** Only this
+successful result returns Enforced. A nonmatching result returns Advisory, and a
+failed/invalid probe returns a typed error; failed inventory is never published as
+a complete list. Open, empty deny-all and nonrunning sandboxes remain Advisory.
+Probe on every observation avoids carrying a stale claim after an out-of-band
+policy change. Configuring a probe declares the Enforced capability so the
+conformance checker requires and tests the claim. Probe calls consume vendor
+requests in addition to inventory calls.
+
+Observation polls every 30 seconds, with complete cursor pagination, provider
+`updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The host
+owns all state diffs and event emission. Error reasons map OOM/eviction to loss
+causes, unreachable to host-unreachable, and other provider errors to API-error;
+unknown/transitional states never masquerade as running or gone. No webhooks.
+
+The module declares the documented per-organisation Tier 1–4 general, creation
+and lifecycle limits (10k/300/10k through 50k/600/50k per minute). Each response
+reads the suffixed X-RateLimit limit/remaining/reset counters; 429 propagates
+Retry-After seconds without retry. Provision/build observation requests and guest
+probes also count toward the organisation's vendor limits. Other hosts sharing
+that organisation share those limits; host route budgets are not a global vendor
+quota reservation.
+
+Quota maps `/organizations/{id}/usage` into `Quota.resources` with current use,
+limits and units per region/class plus snapshots and volumes. Usage calls the
+analytics aggregated route and exposes CPU/RAM/disk/GPU seconds, count and USD
+cost in `Usage.totals`; `environment_hours` is empty because aggregates do not
+preserve sizes. These optional protocol fields keep older wire documents valid.
+The checker validates both forms and compares aggregate CPU when supplied.
+
+For operator acceptance, configure an otherwise idle organisation, a real baked
+agent image, a pinned gateway key and matching root/network/reach probes. Run the
+standard conformance checker including the egress scenario; use a billing sample
+long enough for whole-second vendor aggregation and transition deadlines above
+the 30-second polling interval. Retain the JSON report's `usage.totals.cost_usd`
+as spend evidence. This crew's stand-in tests spend **$0**; live conformance and
+live cost remain operator acceptance, not claimed by the stand-in run.
+
+Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
+and contain no URL credentials, query or fragment. Defaults are Daytona's public
+REST, toolbox proxy and analytics endpoints.

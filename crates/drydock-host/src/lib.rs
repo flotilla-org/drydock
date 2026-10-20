@@ -1,4 +1,5 @@
 //! Reference Rust language host. See the crate README for module and serving contracts.
+pub mod daytona;
 pub mod module;
 mod observer;
 pub mod reference;

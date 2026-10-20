@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+sha2 = "0.10"
+http = "1"
 drydock-protocol = { path = "../drydock-protocol" }
 futures = "0.3"
 rigging-http-client.workspace = true

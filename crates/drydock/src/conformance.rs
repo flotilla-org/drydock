@@ -271,7 +271,8 @@ async fn transition(
 fn valid_usage(usage: &Usage, period: &Period) -> Result<()> {
     require(&usage.period == period, "usage period differs from request")?;
     require(
-        usage.environment_hours.iter().all(|row| row.hours.is_finite() && row.hours >= 0.0 && valid_size(&row.size)),
+        usage.environment_hours.iter().all(|row| row.hours.is_finite() && row.hours >= 0.0 && valid_size(&row.size))
+            && usage.totals.as_ref().is_none_or(|totals| totals.cost_usd.is_finite() && totals.cost_usd >= 0.0),
         "invalid usage size or hours",
     )
 }
@@ -279,7 +280,13 @@ fn valid_size(size: &Size) -> bool {
     size.cpus.is_finite() && size.cpus > 0.0
 }
 fn valid_quota(quota: &Quota) -> Result<()> {
-    require(quota.credits_remaining.is_none_or(f64::is_finite), "nonfinite credits")
+    require(quota.credits_remaining.is_none_or(f64::is_finite), "nonfinite credits")?;
+    require(
+        quota.resources.iter().all(|r| {
+            !r.resource.is_empty() && !r.unit.is_empty() && r.in_use.is_finite() && r.in_use >= 0.0 && r.limit.is_finite() && r.limit >= 0.0
+        }),
+        "invalid resource quota",
+    )
 }
 /// Each scenario records its own verdict. Cleanup is attempted even after failures.
 /// Use a unique label and an otherwise idle provider to avoid metering interference.
@@ -395,6 +402,12 @@ async fn billing_window(client: &Client, provider: &str, size: &Size, millis: u6
     let period = Period::new(start.into(), chrono::Utc::now().into()).map_err(str::to_owned)?;
     let usage = client.usage(provider, &period).await.map_err(SafeError::category)?;
     valid_usage(&usage, &period)?;
+    if let Some(totals) = &usage.totals {
+        return require(
+            if running { totals.cpu_seconds > 0 } else { totals.cpu_seconds == 0 },
+            "vendor aggregate CPU disagrees with billing transition",
+        );
+    }
     let hours: f64 = usage.environment_hours.iter().filter(|row| &row.size == size).map(|row| row.hours).sum();
     require(if running { hours > 0.0 } else { hours == 0.0 }, "vendor usage disagrees with billing transition")
 }
@@ -1165,15 +1178,42 @@ mod tests {
         let period = Period::new("2026-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();
         for value in [f64::NEG_INFINITY, -1., -0., 0., f64::MIN_POSITIVE, 1., f64::MAX, f64::INFINITY, f64::NAN] {
             let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
-            let usage = Usage { period: period.clone(), environment_hours: vec![SizeUsage { size, hours: value }] };
+            let usage = Usage { totals: None, period: period.clone(), environment_hours: vec![SizeUsage { size, hours: value }] };
             assert_eq!(valid_usage(&usage, &period).is_ok(), value.is_finite() && value >= 0.);
-            let quota = Quota { credits_remaining: Some(value), credit_unit: None, concurrency_in_use: None, concurrency_limit: None };
+            let quota = Quota {
+                resources: vec![],
+                credits_remaining: Some(value),
+                credit_unit: None,
+                concurrency_in_use: None,
+                concurrency_limit: None,
+            };
             assert_eq!(valid_quota(&quota).is_ok(), value.is_finite());
+            // Aggregated cost and resource quota figures must be finite and
+            // nonnegative; unknown credit balances may still be negative.
+            let aggregate = Usage {
+                period: period.clone(),
+                environment_hours: vec![],
+                totals: Some(UsageTotals {
+                    cpu_seconds: 0,
+                    memory_gib_seconds: 0,
+                    disk_gib_seconds: 0,
+                    gpu_seconds: 0,
+                    cost_usd: value,
+                    environments: 0,
+                }),
+            };
+            assert_eq!(valid_usage(&aggregate, &period).is_ok(), value.is_finite() && value >= 0.0);
+            let resources = Quota {
+                resources: vec![ResourceQuota { resource: "cpu".into(), unit: "vCPU".into(), in_use: value, limit: 10.0 }],
+                credits_remaining: None,
+                ..quota
+            };
+            assert_eq!(valid_quota(&resources).is_ok(), value.is_finite() && value >= 0.0);
             assert_eq!(valid_size(&Size { cpus: value, memory_bytes: 0, disk_bytes: 0 }), value.is_finite() && value > 0.);
         }
-        assert!(valid_usage(&Usage { period: period.clone(), environment_hours: vec![] }, &period).is_ok());
+        assert!(valid_usage(&Usage { totals: None, period: period.clone(), environment_hours: vec![] }, &period).is_ok());
         let other = Period::new("2025-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();
-        assert!(valid_usage(&Usage { period: other, environment_hours: vec![] }, &period).is_err());
+        assert!(valid_usage(&Usage { totals: None, period: other, environment_hours: vec![] }, &period).is_err());
     }
 }
 

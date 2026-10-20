@@ -124,6 +124,9 @@ pub struct Capabilities {
     pub checkout_strategies: Vec<CheckoutStrategy>,
     pub workspace_root: String,
     pub suspend_resume: bool,
+    /// Whether suspend retains running processes/memory, when supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_preserves_memory: Option<bool>,
     pub export: bool,
     pub egress: EgressCapability,
     pub fallback_runner: bool,
@@ -188,8 +191,17 @@ impl Default for EgressRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Destination {
-    HostPort { host: HostAddress, port: Port },
-    Cidr { cidr: Cidr },
+    /// Resolve once when applying a provider policy; no port restriction.
+    Host {
+        host: HostAddress,
+    },
+    HostPort {
+        host: HostAddress,
+        port: Port,
+    },
+    Cidr {
+        cidr: Cidr,
+    },
 }
 /// Preparation is look-up-or-build at the provider, keyed by both digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -248,7 +260,8 @@ pub struct Environment {
 pub enum Reach {
     Ssh {
         endpoint: String,
-        user: String,
+        /// May contain a short-lived gateway token; always redact diagnostics.
+        user: Secret,
         host_key: String,
     },
     Dial {
@@ -363,8 +376,28 @@ pub struct Period {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
+    /// Organization aggregates; these cannot be reconstructed as hours by size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals: Option<UsageTotals>,
     pub period: Period,
     pub environment_hours: Vec<SizeUsage>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageTotals {
+    pub cpu_seconds: u64,
+    pub memory_gib_seconds: u64,
+    pub disk_gib_seconds: u64,
+    pub gpu_seconds: u64,
+    /// Vendor's totalPrice, denominated in USD.
+    pub cost_usd: f64,
+    pub environments: u64,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ResourceQuota {
+    pub resource: String,
+    pub unit: String,
+    pub in_use: f64,
+    pub limit: f64,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SizeUsage {
@@ -373,6 +406,8 @@ pub struct SizeUsage {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Quota {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceQuota>,
     pub credits_remaining: Option<f64>,
     pub credit_unit: Option<String>,
     pub concurrency_in_use: Option<u64>,

@@ -59,7 +59,7 @@ pub enum Provisioned {
     Existing(Environment),
 }
 pub enum Connection {
-    Ssh { endpoint: String, user: String, host_key: String },
+    Ssh { endpoint: String, user: Secret, host_key: String },
     Dial { url: String, token: Secret, expires_at: Timestamp },
     Relay,
 }

@@ -1086,6 +1086,13 @@
           "quota": {
             "type": "boolean"
           },
+          "suspend_preserves_memory": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether suspend retains running processes/memory, when supported."
+          },
           "suspend_resume": {
             "type": "boolean"
           },
@@ -1172,6 +1179,25 @@
       },
       "Destination": {
         "oneOf": [
+          {
+            "type": "object",
+            "description": "Resolve once when applying a provider policy; no port restriction.",
+            "required": [
+              "host",
+              "kind"
+            ],
+            "properties": {
+              "host": {
+                "$ref": "#/components/schemas/HostAddress"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "host"
+                ]
+              }
+            }
+          },
           {
             "type": "object",
             "required": [
@@ -2194,6 +2220,12 @@
               "null"
             ],
             "format": "double"
+          },
+          "resources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResourceQuota"
+            }
           }
         }
       },
@@ -2244,7 +2276,8 @@
                 ]
               },
               "user": {
-                "type": "string"
+                "$ref": "#/components/schemas/Secret",
+                "description": "May contain a short-lived gateway token; always redact diagnostics."
               }
             }
           },
@@ -2384,6 +2417,31 @@
           }
         ]
       },
+      "ResourceQuota": {
+        "type": "object",
+        "required": [
+          "resource",
+          "unit",
+          "in_use",
+          "limit"
+        ],
+        "properties": {
+          "in_use": {
+            "type": "number",
+            "format": "double"
+          },
+          "limit": {
+            "type": "number",
+            "format": "double"
+          },
+          "resource": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string"
+          }
+        }
+      },
       "ResumeToken": {
         "type": "object",
         "required": [
@@ -2483,6 +2541,60 @@
           },
           "period": {
             "$ref": "#/components/schemas/Period"
+          },
+          "totals": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UsageTotals",
+                "description": "Organization aggregates; these cannot be reconstructed as hours by size."
+              }
+            ]
+          }
+        }
+      },
+      "UsageTotals": {
+        "type": "object",
+        "required": [
+          "cpu_seconds",
+          "memory_gib_seconds",
+          "disk_gib_seconds",
+          "gpu_seconds",
+          "cost_usd",
+          "environments"
+        ],
+        "properties": {
+          "cost_usd": {
+            "type": "number",
+            "format": "double",
+            "description": "Vendor's totalPrice, denominated in USD."
+          },
+          "cpu_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "disk_gib_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "environments": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "gpu_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "memory_gib_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       }
