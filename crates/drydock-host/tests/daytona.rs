@@ -28,6 +28,7 @@ struct State {
     inactive_reads: usize,
     created_state: Option<String>,
     command_exit: Option<i32>,
+    command_output: Option<String>,
     require_bootstrap_budget: bool,
     probe_exit: Option<i32>,
     exec_timeouts: Vec<u64>,
@@ -237,7 +238,7 @@ impl StandIn {
                 let output = if command.starts_with("test \"$(id -u)\"") {
                     s.probe.clone().unwrap_or(Value::Null).to_string()
                 } else {
-                    "guest output".into()
+                    s.command_output.clone().unwrap_or_else(|| "guest output".into())
                 };
                 let code = if command.starts_with("test \"$(id -u)\"") { s.probe_exit.unwrap_or(0) } else { s.command_exit.unwrap_or(0) };
                 response(200, json!({"exitCode":code,"result":output}))
@@ -892,4 +893,21 @@ async fn internal_retains_vendor_body() {
     assert!(!format!("{error:?}").contains("key-a"));
     let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
     assert!(provider_error.expose().contains("key-a must never be echoed"));
+}
+
+// The trusted bootstrap preflight has a safe public diagnostic while preserving
+// its raw merged output inside the redacting field.
+#[tokio::test]
+async fn missing_python_has_a_public_bootstrap_diagnostic() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().command_exit = Some(2);
+    http.0.lock().unwrap().command_output = Some("missing-python3\n".into());
+    let Err(ProtocolError::CommandFailed { reason, exit_code: 2, output }) = p.provision(request(prep, "missing-tool"), &c).await else {
+        panic!("bootstrap must fail")
+    };
+    assert!(reason.contains("missing python3"));
+    assert_eq!(output.expose(), "missing-python3\n");
 }

@@ -342,7 +342,16 @@ impl Daytona {
         let command =
             format!("mkdir -p /run/drydock && flock --close --wait 8 /run/drydock/bootstrap.lock sh -c {}", shell_command(&[start]));
         // 8s lock + at most 6 one-second connects + 5s sleeps, with headroom.
-        self.execute(id, &command, 25, c).await?;
+        self.execute(id, &command, 25, c).await.map_err(|error| match error {
+            ProtocolError::CommandFailed { exit_code: 2, output, .. } if output.expose().trim() == "missing-python3" => {
+                ProtocolError::CommandFailed {
+                    reason: "Daytona image is missing python3 required for agent liveness".into(),
+                    exit_code: 2,
+                    output,
+                }
+            }
+            error => error,
+        })?;
         Ok(())
     }
     async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
@@ -387,16 +396,36 @@ fn bounded(bytes: &[u8]) -> String {
 }
 fn policy_matches(row: &Value, policy: &Value) -> bool {
     // Compare stable requested destinations, never a DNS resolution at retry.
-    let set = |v: &Value| v.as_str().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect::<BTreeSet<_>>();
+    let set = |key: &str, v: &Value| {
+        v.as_str()
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let s = s.trim();
+                if key == "domainAllowList" {
+                    return s.trim_end_matches('.').to_ascii_lowercase();
+                }
+                let (ip, bits) = s.split_once('/').unwrap_or((s, "32"));
+                match (ip.parse::<std::net::Ipv4Addr>(), bits.parse::<u32>()) {
+                    (Ok(ip), Ok(bits)) if bits <= 32 => {
+                        let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                        format!("{}/{}", std::net::Ipv4Addr::from(u32::from(ip) & mask), bits)
+                    }
+                    _ => s.into(),
+                }
+            })
+            .collect::<BTreeSet<_>>()
+    };
     ["networkAllowList", "domainAllowList", "networkBlockAll"].iter().all(|key| {
         if *key == "networkBlockAll" {
             row[*key].as_bool().unwrap_or(false) == policy[*key].as_bool().unwrap_or(false)
         } else {
-            set(&row[*key]) == set(&policy[*key])
+            set(key, &row[*key]) == set(key, &policy[*key])
         }
     })
 }
-async fn allowlist(request: EgressRequest) -> Result<Value> {
+fn allowlist(request: EgressRequest) -> Result<Value> {
     match request {
         EgressRequest::Open => Ok(json!({"networkAllowList":"0.0.0.0/0"})),
         EgressRequest::DenyAll { direct } => {
@@ -425,7 +454,7 @@ async fn allowlist(request: EgressRequest) -> Result<Value> {
                 }
             }
             if !cidrs.is_empty() && !hosts.is_empty() {
-                return Err(refused("Daytona cannot combine domain and CIDR allowlists"));
+                return Err(refused("Daytona cannot combine domain names with CIDRs or IPv4 literals"));
             }
             if !hosts.is_empty() {
                 Ok(json!({"domainAllowList":hosts.into_iter().collect::<Vec<_>>().join(",")}))
@@ -539,7 +568,7 @@ impl Provider for Daytona {
         if r.prepared.provider != self.name {
             return Err(refused("prepared snapshot belongs to another provider"));
         }
-        let policy = allowlist(r.egress).await?;
+        let policy = allowlist(r.egress)?;
         let size = &r.size;
         if !size.cpus.is_finite()
             || size.cpus.fract() != 0.0
@@ -816,6 +845,22 @@ mod tests {
         assert_eq!(decimal_lexeme("1.23e-7").as_deref(), Some("0.000000123"));
         assert_eq!(decimal_lexeme("1.23e+5").as_deref(), Some("123000"));
         assert!(decimal_lexeme("1e99999").is_none());
+        for invalid in ["-1e2", ".5e1", "1.e2", "1ee2", "1e", "NaN", "", "1e-99999"] {
+            assert!(decimal_lexeme(invalid).is_none(), "{invalid}");
+        }
+    }
+    // Vendor normalization must not break an exact label retry.
+    #[test]
+    fn normalized_policy_identity() {
+        assert!(policy_matches(
+            &json!({"domainAllowList":"EXAMPLE.COM.,other.test"}),
+            &json!({"domainAllowList":"other.test,example.com"})
+        ));
+        assert!(policy_matches(
+            &json!({"networkAllowList":"192.0.2.5,10.0.0.12/24"}),
+            &json!({"networkAllowList":"10.0.0.0/24,192.0.2.5/32"})
+        ));
+        assert!(!policy_matches(&json!({"networkAllowList":"192.0.2.5"}), &json!({"networkAllowList":"192.0.2.6/32"})));
     }
     // Retry headers use named throttlers; reset fallback applies only to an
     // exhausted bucket. Reset is a duration, not a Unix epoch.

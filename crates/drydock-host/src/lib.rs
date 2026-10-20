@@ -112,6 +112,7 @@ struct Instance {
     credential_changes: watch::Sender<Credentials>,
     destroyed: Mutex<BTreeMap<String, DestroyState>>,
     inspected: Mutex<BTreeMap<String, ObservedEnvironment>>,
+    egress_measured_at: Mutex<BTreeMap<String, tokio::time::Instant>>,
 }
 #[derive(Default)]
 struct DestroyState {
@@ -772,6 +773,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
                 budget: Mutex::new(BTreeMap::new()),
                 destroyed: Mutex::new(BTreeMap::new()),
                 inspected: Mutex::new(BTreeMap::new()),
+                egress_measured_at: Mutex::new(BTreeMap::new()),
             }),
         );
     }
@@ -841,6 +843,7 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
     let result = h.call(&p, Gate::Provision, |p, c| async move { p.provision(r, &c).await }).await?;
     let (Provisioned::Created(env) | Provisioned::Existing(env)) = &result;
     instance.inspected.recover().insert(env.id.clone(), env.clone().into());
+    instance.egress_measured_at.recover().insert(env.id.clone(), tokio::time::Instant::now());
     Ok(match result {
         Provisioned::Created(s) => (StatusCode::CREATED, Json(s)),
         Provisioned::Existing(s) => (StatusCode::OK, Json(s)),
@@ -851,19 +854,26 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
 // the last claim while running; stopped/gone rows invalidate it.
 fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
     let mut measured = instance.inspected.recover();
+    let mut times = instance.egress_measured_at.recover();
+    times.retain(|id, _| measured.contains_key(id));
     for row in rows {
         if row.egress_measured {
+            times.insert(row.environment.id.clone(), tokio::time::Instant::now());
             if row.timestamp.is_none() {
                 row.timestamp =
                     measured.get(&row.environment.id).filter(|old| old.environment == row.environment).and_then(|old| old.timestamp);
             }
             measured.insert(row.environment.id.clone(), row.clone());
         } else if matches!(row.environment.state, Observation::Running) {
-            if let Some(old) = measured.get(&row.environment.id).filter(|r| matches!(r.environment.state, Observation::Running)) {
+            if let Some(old) = measured.get(&row.environment.id).filter(|r| {
+                matches!(r.environment.state, Observation::Running)
+                    && times.get(&row.environment.id).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+            }) {
                 row.environment.egress = old.environment.egress.clone();
             }
         } else if !matches!(row.environment.state, Observation::Transitioning { .. }) {
             measured.remove(&row.environment.id);
+            times.remove(&row.environment.id);
         }
     }
 }
@@ -878,6 +888,7 @@ async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, Strin
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&id, &c).await }).await?;
     if instance.poll_interval.is_some() {
         instance.inspected.recover().insert(row.environment.id.clone(), row.clone());
+        instance.egress_measured_at.recover().insert(row.environment.id.clone(), tokio::time::Instant::now());
     }
     Ok(Json(row.environment))
 }
@@ -915,6 +926,7 @@ async fn resume(
     let inspect_id = id.clone();
     instance.call(Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&inspect_id, &c).await }).await?;
+    instance.egress_measured_at.recover().insert(row.environment.id.clone(), tokio::time::Instant::now());
     instance.inspected.recover().insert(row.environment.id.clone(), row);
     Ok(StatusCode::NO_CONTENT)
 }

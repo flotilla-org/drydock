@@ -327,9 +327,9 @@ For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
 is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
 real externally verified reachable services; never print constants as evidence.
 Provision, resume and explicit inspect measure the claim. Cheap list/poll calls
-do not exec; the host carries its last measured claim while running and clears
-it on stopped/gone/unknown state. Out-of-band policy changes need explicit
-inspect to refresh that evidence. A negative proof is Advisory; malformed
+do not exec; the host carries its last measured claim for at most 60 seconds while running and clears
+it on stopped/gone/unknown state. Out-of-band policy changes may retain the old claim until that expiry; explicit
+inspect refreshes the evidence immediately. Cheap inventory never extends its age. A negative proof is Advisory; malformed
 proofs and toolbox failures surface typed diagnostics instead of silently
 flapping the claim or erasing inventory. Open/nonrunning rows are Advisory.
 

@@ -1519,6 +1519,18 @@ async fn cheap_inventory_carries_measured_egress() {
     control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Advisory;
     let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
     assert_eq!(rows[0].egress, Enforcement::Enforced);
+    // Cheap inventory cannot extend evidence indefinitely after an unmeasured
+    // policy change. Expiry is inclusive at exactly sixty seconds.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
+    assert_eq!(rows[0].egress, Enforcement::Advisory);
+    // A fresh measurement repairs expiry; an observed stop invalidates that
+    // fresh claim immediately rather than waiting for the next deadline.
+    control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Enforced;
+    h.ok(Method::GET, "/providers/a/environments/measured", Value::Null, 200).await;
+    control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Advisory;
     control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
     let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
     assert_eq!(rows[0].egress, Enforcement::Advisory);
