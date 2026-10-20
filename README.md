@@ -36,6 +36,16 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
+Protocol version 2 changes snapshot reconciliation semantics. Clients must check
+`hello.protocol_version` for an exact match before using any provider or event
+route (ADR 0070). Version 1 clients must not consume version 2 snapshots: ignoring
+`unavailable_providers` could turn unavailable inventory into false deletions or
+billing transitions. Upgrade snapshot reconciliation before accepting version 2.
+The HTTP route namespace remains `/v1`; the hello version is the compatibility gate.
+Snapshot errors retain the same typed details as route errors, including vendor
+reasons and raw `Internal` error text. They are visible to authenticated host clients;
+modules must exclude credentials from error text. The host does not sanitize it.
+
 Wire conventions chosen for this first protocol version:
 
 - Names follow the ADR amendment: configured `providers` load `modules`;
@@ -52,9 +62,12 @@ Wire conventions chosen for this first protocol version:
   unsupported destinations are refused, never widened. The result records
   enforced versus advisory protection.
 - `/v1/events` is one host-wide NDJSON stream. Each line is an `ObserveRecord`.
-  `since` is an opaque exclusive cursor. A host unable to replay emits a complete
-  list snapshot with a new cursor, marking a metering gap. Event times are RFC
-  3339 with explicit provider/adaptor provenance; running events carry granted size.
+  `since` is an opaque exclusive cursor. A host unable to replay emits a
+  list snapshot with a new cursor, marking a metering gap. An optional
+  `unavailable_providers` map names providers whose inventory is omitted, with
+  typed errors; consumers preserve their previous rows rather than infer deletion.
+  Event times are RFC 3339 with explicit provider/adaptor provenance; running
+  events carry granted size.
 - Retry hints are whole seconds. Modules do not retry. Capability flags govern
   optional suspend/resume, export, exec, usage and quota operations. A resume
   token is valid only at the same provider. Usage periods are RFC 3339 start/end;

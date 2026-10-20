@@ -5,6 +5,8 @@ use drydock_protocol::*;
 pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+/// Errors are serialized to authenticated host clients, including snapshot readers.
+/// Modules must exclude credentials from reasons and raw provider error text.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
@@ -16,6 +18,8 @@ pub fn refused(reason: impl Into<String>) -> ProtocolError {
 #[async_trait]
 pub trait Module: Send + Sync {
     fn version(&self) -> &str;
+    /// Cancelled when the host stops. Dropping the future must release uncommitted
+    /// resources; factories must yield while waiting on external work.
     async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
 }
 #[derive(Clone)]

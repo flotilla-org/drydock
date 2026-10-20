@@ -429,7 +429,7 @@ async fn tcp_bearer_auth() {
 }
 
 // After bounded history eviction, readers get a complete snapshot and can resume at
-// its new cursor without a missing transition. An initial snapshot failure is typed.
+// its new cursor without a missing transition. A failed provider is marked separately.
 #[tokio::test]
 async fn event_eviction_and_initial_error() {
     let h = Harness::start().await;
@@ -459,8 +459,9 @@ async fn event_eviction_and_initial_error() {
     let bad = Harness::start().await;
     bad.configure(vec![provider("fault", json!({"fault":{"kind":"unavailable","reason":"offline","retry_after":null}}))]).await;
     bad.credential("fault", "delivered").await;
-    let response = bad.ok(Method::GET, "/events", Value::Null, 503).await;
-    assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Unavailable { .. }));
+    let mut records = bad.stream(None).await;
+    let record = serde_json::to_value(records.next().await).unwrap();
+    assert_eq!(record["unavailable_providers"]["fault"]["kind"], "unavailable");
 }
 
 // The supervisor proxy receives absolute vendor requests and the placeholder token.
@@ -812,25 +813,125 @@ async fn independent_providers_and_inflight_credential_refresh() {
     h.prepared("a").await;
 }
 
-// A complete snapshot cannot omit unready providers: refuse before invoking their
-// vendor API, rather than reporting their existing environments as missing.
+// An unready provider must not block another provider's snapshot or call the
+// vendor without credentials. Snapshot metadata marks its inventory unavailable.
 #[tokio::test]
-async fn snapshots_never_call_unready_providers() {
+async fn snapshots_isolate_unready_providers() {
     use std::sync::atomic::Ordering::SeqCst;
     let (h, control) = controlled().await;
-    h.configure(vec![provider("a", json!({}))]).await;
-    h.ok(Method::GET, "/events", Value::Null, 503).await;
-    assert_eq!(control.list_calls.load(SeqCst), 0);
-    h.credential("a", "ready").await;
+    h.configure(vec![provider("a", json!({})), provider("b", json!({}))]).await;
+    h.credential("b", "ready").await;
+    let prepared = h.prepared("b").await;
+    let environment = h.provision("b", "healthy", &prepared, 201).await;
     let mut records = h.stream(None).await;
-    assert!(matches!(records.next().await, ObserveRecord::Snapshot { .. }));
+    let record = serde_json::to_value(records.next().await).unwrap();
+    assert_eq!(record["environments"][0]["id"], environment.id);
+    assert!(record["unavailable_providers"]["a"].is_object());
     assert_eq!(control.list_calls.load(SeqCst), 1);
 }
 
-// After headers are sent, a failed recovery snapshot fails the body, rather than
-// reporting normal EOF or introducing an undocumented NDJSON terminal-error shape.
+// Before the first successful poll, missing credentials are provider-local;
+// refreshing them lets normal polling produce a complete cached snapshot.
 #[tokio::test]
-async fn recovery_snapshot_error_fails_stream() {
+async fn unready_polled_provider_has_snapshot_marker() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    let mut records = h.stream(None).await;
+    let record = serde_json::to_value(records.next().await).unwrap();
+    assert_eq!(record["environments"], json!([]));
+    assert!(record["unavailable_providers"]["a"].is_object());
+    assert_eq!(control.list_calls.load(SeqCst), 0);
+    h.credential("a", "ready").await;
+    let mut repaired = h.stream(None).await;
+    let record = serde_json::to_value(repaired.next().await).unwrap();
+    assert!(record.get("unavailable_providers").is_none());
+    assert!(control.list_calls.load(SeqCst) >= 1);
+}
+
+// Cached polling rows are withheld, with a marker, after the provider becomes
+// unready. Recovery restores the inventory without inferring a deletion.
+#[tokio::test]
+async fn unready_polled_provider_withholds_cached_inventory() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let prepared = h.prepared("a").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let environment = h.provision("a", "cached", &prepared, 201).await;
+    for _ in 0..2 {
+        events.next().await;
+    }
+    let mut cached = h.stream(None).await;
+    assert!(matches!(cached.next().await, ObserveRecord::Snapshot { environments, .. } if environments == vec![environment.clone()]));
+    control.missing_tool.store(true, SeqCst);
+    let mut unavailable = h.stream(None).await;
+    let record = serde_json::to_value(unavailable.next().await).unwrap();
+    assert_eq!(record["environments"], json!([]));
+    assert_eq!(record["unavailable_providers"]["a"]["kind"], "unavailable");
+    control.missing_tool.store(false, SeqCst);
+    let mut repaired = h.stream(None).await;
+    assert!(matches!(repaired.next().await, ObserveRecord::Snapshot { environments, unavailable_providers, .. }
+        if environments == vec![environment] && unavailable_providers.is_empty()));
+}
+
+// A rejected proxy remains callable for repair. Events must both isolate a
+// persistent rejection and repair a push provider once its list probe succeeds.
+#[tokio::test]
+async fn events_after_proxied_rejection_probe_and_repair() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let control = std::sync::Arc::new(Control::default());
+    let healthy_control = std::sync::Arc::new(Control::default());
+    let registry = drydock_host::module::Registry::from([
+        ("reference".into(), std::sync::Arc::new(ControlledModule(control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>),
+        (
+            "healthy".into(),
+            std::sync::Arc::new(ControlledModule(healthy_control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>,
+        ),
+    ]);
+    let h = Harness::with_host(Host::new(registry), unsafe { libc::geteuid() }).await;
+    let mut proxied = provider("a", json!({}));
+    proxied["credential"] = json!({"mode":"proxied", "proxy_url":"http://127.0.0.1:1", "placeholder_token":"placeholder"});
+    let mut healthy = provider("b", json!({}));
+    healthy["module"] = json!("healthy");
+    h.ok(
+        Method::PUT,
+        "/config",
+        json!({
+            "modules":[{"name":"memory","entrypoint":"reference"},{"name":"healthy","entrypoint":"healthy"}],
+            "providers":[proxied, healthy]
+        }),
+        204,
+    )
+    .await;
+    h.credential("b", "ready").await;
+    let prepared = h.prepared("b").await;
+    let environment = h.provision("b", "healthy", &prepared, 201).await;
+    control.reject_list.store(true, SeqCst);
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    assert!(matches!(h.hello().await.providers[0].readiness, Readiness::Unknown { .. }));
+    let mut records = h.stream(None).await;
+    let record = serde_json::to_value(records.next().await).unwrap();
+    assert!(record["unavailable_providers"]["a"].is_object());
+    assert_eq!(record["environments"][0]["id"], environment.id);
+    healthy_control.started.notified().await;
+    healthy_control.sink.lock().unwrap().as_ref().unwrap().publish("healthy-event".into(), None, None, EventKind::Created);
+    assert!(matches!(records.next().await, ObserveRecord::Event { event } if event.provider == "b" && event.id == "healthy-event"));
+    control.reject_list.store(false, SeqCst);
+    let mut repaired = h.stream(None).await;
+    let record = serde_json::to_value(repaired.next().await).unwrap();
+    assert!(record.get("unavailable_providers").is_none());
+    assert!(matches!(h.hello().await.providers[0].readiness, Readiness::Ready));
+}
+
+// After history eviction, a failed provider is marked in the recovery snapshot;
+// the stream remains open and continues delivering healthy provider events.
+#[tokio::test]
+async fn recovery_snapshot_error_is_provider_local() {
     let (h, control) = controlled().await;
     h.configure(vec![provider("a", json!({}))]).await;
     h.credential("a", "ready").await;
@@ -843,8 +944,11 @@ async fn recovery_snapshot_error_fails_stream() {
     for n in 0..drydock_host::EVENT_HISTORY_CAPACITY + 1 {
         sink.publish(format!("id-{n}"), None, None, EventKind::Created);
     }
-    let failed = tokio::time::timeout(Duration::from_secs(2), records.stream.next()).await.unwrap();
-    assert!(matches!(failed, Some(Err(_))), "failed snapshot must not look like normal EOF");
+    let record = serde_json::to_value(records.next().await).unwrap();
+    assert_eq!(record["type"], "snapshot");
+    assert_eq!(record["unavailable_providers"]["a"]["kind"], "unavailable");
+    sink.publish("after-gap".into(), None, None, EventKind::Created);
+    assert!(matches!(records.next().await, ObserveRecord::Event { event } if event.id == "after-gap"));
 }
 
 // A later factory failure leaves both existing providers and credentials intact,
@@ -903,7 +1007,7 @@ async fn binary_sigterm_drains_and_removes_socket() {
             .status(),
         204
     );
-    assert_eq!(client.get("http://localhost/v1/events?since=expired").send().await.unwrap().status(), 503);
+    assert_eq!(client.get("http://localhost/v1/events?since=expired").send().await.unwrap().status(), 200);
     let malformed = client
         .put("http://localhost/v1/config")
         .header("content-type", "application/json")
@@ -978,7 +1082,7 @@ async fn snapshot_uses_polled_inventory_while_vendor_is_held() {
     let calls = control.list_calls.load(SeqCst);
     let mut snapshot =
         tokio::time::timeout(Duration::from_secs(1), h.stream(Some("expired"))).await.expect("cached snapshot must not wait for vendor");
-    assert!(matches!(snapshot.next().await, ObserveRecord::Snapshot { cursor: c, environments }
+    assert!(matches!(snapshot.next().await, ObserveRecord::Snapshot { cursor: c, environments, .. }
         if c == cursor(&running) && environments == vec![environment]));
     assert_eq!(control.list_calls.load(SeqCst), calls);
     control.hold_list.store(false, SeqCst);
