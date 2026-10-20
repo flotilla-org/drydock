@@ -277,6 +277,9 @@ disables auto-stop/auto-pause and auto-delete, waits for started, then launches
 the fixed command through toolbox exec. A guest `flock` serialises bootstrap;
 bootstrap succeeds only when a connection to `/run/drydock/agent.sock` succeeds.
 A stale socket with no listener is removed and the fixed agent command is restarted.
+`agent_command` is a trusted operator shell fragment interpreted by `sh`; unlike
+`ExecRequest.command` and the probe argv, it is not quoted as one executable.
+
 The toolbox budget is 25 seconds, covering the eight-second flock wait, five-second
 readiness loop and bounded one-second liveness connects; ordinary exec/probes get
 20 seconds (the current protocol `ExecRequest` has no timeout field). The agent should
@@ -353,7 +356,11 @@ outside route admission; sharing an organization also shares these limits.
 
 Quota reports structured region/class/resource keys with UCUM capacity units.
 Analytics reports organization-scoped neutral resource measurements, integrated
-UCUM units and exact decimal cost with currency code. Money is parsed from the
+UCUM units and exact decimal cost with currency code. Analytics GBSeconds are
+interpreted as reserved GiB integrated over time, using Daytona's documented
+[resource units](https://www.daytona.io/docs/en/sandboxes/#resources), and converted
+to By.s with 2^30. This interpretation of the analytics field naming remains a
+live metering acceptance assumption. Money is parsed from the
 original decimal lexeme before numeric conversion. An analytics currency code is
 used when present; the documented USD denomination is the fallback. `environment_hours` stays
 empty because aggregates cannot recover size distribution. Scope IDs are opaque.

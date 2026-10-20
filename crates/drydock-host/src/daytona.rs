@@ -11,6 +11,13 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 
 pub struct DaytonaModule;
+const SSH_TOKEN_TTL_MINUTES: &str = "5";
+#[derive(Clone, Copy)]
+enum ResponseFormat {
+    Json,
+    Analytics,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -105,12 +112,12 @@ impl Daytona {
         self.path(&self.settings.api_url, &segments)
     }
     async fn call(&self, method: Method, url: Url, body: Option<Value>, c: &Credentials) -> Result<Value> {
-        self.request(method, url, body, c, false).await?.ok_or_else(bad_response)
+        self.request(method, url, body, c, false, ResponseFormat::Json).await?.ok_or_else(bad_response)
     }
     /// None represents a provider uniqueness conflict for look-up-or-create only.
     /// Keep status branching here, independent of user-facing error wording.
     async fn create(&self, url: Url, body: Value, c: &Credentials) -> Result<Option<Value>> {
-        self.request(Method::POST, url, Some(body), c, true).await
+        self.request(Method::POST, url, Some(body), c, true, ResponseFormat::Json).await
     }
     async fn request(
         &self,
@@ -119,9 +126,9 @@ impl Daytona {
         body: Option<Value>,
         c: &Credentials,
         accept_conflict: bool,
+        response_format: ResponseFormat,
     ) -> Result<Option<Value>> {
         let token = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "Daytona API key not delivered".into() })?;
-        let exact_money = url.path().ends_with("/usage/aggregated");
         let mut request = reqwest::Request::new(method, url);
         let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| refused("invalid Daytona API key header"))?;
@@ -151,21 +158,18 @@ impl Daytona {
                 429 => ProtocolError::RateLimited { reason: "Daytona organization rate limit".into(), retry_after },
                 408 => ProtocolError::Unavailable { reason: "Daytona command or request timed out".into(), retry_after: None },
                 500..=599 => ProtocolError::Unavailable { reason: "Daytona API unavailable".into(), retry_after },
-                _ => ProtocolError::Internal {
-                    reason: format!("unexpected Daytona HTTP {status}"),
-                    provider_error: Secret::new(raw.clone()),
-                },
+                _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: Secret::new(raw) },
             });
         }
         if response.body().is_empty() {
             return Ok(Some(Value::Null));
         }
-        if exact_money {
+        if matches!(response_format, ResponseFormat::Analytics) {
             return parse_analytics(response.body()).map(Some);
         }
         serde_json::from_slice(response.body())
             .map(Some)
-            .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona response".into(), provider_error: Secret::new(raw.clone()) })
+            .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona response".into(), provider_error: Secret::new(raw) })
     }
     async fn inventory(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Value>> {
         let mut rows = Vec::new();
@@ -301,6 +305,9 @@ impl Daytona {
         let base = match &self.settings.toolbox_url {
             Some(base) => base.clone(),
             None => {
+                // Fetch the canonical route per call so resume/migration cannot
+                // leave a cached runner URL stale. This extra GET is intentional;
+                // individual-call admission accounting is tracked in drydock#35.
                 let row = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
                 text(&row, "toolboxProxyUrl")?.to_owned()
             }
@@ -650,7 +657,7 @@ impl Provider for Daytona {
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
         let mut url = self.sandbox_url(id, Some("ssh-access"))?;
-        url.query_pairs_mut().append_pair("expiresInMinutes", "5");
+        url.query_pairs_mut().append_pair("expiresInMinutes", SSH_TOKEN_TTL_MINUTES);
         let v = self.call(Method::POST, url, None, c).await?;
         Ok(Connection::Ssh {
             endpoint: self.settings.ssh_endpoint.clone(),
@@ -665,7 +672,10 @@ impl Provider for Daytona {
 #[async_trait]
 impl SuspendResume for Daytona {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        if !matches!(self.lifecycle_state(id, c).await?, Observation::Stopped { .. }) {
+        if !matches!(
+            self.lifecycle_state(id, c).await?,
+            Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping }
+        ) {
             self.call(Method::POST, self.sandbox_url(id, Some("stop"))?, None, c).await?;
         }
         // This deterministic continuation marker binds provider and id; it is
@@ -682,10 +692,13 @@ impl SuspendResume for Daytona {
         if token.token.expose() != name("resume", &format!("{}\0{id}", self.name)) {
             return Err(refused("resume token belongs to another environment"));
         }
-        if matches!(self.lifecycle_state(id, c).await?, Observation::Running) {
+        let state = self.lifecycle_state(id, c).await?;
+        if matches!(state, Observation::Running) {
             return self.bootstrap(id, c).await;
         }
-        self.call(Method::POST, self.sandbox_url(id, Some("start"))?, None, c).await?;
+        if !matches!(state, Observation::Transitioning { phase: TransitionPhase::Starting }) {
+            self.call(Method::POST, self.sandbox_url(id, Some("start"))?, None, c).await?;
+        }
         self.wait_started(id, c).await?;
         self.bootstrap(id, c).await?;
         Ok(())
@@ -752,7 +765,11 @@ impl UsageOperation for Daytona {
         url.query_pairs_mut()
             .append_pair("from", &String::from(period.start().clone()))
             .append_pair("to", &String::from(period.end().clone()));
-        let v = self.call(Method::GET, url, None, c).await?;
+        let v = self.request(Method::GET, url, None, c, false, ResponseFormat::Analytics).await?.ok_or_else(bad_response)?;
+        // Daytona's reserved memory/disk quantities are GiB:
+        // https://www.daytona.io/docs/en/sandboxes/#resources
+        // Interpret analytics' GBSeconds as the integral of those same reserved
+        // quantities. This naming assumption is part of live metering acceptance.
         let resources = [
             (ResourceKind::Cpu, "{vCPU}.s", "totalCPUSeconds", 1.0),
             (ResourceKind::Memory, "By.s", "totalRAMGBSeconds", GIB as f64),

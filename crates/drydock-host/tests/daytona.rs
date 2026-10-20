@@ -28,6 +28,8 @@ struct State {
     activations: usize,
     inactive_reads: usize,
     created_state: Option<String>,
+    complete_transition_on_read: bool,
+    lifecycle_posts: Vec<String>,
     command_exit: Option<i32>,
     command_output: Option<String>,
     require_bootstrap_budget: bool,
@@ -207,8 +209,22 @@ impl StandIn {
             }
             ("GET", p) if p.starts_with("/api/sandbox/") => {
                 let id = p.trim_start_matches("/api/sandbox/");
-                let row = s.rows.get(id).or_else(|| s.rows.values().find(|v| v["name"].as_str() == Some(id)));
-                response(if row.is_some() { 200 } else { 404 }, row.cloned().unwrap_or(Value::Null))
+                let row = s.rows.get(id).or_else(|| s.rows.values().find(|v| v["name"].as_str() == Some(id))).cloned();
+                if s.complete_transition_on_read
+                    && let Some(row) = &row
+                {
+                    let next = match row["state"].as_str() {
+                        Some("starting") => Some("started"),
+                        Some("stopping") => Some("stopped"),
+                        _ => None,
+                    };
+                    if let Some(next) = next {
+                        let key = row["id"].as_str().unwrap();
+                        s.rows.get_mut(key).unwrap()["state"] = json!(next);
+                        s.complete_transition_on_read = false;
+                    }
+                }
+                response(if row.is_some() { 200 } else { 404 }, row.unwrap_or(Value::Null))
             }
             ("DELETE", p) if p.starts_with("/api/sandbox/") => {
                 let row = s.rows.remove(p.trim_start_matches("/api/sandbox/"));
@@ -220,6 +236,7 @@ impl StandIn {
                 response(200, json!({"token":format!("ephemeral-{}",s.mints),"expiresAt":"2026-10-19T12:05:00Z"}))
             }
             ("POST", p) if p.ends_with("/stop") || p.ends_with("/start") => {
+                s.lifecycle_posts.push(p.into());
                 let id = p.trim_start_matches("/api/sandbox/").split('/').next().unwrap();
                 let row = s.rows.get_mut(id).unwrap();
                 row["state"] = json!(if p.ends_with("/stop") { "stopped" } else { "started" });
@@ -381,7 +398,11 @@ async fn lifecycle_and_credential_modes() {
         assert_eq!(quota.resources[0].in_use, 2.0);
         assert_eq!(quota.resources[0].limit, Some(10.0));
         let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-20T00:00:00Z".parse().unwrap()).unwrap();
-        let cost = ops.usage.unwrap().usage(period.clone(), &c).await.unwrap().measurements.unwrap().cost.unwrap();
+        let measurements = ops.usage.unwrap().usage(period.clone(), &c).await.unwrap().measurements.unwrap();
+        assert_eq!(measurements.resources[&ResourceKind::Memory].unit, "By.s");
+        assert_eq!(measurements.resources[&ResourceKind::Memory].amount, 14400.0 * (1u64 << 30) as f64);
+        assert_eq!(measurements.resources[&ResourceKind::Disk].amount, 36000.0 * (1u64 << 30) as f64);
+        let cost = measurements.cost.unwrap();
         assert_eq!(cost.amount, "0.0123");
         assert_eq!(cost.currency, "USD");
         http.0.lock().unwrap().currency = Some("EUR".into());
@@ -943,4 +964,31 @@ async fn lifecycle_state_checks_do_not_probe() {
     sr.resume(&env.id, token, &c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before + 1);
     assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { .. })));
+}
+
+// Retried stop/start observes operations already moving in the requested
+// direction. It must not submit another lifecycle command during transition.
+#[tokio::test]
+async fn lifecycle_retries_wait_for_existing_transition() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let env = row(p.provision(request(prep, "transition-retry"), &c).await.unwrap());
+    {
+        let mut state = http.0.lock().unwrap();
+        state.rows.get_mut(&env.id).unwrap()["state"] = json!("stopping");
+        state.complete_transition_on_read = true;
+    }
+    let sr = p.operations().suspend_resume.unwrap();
+    let token = sr.suspend(&env.id, &c).await.unwrap();
+    assert!(http.0.lock().unwrap().lifecycle_posts.is_empty());
+    {
+        let mut state = http.0.lock().unwrap();
+        state.rows.get_mut(&env.id).unwrap()["state"] = json!("starting");
+        state.complete_transition_on_read = true;
+    }
+    sr.resume(&env.id, token, &c).await.unwrap();
+    assert!(http.0.lock().unwrap().lifecycle_posts.is_empty());
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.state, Observation::Running);
 }
