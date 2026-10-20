@@ -566,7 +566,14 @@ async fn observations_are_typed() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials(false);
+    // Published vendor wording, not a captured live-account response. Other
+    // rows below are synthetic cause/refusal examples, labelled deliberately.
+    let schema: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
+    let documented_reason = schema["schemas"]["Sandbox"]["properties"]["errorReason"]["example"].as_str().unwrap();
     for (state, reason, expected) in [
+        ("error", documented_reason, Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+        ("error", "no room on runner", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+        ("error", "zoom process startup failed", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
         ("error", "out of memory", Observation::Gone { cause: GoneCause::HostOutOfMemory }),
         ("error", "evicted by provider", Observation::Gone { cause: GoneCause::EvictedByProvider }),
         ("error", "runner unreachable", Observation::Unknown { reason: UnknownReason::HostUnreachable }),

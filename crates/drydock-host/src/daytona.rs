@@ -259,10 +259,10 @@ impl Daytona {
         Ok(())
     }
     async fn observed(&self, v: Value, c: &Credentials) -> Result<ObservedEnvironment> {
-        let restricted = v.get("networkBlockAll").and_then(Value::as_bool) == Some(true)
+        let deny_all = v.get("networkBlockAll").and_then(Value::as_bool) == Some(true);
+        let restricted = deny_all
             || v.get("domainAllowList").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
             || v.get("networkAllowList").and_then(Value::as_str).is_some_and(|s| !s.is_empty() && s != "0.0.0.0/0");
-        let deny_all = v.get("networkBlockAll").and_then(Value::as_bool) == Some(true);
         let mut row = self.environment(v)?;
         if restricted
             && matches!(row.environment.state, Observation::Running)
@@ -308,6 +308,9 @@ impl Daytona {
                 // Fetch the canonical route per call so resume/migration cannot
                 // leave a cached runner URL stale. This extra GET is intentional;
                 // individual-call admission accounting is tracked in drydock#35.
+                // The control plane is trusted to delegate bearer authentication
+                // to this proxy host. Pin toolbox_url when that delegation is not
+                // acceptable; HTTPS validation alone is not a host allowlist.
                 let row = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
                 text(&row, "toolboxProxyUrl")?.to_owned()
             }
