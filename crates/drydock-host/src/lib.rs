@@ -259,6 +259,10 @@ impl Instance {
     {
         let (credentials, generation) = {
             let auth = self.auth.recover();
+            // Routes and polls use exactly the same admission gate. Direct
+            // rejection blocks both; proxied rejection permits both to probe.
+            // A pending observation reservation can safely survive unready time:
+            // no route can resume while polling remains disabled by readiness.
             if !self.availability(&auth).may_call {
                 return Err(ProtocolError::Unavailable { reason: "provider is not ready; inspect hello".into(), retry_after: None });
             }
@@ -526,7 +530,7 @@ impl Host {
             return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
         }
         let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
-        let mut unavailable_providers = BTreeMap::new();
+        let mut push_errors = BTreeMap::new();
         let push_cursor = {
             let log = self.events.log.recover();
             format!("{}:{}", log.epoch, log.serial)
@@ -548,11 +552,10 @@ impl Host {
             match result {
                 Ok(rows) => push_rows.extend(rows),
                 Err(error) => {
-                    unavailable_providers.insert(name, error);
+                    push_errors.insert(name, error);
                 }
             }
         }
-        let push_errors = unavailable_providers;
         loop {
             if *stopping.borrow() {
                 return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
@@ -715,6 +718,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
             continue;
         }
         let module = &host.registry[&modules[&p.module]];
+        // Also validate programmatic configurations, which can bypass the wire decoder.
         if matches!(&p.credential, CredentialMode::Proxied { placeholder_token, .. } if placeholder_token.expose().is_empty()) {
             return Err(refused("empty proxy placeholder token").into());
         }
@@ -819,6 +823,12 @@ async fn credential(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// A module violating stable port declarations must produce a typed request
+// refusal rather than panic after the cached capability gate has admitted it.
+fn operation_port<T: ?Sized>(port: Option<&T>) -> Result<&T> {
+    port.ok_or_else(|| refused("operation port unavailable"))
+}
+
 async fn prepare(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<PrepareRequest>) -> ApiResult<Json<Prepared>> {
     Ok(Json(h.call(&p, Gate::Prepare, |p, c| async move { p.prepare(r, &c).await }).await?))
 }
@@ -867,31 +877,18 @@ async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
     Ok(Json(reach))
 }
 async fn suspend(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<ResumeToken>> {
-    Ok(Json(
-        h.call(
-            &p,
-            Gate::Suspend,
-            |p, c| async move { p.operations().suspend_resume.expect("validated operation port").suspend(&id, &c).await },
-        )
-        .await?,
-    ))
+    Ok(Json(h.call(&p, Gate::Suspend, |p, c| async move { operation_port(p.operations().suspend_resume)?.suspend(&id, &c).await }).await?))
 }
 async fn resume(
     State(h): State<Host>,
     ApiPath((p, id)): ApiPath<(String, String)>,
     ApiJson(token): ApiJson<ResumeToken>,
 ) -> ApiResult<StatusCode> {
-    h.call(&p, Gate::Resume, |p, c| async move {
-        p.operations().suspend_resume.expect("validated operation port").resume(&id, token, &c).await
-    })
-    .await?;
+    h.call(&p, Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {
-    Ok(Json(
-        h.call(&p, Gate::Export, |p, c| async move { p.operations().export.expect("validated operation port").export(&id, &c).await })
-            .await?,
-    ))
+    Ok(Json(h.call(&p, Gate::Export, |p, c| async move { operation_port(p.operations().export)?.export(&id, &c).await }).await?))
 }
 async fn usage(
     State(h): State<Host>,
@@ -899,13 +896,10 @@ async fn usage(
     query: std::result::Result<Query<Period>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult<Json<Usage>> {
     let Query(period) = query.map_err(|_| refused("invalid usage period"))?;
-    Ok(Json(
-        h.call(&p, Gate::Usage, |p, c| async move { p.operations().usage.expect("validated operation port").usage(period, &c).await })
-            .await?,
-    ))
+    Ok(Json(h.call(&p, Gate::Usage, |p, c| async move { operation_port(p.operations().usage)?.usage(period, &c).await }).await?))
 }
 async fn quota(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Quota>> {
-    Ok(Json(h.call(&p, Gate::Quota, |p, c| async move { p.operations().quota.expect("validated operation port").quota(&c).await }).await?))
+    Ok(Json(h.call(&p, Gate::Quota, |p, c| async move { operation_port(p.operations().quota)?.quota(&c).await }).await?))
 }
 
 fn validate_upgrade(request: &Request, protocol: &str) -> Result<()> {
@@ -967,10 +961,7 @@ async fn relay(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
 }
 async fn exec(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>, request: ExecUpgrade) -> ApiResult<Response> {
     let stream =
-        h.call(&p, Gate::Exec, |p, c| async move {
-            p.operations().exec.expect("validated operation port").exec(&id, request.command, &c).await
-        })
-        .await?;
+        h.call(&p, Gate::Exec, |p, c| async move { operation_port(p.operations().exec)?.exec(&id, request.command, &c).await }).await?;
     Ok(upgrade(request.upgrade, "drydock-stream", stream, h.stopping.subscribe()))
 }
 #[derive(Deserialize)]
@@ -1292,6 +1283,13 @@ mod operation_tests {
             for _ in 0..3 {
                 assert!(i.reserve("list", false).is_ok());
                 assert!(matches!(i.reserve("list", true), Err(ProtocolError::RateLimited { .. })));
+                i.auth.recover().rejected = true;
+                for poll in [false, true] {
+                    let result: Result<()> =
+                        i.call_with_budget(Gate::List, poll, |_, _| async { panic!("unready calls must not reach provider") }).await;
+                    assert!(matches!(result, Err(ProtocolError::Unavailable { .. })));
+                }
+                i.auth.recover().rejected = false;
                 tokio::time::advance(std::time::Duration::from_secs(2)).await;
                 assert!(matches!(i.reserve("list", false), Err(ProtocolError::RateLimited { .. })));
                 assert!(i.reserve("list", true).is_ok());

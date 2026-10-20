@@ -47,7 +47,9 @@ are borrowed ports returned by `operations()`: `Exec`, `SuspendResume`,
 `Operations`, so a basic provider implements no optional methods. Implement only
 the supported traits, returning `Some(self)` (or a separate adapter) for those ports.
 Registration refuses a mismatch between ports and capability flags. Both declarations
-must stay stable for the configured lifetime. The host remains the single capability
+must stay stable for the configured lifetime. If a module violates this contract by
+withdrawing a port, the request returns a typed Refused error instead of panicking.
+The host remains the single capability
 gate; ports contain no unsupported defaults. All ports are object-safe, `Send + Sync`,
 and use `&self`. Push providers retain the post-commit `run(PushContext)` hook.
 
@@ -137,7 +139,11 @@ provider configuration. A timed-out list is cancelled and its provider is marked
 Unavailable; healthy providers still publish inventory. Lists return complete vectors:
 no captured or unfinished response is published as authoritative. Host shutdown
 cancels the whole batch immediately. Waiting for an initial poll inventory does not
-restart the push lists or their deadline.
+restart the push lists or their deadline. If enough events arrive during that wait
+to evict the pre-list cursor from the 1024-event history, the next stream iteration
+emits a fresh gap snapshot instead of replaying the lost events. Clients apply that
+replacement snapshot normally, preserving inventory for unavailable providers;
+individual evicted billing transitions cannot be recovered from this in-memory log.
 Snapshot rows mark a metering gap and do not create extra billing transitions.
 
 Snapshots omit inventory for unready providers and failed push lists, reporting

@@ -1571,7 +1571,13 @@ async fn push_snapshot_lists_share_deadline_and_isolate_partial_results() {
             tokio::time::timeout(Duration::from_secs(1), entered.notified()).await.expect("all lists must start concurrently");
         }
         healthy_control.sink.lock().unwrap().as_ref().unwrap().publish("overlap".into(), None, None, EventKind::Created);
-        let response = tokio::time::timeout(Duration::from_secs(6), pending).await.unwrap().unwrap();
+        healthy_control.wait_lists(0).await;
+        // Keep socket setup on real time; advance only once all vendor gates
+        // have entered, then resume before waiting for the real HTTP response.
+        tokio::time::pause();
+        tokio::time::advance(drydock_host::PUSH_SNAPSHOT_TIMEOUT).await;
+        tokio::time::resume();
+        let response = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap().unwrap();
         assert!(start.elapsed() < Duration::from_secs(6), "deadline must be shared, not per provider");
         let mut records = Records { stream: response.bytes_stream().boxed(), buffer: vec![] };
         let ObserveRecord::Snapshot { environments, unavailable_providers, .. } = records.next().await else { panic!("expected snapshot") };
@@ -1605,4 +1611,31 @@ async fn shutdown_cancels_held_push_snapshot() {
     let response = tokio::time::timeout(Duration::from_secs(1), request).await.expect("shutdown cancels snapshot").unwrap();
     assert_eq!(response.status(), 503);
     assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Unavailable { .. }));
+}
+
+// A module that violates its stable declaration after configuration must return a
+// typed refusal rather than panic an HTTP task after the cached gate admits it.
+#[tokio::test]
+async fn disappearing_operation_port_is_a_typed_refusal() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "token").await;
+    let prepared = h.prepared("a").await;
+    let row = h.provision("a", "port-change", &prepared, 201).await;
+    control.disable_exec.store(true, SeqCst);
+    let response = h
+        .client
+        .post(format!("http://localhost/v1/providers/a/environments/{}/exec", row.id))
+        .header("connection", "Upgrade")
+        .header("upgrade", "drydock-stream")
+        .json(&json!({"command":["cat"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+    assert!(
+        matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { reason } if reason == "operation port unavailable")
+    );
+    assert!(h.hello().await.providers[0].capabilities.fallback_runner);
 }
