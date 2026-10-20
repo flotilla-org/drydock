@@ -23,7 +23,7 @@ pub struct Options {
     pub auth_audit: Option<Vec<String>>,
     #[serde(default = "default_sample_millis")]
     pub billing_sample_millis: u64,
-    /// Wait after recording the sample before reading vendor usage.
+    /// Wait 0..=86400000 ms after recording the sample before reading vendor usage.
     #[serde(default)]
     pub billing_settle_millis: u64,
     #[serde(default)]
@@ -307,6 +307,10 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         report.record("timeouts", Err(error));
         return report;
     }
+    if let Err(error) = validate_billing_settle(options.billing_settle_millis) {
+        report.record("billing_settle", Err(error));
+        return report;
+    }
     let client = &client.clone().with_request_timeout(Duration::from_secs(options.timeouts.request_seconds));
     let hello = match client.hello().await {
         Ok(hello) => hello,
@@ -406,6 +410,9 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     report.elapsed_seconds = start.elapsed().as_secs_f64();
     report
 }
+fn validate_billing_settle(millis: u64) -> Result<()> {
+    require(millis <= 86_400_000, "billing settle delay must be 0..86400000 milliseconds")
+}
 async fn billing_window(
     client: &Client,
     provider: &str,
@@ -415,6 +422,7 @@ async fn billing_window(
     settle_millis: u64,
     running: bool,
 ) -> Result<()> {
+    validate_billing_settle(settle_millis)?;
     require((1..=60000).contains(&millis), "billing sample must be 1..60000 milliseconds")?;
     let start = chrono::Utc::now();
     tokio::time::sleep(Duration::from_millis(millis)).await;
@@ -1196,6 +1204,14 @@ mod tests {
             assert_eq!(error.category(), expected);
         }
         assert_eq!(std::io::Error::new(std::io::ErrorKind::TimedOut, secret).category(), "timeout");
+    }
+    // Billing settle accepts zero through one day and refuses typos/overflow
+    // before any endpoint calls; it is independent of request/event timeouts.
+    #[test]
+    fn billing_settle_boundaries() {
+        for (millis, valid) in [(0, true), (1, true), (86_400_000, true), (86_400_001, false), (u64::MAX, false)] {
+            assert_eq!(validate_billing_settle(millis).is_ok(), valid);
+        }
     }
     // Deserializing partial options keeps the established defaults, rejects
     // zero/overflowing timer values, and permits bounded live-provider deadlines.

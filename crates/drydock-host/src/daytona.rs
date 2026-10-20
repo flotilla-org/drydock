@@ -650,6 +650,18 @@ impl Provider for Daytona {
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
         self.observed(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?, c).await
     }
+    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+        let value = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
+        let fallback = self.environment(value.clone())?;
+        match self.observed(value, c).await {
+            Ok(row) => Ok(row),
+            Err(error) => {
+                // Typed category reaches host diagnostics; guest/vendor text stays secret.
+                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), error = ?error, "lifecycle succeeded; egress measurement failed");
+                Ok(fallback)
+            }
+        }
+    }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
             Ok(_) | Err(ProtocolError::NotFound { .. }) => Ok(()),
@@ -766,6 +778,7 @@ impl UsageOperation for Daytona {
         let to_text = String::from(period.end().clone());
         let from = from_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period start"))?;
         let to = to_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period end"))?;
+        let ongoing_end = to.min(chrono::Utc::now());
         let mut url = self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "usage", "aggregated"])?;
         url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
         let v = self.request(Method::GET, url, None, c, false, ResponseFormat::Analytics).await?.ok_or_else(bad_response)?;
@@ -807,17 +820,26 @@ impl UsageOperation for Daytona {
             let periods = self.call(Method::GET, url, None, c).await?;
             for row in periods.as_array().ok_or_else(|| bad_value(&periods))? {
                 let cpus = number(row, "cpu")?;
+                // Zero-CPU records contribute no size-hours, even if other
+                // optional fields are absent or malformed.
                 if cpus == 0.0 {
                     continue;
                 }
                 let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
                 let end = match row.get("endAt") {
-                    None => to,
-                    Some(_) => text(row, "endAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?,
+                    None => ongoing_end,
+                    Some(value) => {
+                        let end = value
+                            .as_str()
+                            .ok_or_else(|| bad_value(row))?
+                            .parse::<chrono::DateTime<chrono::Utc>>()
+                            .map_err(|_| bad_value(row))?;
+                        if end < start {
+                            return Err(bad_value(row));
+                        }
+                        end
+                    }
                 };
-                if row.get("endAt").is_some() && end < start {
-                    return Err(bad_value(row));
-                }
                 let start = start.max(from);
                 let end = end.min(to);
                 if end <= start {

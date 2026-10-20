@@ -286,8 +286,8 @@ CPU, memory, disk, destination and usage-period request gets its own verdict.
 Billing checks require the exact stopped cause and vendor usage facts over a
 sample window (`billing_sample_millis`, default 25); use a distinct granted size
 and an idle account so aggregate usage does not mix in another running guest.
-The sample lasts 1..60000 ms. `billing_settle_millis` (default 0) waits after
-the sample ends before querying that exact window, without moving its endpoints.
+The sample lasts 1..60000 ms. `billing_settle_millis` (default 0, range 0..86400000)
+waits after the sample ends before querying that exact window, without moving its endpoints.
 Set it to the provider accounting delay; a longer sample alone does not settle it.
 
 Constant-time authentication has an executable evidence requirement:

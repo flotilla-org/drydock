@@ -107,22 +107,15 @@ pub trait Provider: Send + Sync {
     /// still visible but no billable Running transition can be inferred.
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>>;
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment>;
-    /// Lifecycle enrichment must not turn a completed lifecycle into a probe failure.
-    /// If strict inspection fails, use the authoritative inventory entry; inventory
-    /// errors and absence still propagate. Modules may override to reuse a cheap
-    /// observation already obtained before attempting enrichment.
+    /// The safe lifecycle default reads inventory without attempting guest probes.
+    /// Modules may override to enrich a cheap observation, retaining that observation
+    /// if enrichment fails. Inventory failures and absence still propagate.
     async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        match self.inspect(id, c).await {
-            Ok(row) => Ok(row),
-            Err(error) => {
-                tracing::warn!(environment = %id, error_class = error.class(), "lifecycle inspection failed; using inventory");
-                self.list(c)
-                    .await?
-                    .into_iter()
-                    .find(|row| row.environment.id == id)
-                    .ok_or_else(|| ProtocolError::NotFound { reason: "environment absent after lifecycle".into() })
-            }
-        }
+        self.list(c)
+            .await?
+            .into_iter()
+            .find(|row| row.environment.id == id)
+            .ok_or_else(|| ProtocolError::NotFound { reason: "environment absent after lifecycle".into() })
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()>;
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection>;

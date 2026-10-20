@@ -902,6 +902,8 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generatio
     let listed: std::collections::BTreeSet<_> = rows.iter().map(|r| r.environment.id.as_str()).collect();
     measured.retain(|id, _| listed.contains(id.as_str()));
     times.retain(|id, _| measured.contains_key(id));
+    // Only the named non-starting phases preserve evidence. Starting/preparing
+    // may cross a stop/start between polls; new phases invalidate by default.
     for row in rows {
         if !row.egress_measured && measured.get(&row.environment.id).is_some_and(|old| old.egress_policy != row.egress_policy) {
             // A changed policy permanently invalidates old evidence, even if it

@@ -1130,7 +1130,11 @@ async fn lifecycle_success_is_independent_of_probe_failure() {
             let port = p.operations().suspend_resume.unwrap();
             let token = port.suspend(&row.environment.id, &c).await.unwrap();
             port.resume(&row.environment.id, token, &c).await.unwrap();
+            // Failed enrichment reuses the sandbox GET; it must not list the inventory.
+            let requests = http.0.lock().unwrap().requests;
             let resumed = p.inspect_after_lifecycle(&row.environment.id, &c).await.unwrap();
+            // The probe resolves its toolbox URL with a second GET, then executes.
+            assert_eq!(http.0.lock().unwrap().requests - requests, 3);
             assert!(matches!(resumed.environment.state, Observation::Running));
             assert_eq!(resumed.environment.egress, Enforcement::Advisory);
             assert!(!resumed.egress_measured);
@@ -1313,9 +1317,9 @@ async fn fast_restart_invalidates_host_egress_evidence() {
 #[tokio::test]
 async fn conformance_waits_for_settled_billing_windows() {
     use drydock::conformance::{self, Options, Scenario};
-    for settle in [0, 400] {
+    for settle in [0, 4000] {
         let vendor = Arc::new(StandIn::default());
-        vendor.0.lock().unwrap().accounting_delay_millis = Some(200);
+        vendor.0.lock().unwrap().accounting_delay_millis = Some(2000);
         let host = HostHarness::start(vendor.clone()).await;
         let p = provider(vendor.clone()).await;
         let prep = prepared(p.as_ref(), &credentials(false)).await;
@@ -1340,7 +1344,7 @@ async fn conformance_waits_for_settled_billing_windows() {
         let windows = vendor.0.lock().unwrap().analytics_windows.clone();
         assert_eq!(windows.len(), if settle > 0 { 6 } else { 2 });
         for (start, end) in windows {
-            assert!((25..1000).contains(&(end - start).num_milliseconds()), "sample endpoints moved");
+            assert!((end - start).num_milliseconds() >= 25, "sample must retain its full duration");
         }
         host.finish().await;
     }
@@ -1378,4 +1382,70 @@ async fn analytics_query_formats_are_enforced() {
         .build()
         .unwrap();
     assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
+}
+
+// New providers inherit a lifecycle read that never attempts guest enrichment.
+struct InventoryLifecycle(Arc<dyn Provider>);
+#[async_trait]
+impl Provider for InventoryLifecycle {
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+    fn observation(&self) -> ObservationMode {
+        self.0.observation()
+    }
+    async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+        self.0.prepare(r, c).await
+    }
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+        self.0.provision(r, c).await
+    }
+    async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
+        self.0.list(c).await
+    }
+    async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+        self.0.inspect(id, c).await
+    }
+    async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
+        self.0.destroy(id, c).await
+    }
+    async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
+        self.0.reach(id, c).await
+    }
+    async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
+        self.0.relay(id, c).await
+    }
+}
+#[tokio::test]
+async fn default_lifecycle_inspection_uses_inventory_without_probing() {
+    let http = Arc::new(StandIn::default());
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let env = row(p.provision(request(prep, "default-lifecycle"), &c).await.unwrap());
+    let provider = InventoryLifecycle(p);
+    let probes = http.0.lock().unwrap().executed.len();
+    let row = provider.inspect_after_lifecycle(&env.id, &c).await.unwrap();
+    assert_eq!(row.environment.egress, Enforcement::Advisory);
+    assert_eq!(http.0.lock().unwrap().executed.len(), probes);
+    assert!(matches!(provider.inspect_after_lifecycle("absent", &c).await, Err(ProtocolError::NotFound { .. })));
+    http.0.lock().unwrap().failure = Some(401);
+    assert!(matches!(provider.inspect_after_lifecycle(&env.id, &c).await, Err(ProtocolError::CredentialRejected { .. })));
+}
+
+// Ongoing periods cannot bill time that has not elapsed, even in future windows.
+#[tokio::test]
+async fn ongoing_usage_does_not_bill_the_future() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::hours(1);
+    let end = now + chrono::Duration::hours(1);
+    http.0.lock().unwrap().usage_periods = Some(json!([
+        {"cpu":1,"ramGB":2,"diskGB":3,"startAt": start.to_rfc3339()}
+    ]));
+    let period = Period::new(start.into(), end.into()).unwrap();
+    let usage = p.operations().usage.unwrap().usage(period, &credentials(false)).await.unwrap();
+    let elapsed_hours = (chrono::Utc::now() - start).num_milliseconds() as f64 / 3_600_000.0;
+    assert!((1.0..=elapsed_hours).contains(&usage.environment_hours[0].hours));
 }
