@@ -21,7 +21,9 @@ cursor across calls, reconnecting with `since` after disconnect. Consumers call
 exponential backoff from 100 ms up to five seconds, reset after a delivered record;
 connection refusal and stream disconnect both schedule the next attempt.
 Ordinary route calls never retry. Snapshots remain
-`ObserveRecord::Snapshot`, explicitly marking a gap. NDJSON framing supports
+`ObserveRecord::Snapshot`, explicitly marking a gap. Protocol v2's
+`unavailable_providers` map is preserved: keep previous inventory for those
+providers rather than interpreting their absence as deletion or a billing event. NDJSON framing supports
 fragmented/multiple records and rejects incomplete final records; a single record
 is limited to 8 MiB, and buffered framing input to 8 MiB plus its newline;
 chunks that exceed the remaining framing budget are rejected before copying. Dropping the observer drops its stream.

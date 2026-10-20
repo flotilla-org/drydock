@@ -577,3 +577,26 @@ async fn cache_does_not_block_other_providers() {
     http.release.notify_one();
     assert!(a.await.unwrap().unwrap().is_empty());
 }
+
+// Protocol v2 marks unavailable providers in a snapshot. The typed observer
+// preserves those markers so absence is never mistaken for authoritative loss.
+#[tokio::test]
+async fn typed_observer_preserves_partial_snapshot_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = spec();
+    let mut missing = spec.configuration.providers[0].clone();
+    missing.name = "unavailable".into();
+    missing.credential = CredentialMode::Direct { credential_reference: "missing".into() };
+    spec.configuration.providers.push(missing);
+    let mut host = supervisor(dir.path()).start(spec).await.unwrap();
+    host.ready(Duration::from_secs(5)).await.unwrap();
+    let mut observer = Observer::new(host.client.clone(), None);
+    let record = tokio::time::timeout(Duration::from_secs(3), observer.next()).await.unwrap().unwrap();
+    match record {
+        ObserveRecord::Snapshot { unavailable_providers, .. } => {
+            assert!(matches!(unavailable_providers.get("unavailable"), Some(ProtocolError::Unavailable { .. })));
+            assert!(!unavailable_providers.contains_key("a"));
+        }
+        other => panic!("expected marked gap snapshot, got {other:?}"),
+    }
+}
