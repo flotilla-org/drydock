@@ -32,15 +32,16 @@ async fn cli_lifecycle_against_reference_host() {
                 .output()
                 .await
                 .unwrap();
-            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
             String::from_utf8(output.stdout).unwrap()
         }
     };
     assert!(run(vec!["hosts".into()]).await.contains("ready"));
     assert!(run(vec!["instances".into()]).await.contains("\"instance\":\"a\""));
     let client = drydock::client::Client::unix(socket).unwrap();
-    let prepared =
-        client.prepare("a", &PrepareRequest { image_digest: "sha256:image".into(), tools_digest: "sha256:tools".into() }).await.unwrap();
+    let prepared: Prepared =
+        serde_json::from_str(&run(vec!["prepare".into(), "rust".into(), "a".into(), "sha256:image".into(), "sha256:tools".into()]).await)
+            .unwrap();
     let request = dir.path().join("launch.json");
     std::fs::write(
         &request,
@@ -58,6 +59,59 @@ async fn cli_lifecycle_against_reference_host() {
         serde_json::from_str(&run(vec!["launch".into(), "rust".into(), "a".into(), request.to_string_lossy().into_owned()]).await).unwrap();
     let list: Vec<Environment> = serde_json::from_str(&run(vec!["list".into(), "rust".into(), "a".into()]).await).unwrap();
     assert_eq!(list, vec![environment.clone()]);
+    let options = drydock::conformance::Options {
+        request: ProvisionRequest {
+            label: "cli-conformance".into(),
+            prepared: client.prepare("a", &PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }).await.unwrap(),
+            size: Size { cpus: 2., memory_bytes: 1024, disk_bytes: 0 },
+            egress: EgressRequest::default(),
+            ssh_public_key: None,
+        },
+        scenarios: vec![
+            drydock::conformance::Scenario::Prepare,
+            drydock::conformance::Scenario::Lifecycle,
+            drydock::conformance::Scenario::Observation,
+            drydock::conformance::Scenario::Reach,
+            drydock::conformance::Scenario::Refusal,
+            drydock::conformance::Scenario::Destroy,
+            drydock::conformance::Scenario::Metering,
+        ],
+        fixture_configuration: None,
+        billing_sample_millis: 25,
+        null_environment_id: None,
+        auth_audit: None,
+        timeouts: Default::default(),
+        echo_relay: true,
+        reach_probe: None,
+        egress_probe: None,
+    };
+    let options_file = dir.path().join("conformance.json");
+    std::fs::write(&options_file, serde_json::to_vec(&options).unwrap()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(
+        &run(vec!["conformance".into(), "--provider".into(), "a".into(), "--options".into(), options_file.to_string_lossy().into_owned()])
+            .await,
+    )
+    .unwrap();
+    assert!(report["checks"].as_array().unwrap().iter().all(|check| check["passed"] == true));
+    // A non-reference module must be refused before the CLI starts/configures
+    // any host. The gate uses configured entrypoint, never provider display name.
+    let mut non_reference: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    non_reference[0]["configuration"]["modules"][0]["entrypoint"] = serde_json::json!("vendor-module");
+    let gated_config = dir.path().join("live-hosts.json");
+    std::fs::write(&gated_config, serde_json::to_vec(&non_reference).unwrap()).unwrap();
+    let refused = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+        .arg("--config")
+        .arg(gated_config)
+        .arg("--runtime-directory")
+        .arg(dir.path().join("unused"))
+        .args(["conformance", "--provider", "a", "--options"])
+        .arg(&options_file)
+        .output()
+        .await
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --live"));
+    assert!(!dir.path().join("unused").exists());
     run(vec!["destroy".into(), "rust".into(), "a".into(), environment.id]).await;
     assert!(client.list("a").await.unwrap().is_empty());
     server.abort();

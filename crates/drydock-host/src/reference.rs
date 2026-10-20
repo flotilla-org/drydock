@@ -29,6 +29,14 @@ struct ReferenceSettings {
     #[serde(default)]
     fault: Option<ProtocolError>,
     #[serde(default)]
+    fixture: bool,
+    #[serde(default)]
+    fixture_push: bool,
+    #[serde(default)]
+    fixture_bad_relay: bool,
+    #[serde(default)]
+    reach: Option<Reach>,
+    #[serde(default)]
     rate_limits: Vec<RateLimit>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
@@ -47,8 +55,21 @@ struct Memory {
     environments: BTreeMap<String, Environment>,
     tokens: BTreeMap<String, ResumeToken>,
     next: u64,
+    provider_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    inventory_error: bool,
+    running_since: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
+    usage: Vec<(Size, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 }
 
+impl Memory {
+    fn stop_billing(&mut self, id: &str) {
+        if let Some(start) = self.running_since.remove(id)
+            && let Some(size) = self.environments.get(id).and_then(|row| row.granted_size.clone())
+        {
+            self.usage.push((size, start, chrono::Utc::now()));
+        }
+    }
+}
 impl Reference {
     fn find(&self, id: &str) -> Result<Environment> {
         self.state.recover().environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })
@@ -63,6 +84,9 @@ impl Provider for Reference {
         self.settings.rate_limits.clone()
     }
     fn observation(&self) -> ObservationMode {
+        if self.settings.fixture && self.settings.fixture_push {
+            return ObservationMode::Push;
+        }
         ObservationMode::Poll { interval: Duration::from_millis(self.settings.poll_interval_ms) }
     }
     fn operations(&self) -> Operations<'_> {
@@ -118,20 +142,33 @@ impl Provider for Reference {
             granted_size: Some(r.size.clone()),
             egress: Enforcement::Advisory,
         };
+        state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());
         Ok(Provisioned::Created(s))
     }
     async fn list(&self, _: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.check()?;
-        Ok(self.state.recover().environments.values().cloned().map(Into::into).collect())
+        let state = self.state.recover();
+        if state.inventory_error {
+            return Err(ProtocolError::Unavailable { reason: "fixture inventory unavailable".into(), retry_after: None });
+        }
+        Ok(state
+            .environments
+            .values()
+            .cloned()
+            .map(|environment| ObservedEnvironment { environment, timestamp: state.provider_timestamp })
+            .collect())
     }
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
         self.check()?;
-        Ok(self.find(id)?.into())
+        let environment = self.find(id)?;
+        let timestamp = self.state.recover().provider_timestamp;
+        Ok(ObservedEnvironment { environment, timestamp })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
         let mut state = self.state.recover();
+        state.stop_billing(id);
         state.environments.remove(id);
         state.tokens.remove(id);
         Ok(())
@@ -139,15 +176,36 @@ impl Provider for Reference {
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Connection> {
         self.check()?;
         self.find(id)?;
-        Ok(Connection::Relay)
+        Ok(match &self.settings.reach {
+            Some(Reach::Ssh { endpoint, user, host_key }) => {
+                Connection::Ssh { endpoint: endpoint.clone(), user: user.clone(), host_key: host_key.clone() }
+            }
+            Some(Reach::Dial { url, token, expires_at }) => {
+                Connection::Dial { url: url.clone(), token: token.clone(), expires_at: expires_at.clone() }
+            }
+            _ => Connection::Relay,
+        })
     }
     async fn relay(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
         self.check()?;
         self.find(id)?;
         let (client, mut server) = tokio::io::duplex(65536);
+        let corrupt = self.settings.fixture && self.settings.fixture_bad_relay;
         tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
             let (mut r, mut w) = tokio::io::split(&mut server);
-            let _ = tokio::io::copy(&mut r, &mut w).await;
+            let mut bytes = [0; 4096];
+            while let Ok(count) = r.read(&mut bytes).await {
+                if count == 0 {
+                    break;
+                }
+                if corrupt {
+                    bytes[0] ^= 1;
+                }
+                if w.write_all(&bytes[..count]).await.is_err() {
+                    break;
+                }
+            }
         });
         Ok(Box::new(client))
     }
@@ -156,6 +214,63 @@ impl Provider for Reference {
 #[async_trait::async_trait]
 impl Exec for Reference {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
+        if self.settings.fixture && r.command.first().map(String::as_str) == Some("drydock-fixture") {
+            self.find(id)?;
+            let mut state = self.state.recover();
+            let action = r.command.get(1).map(String::as_str).unwrap_or("");
+            let target = r.command.get(2).map(String::as_str).unwrap_or(id);
+            let value = match action {
+                "null_environment" => {
+                    let row = Environment {
+                        id: format!("null-{id}"),
+                        label: None,
+                        provider: self.name.clone(),
+                        state: Observation::Unknown { reason: UnknownReason::ProviderApiError },
+                        granted_size: None,
+                        egress: Enforcement::Advisory,
+                    };
+                    state.environments.insert(row.id.clone(), row.clone());
+                    serde_json::to_value(row).expect("environment")
+                }
+                "forget" => {
+                    state.stop_billing(target);
+                    state.environments.remove(target);
+                    serde_json::Value::Null
+                }
+                "timestamp" => {
+                    state.provider_timestamp =
+                        if target.is_empty() { None } else { Some(target.parse().map_err(|_| refused("invalid timestamp"))?) };
+                    serde_json::Value::Null
+                }
+                "inventory_error" => {
+                    state.inventory_error = target == "true";
+                    serde_json::Value::Null
+                }
+                "state" => {
+                    let observation: Observation = serde_json::from_str(r.command.get(3).ok_or_else(|| refused("missing fixture state"))?)
+                        .map_err(|_| refused("invalid fixture state"))?;
+                    state.stop_billing(target);
+                    if matches!(observation, Observation::Running) {
+                        state.running_since.insert(target.into(), chrono::Utc::now());
+                    }
+                    state.environments.get_mut(target).ok_or_else(|| refused("unknown fixture target"))?.state = observation;
+                    serde_json::Value::Null
+                }
+                "pause" => {
+                    state.stop_billing(target);
+                    state.environments.get_mut(target).ok_or_else(|| refused("unknown fixture target"))?.state =
+                        Observation::Stopped { cause: StopCause::PausedByProvider };
+                    serde_json::Value::Null
+                }
+                _ => return Err(refused("unknown fixture action")),
+            };
+            let bytes = serde_json::to_vec(&value).expect("fixture value");
+            let (client, mut server) = tokio::io::duplex(65536);
+            tokio::spawn(async move {
+                let _ = server.write_all(&bytes).await;
+            });
+            return Ok(Box::new(client));
+        }
         if r.command == ["cat"] {
             return self.relay(id, c).await;
         }
@@ -183,6 +298,7 @@ impl SuspendResume for Reference {
         if matches!(s.state, Observation::Stopped { .. }) {
             return state.tokens.get(id).cloned().ok_or_else(|| refused("missing resume token"));
         }
+        state.stop_billing(id);
         s.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
         let token = ResumeToken { token: Secret::new(format!("{}:{id}", self.name)) };
         state.tokens.insert(id.into(), token.clone());
@@ -198,6 +314,7 @@ impl SuspendResume for Reference {
         if state.tokens.get(id) != Some(&token) {
             return Err(refused("invalid resume token for this provider/environment"));
         }
+        state.running_since.entry(id.into()).or_insert_with(chrono::Utc::now);
         state.environments.get_mut(id).ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })?.state =
             Observation::Running;
         Ok(())
@@ -217,7 +334,28 @@ impl ExportOperation for Reference {
 impl UsageOperation for Reference {
     async fn usage(&self, period: Period, _: &Credentials) -> Result<Usage> {
         self.check()?;
-        Ok(Usage { period, environment_hours: vec![] })
+        let state = self.state.recover();
+        let now = chrono::Utc::now();
+        let mut segments = state.usage.clone();
+        for (id, start) in &state.running_since {
+            if let Some(size) = state.environments.get(id).and_then(|row| row.granted_size.clone()) {
+                segments.push((size, *start, now));
+            }
+        }
+        let mut environment_hours: Vec<SizeUsage> = vec![];
+        for (size, start, end) in segments {
+            let start = start.max(period.start().instant());
+            let end = end.min(period.end().instant());
+            if end > start {
+                let hours = (end - start).num_microseconds().unwrap_or(i64::MAX) as f64 / 3_600_000_000.0;
+                if let Some(row) = environment_hours.iter_mut().find(|row| row.size == size) {
+                    row.hours += hours;
+                } else {
+                    environment_hours.push(SizeUsage { size, hours });
+                }
+            }
+        }
+        Ok(Usage { period, environment_hours })
     }
 }
 

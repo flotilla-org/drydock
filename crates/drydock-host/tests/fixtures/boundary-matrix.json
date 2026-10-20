@@ -1,0 +1,9 @@
+{
+  "unix_peer_authentication": ["wrong_allowed_uid", "admission_bypass"],
+  "authentication_transport": ["injected_401", "injected_bypass_200", "injected_pending_deadline"],
+  "authentication_constant_time": ["python_ordinary_equality", "rust_ordinary_equality"],
+  "guest_probe_dns": ["udp_connect_network_unreachable", "real_loopback_script_execution"],
+  "reach_byte_stream": ["relay_corrupts_bytes", "tcp_wrong_token", "websocket_wrong_token", "ssh_wrong_host_key"],
+  "cleanup_after_failed_provision": ["partial_creation_then_internal_error", "stray_delete_transient", "stray_delete_permanent"],
+  "configured_deadlines": ["short_event_deadline", "long_event_deadline"]
+}

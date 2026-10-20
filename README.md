@@ -128,3 +128,166 @@ no Display implementation. Explicit-null serialization is part of protocol v1.
 Exec intentionally uses POST with a 101 upgrade, while relay uses GET; some HTTP
 proxies and generated clients handle POST upgrades poorly, so hosts and clients
 must use a transport that preserves the upgrade rather than changing the method.
+
+## Conformance
+
+`drydock conformance --provider NAME --options probe.json` runs destructive
+ADR 0070 scenarios against exactly one provider in the normal `--config` host
+configuration. Unix sockets, managed host binaries and authenticated loopback
+TCP hosts all use the same client and scenario list. A built-in provider can
+expose that same endpoint without a special test interface. The Rust reference
+binary and a small independent Python socket fixture run this list in CI; the
+fixture also deliberately violates each reported check. The checked-in
+[`broken-matrix.json`](crates/drydock-host/tests/fixtures/broken-matrix.json)
+must exactly match the healthy full report: removing a verdict fails CI too.
+Endpoint scenarios own deterministic polling, lifecycle sequences, provider
+isolation, typed errors, optional operations and stream upgrades. Unix admission
+and TCP bearer scenarios use the same endpoint client; host-internal poll races
+remain implementation tests.
+
+For example, choose the image and tools digests in the request:
+
+```json
+{
+  "request": {
+    "label": "conformance-unique-run-id",
+    "prepared": {
+      "provider": "reference", "id": "prepared-1",
+      "image_digest": "sha256:image", "tools_digest": "sha256:tools"
+    },
+    "size": {"cpus": 1, "memory_bytes": 1024, "disk_bytes": 0},
+    "egress": {"mode": "deny_all", "direct": []},
+    "ssh_public_key": null
+  },
+  "echo_relay": true,
+  "reach_probe": null,
+  "egress_probe": null
+}
+```
+
+```sh
+drydock --config hosts.json --runtime-directory /private/runtime \
+  conformance --provider reference --options probe.json
+# Vendor modules require explicit consent to charges:
+drydock --config hosts.json --runtime-directory /private/runtime \
+  conformance --provider daytona --options daytona-probe.json --live
+```
+
+The configuration and options files are trusted operator input: probe argv can
+execute local programs or guest commands. The `reference` entrypoint convention
+is a guard against accidental charges, not a security boundary; a host can load
+anything under that name. Treat externally supplied hosts and configs accordingly.
+
+Use a unique label and an idle test account. The concurrent-idempotency scenario
+makes two simultaneous provision calls. A broken provider can create two billable
+resources; refusal and range probes can also create strays on a broken host.
+The runner tracks their IDs and exact probe labels, retries final teardown once,
+and records a verified final cleanup sweep before reporting spend. It avoids a
+label-prefix wildcard so another run sharing a prefix is preserved. Failed
+cleanup remains a failing verdict and requires operator attention.
+
+The runner provisions, suspends and resumes when supported, and destroys its environment, including after failed
+checks. It returns nonzero if any check fails and prints a JSON report with
+individual verdicts, elapsed resource exposure, provider-reported usage for the
+run period, before/after quota, and a credit delta when available in the same
+unit. Missing cost data is `null`, never an assertion of zero spend. These account
+figures can include concurrent workloads and delayed vendor accounting; they are
+not a monetary estimate. The runner prepares the selected image/tools digests twice and checks
+look-up-or-build identity before provisioning; the input prepared ID is replaced.
+Operators can also obtain a complete prepared form with
+`drydock --config hosts.json prepare HOST NAME IMAGE_DIGEST TOOLS_DIGEST`.
+Preparation can incur provider charges. Live Daytona and then Namespace validation
+are operator runs once their modules and test credentials exist.
+
+For slow providers, add an optional `timeouts` object to `probe.json`. Defaults
+are `startup_seconds: 15`, `request_seconds: 30`, `headers_seconds: 20`,
+`record_seconds: 20`, `transition_seconds: 30`, and `probe_seconds: 30`. Each is
+independent and accepts 1–86400 seconds. For example, a cold start can use
+`{"startup_seconds":120,"request_seconds":180,"record_seconds":300,"transition_seconds":600}`.
+Startup includes host configuration/credential readiness; request deadlines cover
+buffered HTTP calls and upgrade setup. Record and transition deadlines bound
+observation waits, while headers and probes have their own deadlines. Failure
+details contain safe categories (`timeout`, `decode`, `transport`, or typed HTTP
+status/class), never vendor reasons or probe output.
+
+`echo_relay` is only for fixtures whose relay is an echo server. Real agents have
+a protocol: provide `reach_probe: ["/absolute/path/to/round-trip-probe", ...]`.
+It receives the returned SSH, Dial or Relay recipe as JSON on stdin, establishes
+and authenticates the recipe, exchanges bytes with the agent, then exits zero
+only on success. It owns SSH private-key material matching `ssh_public_key`.
+The runner suppresses probe output and never puts recipe secrets in argv or
+reports. Missing probes fail the stream check rather than silently accepting a
+recipe declaration. The same seam supports every declared recipe as providers
+are added; it does not assume arbitrary agent streams echo input.
+
+An `Enforced` provider must also use `DenyAll` with exactly one direct destination
+and supply `egress_probe: {"command": [...]}`. Copy
+[`tools/egress-probe.py`](tools/egress-probe.py) into the prepared guest and run it
+through exec as root, with these arguments: listed IP, listed port, unlisted
+canary IP, canary port, and raw DNS server IP. Use IP literals and independently
+verify that both TCP services and the DNS server are reachable outside the
+sandbox before the run. This avoids confusing an unavailable canary with an
+enforced policy. The probe bypasses process proxy settings with direct sockets
+and sends an actual UDP DNS query. Its entire output must be the following JSON,
+followed by stream EOF. Guest exec exposes a byte stream without an exit-status
+channel, so the checker validates output and EOF rather than certifying the
+process exit code:
+
+```json
+{"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
+```
+
+Any other result, missing root evidence, missing probe, refusal of the required
+allowlist, or downgrade to Advisory fails an Enforced claim. Providers without
+exec can supply the probe through a guest bridge when that tooling is available;
+currently this check requires exec and cannot silently pass without it.
+
+TCP authentication checks reject absent tokens and tokens changed at each byte
+position through the injected HTTP client and configured request timeout. A Unix
+endpoint without a bearer reports that this scenario needs a bearer fixture;
+it cannot silently pass. The separate `unix_peer_admission` endpoint scenario
+requires a client connected as an unauthorized UID.
+
+Select groups with `"scenarios": ["prepare", "lifecycle", "observation", "destroy"]`.
+The available groups are `capabilities`, `authentication`, `prepare`, `lifecycle`,
+`observation`, `semantics`, `nulls`, `reach`, `refusal`, `egress`, `destroy`,
+`metering`, and `host_fixtures`. An omitted/empty list selects the provider suite
+excluding host fixtures. Dependencies (for example provisioning for observation)
+are still run; unrelated verdicts are omitted. A capabilities-only selection
+allocates nothing. The full reference/independent-host CI profile selects all.
+
+`host_fixtures` is for disposable host validation: supply `fixture_configuration`
+with two fixture-capable providers. It exercises configuration atomicity,
+credential refresh, all typed error classes/statuses/retry headers, provider
+isolation, modelled create/delete sequences, stream upgrades, and deterministic
+poll recovery, timestamps, pause/halt billing and typed loss causes. Its exec
+control vocabulary is `drydock-fixture` plus `null_environment`, `forget`,
+`state`, `timestamp`, `inventory_error`, or `pause`. Reference settings must
+explicitly enable `fixture`; vendor providers must not enable this profile.
+
+Environment null checks require a genuinely unlabeled environment with unknown
+granted size: use the fixture profile or supply `null_environment_id`. Without
+such evidence the verdict fails. Quota nulls are checked separately. Each invalid
+CPU, memory, disk, destination and usage-period request gets its own verdict.
+Billing checks require the exact stopped cause and vendor usage facts over a
+sample window (`billing_sample_millis`, default 25); use a distinct granted size
+and an idle account so aggregate usage does not mix in another running guest.
+Providers with delayed accounting may need a longer window.
+
+Constant-time authentication has an executable evidence requirement:
+`auth_audit: ["/absolute/path/to/audit", ...]`. Missing or unsuccessful evidence
+fails `authentication_constant_time`. Network timing cannot prove constant-time
+machine execution. CI runs [`tools/auth-audit.py`](tools/auth-audit.py) against
+the exact linked Rust admission source (fixed-size SHA-256 plus
+`ConstantTimeEq`) and the Python comparator source actually loaded by its host
+(`hmac.compare_digest`). Equality mutations fail the audit; endpoint probes
+exercise the real admission path. Other language hosts supply an equivalent
+audit of their loaded comparator.
+
+CI also executes the real guest egress script, including denied UDP-connect
+handling, and real TCP, WebSocket, SSH and relay recipe exchanges. Wrong tokens,
+SSH pins and corrupt relay bytes fail the exact reach verdict. The fixture
+[`tools/recipe-probe.py`](tools/recipe-probe.py) speaks the fixture echo-agent
+protocol; production agents provide their own round-trip executable through
+`reach_probe`. Additional transport/probe fault coverage is listed in
+[`boundary-matrix.json`](crates/drydock-host/tests/fixtures/boundary-matrix.json).

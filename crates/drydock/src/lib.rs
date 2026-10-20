@@ -1,5 +1,6 @@
 //! Managed host lifecycle, injected runtime detection, and credential refresh.
 //! Dropping a HostHandle cancels supervision and terminates its managed child.
+pub mod conformance;
 pub mod credentials;
 use client::Client;
 use credentials::*;
@@ -132,6 +133,7 @@ pub struct Supervisor {
     pub credentials: Arc<dyn CredentialSource>,
     pub refresh_interval: Duration,
     pub restart_delay: Duration,
+    pub request_timeout: Duration,
 }
 impl Supervisor {
     pub fn new(runtime_directory: PathBuf, credentials: Arc<dyn CredentialSource>) -> Self {
@@ -142,6 +144,7 @@ impl Supervisor {
             credentials,
             refresh_interval: Duration::from_secs(1),
             restart_delay: Duration::from_millis(100),
+            request_timeout: Duration::from_secs(30),
         }
     }
     pub async fn start(&self, spec: HostSpec) -> Result<HostHandle, client::Error> {
@@ -190,6 +193,7 @@ impl Supervisor {
             HostConnection::ExternalUnix { path } => Client::unix(path)?,
             HostConnection::External { url, token_file } => Client::external(url, read_bearer_token(token_file).await?)?,
         };
+        let client = client.with_request_timeout(self.request_timeout);
         let (status, receiver) = watch::channel(HostStatus::new(Readiness::Unknown { reason: "connecting".into() }, 0));
         let mut supervisor = self.clone();
         supervisor.runtime_directory = runtime_directory;

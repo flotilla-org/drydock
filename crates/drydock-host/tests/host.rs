@@ -4,7 +4,7 @@ use drydock_protocol::*;
 use futures::{StreamExt, stream::BoxStream};
 use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, time::Duration};
+use std::{os::unix::fs::PermissionsExt, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 struct Harness {
@@ -142,20 +142,12 @@ async fn hello_configuration_credentials_and_atomic_rejection() {
     h.credential("a", "TOP_SECRET").await;
     let prepared = h.prepared("a").await;
     let s = h.provision("a", "label", &prepared, 201).await;
-    h.credential("a", "ROTATED").await;
-    h.configure(vec![provider("a", json!({})), provider("b", json!({}))]).await;
-    let again = h.provision("a", "label", &prepared, 200).await;
-    assert_eq!(s, again);
-    let bad = json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("c",json!({})),provider("a",json!({"changed":true}))]});
-    h.ok(Method::PUT, "/config", bad, 422).await;
-    let hello: Hello = h.hello().await;
-    assert_eq!(hello.providers.len(), 2);
-    assert!(matches!(hello.providers[0].readiness, Readiness::Ready));
-    let malformed =
-        h.client.put("http://localhost/v1/providers/a/credential").body(r#"{"value":{"TOP_SECRET":123}}"#).send().await.unwrap();
-    assert_eq!(malformed.status(), 422);
-    assert!(!malformed.text().await.unwrap().contains("TOP_SECRET"));
-    h.ok(Method::PUT, "/config", json!({"modules":[{"name":"memory","entrypoint":"unknown"}],"providers":[]}), 422).await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let configuration: HostConfiguration = serde_json::from_value(
+        json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("a",json!({})),provider("b",json!({}))]}),
+    )
+    .unwrap();
+    drydock::conformance::configuration_contract(&client, &configuration, "a", &s).await.unwrap();
 }
 
 // Label idempotency and provider isolation hold after every generated create/delete step.
@@ -171,42 +163,8 @@ fn generated_label_lifecycle(tc: hegel::TestCase) {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let h = Harness::start().await;
         h.normal().await;
-        let prepared = [h.prepared("a").await, h.prepared("b").await];
-        let mut model: BTreeMap<(usize, usize), Environment> = BTreeMap::new();
-        for (provider, label, delete) in steps {
-            let p = usize::from(provider);
-            let name = ["a", "b"][p];
-            let key = (p, label);
-            let path = format!("/providers/{name}/environments");
-            if delete {
-                let id = model.remove(&key).map(|s| s.id).unwrap_or_else(|| "absent".into());
-                h.ok(Method::DELETE, &format!("{path}/{id}"), Value::Null, 204).await;
-                h.ok(Method::DELETE, &format!("{path}/{id}"), Value::Null, 204).await;
-            } else {
-                let old = model.get(&key);
-                let s = h.provision(name, &format!("label-{label}"), &prepared[p], if old.is_some() { 200 } else { 201 }).await;
-                if let Some(old) = old {
-                    assert_eq!(&s, old);
-                }
-                model.insert(key, s);
-            }
-            for name in ["a", "b"] {
-                let actual: Vec<Environment> =
-                    h.ok(Method::GET, &format!("/providers/{name}/environments"), Value::Null, 200).await.json().await.unwrap();
-                let expected: Vec<_> = model.values().filter(|s| s.provider == name).cloned().collect();
-                assert_eq!(actual.len(), expected.len());
-                for s in &expected {
-                    assert!(actual.contains(s));
-                    let inspected: Environment = h
-                        .ok(Method::GET, &format!("/providers/{name}/environments/{}", s.id), Value::Null, 200)
-                        .await
-                        .json()
-                        .await
-                        .unwrap();
-                    assert_eq!(&inspected, s);
-                }
-            }
-        }
+        let client = drydock::client::Client::unix(&h.path).unwrap();
+        drydock::conformance::lifecycle_sequence(&client, ["a", "b"], "generated", &steps).await.unwrap();
     });
 }
 
@@ -217,67 +175,26 @@ async fn concurrent_provision_and_event_resume() {
     let h = Harness::start().await;
     h.normal().await;
     let prepared = h.prepared("a").await;
-    let mut initial = h.stream(None).await;
-    let snapshot = initial.next().await;
-    assert!(matches!(&snapshot,ObserveRecord::Snapshot {environments,..} if environments.is_empty()));
-    let start = cursor(&snapshot).to_owned();
-    let (first, second) = tokio::join!(
-        h.send(Method::POST, "/providers/a/environments", request("same", &prepared)),
-        h.send(Method::POST, "/providers/a/environments", request("same", &prepared))
-    );
-    let statuses = [first.status().as_u16(), second.status().as_u16()];
-    assert!(statuses.contains(&201) && statuses.contains(&200));
-    assert_eq!(first.json::<Environment>().await.unwrap(), second.json::<Environment>().await.unwrap());
-    let created = initial.next().await;
-    assert!(matches!(&created,ObserveRecord::Event {event} if matches!(event.event,EventKind::Created)));
-    let running = initial.next().await;
-    assert!(matches!(&running,ObserveRecord::Event {event} if matches!(event.event,EventKind::Running {..})));
-    let mut resumed = h.stream(Some(cursor(&created))).await;
-    assert_eq!(resumed.next().await, running);
-    let mut replay = h.stream(Some(&start)).await;
-    assert_eq!(replay.next().await, created);
-    assert_eq!(replay.next().await, running);
-    let pb = h.prepared("b").await;
-    h.provision("b", "second", &pb, 201).await;
-    initial.next().await;
-    initial.next().await;
-    let mut gap = h.stream(Some("expired-cursor")).await;
-    assert!(matches!(gap.next().await,ObserveRecord::Snapshot {environments,..} if environments.len()==2));
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let options: drydock::conformance::Options = serde_json::from_value(
+        json!({"request":request("concurrent", &prepared),"scenarios":["prepare","lifecycle","observation","destroy"]}),
+    )
+    .unwrap();
+    let report = drydock::conformance::run(&client, "a", &options).await;
+    assert!(report.passed(), "{report:?}");
 }
 
 // Every typed module error retains its class and agreed status, retry hints, and
 // CredentialRejected changes hello readiness until an explicit credential refresh.
 #[tokio::test]
 async fn all_typed_error_classes() {
-    let (h, _) = controlled().await;
-    let errors = [
-        (422, json!({"kind":"refused","reason":"no"})),
-        (503, json!({"kind":"unavailable","reason":"no","retry_after":3})),
-        (429, json!({"kind":"rate_limited","reason":"no","retry_after":7})),
-        (402, json!({"kind":"quota_exhausted","reason":"no"})),
-        (502, json!({"kind":"credential_rejected","reason":"no"})),
-        (500, json!({"kind":"internal","reason":"no","provider_error":"raw vendor error"})),
-        (404, json!({"kind":"not_found","reason":"no"})),
-        (405, json!({"kind":"method_not_allowed","reason":"no"})),
-    ];
-    h.configure(
-        errors.iter().enumerate().map(|(n, (_, e))| provider(&format!("p{n}"), json!({"fault":e,"poll_interval_ms":100000}))).collect(),
-    )
-    .await;
-    for (n, (status, error)) in errors.iter().enumerate() {
-        let p = format!("p{n}");
-        h.credential(&p, "secret").await;
-        let response = h.ok(Method::GET, &format!("/providers/{p}/environments"), Value::Null, *status).await;
-        if let Some(retry) = error.get("retry_after") {
-            assert_eq!(response.headers()["retry-after"], retry.to_string());
-        }
-        assert_eq!(response.json::<Value>().await.unwrap(), *error);
-    }
-    let hello: Hello = h.hello().await;
-    assert!(matches!(hello.providers[4].readiness, Readiness::MissingCredential { .. }));
-    h.credential("p4", "refreshed").await;
-    let hello: Hello = h.hello().await;
-    assert!(matches!(hello.providers[4].readiness, Readiness::Ready));
+    let h = Harness::start().await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let configuration: HostConfiguration =
+        serde_json::from_value(json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[]})).unwrap();
+    let mut report = drydock::conformance::Report::default();
+    drydock::conformance::error_contract(&client, &configuration, &mut report).await;
+    assert!(report.passed(), "{report:?}");
 }
 
 // Optional lifecycle operations use opaque IDs; provider-local resume tokens cannot cross
@@ -286,80 +203,16 @@ async fn all_typed_error_classes() {
 async fn optional_operations_and_validation() {
     let h = Harness::start().await;
     h.normal().await;
-    let pa = h.prepared("a").await;
-    assert_eq!(pa, h.prepared("a").await);
-    let pb = h.prepared("b").await;
-    h.ok(Method::POST, "/providers/b/environments", request("cross", &pa), 422).await;
-    for cpus in [json!(0), json!(-1), json!("NaN")] {
-        let mut r = request("bad", &pa);
-        r["size"]["cpus"] = cpus;
-        h.ok(Method::POST, "/providers/a/environments", r, 422).await;
-    }
-    for direct in [
-        json!({"kind":"cidr","cidr":"1.2.3.4/33"}),
-        json!({"kind":"host_port","host":"bad host","port":1}),
-        json!({"kind":"host_port","host":"host","port":0}),
-    ] {
-        let mut r = request("bad", &pa);
-        r["egress"] = json!({"mode":"deny_all","direct":[direct]});
-        let error: ProtocolError = h.ok(Method::POST, "/providers/a/environments", r, 422).await.json().await.unwrap();
-        assert_eq!(error, ProtocolError::Refused { reason: "invalid JSON request".into() });
-    }
-    let mut valid = request("valid-direct", &pa);
-    valid["egress"] = json!({"mode":"deny_all","direct":[{"kind":"host_port","host":"valid.example","port":443}]});
-    let error: ProtocolError = h.ok(Method::POST, "/providers/a/environments", valid, 422).await.json().await.unwrap();
-    assert_eq!(error, ProtocolError::Refused { reason: "reference cannot implement direct destinations".into() });
-    let a = h.provision("a", "a", &pa, 201).await;
-    let b = h.provision("b", "b", &pb, 201).await;
-    let path = format!("/providers/a/environments/{}", a.id);
-    let reach: Reach = h.ok(Method::POST, &format!("{path}/reach"), Value::Null, 200).await.json().await.unwrap();
-    assert!(matches!(reach,Reach::Relay {path:p} if p==format!("/v1{path}/relay")));
-    let token: ResumeToken = h.ok(Method::POST, &format!("{path}/suspend"), Value::Null, 200).await.json().await.unwrap();
-    let repeat: ResumeToken = h.ok(Method::POST, &format!("{path}/suspend"), Value::Null, 200).await.json().await.unwrap();
-    assert_eq!(token, repeat);
-    let paused: Environment = h.ok(Method::GET, &path, Value::Null, 200).await.json().await.unwrap();
-    assert!(matches!(paused.state, Observation::Stopped { .. }));
-    h.ok(Method::POST, &format!("/providers/b/environments/{}/resume", b.id), serde_json::to_value(&token).unwrap(), 422).await;
-    for _ in 0..2 {
-        h.ok(Method::POST, &format!("{path}/resume"), serde_json::to_value(&token).unwrap(), 204).await;
-    }
-    let running: Environment = h.ok(Method::GET, &path, Value::Null, 200).await.json().await.unwrap();
-    assert!(matches!(running.state, Observation::Running));
-    let exported: Export = h.ok(Method::POST, &format!("{path}/export"), Value::Null, 200).await.json().await.unwrap();
-    assert!(exported.reference.contains(&a.id));
-    let quota: Quota = h.ok(Method::GET, "/providers/a/quota", Value::Null, 200).await.json().await.unwrap();
-    assert_eq!(quota.concurrency_in_use, Some(1));
-    h.ok(Method::GET, "/providers/a/usage?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z", Value::Null, 200).await;
-    for query in ["start=bad&end=bad", "start=2026-01-02T00:00:00Z&end=2026-01-01T00:00:00Z", ""] {
-        h.ok(Method::GET, &format!("/providers/a/usage?{query}"), Value::Null, 422).await;
-    }
-    h.ok(Method::GET, &format!("{path}/relay"), Value::Null, 422).await;
-    h.ok(Method::GET, "/providers/a/environments/usage", Value::Null, 404).await;
-    h.ok(Method::GET, "/providers/a", Value::Null, 404).await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let prepared = h.prepared("a").await;
+    let request: ProvisionRequest = serde_json::from_value(request("optional", &prepared)).unwrap();
+    drydock::conformance::optional_contract(&client, "a", "b", &request, &Default::default()).await.unwrap();
+    let options: drydock::conformance::Options =
+        serde_json::from_value(json!({"request":request,"scenarios":["prepare","semantics"]})).unwrap();
+    let report = drydock::conformance::run(&client, "a", &options).await;
+    assert!(report.passed(), "{report:?}");
 }
 
-async fn raw_upgrade(h: &Harness, path: &str, command: Option<Value>) -> BufReader<tokio::net::UnixStream> {
-    let socket = tokio::net::UnixStream::connect(&h.path).await.unwrap();
-    let mut io = BufReader::new(socket);
-    let body = command.as_ref().map(Value::to_string).unwrap_or_default();
-    let (method, protocol) = if command.is_some() { ("POST", "drydock-stream") } else { ("GET", "drydock-relay") };
-    io.write_all(format!("{method} /v1{path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: {protocol}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-    let mut line = String::new();
-    io.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("HTTP/1.1 101"), "{line}");
-    let mut headers = String::new();
-    loop {
-        line.clear();
-        io.read_line(&mut line).await.unwrap();
-        if line == "\r\n" {
-            break;
-        }
-        headers.push_str(&line.to_lowercase());
-    }
-    assert!(headers.contains("connection: upgrade"));
-    assert!(headers.contains(&format!("upgrade: {protocol}")));
-    io
-}
 // Relay and POST exec preserve the 101 upgrade and bridge raw bytes, including half close
 // and payloads larger than the reference stream buffer. Exec is a fake vendor boundary.
 #[tokio::test]
@@ -367,38 +220,16 @@ async fn relay_and_exec_round_trip() {
     let h = Harness::start().await;
     h.normal().await;
     let prepared = h.prepared("a").await;
-    let s = h.provision("a", "stream", &prepared, 201).await;
-    let path = format!("/providers/a/environments/{}", s.id);
-    for command in [None, Some(json!({"command":["cat"]}))] {
-        let route = if command.is_some() { "exec" } else { "relay" };
-        let mut stream = raw_upgrade(&h, &format!("{path}/{route}"), command).await;
-        let data: Vec<u8> = (0..200_000).map(|n| (n % 256) as u8).collect();
-        let (mut read, mut write) = tokio::io::split(&mut stream);
-        let ((), received) = tokio::join!(
-            async {
-                write.write_all(&data).await.unwrap();
-                write.shutdown().await.unwrap();
-            },
-            async {
-                let mut bytes = vec![];
-                tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut bytes)).await.unwrap().unwrap();
-                bytes
-            }
-        );
-        assert_eq!(received, data);
-    }
-    let mut stream = raw_upgrade(&h, &format!("{path}/exec"), Some(json!({"command":["echo","hello"]}))).await;
-    let mut data = vec![];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut data)).await.unwrap().unwrap();
-    assert_eq!(data, b"hello\n");
+    let environment = h.provision("a", "streams", &prepared, 201).await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    drydock::conformance::stream_contract(&client, "a", &environment.id, &Default::default()).await.unwrap();
 }
 
 // Kernel peer credentials gate even hello; a caller-supplied HTTP header cannot impersonate UID.
 #[tokio::test]
 async fn unix_peer_rejected() {
     let h = Harness::with_uid(unsafe { libc::geteuid() } + 1).await;
-    let r = h.client.get("http://localhost/v1/hello").header("X-Uid", unsafe { libc::geteuid() }).send().await.unwrap();
-    assert_eq!(r.status(), 403);
+    drydock::conformance::unix_peer_admission(&drydock::client::Client::unix(&h.path).unwrap()).await.unwrap();
 }
 
 // Loopback hosts create a private token file, require bearer auth, and reject wrong tokens.
@@ -424,6 +255,12 @@ async fn tcp_bearer_auth() {
         client.get(&url).bearer_auth("wrong").header("Cookie", format!("rigging_token={secret}")).send().await.unwrap().status(),
         401
     );
+    drydock::conformance::authentication(
+        &drydock::client::Client::external(&format!("http://{addr}"), Secret::new(secret.clone())).unwrap(),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
     assert_eq!(client.get(&url).bearer_auth(secret).send().await.unwrap().status(), 200);
     task.abort();
 }
@@ -532,7 +369,7 @@ async fn shutdown_closes_event_stream() {
     h.normal().await;
     let prepared = h.prepared("a").await;
     let environment = h.provision("a", "shutdown", &prepared, 201).await;
-    let mut relay = raw_upgrade(&h, &format!("/providers/a/environments/{}/relay", environment.id), None).await;
+    let mut relay = drydock::client::Client::unix(&h.path).unwrap().relay("a", &environment.id).await.unwrap();
     let mut records = h.stream(None).await;
     records.next().await;
     h.stop.take().unwrap().send(()).unwrap();
@@ -1080,68 +917,29 @@ async fn reference_polling_billing_transitions() {
     let h = Harness::start().await;
     h.normal().await;
     let prepared = h.prepared("a").await;
-    let mut events = h.stream(None).await;
-    events.next().await;
-    let s = h.provision("a", "polled", &prepared, 201).await;
-    for expected in ["created", "running"] {
-        let ObserveRecord::Event { event } = events.next().await else { panic!("expected event") };
-        assert_eq!(event.id, s.id);
-        assert_eq!(event.timestamp_source, TimestampSource::Adaptor);
-        assert_eq!(serde_json::to_value(event.event).unwrap()["kind"], expected);
-    }
-    let path = format!("/providers/a/environments/{}", s.id);
-    let token: ResumeToken = h.ok(Method::POST, &format!("{path}/suspend"), Value::Null, 200).await.json().await.unwrap();
-    assert!(matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Stopped {..})));
-    h.ok(Method::POST, &format!("{path}/resume"), serde_json::to_value(token).unwrap(), 204).await;
-    assert!(matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Resumed)));
-    assert!(matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Running {..})));
-    h.ok(Method::DELETE, &path, Value::Null, 204).await;
-    assert!(
-        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Gone {cause:GoneCause::DestroyedByRequest}))
-    );
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let options: drydock::conformance::Options = serde_json::from_value(
+        json!({"request":request("polled", &prepared),"scenarios":["prepare","lifecycle","observation","destroy","metering"]}),
+    )
+    .unwrap();
+    let report = drydock::conformance::run(&client, "a", &options).await;
+    assert!(report.passed(), "{report:?}");
 }
 
 // External changes observed through polling retain typed provider timestamps.
 // Failed lists keep prior state; only a successful complete list can report loss.
 #[tokio::test]
 async fn polled_provider_time_pause_and_authoritative_loss() {
-    use std::sync::atomic::Ordering::SeqCst;
-    let (h, control) = controlled().await;
-    control.poll.store(true, SeqCst);
-    h.configure(vec![provider("a", json!({}))]).await;
+    let h = Harness::start().await;
+    h.configure(vec![provider("a", json!({"fixture":true}))]).await;
     h.credential("a", "ready").await;
-    let mut events = h.stream(None).await;
-    events.next().await;
-    let time = "2026-10-19T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
-    *control.timestamp.lock().unwrap() = Some(time);
-    let row = Environment {
-        id: "vendor".into(),
-        label: None,
-        provider: "a".into(),
-        state: Observation::Running,
-        granted_size: Some(Size { cpus: 2.0, memory_bytes: 0, disk_bytes: 0 }),
-        egress: Enforcement::Advisory,
-    };
-    control.vendor.lock().unwrap().row = Some(row.clone());
-    for _ in 0..2 {
-        let ObserveRecord::Event { event } = events.next().await else { panic!("expected event") };
-        assert_eq!(event.timestamp_source, TimestampSource::Provider);
-        assert_eq!(event.timestamp.instant(), time);
-    }
-    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: StopCause::PausedByProvider };
-    assert!(
-        matches!(events.next().await,ObserveRecord::Event {event} if matches!(event.event,EventKind::Paused {cause:StopCause::PausedByProvider}))
-    );
-    {
-        let mut vendor = control.vendor.lock().unwrap();
-        vendor.error = true;
-        vendor.row = None;
-    }
-    assert!(tokio::time::timeout(Duration::from_millis(40), events.stream.next()).await.is_err());
-    control.vendor.lock().unwrap().error = false;
-    assert!(
-        matches!(events.next().await,ObserveRecord::Event {event} if event.timestamp_source==TimestampSource::Adaptor && matches!(event.event,EventKind::Gone {cause:GoneCause::MissingOnList}))
-    );
+    let prepared = h.prepared("a").await;
+    let environment = h.provision("a", "poll-contract", &prepared, 201).await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let options: drydock::conformance::Options = serde_json::from_value(json!({"request":request("poll-probes", &prepared)})).unwrap();
+    let mut report = drydock::conformance::Report::default();
+    drydock::conformance::poll_contract(&client, "a", &options, &environment, &mut report).await;
+    assert!(report.passed(), "{report:?}");
 }
 
 // Polling has at most half the declared list allowance; a route can use the
@@ -1638,4 +1436,16 @@ async fn disappearing_operation_port_is_a_typed_refusal() {
         matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { reason } if reason == "operation port unavailable")
     );
     assert!(h.hello().await.providers[0].capabilities.fallback_runner);
+}
+
+// Admission fault: a server allowing this UID must fail a scenario that requires
+// rejection of an unauthorized peer. The healthy counterpart uses another UID.
+#[tokio::test]
+async fn unix_peer_admission_fault_matrix() {
+    for admits_this_uid in [false, true] {
+        let uid = unsafe { libc::geteuid() } + u32::from(!admits_this_uid);
+        let h = Harness::with_uid(uid).await;
+        let result = drydock::conformance::unix_peer_admission(&drydock::client::Client::unix(&h.path).unwrap()).await;
+        assert_eq!(result.is_ok(), !admits_this_uid);
+    }
 }
