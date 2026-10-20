@@ -778,6 +778,7 @@ impl UsageOperation for Daytona {
         let to_text = String::from(period.end().clone());
         let from = from_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period start"))?;
         let to = to_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period end"))?;
+        // Sample once before the reads; ongoing usage conservatively excludes time spent querying analytics.
         let ongoing_end = to.min(chrono::Utc::now());
         let mut url = self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "usage", "aggregated"])?;
         url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);

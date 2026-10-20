@@ -115,6 +115,11 @@ use DestroyedByRequest; unexplained absence uses MissingOnList. If a list observ
 absence while destroy is pending, the host defers the billing cause until the call
 confirms or fails. Failure/cancellation is never promoted to confirmed deletion.
 
+The default `inspect_after_lifecycle` reads the complete inventory to avoid guest
+probes on a completed lifecycle. This costs O(inventory); providers with a cheap
+per-environment read can override it, as Daytona does, retaining that observation
+if optional enrichment fails. Explicit inspect remains strict.
+
 Modules return `ObservedEnvironment` from list/inspect: the environment plus an optional
 typed provider timestamp. Polling uses that time, including matching inspect
 metadata when list has none; otherwise the host stamps first observation with
@@ -389,6 +394,8 @@ in the sampled lifecycle state while waiting. For example,
 `"billing_sample_millis": 60000, "billing_settle_millis": 120000` reads a roughly
 60-second window that ended at least two minutes before the usage request.
 Choose the settle duration to cover vendor accounting delay during live acceptance.
+The CLI announces a nonzero per-sample settle delay on stderr; stdout remains the
+JSON conformance report.
 Usage currently fans out sequentially across all IDs returned for the organization/window;
 individual-call budgeting and bounded fan-out are tracked in drydock#35.
 
