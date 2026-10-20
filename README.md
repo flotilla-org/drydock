@@ -168,8 +168,20 @@ drydock --config hosts.json --runtime-directory /private/runtime \
   conformance --provider daytona --options daytona-probe.json --live
 ```
 
-Use a unique label and an idle test account. The runner provisions, suspends and
-resumes when supported, and destroys its environment, including after failed
+The configuration and options files are trusted operator input: probe argv can
+execute local programs or guest commands. The `reference` entrypoint convention
+is a guard against accidental charges, not a security boundary; a host can load
+anything under that name. Treat externally supplied hosts and configs accordingly.
+
+Use a unique label and an idle test account. The concurrent-idempotency scenario
+makes two simultaneous provision calls. A broken provider can create two billable
+resources; refusal and range probes can also create strays on a broken host.
+The runner tracks their IDs and exact probe labels, retries final teardown once,
+and records a verified final cleanup sweep before reporting spend. It avoids a
+label-prefix wildcard so another run sharing a prefix is preserved. Failed
+cleanup remains a failing verdict and requires operator attention.
+
+The runner provisions, suspends and resumes when supported, and destroys its environment, including after failed
 checks. It returns nonzero if any check fails and prints a JSON report with
 individual verdicts, elapsed resource exposure, provider-reported usage for the
 run period, before/after quota, and a credit delta when available in the same
@@ -178,6 +190,17 @@ figures can include concurrent workloads and delayed vendor accounting; they are
 not a monetary estimate. Preparation is explicit so the operator controls the
 image, tools and preparation spend. Live Daytona and then Namespace validation
 are operator runs once their modules and test credentials exist.
+
+For slow providers, add an optional `timeouts` object to `probe.json`. Defaults
+are `startup_seconds: 15`, `request_seconds: 30`, `headers_seconds: 20`,
+`record_seconds: 20`, `transition_seconds: 30`, and `probe_seconds: 30`. Each is
+independent and accepts 1–86400 seconds. For example, a cold start can use
+`{"startup_seconds":120,"request_seconds":180,"record_seconds":300,"transition_seconds":600}`.
+Startup includes host configuration/credential readiness; request deadlines cover
+buffered HTTP calls and upgrade setup. Record and transition deadlines bound
+observation waits, while headers and probes have their own deadlines. Failure
+details contain safe categories (`timeout`, `decode`, `transport`, or typed HTTP
+status/class), never vendor reasons or probe output.
 
 `echo_relay` is only for fixtures whose relay is an echo server. Real agents have
 a protocol: provide `reach_probe: ["/absolute/path/to/round-trip-probe", ...]`.
@@ -197,7 +220,10 @@ canary IP, canary port, and raw DNS server IP. Use IP literals and independently
 verify that both TCP services and the DNS server are reachable outside the
 sandbox before the run. This avoids confusing an unavailable canary with an
 enforced policy. The probe bypasses process proxy settings with direct sockets
-and sends an actual UDP DNS query. Its entire output must be:
+and sends an actual UDP DNS query. Its entire output must be the following JSON,
+followed by stream EOF. Guest exec exposes a byte stream without an exit-status
+channel, so the checker validates output and EOF rather than certifying the
+process exit code:
 
 ```json
 {"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}

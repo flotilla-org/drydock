@@ -13,6 +13,7 @@ import urllib.parse
 
 fault = sys.argv[2] if len(sys.argv) > 2 else "none"
 rows = {}
+delete_attempts = {}
 events = []
 condition = threading.Condition()
 size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
@@ -133,7 +134,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     for row in value:
                         row["label"] = None
                 return self.respond(200, value)
-            if body["prepared"]["provider"] != "a":
+            if body["prepared"]["provider"] != "a" and fault not in ("stray-cleanup", "cleanup-failure"):
                 return self.refused()
             for field, value in body["size"].items():
                 if not isinstance(value, (int, float)) or value < 0 or (field == "cpus" and value == 0) or (field != "cpus" and not isinstance(value, int)):
@@ -141,12 +142,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return self.refused()
             for row in rows.values():
                 if row["label"] == body["label"] and fault != "idempotent":
+                    if fault == "partial":
+                        return self.respond(500, {"kind": "internal", "reason": "SECRET", "provider_error": "SECRET"})
                     return self.respond(200, row)
             row = {"id": str(len(events) + 1), "label": body["label"], "provider": "a",
                    "state": {"state": "running"}, "granted_size": body["size"], "egress": "enforced" if fault.startswith("egress-") else "advisory"}
             rows[row["id"]] = row
             emit(row, "created")
-            emit(row, "running", granted_size=row["granted_size"])
+            if fault == "slow":
+                threading.Timer(1.5, lambda: emit(row, "running", granted_size=row["granted_size"])).start()
+            else:
+                emit(row, "running", granted_size=row["granted_size"])
+            if fault == "partial":
+                return self.respond(500, {"kind": "internal", "reason": "SECRET", "provider_error": "SECRET"})
             return self.respond(201, row)
         identifier = parts[5] if len(parts) > 5 else ""
         row = rows.get(identifier)
@@ -167,7 +175,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     result["raw_dns"] = True
                 if fault == "egress-root":
                     result["uid"] = 1000
-                self.connection.sendall(json.dumps(result).encode())
+                payload = json.dumps(result).encode()
+                if fault == "egress-oversized":
+                    payload += b" " * 4097 + b"trailing data"
+                self.connection.sendall(payload)
                 self.close_connection = True
                 return
             while True:
@@ -187,6 +198,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             emit(row, "running", granted_size=row["granted_size"])
             return self.respond(204)
         if self.command == "DELETE":
+            attempt = delete_attempts.get(identifier, 0)
+            delete_attempts[identifier] = attempt + 1
+            if row and ((fault == "transient-destroy" and attempt == 0) or
+                        (fault == "stray-cleanup" and row["label"].endswith("-refused") and attempt == 0) or
+                        (fault == "cleanup-failure" and row["label"].endswith("-refused"))):
+                return self.respond(503, {"kind": "unavailable", "reason": "transient", "retry_after": None})
             if row is None and fault == "destroy":
                 return self.respond(404, {"kind": "not_found", "reason": "gone"})
             if row:

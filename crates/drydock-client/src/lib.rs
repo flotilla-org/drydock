@@ -57,6 +57,7 @@ pub struct Client {
     bearer: Option<Secret>,
     transport: reqwest::Client,
     http: Arc<dyn HttpClient>,
+    request_timeout: Duration,
 }
 impl Client {
     pub fn unix(path: impl AsRef<Path>) -> Result<Self> {
@@ -64,6 +65,7 @@ impl Client {
         Ok(Self {
             base: Url::parse("http://localhost/").expect("constant URL"),
             bearer: None,
+            request_timeout: Duration::from_secs(30),
             http: Arc::new(SocketHttp(transport.clone())),
             transport,
         })
@@ -87,7 +89,12 @@ impl Client {
         }
         let transport = Self::builder().build().map_err(|_| Error::InvalidRequest)?;
         let http = rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(|_| Error::InvalidRequest)?;
-        Ok(Self { base, bearer: Some(bearer), transport, http: Arc::new(http) })
+        Ok(Self { base, bearer: Some(bearer), transport, http: Arc::new(http), request_timeout: Duration::from_secs(30) })
+    }
+    /// Bound buffered calls and upgrade setup independently of stream lifetimes.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
     /// Replace the buffered execution port for recording or deterministic tests.
     pub fn with_http(mut self, http: Arc<dyn HttpClient>) -> Self {
@@ -118,7 +125,7 @@ impl Client {
         self.execute(request).await
     }
     async fn execute<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
-        let request = request.timeout(Duration::from_secs(30)).build().map_err(|_| Error::InvalidRequest)?;
+        let request = request.timeout(self.request_timeout).build().map_err(|_| Error::InvalidRequest)?;
         let response = http_execute!(self.http, request).map_err(|_| Error::Transport)?;
         if !response.status().is_success() {
             return Err(Error::Protocol(serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?));
@@ -166,7 +173,7 @@ impl Client {
         body: Option<&serde_json::Value>,
     ) -> Result<(u16, serde_json::Value)> {
         let method = Method::from_bytes(method.as_bytes()).map_err(|_| Error::InvalidRequest)?;
-        let mut request = self.request(method, segments)?.query(query).timeout(Duration::from_secs(30));
+        let mut request = self.request(method, segments)?.query(query).timeout(self.request_timeout);
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -236,7 +243,7 @@ impl Client {
             .request(if body.is_some() { Method::POST } else { Method::GET }, &["v1", "providers", provider, "environments", id, route])?
             .header("connection", "upgrade")
             .header("upgrade", protocol)
-            .timeout(Duration::from_secs(30));
+            .timeout(self.request_timeout);
         if let Some(body) = body {
             request = request.json(body);
         }

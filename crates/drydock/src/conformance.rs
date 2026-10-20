@@ -10,14 +10,57 @@ type Result<T> = std::result::Result<T, String>;
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Options {
     pub request: ProvisionRequest,
+    #[serde(default)]
+    pub timeouts: Timeouts,
     /// Only hermetic echo fixtures may enable this. Real agents speak their own protocol.
     #[serde(default)]
     pub echo_relay: bool,
     /// Command must exercise the returned reach recipe and exit only after a byte round trip.
     /// Receives the recipe on stdin, never argv or logs. For SSH it owns the matching key.
     pub reach_probe: Option<Vec<String>>,
-    /// Root guest probe: exit zero and emit exactly the JSON contract documented in README.
+    /// Root guest probe: emit exactly the documented JSON and close the stream.
+    /// The exec byte-stream protocol has no process exit-status channel.
     pub egress_probe: Option<ExecRequest>,
+}
+/// Independently tunable deadlines for cold provider starts and guest probes.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Timeouts {
+    pub startup_seconds: u64,
+    pub request_seconds: u64,
+    pub headers_seconds: u64,
+    pub record_seconds: u64,
+    pub transition_seconds: u64,
+    pub probe_seconds: u64,
+}
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            startup_seconds: 15,
+            request_seconds: 30,
+            headers_seconds: 20,
+            record_seconds: 20,
+            transition_seconds: 30,
+            probe_seconds: 30,
+        }
+    }
+}
+impl Timeouts {
+    pub fn validate(&self) -> Result<()> {
+        require(
+            [
+                self.startup_seconds,
+                self.request_seconds,
+                self.headers_seconds,
+                self.record_seconds,
+                self.transition_seconds,
+                self.probe_seconds,
+            ]
+            .into_iter()
+            .all(|seconds| (1..=86400).contains(&seconds)),
+            "timeouts must be between 1 and 86400 seconds",
+        )
+    }
 }
 #[derive(Debug, Serialize)]
 pub struct Check {
@@ -40,6 +83,18 @@ impl Report {
     pub fn passed(&self) -> bool {
         self.checks.iter().all(|c| c.passed)
     }
+    fn capture<T>(&mut self, name: &str, result: Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => {
+                self.record(name, Ok(()));
+                Some(value)
+            }
+            Err(error) => {
+                self.record(name, Err(error));
+                None
+            }
+        }
+    }
     fn record(&mut self, name: &str, result: Result<()>) {
         let (passed, detail) = match result {
             Ok(()) => (true, "ok".into()),
@@ -51,30 +106,62 @@ impl Report {
 fn require(value: bool, message: &str) -> Result<()> {
     if value { Ok(()) } else { Err(message.into()) }
 }
-fn transport(_: impl std::fmt::Display) -> String {
-    // Neither vendor errors nor probe output are safe diagnostics.
-    "request, stream or probe failed".into()
+trait SafeError {
+    fn category(&self) -> String;
 }
-async fn observe(client: &Client, since: Option<&str>) -> Result<Records> {
-    tokio::time::timeout(Duration::from_secs(20), client.observe(since)).await.map_err(transport)?.map_err(transport)
+impl SafeError for Error {
+    fn category(&self) -> String {
+        match self {
+            Error::Protocol(error) => format!("http {} {}", error.status(), error.class()),
+            Error::InvalidResponse => "decode".into(),
+            Error::Transport => "transport".into(),
+            Error::InvalidRequest => "invalid request".into(),
+            Error::VersionMismatch => "version mismatch".into(),
+            Error::RateLimited => "rate limited".into(),
+            Error::NotReady(_) => "not ready".into(),
+            Error::ReadinessTimeout(_) => "startup timeout".into(),
+        }
+    }
 }
-async fn next(records: &mut Records) -> Result<ObserveRecord> {
-    tokio::time::timeout(Duration::from_secs(20), records.next())
+impl SafeError for std::io::Error {
+    fn category(&self) -> String {
+        if self.kind() == std::io::ErrorKind::TimedOut { "timeout" } else { "io" }.into()
+    }
+}
+impl SafeError for serde_json::Error {
+    fn category(&self) -> String {
+        "decode".into()
+    }
+}
+impl SafeError for tokio::time::error::Elapsed {
+    fn category(&self) -> String {
+        "timeout".into()
+    }
+}
+fn transport(error: impl SafeError) -> String {
+    // Only static categories and numeric status: no vendor text or probe output.
+    error.category()
+}
+async fn observe(client: &Client, since: Option<&str>, timeouts: &Timeouts) -> Result<Records> {
+    tokio::time::timeout(Duration::from_secs(timeouts.headers_seconds), client.observe(since)).await.map_err(transport)?.map_err(transport)
+}
+async fn next(records: &mut Records, timeouts: &Timeouts) -> Result<ObserveRecord> {
+    tokio::time::timeout(Duration::from_secs(timeouts.record_seconds), records.next())
         .await
         .map_err(transport)?
         .map_err(transport)?
         .ok_or_else(|| "event stream ended".into())
 }
-fn cursor(record: &ObserveRecord) -> &str {
-    match record {
-        ObserveRecord::Event { event } => &event.cursor,
-        ObserveRecord::Snapshot { cursor, .. } => cursor,
-    }
-}
-async fn transition(records: &mut Records, provider: &str, id: &str, predicate: impl Fn(&EventKind) -> bool) -> Result<Event> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+async fn transition(
+    records: &mut Records,
+    provider: &str,
+    id: &str,
+    predicate: impl Fn(&EventKind) -> bool,
+    timeouts: &Timeouts,
+) -> Result<Event> {
+    tokio::time::timeout(Duration::from_secs(timeouts.transition_seconds), async {
         loop {
-            if let ObserveRecord::Event { event } = next(records).await?
+            if let ObserveRecord::Event { event } = next(records, timeouts).await?
                 && event.provider == provider
                 && event.id == id
                 && predicate(&event.event)
@@ -106,6 +193,13 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     let start = std::time::Instant::now();
     let period_start = chrono::Utc::now();
     let mut report = Report::default();
+    if let Err(error) = options.timeouts.validate() {
+        report.record("timeouts", Err(error));
+        return report;
+    }
+    let timeouts = &options.timeouts;
+    let client = &client.clone().with_request_timeout(Duration::from_secs(timeouts.request_seconds));
+    let mut owned_ids = std::collections::BTreeSet::new();
     let hello = match client.hello().await {
         Ok(hello) => hello,
         Err(error) => {
@@ -129,19 +223,24 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             Err(e) => report.record("quota_before", Err(transport(e))),
         }
     }
-    let mut records = observe(client, None).await.ok();
+    let mut records = match observe(client, None, timeouts).await {
+        Ok(records) => Some(records),
+        Err(error) => {
+            report.record("initial_snapshot", Err(error));
+            None
+        }
+    };
     if let Some(records) = records.as_mut() {
         report.record(
             "initial_snapshot",
-            match next(records).await {
+            match next(records, timeouts).await {
                 Ok(ObserveRecord::Snapshot { unavailable_providers, .. }) => {
                     require(!unavailable_providers.contains_key(provider), "provider inventory unavailable")
                 }
-                _ => Err("initial observation must mark a snapshot".into()),
+                Ok(_) => Err("initial observation must mark a snapshot".into()),
+                Err(error) => Err(error),
             },
         );
-    } else {
-        report.record("initial_snapshot", Err("cannot observe".into()));
     }
     let body = serde_json::to_value(&options.request).expect("serializable provision request");
     let path = ["v1", "providers", provider, "environments"];
@@ -151,38 +250,26 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         Ok((status, value)) if status == 200 || status == 201 => {
             serde_json::from_value::<Environment>(value).map_err(|_| Error::InvalidResponse)
         }
-        _ => Err(Error::InvalidResponse),
+        Ok((_, value)) => Err(serde_json::from_value::<ProtocolError>(value).map(Error::Protocol).unwrap_or(Error::InvalidResponse)),
+        Err(error) => Err(error),
     };
     let environment = match provisioned {
         Ok(environment) => environment,
         Err(e) => {
             report.record("provision", Err(transport(e)));
-            // A lost or malformed response may still have created a resource.
-            // Discover only this run's unique label, and report cleanup failure.
-            report.record(
-                "cleanup_after_failed_provision",
-                async {
-                    let rows = client.list(provider).await.map_err(transport)?;
-                    for row in rows.into_iter().filter(|row| row.label.as_deref() == Some(options.request.label.as_str())) {
-                        client.destroy(provider, &row.id).await.map_err(transport)?;
-                    }
-                    Ok(())
-                }
-                .await,
-            );
+            report.record("cleanup_after_failed_provision", cleanup(client, provider, &options.request.label, &owned_ids).await);
             finish_report(client, provider, caps, &mut report, start, period_start).await;
             return report;
         }
     };
+    owned_ids.insert(environment.id.clone());
     report.record(
         "concurrent_label",
         async {
             let (status, value) = second.map_err(transport)?;
             let other: Environment = serde_json::from_value(value).map_err(transport)?;
             let same = other.id == environment.id;
-            if !same {
-                let _ = client.destroy(provider, &other.id).await;
-            }
+            owned_ids.insert(other.id.clone());
             require(
                 matches!((first_status, status), (Some(200), 201) | (Some(201), 200)) && same,
                 "concurrent retries must return one creation and one existing resource",
@@ -204,9 +291,7 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         async {
             let again = client.provision(provider, &options.request).await.map_err(transport)?;
             let same = again.id == environment.id && again.label == environment.label;
-            if again.id != environment.id {
-                let _ = client.destroy(provider, &again.id).await;
-            }
+            owned_ids.insert(again.id.clone());
             require(same, "duplicate label created another environment")
         }
         .await,
@@ -220,48 +305,116 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         }
         .await,
     );
-    let mut resumed_records = None;
-    report.record(
-        "running_event",
+    let created = report.capture(
+        "created_event",
         async {
-            let records = records.as_mut().ok_or("cannot observe")?;
-            let event = transition(records, provider, &environment.id, |e| matches!(e, EventKind::Running { .. })).await?;
-            let EventKind::Running { granted_size } = &event.event else { unreachable!() };
-            // Provision may return an environment still booting. Compare granted
-            // size against current inventory after Running, not the creation reply.
-            let running = client.inspect(provider, &environment.id).await.map_err(transport)?;
-            require(
-                valid_size(granted_size)
-                    && running.granted_size.as_ref() == Some(granted_size)
-                    && matches!(running.state, Observation::Running),
-                "running event has wrong granted size or billing state",
-            )?;
-            // Typed decoding requires timestamp and its source; reconnect is exclusive or a marked snapshot.
-            let mut resumed = observe(client, Some(&event.cursor)).await?;
-            let mut gap = observe(client, Some("conformance-unknown-cursor")).await?;
-            require(matches!(next(&mut gap).await?, ObserveRecord::Snapshot { .. }), "unknown cursor did not mark snapshot")?;
-            // A subsequent lifecycle transition below validates the resumed cursor too.
-            if caps.suspend_resume {
-                let token = client.suspend(provider, &environment.id).await.map_err(transport)?;
-                let stopped = transition(&mut resumed, provider, &environment.id, |e| {
-                    matches!(e, EventKind::Stopped { .. } | EventKind::Paused { .. })
-                })
-                .await?;
-                require(cursor(&ObserveRecord::Event { event: stopped.clone() }) != event.cursor, "resume replayed old cursor")?;
-                require(
-                    matches!(client.inspect(provider, &environment.id).await.map_err(transport)?.state, Observation::Stopped { .. }),
-                    "suspended environment still bills as running",
-                )?;
-                client.resume(provider, &environment.id, &token).await.map_err(transport)?;
-                transition(&mut resumed, provider, &environment.id, |e| matches!(e, EventKind::Resumed | EventKind::Running { .. }))
-                    .await?;
-            }
-            resumed_records = Some(resumed);
-            Ok(())
+            transition(records.as_mut().ok_or("cannot observe")?, provider, &environment.id, |e| matches!(e, EventKind::Created), timeouts)
+                .await
         }
         .await,
     );
-    report.record("semantic_requests", semantic_requests(client, provider, options).await);
+    let running = report.capture(
+        "running_event",
+        async {
+            let event = transition(
+                records.as_mut().ok_or("cannot observe")?,
+                provider,
+                &environment.id,
+                |e| matches!(e, EventKind::Running { .. }),
+                timeouts,
+            )
+            .await?;
+            let EventKind::Running { granted_size } = &event.event else { unreachable!() };
+            let current = client.inspect(provider, &environment.id).await.map_err(transport)?;
+            require(
+                valid_size(granted_size)
+                    && current.granted_size.as_ref() == Some(granted_size)
+                    && matches!(current.state, Observation::Running),
+                "running event has wrong granted size or billing state",
+            )?;
+            Ok(event)
+        }
+        .await,
+    );
+    // Replay a known predecessor to check exclusive resume without depending on
+    // optional suspend support. Snapshot fallback explicitly marks a metering gap.
+    if let (Some(created), Some(running)) = (&created, &running) {
+        report.record(
+            "cursor_resume",
+            async {
+                let mut replay = observe(client, Some(&created.cursor), timeouts).await?;
+                match next(&mut replay, timeouts).await? {
+                    ObserveRecord::Event { event } => require(event == *running, "resume did not return the next event exclusively"),
+                    ObserveRecord::Snapshot { unavailable_providers, .. } => {
+                        require(!unavailable_providers.contains_key(provider), "resume inventory unavailable")
+                    }
+                }
+            }
+            .await,
+        );
+    }
+    report.record(
+        "gap_snapshot",
+        async {
+            let mut gap = observe(client, Some("conformance-unknown-cursor"), timeouts).await?;
+            require(matches!(next(&mut gap, timeouts).await?, ObserveRecord::Snapshot { .. }), "unknown cursor did not mark snapshot")
+        }
+        .await,
+    );
+    // Keep the resumed stream as soon as it opens, even if a later scenario fails.
+    let mut resumed_records = if let Some(event) = &running {
+        report.capture("resume_stream", observe(client, Some(&event.cursor), timeouts).await)
+    } else {
+        None
+    };
+    if caps.suspend_resume
+        && let Some(token) = report.capture("suspend", client.suspend(provider, &environment.id).await.map_err(transport))
+    {
+        report.record(
+            "stopped_event",
+            async {
+                let stream = resumed_records.as_mut().or(records.as_mut()).ok_or("cannot observe")?;
+                let stopped = transition(
+                    stream,
+                    provider,
+                    &environment.id,
+                    |e| matches!(e, EventKind::Stopped { .. } | EventKind::Paused { .. }),
+                    timeouts,
+                )
+                .await?;
+                require(running.as_ref().is_none_or(|event| stopped.cursor != event.cursor), "resume replayed old cursor")
+            }
+            .await,
+        );
+        report.record(
+            "stopped_billing",
+            async {
+                require(
+                    matches!(client.inspect(provider, &environment.id).await.map_err(transport)?.state, Observation::Stopped { .. }),
+                    "suspended environment still bills as running",
+                )
+            }
+            .await,
+        );
+        if report.capture("resume", client.resume(provider, &environment.id, &token).await.map_err(transport)).is_some() {
+            report.record(
+                "resumed_event",
+                async {
+                    transition(
+                        resumed_records.as_mut().or(records.as_mut()).ok_or("cannot observe")?,
+                        provider,
+                        &environment.id,
+                        |e| matches!(e, EventKind::Resumed | EventKind::Running { .. }),
+                        timeouts,
+                    )
+                    .await?;
+                    Ok(())
+                }
+                .await,
+            );
+        }
+    }
+    report.record("semantic_requests", semantic_requests(client, provider, options, &mut owned_ids).await);
     report.record(
         "explicit_nulls",
         async {
@@ -292,7 +445,7 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             match client.provision(provider, &invalid).await {
                 Err(Error::Protocol(ProtocolError::Refused { .. })) => Ok(()),
                 Ok(unexpected) => {
-                    let _ = client.destroy(provider, &unexpected.id).await;
+                    owned_ids.insert(unexpected.id);
                     Err("cross-provider prepared form accepted".into())
                 }
                 _ => Err("refusal was not typed Refused".into()),
@@ -315,14 +468,18 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         }
         .await,
     );
+    report.record("cleanup", cleanup(client, provider, &options.request.label, &owned_ids).await);
     report.record(
         "typed_loss",
         async {
-            let event =
-                transition(resumed_records.as_mut().or(records.as_mut()).ok_or("cannot observe")?, provider, &environment.id, |e| {
-                    matches!(e, EventKind::Gone { .. })
-                })
-                .await?;
+            let event = transition(
+                resumed_records.as_mut().or(records.as_mut()).ok_or("cannot observe")?,
+                provider,
+                &environment.id,
+                |e| matches!(e, EventKind::Gone { .. }),
+                timeouts,
+            )
+            .await?;
             require(
                 matches!(event.event, EventKind::Gone { cause: GoneCause::DestroyedByRequest }),
                 "confirmed destroy has wrong loss cause",
@@ -332,6 +489,41 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     );
     finish_report(client, provider, caps, &mut report, start, period_start).await;
     report
+}
+async fn cleanup(client: &Client, provider: &str, label: &str, known: &std::collections::BTreeSet<String>) -> Result<()> {
+    let labels = [
+        label.to_owned(),
+        format!("{label}-refused"),
+        format!("{label}-invalid-cpus"),
+        format!("{label}-invalid-memory_bytes"),
+        format!("{label}-invalid-disk_bytes"),
+    ];
+    let owns = |row: &Environment| known.contains(&row.id) || row.label.as_ref().is_some_and(|label| labels.contains(label));
+    let mut ids = known.clone();
+    let inventory = match client.list(provider).await {
+        Ok(rows) => Ok(rows),
+        Err(_) => client.list(provider).await,
+    };
+    if let Ok(rows) = &inventory {
+        ids = rows.iter().filter(|row| owns(row)).map(|row| row.id.clone()).collect();
+    }
+    let mut failure = None;
+    for id in ids {
+        if client.destroy(provider, &id).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Err(error) = client.destroy(provider, &id).await {
+                failure = Some(transport(error));
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(format!("cleanup: {error}"));
+    }
+    let rows = match client.list(provider).await {
+        Ok(rows) => rows,
+        Err(_) => client.list(provider).await.map_err(transport)?,
+    };
+    require(!rows.iter().any(owns), "cleanup left test resources running")
 }
 async fn finish_report(
     client: &Client,
@@ -382,18 +574,20 @@ async fn reach(client: &Client, provider: &str, id: &str, options: &Options) -> 
             .kill_on_drop(true)
             .spawn()
             .map_err(transport)?;
-        let mut input = child.stdin.take().ok_or("probe stdin unavailable")?;
-        input.write_all(&serde_json::to_vec(&recipe).map_err(transport)?).await.map_err(transport)?;
-        drop(input);
-        return require(
-            tokio::time::timeout(Duration::from_secs(30), child.wait()).await.map_err(transport)?.map_err(transport)?.success(),
-            "reach round trip probe failed",
-        );
+        let status = tokio::time::timeout(Duration::from_secs(options.timeouts.probe_seconds), async {
+            let mut input = child.stdin.take().ok_or("probe stdin unavailable")?;
+            input.write_all(&serde_json::to_vec(&recipe).map_err(transport)?).await.map_err(transport)?;
+            drop(input);
+            child.wait().await.map_err(transport)
+        })
+        .await
+        .map_err(transport)??;
+        return require(status.success(), "reach round trip probe failed");
     }
     if options.echo_relay && matches!(recipe, Reach::Relay { .. }) {
         let mut stream = client.relay(provider, id).await.map_err(transport)?;
         let bytes = b"drydock-conformance\0\xff\n";
-        return tokio::time::timeout(Duration::from_secs(10), async {
+        return tokio::time::timeout(Duration::from_secs(options.timeouts.probe_seconds), async {
             stream.write_all(bytes).await.map_err(transport)?;
             let mut actual = vec![0; bytes.len()];
             stream.read_exact(&mut actual).await.map_err(transport)?;
@@ -413,10 +607,11 @@ async fn egress(client: &Client, provider: &str, environment: &Environment, opti
     let command = options.egress_probe.as_ref().ok_or("Enforced check requires root guest probe")?;
     let mut stream = client.exec(provider, &environment.id, command).await.map_err(transport)?;
     let mut bytes = Vec::new();
-    tokio::time::timeout(Duration::from_secs(30), (&mut stream).take(4097).read_to_end(&mut bytes))
+    tokio::time::timeout(Duration::from_secs(options.timeouts.probe_seconds), (&mut stream).take(4097).read_to_end(&mut bytes))
         .await
         .map_err(transport)?
         .map_err(transport)?;
+    require(bytes.len() <= 4096, "oversized guest probe output")?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(transport)?;
     require(
         value == serde_json::json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}),
@@ -424,7 +619,12 @@ async fn egress(client: &Client, provider: &str, environment: &Environment, opti
     )
 }
 
-async fn semantic_requests(client: &Client, provider: &str, options: &Options) -> Result<()> {
+async fn semantic_requests(
+    client: &Client,
+    provider: &str,
+    options: &Options,
+    owned_ids: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
     let original = serde_json::to_value(&options.request).map_err(transport)?;
     // Boundary generator: negative, zero, overflow and wrong-type values cross
     // the CPU and unsigned byte-size domains, including JSON exponent overflow.
@@ -442,7 +642,7 @@ async fn semantic_requests(client: &Client, provider: &str, options: &Options) -
             if status < 300
                 && let Some(id) = body["id"].as_str()
             {
-                let _ = client.destroy(provider, id).await;
+                owned_ids.insert(id.to_owned());
             }
             require(
                 status == 422 && matches!(serde_json::from_value::<ProtocolError>(body), Ok(ProtocolError::Refused { .. })),
@@ -466,6 +666,38 @@ async fn semantic_requests(client: &Client, provider: &str, options: &Options) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Operator diagnostics identify failure classes but never include vendor
+    // reasons, raw errors or readiness text, which may contain credentials.
+    #[test]
+    fn safe_diagnostic_categories() {
+        let secret = "must-never-appear";
+        let errors = [
+            (Error::InvalidResponse, "decode"),
+            (Error::Transport, "transport"),
+            (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused"),
+            (Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: Secret::new(secret) }), "http 500 internal"),
+            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready"),
+        ];
+        for (error, expected) in errors {
+            assert_eq!(transport(error), expected);
+        }
+        assert_eq!(transport(std::io::Error::new(std::io::ErrorKind::TimedOut, secret)), "timeout");
+    }
+    // Deserializing partial options keeps the established defaults, rejects
+    // zero/overflowing timer values, and permits bounded live-provider deadlines.
+    #[test]
+    fn timeout_options_defaults_and_boundaries() {
+        let timeouts: Timeouts = serde_json::from_str(r#"{"startup_seconds":120,"transition_seconds":600}"#).unwrap();
+        assert_eq!(timeouts.startup_seconds, 120);
+        assert_eq!(timeouts.transition_seconds, 600);
+        assert_eq!(timeouts.record_seconds, 20);
+        assert_eq!(timeouts.request_seconds, 30);
+        assert!(timeouts.validate().is_ok());
+        for value in [0, 1, 86400, 86401, u64::MAX] {
+            let timeouts = Timeouts { request_seconds: value, ..Default::default() };
+            assert_eq!(timeouts.validate().is_ok(), (1..=86400).contains(&value));
+        }
+    }
     // Exhaust the interesting floating-point classes: infinities, NaN, negative,
     // both signed zeroes, smallest positive and largest finite representable values.
     // Hours are finite/nonnegative, CPUs finite/positive, credits finite (debt is legal).

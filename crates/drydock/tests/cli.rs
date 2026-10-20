@@ -66,6 +66,7 @@ async fn cli_lifecycle_against_reference_host() {
             egress: EgressRequest::default(),
             ssh_public_key: None,
         },
+        timeouts: Default::default(),
         echo_relay: true,
         reach_probe: None,
         egress_probe: None,
@@ -78,6 +79,25 @@ async fn cli_lifecycle_against_reference_host() {
     )
     .unwrap();
     assert!(report["checks"].as_array().unwrap().iter().all(|check| check["passed"] == true));
+    // A non-reference module must be refused before the CLI starts/configures
+    // any host. The gate uses configured entrypoint, never provider display name.
+    let mut non_reference: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    non_reference[0]["configuration"]["modules"][0]["entrypoint"] = serde_json::json!("vendor-module");
+    let gated_config = dir.path().join("live-hosts.json");
+    std::fs::write(&gated_config, serde_json::to_vec(&non_reference).unwrap()).unwrap();
+    let refused = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+        .arg("--config")
+        .arg(gated_config)
+        .arg("--runtime-directory")
+        .arg(dir.path().join("unused"))
+        .args(["conformance", "--provider", "a", "--options"])
+        .arg(&options_file)
+        .output()
+        .await
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --live"));
+    assert!(!dir.path().join("unused").exists());
     run(vec!["destroy".into(), "rust".into(), "a".into(), environment.id]).await;
     assert!(client.list("a").await.unwrap().is_empty());
     server.abort();

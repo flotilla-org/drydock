@@ -55,9 +55,20 @@ async fn main() -> std::process::ExitCode {
 }
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let conformance_options = if let Command::Conformance { options, .. } = &args.command {
+        let options: drydock::conformance::Options =
+            serde_json::from_slice(&tokio::fs::read(options).await?).map_err(|_| "invalid conformance options")?;
+        options.timeouts.validate()?;
+        Some(options)
+    } else {
+        None
+    };
     // Deliberately suppress serde diagnostics: a malformed document can contain a secret.
     let specs: Vec<HostSpec> = serde_json::from_slice(&tokio::fs::read(args.config).await?).map_err(|_| "invalid host configuration")?;
-    let supervisor = Supervisor::new(args.runtime_directory, Arc::new(BuiltinCredentials::default()));
+    let mut supervisor = Supervisor::new(args.runtime_directory, Arc::new(BuiltinCredentials::default()));
+    if let Some(options) = &conformance_options {
+        supervisor.request_timeout = Duration::from_secs(options.timeouts.request_seconds);
+    }
     let selected = match &args.command {
         Command::List { host, .. } | Command::Launch { host, .. } | Command::Destroy { host, .. } => Some(host),
         _ => None,
@@ -93,14 +104,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let name = spec.name.clone();
         let mut handle = supervisor.start(spec).await?;
-        let status = handle.ready(Duration::from_secs(15)).await;
+        let status =
+            handle.ready(Duration::from_secs(conformance_options.as_ref().map_or(15, |options| options.timeouts.startup_seconds))).await;
         match &args.command {
-            Command::Conformance { provider, options, .. } => {
+            Command::Conformance { provider, .. } => {
                 status?;
                 instance_ready(&handle, provider)?;
-                let options: drydock::conformance::Options =
-                    serde_json::from_slice(&tokio::fs::read(options).await?).map_err(|_| "invalid conformance options")?;
-                let report = drydock::conformance::run(&handle.client, provider, &options).await;
+                let options = conformance_options.as_ref().expect("parsed conformance options");
+                let report = drydock::conformance::run(&handle.client, provider, options).await;
                 println!("{}", serde_json::to_string(&report)?);
                 if !report.passed() {
                     return Err("provider failed conformance".into());
