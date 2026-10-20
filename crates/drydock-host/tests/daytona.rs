@@ -24,6 +24,13 @@ struct State {
     executed: Vec<String>,
     probe: Option<Value>,
     hide_label_once: bool,
+    activations: usize,
+    inactive_reads: usize,
+    created_state: Option<String>,
+    command_exit: Option<i32>,
+    require_bootstrap_budget: bool,
+    probe_exit: Option<i32>,
+    exec_timeouts: Vec<u64>,
 }
 #[derive(Default)]
 struct StandIn(Mutex<State>);
@@ -60,8 +67,23 @@ impl HttpClient for StandIn {
         match (method, path) {
             ("GET", p) if p.starts_with("/api/snapshots/") => {
                 let key = p.trim_start_matches("/api/snapshots/");
+                if s.activations > 0 {
+                    s.inactive_reads += 1;
+                    if s.inactive_reads >= 2 {
+                        for v in s.snapshots.values_mut() {
+                            if v["state"] == "inactive" {
+                                v["state"] = json!("active");
+                            }
+                        }
+                    }
+                }
                 let row = s.snapshots.get(key).or_else(|| s.snapshots.values().find(|v| v["id"].as_str() == Some(key)));
                 response(if row.is_some() { 200 } else { 404 }, row.cloned().unwrap_or(Value::Null))
+            }
+            ("POST", p) if p.ends_with("/activate") => {
+                s.activations += 1;
+                // Activation is asynchronous; a successful POST may still say inactive.
+                response(200, s.snapshots.values().next().unwrap().clone())
             }
             ("POST", "/api/snapshots") => {
                 assert!(body["imageName"].as_str().unwrap().contains("@sha256:"));
@@ -132,7 +154,7 @@ impl HttpClient for StandIn {
                 }
                 s.creates += 1;
                 let id = format!("sandbox-{}", s.creates);
-                let row = json!({"id":id,"name":body["name"],"labels":body["labels"],"state":"started","cpu":body["cpu"],"memory":body["memory"],"disk":body["disk"],"networkAllowList":body["networkAllowList"],"networkBlockAll":body["networkBlockAll"],"updatedAt":"2026-10-19T12:00:00Z"});
+                let row = json!({"id":id,"name":body["name"],"labels":body["labels"],"state":s.created_state.clone().unwrap_or_else(||"started".into()),"cpu":body["cpu"],"memory":body["memory"],"disk":body["disk"],"networkAllowList":body["networkAllowList"],"networkBlockAll":body["networkBlockAll"],"updatedAt":"2026-10-19T12:00:00Z"});
                 s.rows.insert(id, row.clone());
                 response(201, row)
             }
@@ -158,7 +180,10 @@ impl HttpClient for StandIn {
             }
             ("POST", p) if p.starts_with("/toolbox/") && p.ends_with("/process/execute") => {
                 let command = body["command"].as_str().unwrap();
-                assert_eq!(body["timeout"], 10);
+                s.exec_timeouts.push(body["timeout"].as_u64().unwrap());
+                if s.require_bootstrap_budget && command.contains("nohup") && body["timeout"].as_u64().unwrap() < 20 {
+                    return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
+                }
                 if command.contains("nohup") {
                     s.bootstraps += 1;
                     assert!(command.contains("--socket /run/drydock/agent.sock"));
@@ -169,7 +194,8 @@ impl HttpClient for StandIn {
                 } else {
                     "guest output".into()
                 };
-                response(200, json!({"exitCode":0,"result":output}))
+                let code = if command.starts_with("test \"$(id -u)\"") { s.probe_exit.unwrap_or(0) } else { s.command_exit.unwrap_or(0) };
+                response(200, json!({"exitCode":code,"result":output}))
             }
             ("GET", "/api/organizations/org-1/usage") => response(
                 200,
@@ -193,10 +219,10 @@ fn credentials(proxied: bool) -> Credentials {
         Credentials { mode: CredentialMode::Direct { credential_reference: "test".into() }, value: Some(Secret::new("key-a")) }
     }
 }
-async fn provider(http: Arc<StandIn>) -> Arc<dyn Provider> {
+async fn provider(http: Arc<dyn HttpClient>) -> Arc<dyn Provider> {
     provider_with_probe(http, false).await
 }
-async fn provider_with_probe(http: Arc<StandIn>, probe: bool) -> Arc<dyn Provider> {
+async fn provider_with_probe(http: Arc<dyn HttpClient>, probe: bool) -> Arc<dyn Provider> {
     let config:ProviderConfiguration = serde_json::from_value(json!({"name":"daytona","module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA","agent_command":"agent --socket /run/drydock/agent.sock"},"credential":{"mode":"direct","credential_reference":"test"}})).unwrap();
     let mut config = config;
     if probe {
@@ -451,6 +477,7 @@ async fn observations_are_typed() {
         ("build_failed", "unknown vendor error", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
         ("paused", "", Observation::Stopped { cause: StopCause::PausedByProvider }),
         ("creating", "", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+        ("destroyed", "", Observation::Gone { cause: GoneCause::DestroyedAtProvider }),
     ] {
         http.0
             .lock()
@@ -501,4 +528,223 @@ async fn preparation_converges_by_digest_pair() {
     assert_ne!(x.id, other.id);
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 2);
     assert!(a.prepare(PrepareRequest { image_digest: "image:latest".into(), tools_digest: "tools".into() }, &c).await.is_err());
+}
+
+// Activation is submitted once, then its lagging state is observed with paced
+// reads. Repeated activate POSTs cannot make that transition progress faster.
+#[tokio::test(start_paused = true)]
+async fn inactive_snapshot_activates_once_then_polls() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!("inactive");
+    let start = tokio::time::Instant::now();
+    let result = p.prepare(PrepareRequest { image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await;
+    assert!(result.is_ok());
+    assert_eq!(http.0.lock().unwrap().activations, 1);
+    assert!(start.elapsed() >= std::time::Duration::from_secs(2));
+}
+
+// Bootstrap's vendor deadline must contain its flock and readiness budgets.
+// Guest command failure is not a transient provider outage.
+#[tokio::test]
+async fn bootstrap_budget_and_command_failure() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().require_bootstrap_budget = true;
+    let env = row(p.provision(request(prep, "budget"), &c).await.unwrap());
+    http.0.lock().unwrap().command_exit = Some(7);
+    let err = p.operations().exec.unwrap().exec(&env.id, ExecRequest { command: vec!["false".into()] }, &c).await.err().unwrap();
+    assert_eq!(err.class(), "command_failed");
+    let value = serde_json::to_value(&err).unwrap();
+    assert_eq!(value["exit_code"], 7);
+    assert_eq!(value["output"], "guest output");
+    assert!(!format!("{err:?}").contains("guest output"));
+}
+
+// A terminal start/build failure must return immediately, rather than spending
+// the entire successful-operation observation budget polling an impossible start.
+#[tokio::test(start_paused = true)]
+async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
+    for state in ["error", "build_failed", "destroyed"] {
+        let http = Arc::new(StandIn::default());
+        let p = provider(http.clone()).await;
+        let c = credentials(false);
+        let prep = prepared(p.as_ref(), &c).await;
+        http.0.lock().unwrap().created_state = Some(state.into());
+        let start = tokio::time::Instant::now();
+        assert!(p.provision(request(prep, "terminal"), &c).await.is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "terminal state waited out the start budget");
+    }
+    for state in ["error", "build_failed"] {
+        let http = Arc::new(StandIn::default());
+        let p = provider(http.clone()).await;
+        let c = credentials(false);
+        let prep = prepared(p.as_ref(), &c).await;
+        http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!(state);
+        assert!(matches!(
+            p.prepare(PrepareRequest { image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await,
+            Err(ProtocolError::Refused { .. })
+        ));
+    }
+}
+
+// A failed row-local guest probe cannot erase a healthy authoritative inventory.
+#[tokio::test]
+async fn failing_probe_only_downgrades_its_row() {
+    let http = Arc::new(StandIn::default());
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
+    let mut r = request(prep, "probe-fails");
+    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
+    let env = row(p.provision(r, &c).await.unwrap());
+    http.0.lock().unwrap().probe_exit = Some(1);
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    assert_eq!(p.list(&c).await.unwrap().len(), 1);
+}
+
+// A socket inode without a listener must not count as successful bootstrap.
+// Execute the actual emitted guest script in a disposable local directory.
+#[tokio::test]
+async fn stale_socket_fails_bootstrap_liveness() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    p.provision(request(prep, "stale"), &c).await.unwrap();
+    let script = http.0.lock().unwrap().executed.iter().find(|v| v.contains("nohup")).unwrap().clone();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    assert!(socket.exists());
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script.replace("/run/drydock", dir.path().to_str().unwrap()))
+        .status()
+        .await
+        .unwrap();
+    assert!(!status.success(), "stale socket was accepted as a live agent");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(script.replace("/run/drydock", dir.path().to_str().unwrap()))
+        .status()
+        .await
+        .unwrap();
+    assert!(status.success(), "an actual listening agent was not accepted");
+}
+
+// This network-boundary wrapper controls response latency without sleeping
+// while holding the stand-in's state lock.
+struct Latency {
+    vendor: Arc<StandIn>,
+    block_start: bool,
+    blocked: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+    delay_probes: bool,
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+impl Latency {
+    fn new(vendor: Arc<StandIn>, block_start: bool, delay_probes: bool) -> Self {
+        Self {
+            vendor,
+            block_start,
+            blocked: false.into(),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            delay_probes,
+            active: 0.into(),
+            peak: 0.into(),
+        }
+    }
+}
+#[async_trait]
+impl HttpClient for Latency {
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.block_start
+            && request.method() == reqwest::Method::GET
+            && request.url().path() == "/api/sandbox/sandbox-1"
+            && !self.blocked.swap(true, SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        }
+        let probe = self.delay_probes && request.url().path().starts_with("/toolbox/");
+        if probe {
+            let active = self.active.fetch_add(1, SeqCst) + 1;
+            self.peak.fetch_max(active, SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let result = self.vendor.execute(request, label).await;
+        if probe {
+            self.active.fetch_sub(1, SeqCst);
+        }
+        result
+    }
+}
+
+// Vendor uniqueness protects label idempotence without a provider-wide lock:
+// a slow first start must not hold up provisioning an independent label.
+#[tokio::test]
+async fn slow_start_does_not_queue_other_labels() {
+    let vendor = Arc::new(StandIn::default());
+    let http = Arc::new(Latency::new(vendor, true, false));
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let slow_p = p.clone();
+    let slow_c = c.clone();
+    let slow_r = request(prep.clone(), "slow");
+    let slow = tokio::spawn(async move { slow_p.provision(slow_r, &slow_c).await });
+    http.entered.notified().await;
+    let fast = tokio::time::timeout(std::time::Duration::from_millis(500), p.provision(request(prep, "fast"), &c)).await;
+    http.release.add_permits(1);
+    assert!(fast.unwrap().is_ok());
+    assert!(slow.await.unwrap().is_ok());
+}
+
+// Polling uses at most four concurrent probes, so one slow guest cannot
+// serialize every sandbox's inventory; row failures still preserve inventory.
+#[tokio::test]
+async fn list_probes_have_bounded_concurrency() {
+    let vendor = Arc::new(StandIn::default());
+    let http = Arc::new(Latency::new(vendor.clone(), false, true));
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    for i in 0..7 {
+        vendor.0.lock().unwrap().rows.insert(
+            format!("s-{i}"),
+            json!({"id":format!("s-{i}"),"state":"started","networkAllowList":"192.0.2.1/32","cpu":1,"memory":1,"disk":1}),
+        );
+    }
+    vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
+    assert_eq!(p.list(&c).await.unwrap().len(), 7);
+    assert_eq!(http.peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+// Reusing a label cannot silently return a wider network policy or a different
+// size than the request. Exact retries still converge on the same sandbox.
+#[tokio::test]
+async fn existing_labels_surface_size_and_egress_mismatches() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let r = request(prep, "mismatch");
+    p.provision(r.clone(), &c).await.unwrap();
+    let mut changed = r.clone();
+    changed.size.cpus = 3.0;
+    assert!(matches!(p.provision(changed, &c).await, Err(ProtocolError::Refused { .. })));
+    let mut changed = r.clone();
+    changed.egress = EgressRequest::Open;
+    assert!(matches!(p.provision(changed, &c).await, Err(ProtocolError::Refused { .. })));
+    assert!(matches!(p.provision(r, &c).await.unwrap(), Provisioned::Existing(_)));
 }

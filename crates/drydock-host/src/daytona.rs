@@ -3,6 +3,7 @@
 use crate::module::*;
 use async_trait::async_trait;
 use drydock_protocol::*;
+use futures::{StreamExt, TryStreamExt};
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -87,13 +88,7 @@ impl Module for DaytonaModule {
                 return Err(refused("Daytona endpoints must be HTTPS base URLs ending in / without credentials, query or fragment"));
             }
         }
-        Ok(Arc::new(Daytona {
-            name: config.name.clone(),
-            settings,
-            http,
-            rates: Mutex::new(Vec::new()),
-            creation: tokio::sync::Mutex::new(()),
-        }))
+        Ok(Arc::new(Daytona { name: config.name.clone(), settings, http, rates: Mutex::new(Vec::new()) }))
     }
 }
 /// A vendor response's organization-scoped counters. Exposed for diagnostics;
@@ -110,9 +105,6 @@ pub struct Daytona {
     settings: Settings,
     http: Arc<dyn HttpClient>,
     rates: Mutex<Vec<RateWindow>>,
-    // Serialize only look-up/create/bootstrap, to make concurrent label retries
-    // within this provider atomic. Deterministic names cover independent hosts.
-    creation: tokio::sync::Mutex<()>,
 }
 impl Daytona {
     pub fn rate_windows(&self) -> Vec<RateWindow> {
@@ -131,6 +123,21 @@ impl Daytona {
         self.path(&self.settings.api_url, &segments)
     }
     async fn call(&self, method: Method, url: Url, body: Option<Value>, c: &Credentials) -> Result<Value> {
+        self.request(method, url, body, c, false).await?.ok_or_else(bad_response)
+    }
+    /// None represents a provider uniqueness conflict for look-up-or-create only.
+    /// Keep status branching here, independent of user-facing error wording.
+    async fn create(&self, url: Url, body: Value, c: &Credentials) -> Result<Option<Value>> {
+        self.request(Method::POST, url, Some(body), c, true).await
+    }
+    async fn request(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+        c: &Credentials,
+        accept_conflict: bool,
+    ) -> Result<Option<Value>> {
         let token = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "Daytona API key not delivered".into() })?;
         let mut request = reqwest::Request::new(method, url);
         let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
@@ -158,6 +165,9 @@ impl Daytona {
         }
         let retry_after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
         let status = response.status().as_u16();
+        if status == 409 && accept_conflict {
+            return Ok(None);
+        }
         if !(200..300).contains(&status) {
             // Never echo an untrusted provider body: it may contain an SSH token
             // or the API key. No SDK retry is involved.
@@ -175,9 +185,9 @@ impl Daytona {
             });
         }
         if response.body().is_empty() {
-            return Ok(Value::Null);
+            return Ok(Some(Value::Null));
         }
-        serde_json::from_slice(response.body()).map_err(|_| ProtocolError::Internal {
+        serde_json::from_slice(response.body()).map(Some).map_err(|_| ProtocolError::Internal {
             reason: "invalid Daytona response".into(),
             provider_error: Secret::new("response withheld"),
         })
@@ -212,7 +222,7 @@ impl Daytona {
             "destroyed" if v.get("spotEvictedAt").and_then(Value::as_str).is_some() => {
                 Observation::Gone { cause: GoneCause::EvictedByProvider }
             }
-            "destroyed" => Observation::Gone { cause: GoneCause::GuestPoweredOff },
+            "destroyed" => Observation::Gone { cause: GoneCause::DestroyedAtProvider },
             "error" | "build_failed" => match v.get("errorReason").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase().as_str() {
                 reason if reason.contains("out of memory") || reason.contains("oom") => {
                     Observation::Gone { cause: GoneCause::HostOutOfMemory }
@@ -250,6 +260,19 @@ impl Daytona {
             timestamp,
         })
     }
+    fn check_existing_request(&self, v: &Value, size: &Size, allow: &str, block: bool) -> Result<()> {
+        let row = self.environment(v.clone())?;
+        fn policy(s: &str) -> BTreeSet<&str> {
+            s.split(',').filter(|v| !v.is_empty()).collect()
+        }
+        if row.environment.granted_size.as_ref() != Some(size)
+            || v.get("networkBlockAll").and_then(Value::as_bool) != Some(block)
+            || !v.get("networkAllowList").and_then(Value::as_str).is_some_and(|s| policy(s) == policy(allow))
+        {
+            return Err(refused("existing Daytona label has a different or unknown size/egress policy; provision a new label"));
+        }
+        Ok(())
+    }
     async fn observed(&self, v: Value, c: &Credentials) -> Result<ObservedEnvironment> {
         let restricted = v.get("networkAllowList").and_then(Value::as_str).is_some_and(|v| !v.is_empty() && v != "0.0.0.0/0");
         let mut row = self.environment(v)?;
@@ -258,38 +281,62 @@ impl Daytona {
             && let Some(probe) = &self.settings.egress_probe
         {
             let command = format!("test \"$(id -u)\" = 0 && {}", shell_command(&probe.command));
-            let output = self.execute(&row.environment.id, &command, c).await?;
-            let result: Value = serde_json::from_str(&output).map_err(|_| refused("invalid root egress probe output"))?;
-            if result == json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}) {
-                row.environment.egress = Enforcement::Enforced;
+            match self.execute(&row.environment.id, &command, 20, c).await {
+                Ok(output)
+                    if serde_json::from_str::<Value>(&output).ok()
+                        == Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false})) =>
+                {
+                    row.environment.egress = Enforcement::Enforced;
+                }
+                // Authentication and organization throttling still govern host
+                // admission. A guest's inability to prove isolation is row-local.
+                Err(e @ (ProtocolError::CredentialRejected { .. } | ProtocolError::RateLimited { .. })) => return Err(e),
+                _ => {}
             }
         }
         Ok(row)
     }
-    async fn execute(&self, id: &str, command: &str, c: &Credentials) -> Result<String> {
+    async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<String> {
         let url = self.path(&self.settings.toolbox_url, &[id, "process", "execute"])?;
-        let v = self.call(Method::POST, url, Some(json!({"command": command, "timeout": 10})), c).await?;
-        if v.get("exitCode").and_then(Value::as_i64) != Some(0) {
-            return Err(ProtocolError::Unavailable { reason: "Daytona guest command failed".into(), retry_after: None });
+        let v = self.call(Method::POST, url, Some(json!({"command": command, "timeout": timeout})), c).await?;
+        let exit_code = v.get("exitCode").and_then(Value::as_i64).and_then(|v| i32::try_from(v).ok()).ok_or_else(bad_response)?;
+        // Empty output is valid for a successful command (or a failing command).
+        let output = v.get("result").and_then(Value::as_str).ok_or_else(bad_response)?;
+        if exit_code != 0 {
+            return Err(ProtocolError::CommandFailed {
+                reason: "Daytona guest command failed".into(),
+                exit_code,
+                output: Secret::new(output),
+            });
         }
-        Ok(text(&v, "result")?.into())
+        Ok(output.into())
     }
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<()> {
+        // Connecting verifies an actual listener, not merely a leftover inode.
+        // Python is part of the baked tools contract; a missing liveness tool
+        // fails closed instead of reporting a ready agent.
+        let check = "import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1]); s.close()";
+        let alive = format!("python3 -c {} /run/drydock/agent.sock >/dev/null 2>&1", shell_command(&[check.into()]));
         let start = format!(
-            "test -S /run/drydock/agent.sock || (nohup {} </dev/null >/tmp/drydock-agent.log 2>&1 &); for i in 1 2 3 4 5; do test -S /run/drydock/agent.sock && exit 0; sleep 1; done; exit 1",
+            "alive() {{ {alive}; }}; alive && exit 0; rm -f /run/drydock/agent.sock; nohup {} </dev/null >/tmp/drydock-agent.log 2>&1 & for i in 1 2 3 4 5; do alive && exit 0; sleep 1; done; exit 1",
             self.settings.agent_command
         );
         let command =
             format!("mkdir -p /run/drydock && flock --close --wait 8 /run/drydock/bootstrap.lock sh -c {}", shell_command(&[start]));
-        self.execute(id, &command, c).await?;
+        // 8s lock + at most 6 one-second connects + 5s sleeps, with headroom.
+        self.execute(id, &command, 25, c).await?;
         Ok(())
     }
     async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
         // Observe an asynchronous operation, never retry a failed vendor request.
         for _ in 0..60 {
-            let row = self.inspect(id, c).await?.environment;
-            if matches!(row.state, Observation::Running) {
-                return Ok(row);
+            let raw = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
+            match text(&raw, "state")? {
+                "started" => return Ok(self.observed(raw, c).await?.environment),
+                "error" | "build_failed" | "destroyed" | "destroying" => {
+                    return Err(refused("Daytona sandbox entered a terminal state before startup"));
+                }
+                _ => {}
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
@@ -400,20 +447,23 @@ impl Provider for Daytona {
         let snapshot = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
             Err(ProtocolError::NotFound { .. }) => {
-                match self.call(
-                    Method::POST,
-                    self.path(&self.settings.api_url, &["snapshots"])?,
-                    Some(json!({"name":snapshot_name,"imageName":r.image_digest,"regionId":self.settings.region,"sandboxClass":"container"})), c,
-                ).await {
-                    Err(ProtocolError::Refused { reason }) if reason == "Daytona refused request (HTTP 409)" =>
-                        self.call(Method::GET, self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?, None, c).await?,
-                    result => result?,
+                match self
+                    .create(
+                        self.path(&self.settings.api_url, &["snapshots"])?,
+                        json!({"name":snapshot_name,"imageName":r.image_digest,"regionId":self.settings.region,"sandboxClass":"container"}),
+                        c,
+                    )
+                    .await?
+                {
+                    Some(snapshot) => snapshot,
+                    None => self.call(Method::GET, self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?, None, c).await?,
                 }
             }
             Err(e) => return Err(e),
         };
         let id = text(&snapshot, "id")?.to_owned();
         let mut snapshot = snapshot;
+        let mut activation_submitted = false;
         for _ in 0..120 {
             match text(&snapshot, "state")? {
                 "active" => {
@@ -424,10 +474,11 @@ impl Provider for Daytona {
                         tools_digest: r.tools_digest,
                     });
                 }
-                "inactive" => {
-                    snapshot =
-                        self.call(Method::POST, self.path(&self.settings.api_url, &["snapshots", &id, "activate"])?, None, c).await?;
-                    continue;
+                "inactive" if !activation_submitted => {
+                    // A successful activation response can lag at inactive.
+                    // Submit once; all subsequent observations use paced GETs.
+                    self.call(Method::POST, self.path(&self.settings.api_url, &["snapshots", &id, "activate"])?, None, c).await?;
+                    activation_submitted = true;
                 }
                 "error" | "build_failed" => return Err(refused("Daytona snapshot build failed")),
                 _ => {}
@@ -455,46 +506,43 @@ impl Provider for Daytona {
         {
             return Err(refused("Daytona container size requires 1..4 whole vCPU, 1..8 GiB RAM, 1..10 GiB disk"));
         }
-        let _guard = self.creation.lock().await;
         if let Some(v) = self
             .inventory(Some(&r.label), c)
             .await?
             .into_iter()
             .find(|v| v.pointer("/labels/flotilla.label").and_then(Value::as_str) == Some(&r.label))
         {
+            self.check_existing_request(&v, size, &allow, block)?;
             let row = self.observed(v, c).await?.environment;
             if matches!(row.state, Observation::Running) {
                 self.bootstrap(&row.id, c).await?;
             }
             return Ok(Provisioned::Existing(row));
         }
-        let created = self.call(Method::POST, self.path(&self.settings.api_url, &["sandbox"])?, Some(json!({
+        let created = self.create(self.path(&self.settings.api_url, &["sandbox"])?, json!({
             "name":name("environment", &r.label), "snapshot":r.prepared.id, "labels":{"flotilla.label":r.label.clone()},
             "target":self.settings.region, "cpu":size.cpus as u64, "memory":size.memory_bytes/GIB, "disk":size.disk_bytes/GIB,
             "networkAllowList":allow, "networkBlockAll":block, "autoStopInterval":0, "autoPauseInterval":0, "autoDeleteInterval":-1, "public":false
-        })), c).await;
+        }), c).await?;
         let v = match created {
-            Err(ProtocolError::Refused { reason }) if reason == "Daytona refused request (HTTP 409)" => {
+            None => {
                 let v = self.call(Method::GET, self.sandbox_url(&name("environment", &r.label), None)?, None, c).await?;
                 if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(&r.label) {
                     return Err(refused("Daytona sandbox name belongs to a different label"));
                 }
+                self.check_existing_request(&v, size, &allow, block)?;
                 let row = self.wait_started(text(&v, "id")?, c).await?;
                 self.bootstrap(&row.id, c).await?;
                 return Ok(Provisioned::Existing(row));
             }
-            result => result?,
+            Some(v) => v,
         };
         let row = self.wait_started(text(&v, "id")?, c).await?;
         self.bootstrap(&row.id, c).await?;
         Ok(Provisioned::Created(row))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
-        let mut rows = Vec::new();
-        for v in self.inventory(None, c).await? {
-            rows.push(self.observed(v, c).await?);
-        }
-        Ok(rows)
+        futures::stream::iter(self.inventory(None, c).await?).map(|v| self.observed(v, c)).buffered(4).try_collect().await
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
         self.observed(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?, c).await
@@ -525,6 +573,8 @@ impl SuspendResume for Daytona {
         if !matches!(self.inspect(id, c).await?.environment.state, Observation::Stopped { .. }) {
             self.call(Method::POST, self.sandbox_url(id, Some("stop"))?, None, c).await?;
         }
+        // This deterministic continuation marker binds provider and id; it is
+        // not an access credential. Every resume still requires the API key.
         for _ in 0..60 {
             if matches!(self.inspect(id, c).await?.environment.state, Observation::Stopped { .. }) {
                 return Ok(ResumeToken { token: Secret::new(name("resume", &format!("{}\0{id}", self.name))) });
@@ -542,7 +592,7 @@ impl SuspendResume for Daytona {
         }
         self.call(Method::POST, self.sandbox_url(id, Some("start"))?, None, c).await?;
         self.wait_started(id, c).await?;
-        self.execute(id, "rm -f /run/drydock/agent.sock", c).await?;
+        self.execute(id, "rm -f /run/drydock/agent.sock", 20, c).await?;
         self.bootstrap(id, c).await
     }
 }
@@ -550,7 +600,7 @@ impl SuspendResume for Daytona {
 impl Exec for Daytona {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
         let command = shell_command(&r.command);
-        let output = self.execute(id, &command, c).await?;
+        let output = self.execute(id, &command, 20, c).await?;
         let (client, mut server) = tokio::io::duplex(65536);
         tokio::spawn(async move {
             let _ = server.write_all(output.as_bytes()).await;

@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol version 2 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 3 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
@@ -263,8 +263,8 @@ sandboxes in that organisation.
 `agent_command` is the fixed startup command of **your baked image**, not a
 per-environment argument. The example binary is illustrative; the checked-in
 Flotilla vessel agent is still a skeleton, so an image must provide a working
-agent/listener before live acceptance. Bake the tools and `flock` into the public
-image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
+agent/listener before live acceptance. Bake the tools, `flock` and Python 3
+(for listener liveness checks) into the public image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
 prepare. A deterministic provider snapshot name tags the digest pair; subsequent
 prepare calls look it up and wait for `active`. The module sets the container
 class explicitly. No tools are uploaded. Prepare observes a build for up to four
@@ -275,17 +275,28 @@ snapshot. Size requests must use whole vCPU and GiB within the default 4 vCPU,
 Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
 disables auto-stop/auto-pause and auto-delete, waits for started, then launches
 the fixed command through toolbox exec. A guest `flock` serialises bootstrap;
-bootstrap succeeds only after `/run/drydock/agent.sock` appears. The agent should
+bootstrap succeeds only when a connection to `/run/drydock/agent.sock` succeeds.
+A stale socket with no listener is removed and the fixed agent command is restarted.
+The toolbox budget is 25 seconds, covering the eight-second flock wait, five-second
+readiness loop and bounded one-second liveness connects; ordinary exec/probes get
+20 seconds (the current protocol `ExecRequest` has no timeout field). The agent should
 replace that socket when it starts. Drydock subsequently pushes egress, CA and
 features over its control connection. A failed bootstrap leaves a labelled
 resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
-resource; they do not change its snapshot, size or network policy.
+resource; size or egress mismatches (including missing policy evidence) are refused
+with guidance to use a new label. They never change the existing resource's policy.
+Vendor name uniqueness arbitrates concurrent creates, so one slow startup does not
+hold a provider-wide creation mutex.
 
 Suspend is stop, resume is start plus bootstrap. The whole filesystem persists;
 memory and resident processes do not. `suspend_preserves_memory: false` declares
 this explicitly. There is no pause operation on the container class. Resume
 removes the old stopped process's socket before bootstrapping; repeated resume of
-an already running sandbox checks bootstrap without removing its socket.
+an already running sandbox checks the listener and restarts a dead agent without
+disturbing a live socket.
+The deterministic resume token is an id-bound continuation marker, not an access
+credential; every call still requires the organisation API key. It uses `Secret`
+because that is the protocol's resume-token representation.
 
 Every reach call requests a fresh five-minute SSH token. Daytona authenticates it
 as the gateway username, so `Reach::Ssh.user` now uses the redacting `Secret` type
@@ -315,9 +326,12 @@ The command must actually test the listed destination, an operator-controlled
 unlisted canary and raw DNS; it is trusted operator code, like the conformance
 checker's probe. **Do not substitute a command that prints constants.** Only this
 successful result returns Enforced. A nonmatching result returns Advisory, and a
-failed/invalid probe returns a typed error; failed inventory is never published as
-a complete list. Open, empty deny-all and nonrunning sandboxes remain Advisory.
-Probe on every observation avoids carrying a stale claim after an out-of-band
+failed/invalid guest probe downgrades only that row to Advisory. Authentication
+rejections and organisation throttling still propagate as typed failures; failed
+inventory retrieval is never published as a complete list. Open, empty deny-all
+and nonrunning sandboxes remain Advisory.
+Inventory runs at most four probes concurrently. Probe on every observation
+avoids carrying a stale claim after an out-of-band
 policy change. Configuring a probe declares the Enforced capability so the
 conformance checker requires and tests the claim. Probe calls consume vendor
 requests in addition to inventory calls.
@@ -354,3 +368,15 @@ live cost remain operator acceptance, not claimed by the stand-in run.
 Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
 and contain no URL credentials, query or fragment. Defaults are Daytona's public
 REST, toolbox proxy and analytics endpoints.
+
+Daytona toolbox `/process/execute` returns a buffered, merged `result` and an
+`exitCode`; it supplies neither separate stderr nor a live stdin/output stream.
+Fallback exec preserves that contract: successful merged output is exposed through
+the Drydock byte stream after completion; nonzero exits return `CommandFailed`
+(HTTP 424) with a typed `exit_code` and sensitive `output` wrapped in `Secret`.
+This is a diagnostic runner, not an interactive terminal. Empty output is valid.
+Snapshot activation is submitted once and then observed by paced reads. Terminal
+sandbox start failures are returned immediately. A provider-reported `destroyed`
+without eviction metadata is `DestroyedAtProvider`, rather than claiming that the
+guest powered itself off; confirmed Drydock deletion still uses the host's
+`DestroyedByRequest` event cause.

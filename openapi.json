@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "2"
+    "version": "3"
   },
   "paths": {
     "/v1/config": {
@@ -39,6 +39,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -93,6 +96,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -134,6 +140,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -191,6 +200,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -246,6 +258,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -318,6 +333,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -380,6 +398,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -432,6 +453,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -512,6 +536,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -574,6 +601,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -635,6 +665,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -705,6 +738,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -770,6 +806,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -831,6 +870,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -895,6 +937,9 @@
           "422": {
             "$ref": "#/components/responses/Error422"
           },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
           "429": {
             "$ref": "#/components/responses/Error429"
           },
@@ -947,6 +992,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -1018,6 +1066,9 @@
           },
           "422": {
             "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
           },
           "429": {
             "$ref": "#/components/responses/Error429"
@@ -1608,6 +1659,21 @@
           },
           {
             "type": "object",
+            "description": "The provider explicitly reports destruction without an attributed client request.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "destroyed_at_provider"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "A previously known environment is absent from an authoritative complete list.",
             "required": [
               "kind"
@@ -2069,6 +2135,35 @@
                 "enum": [
                   "credential_rejected"
                 ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A completed guest command failed, distinct from a vendor/transport outage.",
+            "required": [
+              "reason",
+              "exit_code",
+              "output",
+              "kind"
+            ],
+            "properties": {
+              "exit_code": {
+                "type": "integer",
+                "format": "int32"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "command_failed"
+                ]
+              },
+              "output": {
+                "$ref": "#/components/schemas/Secret",
+                "description": "Vendor-merged guest output. Sensitive diagnostics; never log it."
               },
               "reason": {
                 "type": "string"
@@ -2691,6 +2786,42 @@
                   "enum": [
                     "refused"
                   ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Error424": {
+        "description": "CommandFailed: completed guest command failed; includes exit code and sensitive merged output",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "description": "A completed guest command failed, distinct from a vendor/transport outage.",
+              "required": [
+                "reason",
+                "exit_code",
+                "output",
+                "kind"
+              ],
+              "properties": {
+                "exit_code": {
+                  "type": "integer",
+                  "format": "int32"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "command_failed"
+                  ]
+                },
+                "output": {
+                  "$ref": "#/components/schemas/Secret",
+                  "description": "Vendor-merged guest output. Sensitive diagnostics; never log it."
                 },
                 "reason": {
                   "type": "string"

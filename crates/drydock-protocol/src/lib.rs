@@ -9,7 +9,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "3";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -299,6 +299,8 @@ pub enum GoneCause {
         code: i32,
     },
     GuestPoweredOff,
+    /// The provider explicitly reports destruction without an attributed client request.
+    DestroyedAtProvider,
     /// A previously known environment is absent from an authoritative complete list.
     MissingOnList,
     /// The provider confirmed deletion requested by the client.
@@ -454,6 +456,13 @@ pub enum ProtocolError {
     CredentialRejected {
         reason: String,
     },
+    /// A completed guest command failed, distinct from a vendor/transport outage.
+    CommandFailed {
+        reason: String,
+        exit_code: i32,
+        /// Vendor-merged guest output. Sensitive diagnostics; never log it.
+        output: Secret,
+    },
     Internal {
         reason: String,
         /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
@@ -483,6 +492,7 @@ impl ProtocolError {
             Self::RateLimited { .. } => "rate_limited",
             Self::QuotaExhausted { .. } => "quota_exhausted",
             Self::CredentialRejected { .. } => "credential_rejected",
+            Self::CommandFailed { .. } => "command_failed",
             Self::Internal { .. } => "internal",
         }
     }
@@ -497,6 +507,7 @@ impl ProtocolError {
             Self::RateLimited { .. } => 429,
             Self::QuotaExhausted { .. } => 402,
             Self::CredentialRejected { .. } => 502,
+            Self::CommandFailed { .. } => 424,
             Self::Internal { .. } => 500,
         }
     }

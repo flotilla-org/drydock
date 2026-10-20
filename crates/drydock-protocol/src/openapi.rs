@@ -19,6 +19,8 @@ enum ErrorResponses {
     QuotaExhausted(ProtocolError),
     #[response(status = 502, description = "CredentialRejected: vendor rejected delivered credentials")]
     CredentialRejected(ProtocolError),
+    #[response(status = 424, description = "CommandFailed: completed guest command failed; includes exit code and sensitive merged output")]
+    CommandFailed(ProtocolError),
     #[response(status = 500, description = "Internal: sensitive provider error for supervisor diagnostics")]
     Internal(ProtocolError),
 }
@@ -205,6 +207,7 @@ pub fn document() -> utoipa::openapi::OpenApi {
                 ("429", "rate_limited"),
                 ("402", "quota_exhausted"),
                 ("502", "credential_rejected"),
+                ("424", "command_failed"),
                 ("500", "internal"),
             ] {
                 let name = format!("Error{status}");

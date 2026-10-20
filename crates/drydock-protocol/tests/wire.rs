@@ -122,7 +122,7 @@ fn hello_requires_exact_protocol_version() {
     // Version 1 assumes every snapshot is complete and must reject version 2 semantics.
     let old = Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], providers: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "3", "2.0.0", "2 "] {
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "4", "3.0.0", "3 "] {
         let hello = Hello { protocol_version: version.into(), host_version: "test".into(), modules: vec![], providers: vec![] };
         assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
