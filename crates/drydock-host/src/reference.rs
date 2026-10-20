@@ -151,11 +151,7 @@ impl Provider for Reference {
         self.check()?;
         let state = self.state.recover();
         if state.inventory_error {
-            return Err(ProtocolError::Unavailable {
-                provider_error: None,
-                reason: "fixture inventory unavailable".into(),
-                retry_after: None,
-            });
+            return Err(ProtocolError::unavailable("fixture inventory unavailable", None));
         }
         Ok(state
             .environments

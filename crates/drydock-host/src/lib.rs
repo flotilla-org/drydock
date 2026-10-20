@@ -237,11 +237,7 @@ impl Instance {
             {
                 return Err(error);
             }
-            Err(ProtocolError::Unavailable {
-                provider_error: None,
-                reason: "provider is not ready; inspect hello".into(),
-                retry_after: None,
-            })
+            Err(ProtocolError::unavailable("provider is not ready; inspect hello", None))
         }
     }
 
@@ -271,11 +267,7 @@ impl Instance {
             // A pending observation reservation can safely survive unready time:
             // no route can resume while polling remains disabled by readiness.
             if !self.availability(&auth).may_call {
-                return Err(ProtocolError::Unavailable {
-                    provider_error: None,
-                    reason: "provider is not ready; inspect hello".into(),
-                    retry_after: None,
-                });
+                return Err(ProtocolError::unavailable("provider is not ready; inspect hello", None));
             }
             (auth.credentials.clone(), auth.generation)
         };
@@ -538,7 +530,7 @@ impl Host {
         let mut changed = self.events.changed.subscribe();
         let mut stopping = self.stopping.subscribe();
         if *stopping.borrow() {
-            return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None });
+            return Err(ProtocolError::unavailable("host stopping", None));
         }
         let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
         let mut push_errors = BTreeMap::new();
@@ -551,14 +543,12 @@ impl Host {
         let lists = instances.iter().filter(|i| matches!(i.observation, ObservationMode::Push)).map(|instance| async move {
             let result = tokio::time::timeout_at(deadline, instance.call(Gate::List, |p, c| async move { p.list(&c).await }))
                 .await
-                .unwrap_or_else(|_| {
-                    Err(ProtocolError::Unavailable { provider_error: None, reason: "snapshot list timed out".into(), retry_after: None })
-                });
+                .unwrap_or_else(|_| Err(ProtocolError::unavailable("snapshot list timed out", None)));
             (instance.config.name.clone(), result)
         });
         let results = tokio::select! {
             results = futures::future::join_all(lists) => results,
-            _ = stopping.changed() => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }),
+            _ = stopping.changed() => return Err(ProtocolError::unavailable("host stopping", None)),
         };
         let mut push_rows = vec![];
         for (name, result) in results {
@@ -571,7 +561,7 @@ impl Host {
         }
         loop {
             if *stopping.borrow() {
-                return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None });
+                return Err(ProtocolError::unavailable("host stopping", None));
             }
             let mut unavailable_providers = push_errors.clone();
             for instance in &instances {
@@ -617,7 +607,7 @@ impl Host {
             }
             tokio::select! {
                 _ = changed.changed() => {},
-                _ = stopping.changed() => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }),
+                _ = stopping.changed() => return Err(ProtocolError::unavailable("host stopping", None)),
             }
         }
     }
@@ -691,11 +681,11 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
     let mut stopping = host.stopping.subscribe();
     let _transaction = tokio::select! {
         biased;
-        _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into()),
+        _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::unavailable("host stopping", None).into()),
         guard = host.configuring.lock() => guard,
     };
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::unavailable("host stopping", None).into());
     }
     let mut config = host.config.read().await.clone();
     // Exact repeats preserve resources and delivered credentials. Changes to live providers
@@ -747,7 +737,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         let sink = EventSink { shared: host.events.clone(), provider: p.name.clone() };
         let provider = tokio::select! {
             biased;
-            _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into()),
+            _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::unavailable("host stopping", None).into()),
             result = module.configure(p, http) => result?,
         };
         let (credential_changes, _) = watch::channel(credentials.clone());
@@ -799,14 +789,14 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         .collect();
     let mut committed = host.config.write().await;
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::unavailable("host stopping", None).into());
     }
     *committed = config;
     drop(committed);
     // Serialize registration with shutdown's drain, including its stop check.
     let mut tasks = host.tasks.recover();
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::unavailable("host stopping", None).into());
     }
     for instance in observers {
         tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
@@ -939,7 +929,10 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generatio
             }) {
                 row.environment.egress = old.environment.egress.clone();
             }
-        } else if !matches!(row.environment.state, Observation::Transitioning { .. }) {
+        } else if !matches!(
+            row.environment.state,
+            Observation::Transitioning { phase: TransitionPhase::Stopping | TransitionPhase::Reconfiguring | TransitionPhase::Destroying }
+        ) {
             measured.remove(&row.environment.id);
             times.remove(&row.environment.id);
         }

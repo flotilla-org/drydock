@@ -1,0 +1,90 @@
+{
+  "source": "https://www.daytona.io/docs/analytics-openapi.json",
+  "retrieved": "2026-10-20",
+  "schemas": {
+    "models.AggregatedUsage": {
+      "type": "object",
+      "properties": {
+        "firstStart": {
+          "type": "string"
+        },
+        "lastEnd": {
+          "type": "string"
+        },
+        "sandboxCount": {
+          "type": "integer"
+        },
+        "totalCPUSeconds": {
+          "type": "integer"
+        },
+        "totalDiskGBSeconds": {
+          "type": "integer"
+        },
+        "totalGPUSeconds": {
+          "type": "integer"
+        },
+        "totalPrice": {
+          "type": "number"
+        },
+        "totalRAMGBSeconds": {
+          "type": "integer"
+        }
+      }
+    },
+    "models.SandboxUsage": {
+      "type": "object",
+      "properties": {
+        "firstStart": {
+          "type": "string"
+        },
+        "lastEnd": {
+          "type": "string"
+        },
+        "sandboxId": {
+          "type": "string"
+        },
+        "totalCPUSeconds": {
+          "type": "integer"
+        },
+        "totalDiskGBSeconds": {
+          "type": "integer"
+        },
+        "totalGPUSeconds": {
+          "type": "integer"
+        },
+        "totalPrice": {
+          "type": "number"
+        },
+        "totalRAMGBSeconds": {
+          "type": "integer"
+        }
+      }
+    },
+    "models.UsagePeriod": {
+      "type": "object",
+      "properties": {
+        "cpu": {
+          "type": "integer"
+        },
+        "diskGB": {
+          "type": "integer"
+        },
+        "endAt": {
+          "type": "string"
+        },
+        "gpu": {
+          "type": "integer"
+        },
+        "price": {
+          "type": "number"
+        },
+        "ramGB": {
+          "type": "integer"
+        },
+        "startAt": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

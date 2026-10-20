@@ -78,6 +78,7 @@ async fn cli_lifecycle_against_reference_host() {
         ],
         fixture_configuration: None,
         billing_sample_millis: 25,
+        billing_settle_millis: 0,
         null_environment_id: None,
         auth_audit: None,
         timeouts: Default::default(),

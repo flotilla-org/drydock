@@ -147,12 +147,8 @@ impl Daytona {
                 404 => ProtocolError::NotFound { reason: "Daytona resource not found".into() },
                 402 => ProtocolError::QuotaExhausted { reason: "Daytona quota exhausted".into() },
                 429 => ProtocolError::RateLimited { reason: "Daytona organization rate limit".into(), retry_after },
-                408 => ProtocolError::Unavailable {
-                    provider_error: None,
-                    reason: "Daytona command or request timed out".into(),
-                    retry_after: None,
-                },
-                500..=599 => ProtocolError::Unavailable { provider_error: None, reason: "Daytona API unavailable".into(), retry_after },
+                408 => ProtocolError::unavailable("Daytona command or request timed out", None),
+                500..=599 => ProtocolError::unavailable("Daytona API unavailable", retry_after),
                 _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: Secret::new(raw) },
             });
         }
@@ -372,7 +368,7 @@ impl Daytona {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona sandbox has not started".into(), retry_after: Some(5) })
+        Err(ProtocolError::unavailable("Daytona sandbox has not started", Some(5)))
     }
 }
 const GIB: u64 = 1 << 30;
@@ -580,7 +576,7 @@ impl Provider for Daytona {
             tokio::time::sleep(Duration::from_secs(2)).await;
             snapshot = self.call(Method::GET, self.path(&self.settings.api_url, &["snapshots", &id])?, None, c).await?;
         }
-        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona snapshot is still building".into(), retry_after: Some(5) })
+        Err(ProtocolError::unavailable("Daytona snapshot is still building", Some(5)))
     }
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         if r.prepared.provider != self.name {
@@ -654,18 +650,6 @@ impl Provider for Daytona {
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
         self.observed(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?, c).await
     }
-    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        let value = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
-        let fallback = self.environment(value.clone())?;
-        match self.observed(value, c).await {
-            Ok(row) => Ok(row),
-            Err(error) => {
-                // Typed category reaches host diagnostics; guest/vendor text stays secret.
-                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), error = ?error, "lifecycle succeeded; egress measurement failed");
-                Ok(fallback)
-            }
-        }
-    }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
             Ok(_) | Err(ProtocolError::NotFound { .. }) => Ok(()),
@@ -703,7 +687,7 @@ impl SuspendResume for Daytona {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona sandbox has not stopped".into(), retry_after: Some(5) })
+        Err(ProtocolError::unavailable("Daytona sandbox has not stopped", Some(5)))
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         if token.token.expose() != name("resume", &format!("{}\0{id}", self.name)) {
@@ -822,9 +806,16 @@ impl UsageOperation for Daytona {
             url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
             let periods = self.call(Method::GET, url, None, c).await?;
             for row in periods.as_array().ok_or_else(|| bad_value(&periods))? {
+                let cpus = number(row, "cpu")?;
+                if cpus == 0.0 {
+                    continue;
+                }
                 let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
-                let end = text(row, "endAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
-                if end < start {
+                let end = match row.get("endAt") {
+                    None => to,
+                    Some(_) => text(row, "endAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?,
+                };
+                if row.get("endAt").is_some() && end < start {
                     return Err(bad_value(row));
                 }
                 let start = start.max(from);
@@ -836,10 +827,6 @@ impl UsageOperation for Daytona {
                 let bytes = |key| -> Result<u64> {
                     row.get(key).and_then(Value::as_u64).and_then(|v| v.checked_mul(GIB)).ok_or_else(|| bad_value(row))
                 };
-                let cpus = number(row, "cpu")?;
-                if cpus == 0.0 {
-                    return Err(bad_value(row));
-                }
                 environment_hours.push(SizeUsage {
                     size: Size { cpus, memory_bytes: bytes("ramGB")?, disk_bytes: bytes("diskGB")? },
                     hours: seconds / 3600.0,

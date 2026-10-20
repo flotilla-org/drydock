@@ -115,8 +115,11 @@ validate their own resource bounds before vendor calls.
 
 `Secret` redacts Debug output, including nested credential and reach recipes,
 but deliberately serializes the original string for transport. Never log their
-serialized JSON. Raw `Internal.provider_error` is sensitive, untrusted vendor
-text: do not log it at info level or forward it to end users.
+serialized JSON. Raw `Internal.provider_error` and optional
+`Unavailable.provider_error` contain sensitive, untrusted vendor text: do not log
+them at info level or forward them to end users.
+`provider_state_unknown` means the vendor returned an unrecognized state; it is
+an Unknown observation, not evidence that the environment stopped or disappeared.
 
 Paused is an explicit billing transition; Stopped is the general stopped event
 and observation, whose `PausedByProvider` cause is valid under ADR 0058. Consumers
@@ -283,7 +286,9 @@ CPU, memory, disk, destination and usage-period request gets its own verdict.
 Billing checks require the exact stopped cause and vendor usage facts over a
 sample window (`billing_sample_millis`, default 25); use a distinct granted size
 and an idle account so aggregate usage does not mix in another running guest.
-Providers with delayed accounting may need a longer window.
+The sample lasts 1..60000 ms. `billing_settle_millis` (default 0) waits after
+the sample ends before querying that exact window, without moving its endpoints.
+Set it to the provider accounting delay; a longer sample alone does not settle it.
 
 Constant-time authentication has an executable evidence requirement:
 `auth_audit: ["/absolute/path/to/audit", ...]`. Missing or unsuccessful evidence

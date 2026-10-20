@@ -28,6 +28,8 @@ struct State {
     violations: Vec<String>,
     fixture_rows: Vec<Value>,
     usage_periods: Option<Value>,
+    accounting_delay_millis: Option<i64>,
+    analytics_windows: Vec<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     hide_label_once: bool,
     activations: usize,
     inactive_reads: usize,
@@ -91,6 +93,16 @@ impl StandIn {
             Some("Bearer key-a" | "Bearer key-b" | "Bearer placeholder")
         );
         let response = |status, mut body: Value| {
+            if status == 200 && request.url().host_str() == Some("analytics.app.daytona.io") {
+                let schema = if request.url().path().ends_with("/aggregated") {
+                    "models.AggregatedUsage"
+                } else if request.url().path().ends_with("/usage/sandbox") {
+                    "models.SandboxUsage"
+                } else {
+                    "models.UsagePeriod"
+                };
+                validate_analytics_fixture(&body, schema);
+            }
             // Schema-valid vendor fixtures, independent of the module request.
             if let Some(rows) = body.get_mut("items").and_then(Value::as_array_mut) {
                 for row in rows {
@@ -133,10 +145,20 @@ impl StandIn {
         if !permitted {
             reject!(format!("wrong origin for {path}: {origin}"));
         }
-        if origin == "https://analytics.app.daytona.io"
-            && (!request.url().query_pairs().any(|(k, _)| k == "from") || !request.url().query_pairs().any(|(k, _)| k == "to"))
-        {
-            reject!("missing analytics time range");
+        if origin == "https://analytics.app.daytona.io" {
+            let query: BTreeMap<_, _> = request.url().query_pairs().collect();
+            let parse =
+                |key| query.get(key).and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok()).map(|v| v.with_timezone(&chrono::Utc));
+            let (Some(from), Some(to)) = (parse("from"), parse("to")) else {
+                reject!("analytics time range must be RFC3339");
+            };
+            if from >= to {
+                reject!("analytics time range must be ordered");
+            }
+            s.analytics_windows.push((from, to));
+            if s.accounting_delay_millis.is_some_and(|delay| (chrono::Utc::now() - to).num_milliseconds() < delay) {
+                return response(503, json!({"message":"usage not settled"}));
+            }
         }
         let body = request.body().and_then(|b| b.as_bytes()).filter(|b| !b.is_empty()).map(serde_json::from_slice::<Value>).transpose();
         let body = match body {
@@ -305,9 +327,13 @@ impl StandIn {
                 response(200, usage)
             }
             ("GET", "/organization/org-1/usage/sandbox") => response(200,json!([{"sandboxId":"sandbox-1"}])),
-            ("GET", "/organization/org-1/sandbox/sandbox-1/usage") => response(200,s.usage_periods.clone().unwrap_or_else(||json!([
+            ("GET", "/organization/org-1/sandbox/sandbox-1/usage") => response(200,s.usage_periods.clone().unwrap_or_else(|| if s.accounting_delay_millis.is_some() {
+                if let Some(row) = s.rows.values().find(|row| row["state"] == "started") {
+                    json!([{"cpu":row["cpu"],"ramGB":row["memory"],"diskGB":row["disk"],"startAt":"2020-01-01T00:00:00Z"}])
+                } else { json!([]) }
+            } else { json!([
                 {"cpu":2,"ramGB":4,"diskGB":10,"gpu":0,"price":0.0123,"startAt":"2026-10-19T00:00:00Z","endAt":"2026-10-19T01:00:00Z"}
-            ]))),
+            ]) })),
             _ => reject!(format!("unexpected vendor request: {method} {path}")),
         }
     }
@@ -1122,14 +1148,18 @@ async fn sandbox_usage_periods_are_clipped_and_validated() {
     let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-19T02:00:00Z".parse().unwrap()).unwrap();
     http.0.lock().unwrap().usage_periods = Some(json!([
         {"cpu":1,"ramGB":2,"diskGB":3,"startAt":"2026-10-18T23:00:00Z","endAt":"2026-10-19T01:00:00Z"},
-        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T03:00:00Z"},
-        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T02:00:00Z","endAt":"2026-10-19T03:00:00Z"}
+        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T01:00:00Z"},
+        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T02:00:00Z","endAt":"2026-10-19T03:00:00Z"},
+        {"cpu":0,"startAt":"2026-10-19T00:00:00Z"},
+        {"cpu":1,"ramGB":2,"diskGB":3,"startAt":"2026-10-19T03:00:00Z"}
     ]));
     let usage = port.usage(period.clone(), &credentials(false)).await.unwrap();
     assert_eq!(usage.environment_hours.len(), 2);
     assert_eq!(usage.environment_hours.iter().map(|r| r.hours).sum::<f64>(), 2.0);
     assert_eq!(usage.environment_hours[1].size.memory_bytes, 4 << 30);
-    for value in [json!([]), json!([{"startAt":"bad"}]), json!([{"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T00:00:00Z"}])] {
+    for value in
+        [json!([]), json!([{"cpu":1,"startAt":"bad"}]), json!([{"cpu":1,"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T00:00:00Z"}])]
+    {
         http.0.lock().unwrap().usage_periods = Some(value.clone());
         let result = port.usage(period.clone(), &credentials(false)).await;
         if value.as_array().unwrap().is_empty() {
@@ -1160,5 +1190,192 @@ async fn standin_origin_and_contract_errors_are_observable() {
         http.0.lock().unwrap().violations.clear(); // expected negative contract case
     }
     let request = client.get("https://app.daytona.io/api/sandbox").bearer_auth("key-a").build().unwrap();
+    assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
+}
+
+// The pinned analytics schemas contain objects with optional primitive fields.
+// Check every fixture field and required member without strengthening that contract.
+fn validate_analytics_fixture(body: &Value, name: &str) {
+    let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-analytics-schemas.json")).unwrap();
+    let schema = &spec["schemas"][name];
+    let rows = if name == "models.AggregatedUsage" {
+        std::slice::from_ref(body)
+    } else {
+        body.as_array().expect("analytics fixture must be an array").as_slice()
+    };
+    for row in rows {
+        let object = row.as_object().expect("analytics fixture must be an object");
+        if let Some(required) = schema["required"].as_array() {
+            for key in required {
+                assert!(object.contains_key(key.as_str().unwrap()));
+            }
+        }
+        for (key, value) in object {
+            let valid = match schema["properties"][key]["type"].as_str().expect("documented fixture field") {
+                "integer" => value.is_i64() || value.is_u64(),
+                "number" => value.is_number(),
+                "string" => value.is_string(),
+                kind => panic!("unsupported analytics schema type {kind}"),
+            };
+            assert!(valid, "{name}.{key} has invalid type: {value}");
+        }
+    }
+}
+
+// Inject only the vendor HTTP boundary; the host and typed client use real sockets.
+struct VendorModule(Arc<StandIn>);
+#[async_trait]
+impl Module for VendorModule {
+    fn version(&self) -> &str {
+        "test"
+    }
+    async fn configure(&self, config: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+        DaytonaModule.configure(config, self.0.clone()).await
+    }
+}
+struct HostHarness {
+    client: drydock::client::Client,
+    _dir: tempfile::TempDir,
+    task: tokio::task::JoinHandle<()>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl HostHarness {
+    async fn start(vendor: Arc<StandIn>) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.path().join("host.sock");
+        let client = drydock::client::Client::unix(&socket).unwrap();
+        let host = drydock_host::Host::new(BTreeMap::from([("daytona".into(), Arc::new(VendorModule(vendor)) as Arc<dyn Module>)]));
+        let (stop, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            host.serve_unix(socket, unsafe { libc::geteuid() }, async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while client.hello().await.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .configure(
+                &serde_json::from_value(json!({
+                    "modules":[{"name":"daytona","entrypoint":"daytona"}],
+                    "providers":[{"name":"daytona","module":"daytona","settings":{
+                        "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA",
+                        "agent_command":"agent --socket /run/drydock/agent.sock",
+                        "egress_probe":{"command":["/usr/local/bin/check-egress"]}
+                    },"credential":{"mode":"direct","credential_reference":"test"}}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        client.credential("daytona", Secret::new("key-a")).await.unwrap();
+        Self { client, _dir: dir, task, stop: Some(stop) }
+    }
+    async fn finish(mut self) {
+        self.stop.take().unwrap().send(()).unwrap();
+        self.task.await.unwrap();
+    }
+}
+
+// A stop/start between polls must lose measured enforcement as soon as either
+// preparing or starting is observed, even when the effective policy is unchanged.
+#[tokio::test]
+async fn fast_restart_invalidates_host_egress_evidence() {
+    let vendor = Arc::new(StandIn::default());
+    vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
+    let host = HostHarness::start(vendor.clone()).await;
+    let p = provider(vendor.clone()).await;
+    let prep = prepared(p.as_ref(), &credentials(false)).await;
+    let mut r = request(prep, "fast-restart");
+    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
+    let env = host.client.provision("daytona", &r).await.unwrap();
+    for phase in ["starting", "creating"] {
+        assert_eq!(host.client.inspect("daytona", &env.id).await.unwrap().egress, Enforcement::Enforced);
+        assert_eq!(host.client.list("daytona").await.unwrap()[0].egress, Enforcement::Enforced);
+        vendor.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["state"] = json!(phase);
+        assert!(matches!(host.client.list("daytona").await.unwrap()[0].state, Observation::Transitioning { .. }));
+        vendor.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["state"] = json!("started");
+        assert_eq!(host.client.list("daytona").await.unwrap()[0].egress, Enforcement::Advisory);
+    }
+    host.finish().await;
+}
+
+// The exact running/stopped sample is queried only after accounting has settled.
+// Zero delay deliberately fails against the same lagging vendor, proving the seam.
+#[tokio::test]
+async fn conformance_waits_for_settled_billing_windows() {
+    use drydock::conformance::{self, Options, Scenario};
+    for settle in [0, 400] {
+        let vendor = Arc::new(StandIn::default());
+        vendor.0.lock().unwrap().accounting_delay_millis = Some(200);
+        let host = HostHarness::start(vendor.clone()).await;
+        let p = provider(vendor.clone()).await;
+        let prep = prepared(p.as_ref(), &credentials(false)).await;
+        let options = Options {
+            request: request(prep, "settled-billing"),
+            scenarios: vec![Scenario::Observation],
+            fixture_configuration: None,
+            null_environment_id: None,
+            auth_audit: None,
+            billing_sample_millis: 25,
+            billing_settle_millis: settle,
+            timeouts: conformance::Timeouts { record_seconds: 1, transition_seconds: 1, ..Default::default() },
+            echo_relay: false,
+            reach_probe: None,
+            egress_probe: None,
+        };
+        let report = conformance::run(&host.client, "daytona", &options).await;
+        for name in ["billing_running", "billing_suspended"] {
+            let check = report.checks.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("{report:?}"));
+            assert_eq!(check.passed, settle > 0, "{check:?}");
+        }
+        let windows = vendor.0.lock().unwrap().analytics_windows.clone();
+        assert_eq!(windows.len(), if settle > 0 { 6 } else { 2 });
+        for (start, end) in windows {
+            assert!((25..1000).contains(&(end - start).num_milliseconds()), "sample endpoints moved");
+        }
+        host.finish().await;
+    }
+}
+
+// Analytics requires ordered RFC3339 endpoints, including explicit offsets;
+// mere presence, numeric epochs and local times do not meet the vendor contract.
+#[tokio::test]
+async fn analytics_query_formats_are_enforced() {
+    let http = StandIn::default();
+    let network = http.network().await;
+    let client = rigging_tls::client_builder().build().unwrap();
+    for query in [
+        vec![],
+        vec![("from", "2026-10-19T00:00:00Z")],
+        vec![("from", "1729296000"), ("to", "1729299600")],
+        vec![("from", "2026-10-19T00:00:00"), ("to", "2026-10-19T01:00:00")],
+        vec![("from", "2026-10-19T01:00:00Z"), ("to", "2026-10-19T00:00:00Z")],
+        vec![("from", "2026-10-19T00:00:00Z"), ("to", "2026-10-19T00:00:00Z")],
+    ] {
+        let request = client
+            .get("https://analytics.app.daytona.io/organization/org-1/usage/aggregated")
+            .bearer_auth("key-a")
+            .query(&query)
+            .build()
+            .unwrap();
+        assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 400);
+        assert_eq!(http.0.lock().unwrap().violations.len(), 1);
+        http.0.lock().unwrap().violations.clear();
+    }
+    let request = client
+        .get("https://analytics.app.daytona.io/organization/org-1/usage/aggregated")
+        .bearer_auth("key-a")
+        .query(&[("from", "2026-10-19T00:00:00+02:00"), ("to", "2026-10-19T01:00:00+02:00")])
+        .build()
+        .unwrap();
     assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
 }

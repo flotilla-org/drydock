@@ -33,7 +33,7 @@ fn errors_round_trip() {
             ProtocolError::CommandFailed { reason: reason.clone(), exit_code: 7, output: Secret::new(reason.clone()) },
         ];
         for retry_after in [None, Some(0), Some(u64::MAX)] {
-            errors.push(ProtocolError::Unavailable { provider_error: None, reason: reason.clone(), retry_after });
+            errors.push(ProtocolError::unavailable(reason.clone(), retry_after));
             errors.push(ProtocolError::RateLimited { reason: reason.clone(), retry_after });
         }
         for error in errors {

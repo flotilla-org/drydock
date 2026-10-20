@@ -23,6 +23,9 @@ pub struct Options {
     pub auth_audit: Option<Vec<String>>,
     #[serde(default = "default_sample_millis")]
     pub billing_sample_millis: u64,
+    /// Wait after recording the sample before reading vendor usage.
+    #[serde(default)]
+    pub billing_settle_millis: u64,
     #[serde(default)]
     pub timeouts: Timeouts,
     /// Only hermetic echo fixtures may enable this. Real agents speak their own protocol.
@@ -403,11 +406,20 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     report.elapsed_seconds = start.elapsed().as_secs_f64();
     report
 }
-async fn billing_window(client: &Client, provider: &str, size: &Size, id: &str, millis: u64, running: bool) -> Result<()> {
+async fn billing_window(
+    client: &Client,
+    provider: &str,
+    size: &Size,
+    id: &str,
+    millis: u64,
+    settle_millis: u64,
+    running: bool,
+) -> Result<()> {
     require((1..=60000).contains(&millis), "billing sample must be 1..60000 milliseconds")?;
     let start = chrono::Utc::now();
     tokio::time::sleep(Duration::from_millis(millis)).await;
     let period = Period::new(start.into(), chrono::Utc::now().into()).map_err(str::to_owned)?;
+    tokio::time::sleep(Duration::from_millis(settle_millis)).await;
     let usage = client.usage(provider, &period).await.map_err(SafeError::category)?;
     valid_usage(&usage, &period)?;
     if let Some(m) = &usage.measurements
@@ -657,7 +669,8 @@ impl Target<'_> {
         {
             report.record(
                 "billing_running",
-                billing_window(client, provider, size, &environment.id, options.billing_sample_millis, true).await,
+                billing_window(client, provider, size, &environment.id, options.billing_sample_millis, options.billing_settle_millis, true)
+                    .await,
             );
         }
         if caps.suspend_resume
@@ -717,7 +730,16 @@ impl Target<'_> {
             {
                 report.record(
                     "billing_suspended",
-                    billing_window(client, provider, size, &environment.id, options.billing_sample_millis, false).await,
+                    billing_window(
+                        client,
+                        provider,
+                        size,
+                        &environment.id,
+                        options.billing_sample_millis,
+                        options.billing_settle_millis,
+                        false,
+                    )
+                    .await,
                 );
             }
             if report

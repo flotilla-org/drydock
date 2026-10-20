@@ -24,6 +24,7 @@ async fn reference_binary_passes_conformance() {
         scenarios: conformance::Scenario::ALL.to_vec(),
         fixture_configuration: Some(configuration),
         billing_sample_millis: 25,
+        billing_settle_millis: 0,
         null_environment_id: None,
         auth_audit: Some(vec![
             "python3".into(),
@@ -126,6 +127,7 @@ async fn python_report_selection(
         scenarios,
         fixture_configuration: Some(fixture_configuration()),
         billing_sample_millis: 25,
+        billing_settle_millis: 0,
         null_environment_id: None,
         auth_audit: Some(vec![
             "python3".into(),
