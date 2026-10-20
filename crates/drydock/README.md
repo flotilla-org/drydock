@@ -11,7 +11,9 @@ different flag convention can provide a wrapper.
 A missing tool or incompatible hello remains visible for every configured instance
 through `HostHandle::instances()`. `status` is a watch receiver with the handshake,
 declarations and generation. `ready()` waits for host initialization; inspect
-individual instance readiness before placement. Restart delay defaults to 100 ms.
+individual instance readiness before placement. `ready()` waits through missing
+runtimes and retains the last readiness cause in a distinct timeout error;
+terminal credential errors also retain their readiness cause. Restart delay defaults to 100 ms.
 The runtime directory must be private and owned by the current user. A per-name
 OS lock prevents two supervisors from taking the same socket.
 
@@ -88,6 +90,8 @@ modules use the provider's tags as their record, so they need no local store.
 An external Unix host uses `{"kind":"external_unix","path":"/path/host.sock"}`.
 External TCP uses `{"kind":"external","url":"http://127.0.0.1:PORT/",
 "token_file":"/path/token"}`. Tokens must be nonempty regular files with mode
-0600. TCP URLs must use a literal loopback IP; redirects, ambient proxies and
+0400 or 0600 and owned by the current user. Symlinks, special files, tokens over
+64 KiB, and whitespace inside the token are refused; a final CR/LF is removed.
+The open descriptor is checked before reading it. TCP URLs must use a literal loopback IP; redirects, ambient proxies and
 HTTP retries are disabled. External hosts receive the same configuration and
 credential refresh calls, but drydock never starts or terminates them.

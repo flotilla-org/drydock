@@ -74,20 +74,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Command::List { provider, .. } => {
                 let status = status?;
+                instance_ready(&handle, provider)?;
                 let cache = drydock::client::StatusCache::new(handle.client.clone(), &status.providers);
                 println!("{}", serde_json::to_string(&cache.list(provider).await?)?);
             }
             Command::Launch { provider, request, .. } => {
                 status?;
+                instance_ready(&handle, provider)?;
                 let request: ProvisionRequest =
                     serde_json::from_slice(&tokio::fs::read(request).await?).map_err(|_| "invalid launch request")?;
                 println!("{}", serde_json::to_string(&handle.client.provision(provider, &request).await?)?);
             }
             Command::Destroy { provider, id, .. } => {
                 status?;
+                instance_ready(&handle, provider)?;
                 handle.client.destroy(provider, id).await?;
             }
         }
     }
     Ok(())
+}
+
+fn instance_ready(handle: &drydock::HostHandle, provider: &str) -> Result<(), drydock::client::Error> {
+    match handle.instances().remove(provider) {
+        Some(drydock_protocol::Readiness::Ready) => Ok(()),
+        Some(readiness) => Err(drydock::client::Error::NotReady(readiness)),
+        None => Err(drydock::client::Error::NotReady(drydock_protocol::Readiness::Unknown { reason: "instance not configured".into() })),
+    }
 }

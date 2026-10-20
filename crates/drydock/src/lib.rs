@@ -22,6 +22,8 @@ pub enum HostConnection {
     Managed {
         command: Vec<String>,
         runtime: Option<String>,
+        /// Non-secret proxy URLs and CA paths only. Never put credentials here:
+        /// the command runner currently carries these values through env argv.
         #[serde(default)]
         proxy_environment: BTreeMap<String, String>,
     },
@@ -112,14 +114,14 @@ impl HostHandle {
                 match status.readiness {
                     Readiness::Ready => return Ok(status),
                     Readiness::VersionMismatch { .. } => return Err(client::Error::VersionMismatch),
-                    Readiness::MissingTool { .. } | Readiness::MissingCredential { .. } => return Err(client::Error::Transport),
+                    Readiness::MissingCredential { .. } => return Err(client::Error::NotReady(status.readiness)),
                     _ => {}
                 }
                 self.status.changed().await.map_err(|_| client::Error::Transport)?;
             }
         })
         .await
-        .map_err(|_| client::Error::Transport)?
+        .map_err(|_| client::Error::ReadinessTimeout(self.status.borrow().readiness.clone()))?
     }
 }
 #[derive(Clone)]
@@ -186,17 +188,7 @@ impl Supervisor {
                 Client::unix(&socket)?
             }
             HostConnection::ExternalUnix { path } => Client::unix(path)?,
-            HostConnection::External { url, token_file } => {
-                let metadata = tokio::fs::symlink_metadata(token_file).await.map_err(|_| client::Error::InvalidRequest)?;
-                if !metadata.is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
-                    return Err(client::Error::InvalidRequest);
-                }
-                let token = tokio::fs::read_to_string(token_file).await.map_err(|_| client::Error::InvalidRequest)?;
-                if token.trim().is_empty() {
-                    return Err(client::Error::InvalidRequest);
-                }
-                Client::external(url, Secret::new(token.trim_end_matches(['\r', '\n'])))?
-            }
+            HostConnection::External { url, token_file } => Client::external(url, read_bearer_token(token_file).await?)?,
         };
         let (status, receiver) = watch::channel(HostStatus::new(Readiness::Unknown { reason: "connecting".into() }, 0));
         let mut supervisor = self.clone();
@@ -264,7 +256,7 @@ impl Supervisor {
                     args.push("--".to_owned());
                     args.extend(proxy_environment.iter().map(|(k, v)| format!("{k}={v}")));
                     args.push(command[0].clone());
-                    "/usr/bin/env"
+                    "env"
                 };
                 args.extend_from_slice(&command[1..]);
                 args.extend(["--unix".to_owned(), socket.to_string_lossy().into_owned()]);
@@ -352,4 +344,67 @@ impl Supervisor {
 }
 fn missing_credential() -> client::Error {
     client::Error::Protocol(ProtocolError::CredentialRejected { reason: "missing credential".into() })
+}
+
+async fn read_bearer_token(path: &Path) -> Result<Secret, client::Error> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+        .map_err(|_| client::Error::InvalidRequest)?;
+    let metadata = file.metadata().await.map_err(|_| client::Error::InvalidRequest)?;
+    // SAFETY: geteuid has no preconditions. Validate the descriptor we will read,
+    // rather than a pathname that could be replaced between metadata and open.
+    if !metadata.is_file()
+        || !matches!(metadata.permissions().mode() & 0o7777, 0o400 | 0o600)
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(client::Error::InvalidRequest);
+    }
+    let mut token = String::new();
+    file.take(65537).read_to_string(&mut token).await.map_err(|_| client::Error::InvalidRequest)?;
+    if token.len() > 65536 {
+        return Err(client::Error::InvalidRequest);
+    }
+    let token = token.trim_end_matches(['\r', '\n']);
+    if token.is_empty() || token.bytes().any(|c| c.is_ascii_whitespace() || c.is_ascii_control()) {
+        return Err(client::Error::InvalidRequest);
+    }
+    Ok(Secret::new(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Glue: readiness errors retain the observed cause, and timeout is distinct
+    // from a failed transport. No network or process is needed for this mapping.
+    #[tokio::test(start_paused = true)]
+    async fn ready_preserves_failure_reason() {
+        for readiness in [
+            Readiness::MissingCredential { reason: "missing credential".into() },
+            Readiness::Unknown { reason: "connecting".into() },
+            Readiness::MissingTool { reason: "missing tool: node".into() },
+        ] {
+            let (_sender, status) = watch::channel(HostStatus::new(readiness.clone(), 0));
+            let mut handle = HostHandle {
+                client: Client::unix("/unused").unwrap(),
+                status,
+                instances: vec![],
+                task: tokio::spawn(std::future::pending()),
+            };
+            let error = handle.ready(Duration::from_secs(1)).await.unwrap_err();
+            match (readiness, error) {
+                (Readiness::MissingCredential { reason: a }, client::Error::NotReady(Readiness::MissingCredential { reason: b })) => {
+                    assert_eq!(a, b)
+                }
+                (Readiness::Unknown { reason: a }, client::Error::ReadinessTimeout(Readiness::Unknown { reason: b })) => assert_eq!(a, b),
+                (Readiness::MissingTool { reason: a }, client::Error::ReadinessTimeout(Readiness::MissingTool { reason: b })) => {
+                    assert_eq!(a, b)
+                }
+                other => panic!("unexpected readiness mapping: {other:?}"),
+            }
+        }
+    }
 }

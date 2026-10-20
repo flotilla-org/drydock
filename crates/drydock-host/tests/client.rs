@@ -94,7 +94,9 @@ async fn missing_runtime_is_not_ready() {
             *tool = Some(runtime.into());
         }
         let mut host = s.start(spec).await.unwrap();
-        assert!(host.ready(Duration::from_secs(2)).await.is_err());
+        let start = tokio::time::Instant::now();
+        assert!(matches!(host.ready(Duration::from_millis(100)).await, Err(Error::ReadinessTimeout(Readiness::MissingTool { .. }))));
+        assert!(start.elapsed() >= Duration::from_millis(100));
         assert!(matches!(host.status.borrow().readiness, Readiness::MissingTool { .. }));
     }
 }
@@ -452,4 +454,126 @@ async fn proxied_host_receives_environment_without_resolving_secrets() {
     host.ready(Duration::from_secs(3)).await.unwrap();
     assert!(matches!(host.instances().get("a"), Some(Readiness::Ready)));
     assert!(host.client.list("a").await.unwrap().is_empty());
+}
+
+// Repeated connection refusal during restart must be paced, even when no stream
+// was ever established. Paused time measures the public observer's retry path.
+#[tokio::test(start_paused = true)]
+async fn observer_failed_connect_is_paced() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut observer = Observer::new(Client::unix(dir.path().join("absent.sock")).unwrap(), None);
+    assert!(observer.next().await.is_err());
+    for millis in [100, 200, 400, 800, 1600, 3200, 5000, 5000] {
+        let start = tokio::time::Instant::now();
+        assert!(observer.next().await.is_err());
+        assert_eq!(start.elapsed(), Duration::from_millis(millis), "connect retries must back off and cap at five seconds");
+    }
+}
+
+// External bearer inputs are validated on the opened descriptor: owner-readable
+// modes work; symlinks, public modes, special files and malformed values fail.
+#[tokio::test]
+async fn external_token_file_validation() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let token = dir.path().join("token");
+    let with_token = |path| {
+        let mut spec = spec();
+        spec.connection = HostConnection::External { url: "http://127.0.0.1:9".into(), token_file: path };
+        spec
+    };
+    let s = supervisor(dir.path());
+    for mode in [0o400, 0o600] {
+        std::fs::write(&token, "valid-token\r\n").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(mode)).unwrap();
+        let host = s.start(with_token(token.clone())).await.unwrap();
+        drop(host);
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    for mode in [0o000, 0o444, 0o644, 0o660, 0o1600] {
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest)));
+    }
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for content in ["".to_owned(), " \n".into(), "token ".into(), "tok\nen".into(), "x".repeat(65537)] {
+        std::fs::write(&token, content).unwrap();
+        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest)));
+    }
+    std::fs::write(&token, "valid").unwrap();
+    let link = dir.path().join("link");
+    symlink(&token, &link).unwrap();
+    assert!(matches!(s.start(with_token(link)).await, Err(Error::InvalidRequest)));
+    assert!(matches!(s.start(with_token(dir.path().to_path_buf())).await, Err(Error::InvalidRequest)));
+    let fifo = dir.path().join("fifo");
+    let raw = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+    assert!(tokio::time::timeout(Duration::from_secs(1), s.start(with_token(fifo))).await.unwrap().is_err());
+}
+
+// A runtime installed while ready() is waiting should allow initialization,
+// rather than causing a terminal generic transport error on the first poll.
+#[tokio::test]
+async fn ready_waits_for_runtime_recovery() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Detector(Arc<AtomicBool>);
+    #[async_trait::async_trait]
+    impl ToolDetector for Detector {
+        async fn available(&self, _: &str) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let available = Arc::new(AtomicBool::new(false));
+    let mut s = supervisor(dir.path());
+    s.detector = Arc::new(Detector(available.clone()));
+    let mut spec = spec();
+    if let HostConnection::Managed { runtime, .. } = &mut spec.connection {
+        *runtime = Some("node".into());
+    }
+    let mut host = s.start(spec).await.unwrap();
+    let install = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        available.store(true, Ordering::SeqCst);
+    });
+    host.ready(Duration::from_secs(3)).await.unwrap();
+    install.await.unwrap();
+}
+
+// HTTP execution boundary stand-in holds provider a's network call open. A read
+// from b must complete independently while identical reads still coalesce for a.
+#[tokio::test]
+async fn cache_does_not_block_other_providers() {
+    struct Slow {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl rigging_http_client::HttpClient for Slow {
+        async fn execute(
+            &self,
+            request: reqwest::Request,
+            _: &rigging_http_client::ChannelLabel,
+        ) -> Result<http::Response<bytes::Bytes>, String> {
+            if request.url().path().contains("/a/") {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(http::Response::new(bytes::Bytes::from_static(b"[]")))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = supervisor(dir.path()).start(spec()).await.unwrap();
+    let status = host.ready(Duration::from_secs(3)).await.unwrap();
+    let mut declarations = status.providers;
+    let mut b = declarations[0].clone();
+    b.provider = "b".into();
+    declarations.push(b);
+    let http = Arc::new(Slow { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new() });
+    let cache = Arc::new(StatusCache::new(Client::unix("/unused").unwrap().with_http(http.clone()), &declarations));
+    let reader = cache.clone();
+    let a = tokio::spawn(async move { reader.list("a").await });
+    http.entered.notified().await;
+    assert!(tokio::time::timeout(Duration::from_millis(100), cache.list("b")).await.unwrap().unwrap().is_empty());
+    http.release.notify_one();
+    assert!(a.await.unwrap().unwrap().is_empty());
 }

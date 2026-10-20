@@ -10,24 +10,30 @@ buffered port cannot carry a long-lived stream or an HTTP upgrade.
 accepts a loopback HTTP URL and redacting bearer token. Calls make one attempt,
 with no redirects, retries or ambient proxies. Buffered calls have a 30-second
 deadline; event streams intentionally remain open. Errors distinguish transport,
-invalid response, version mismatch, local rate budget and typed `ProtocolError`.
+invalid response, version mismatch, readiness/timeout causes, local rate budget
+and typed `ProtocolError`.
 Error displays never include vendor raw text, secrets or response documents.
 Provider names and IDs are escaped as individual URL path segments.
 
 `hello` refuses an incompatible protocol version. `Observer` retains the last
 cursor across calls, reconnecting with `since` after disconnect. Consumers call
-`next()` again after an error; ordinary route calls never retry. Snapshots remain
+`next()` again after an error. Reconnection attempts use cancellation-safe
+exponential backoff from 100 ms up to five seconds, reset after a delivered record;
+connection refusal and stream disconnect both schedule the next attempt.
+Ordinary route calls never retry. Snapshots remain
 `ObserveRecord::Snapshot`, explicitly marking a gap. NDJSON framing supports
 fragmented/multiple records and rejects incomplete final records; a single record
-is limited to 8 MiB. Dropping the observer drops its stream.
+is limited to 8 MiB, and buffered framing input to 8 MiB plus its newline;
+chunks that exceed the remaining framing budget are rejected before copying. Dropping the observer drops its stream.
 
 `StatusCache::new(client, declarations)` caches list/inspect results according to
 the provider's hello rate limits. Entries expire at the most conservative declared
 period/requests interval. Rolling budgets are per provider and operation; `*`
 shares one budget across both operations. Distinct inspect IDs share the same
-budget, and concurrent identical reads coalesce. Zero request limits return a
+budget, and concurrent identical reads coalesce. Different providers have independent
+locks, so a slow request to one does not block another. Zero request limits return a
 typed local refusal. Failures consume an attempt but are not cached. An exhausted
 budget returns `Error::RateLimited`, with no hidden sleep or retry. No declaration
-means no caching. Each cache holds at most 1024 entries. Recreate the cache when
+means no caching. Each declared provider holds at most 1024 cached entries. Recreate the cache when
 host generation or declarations change; provider-side polling and other clients
 may consume additional budget and return typed remote rate errors.
