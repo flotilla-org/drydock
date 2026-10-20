@@ -354,9 +354,15 @@ impl Daytona {
         })?;
         Ok(())
     }
+    // Lifecycle state checks deliberately avoid explicit inspect's root probe.
+    async fn lifecycle_state(&self, id: &str, c: &Credentials) -> Result<Observation> {
+        Ok(self.environment(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?)?.environment.state)
+    }
     async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
         // Observe only successful asynchronous operations. Any failed GET exits
         // immediately; retrying failures is the caller's policy, not this loop's.
+        // A successful async start may briefly still report stopped, so stopped
+        // alone is not terminal here. Conflict re-adoption handles stopped rows.
         for _ in 0..60 {
             let raw = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
             match text(&raw, "state")? {
@@ -589,6 +595,8 @@ impl Provider for Daytona {
             .find(|v| v.pointer("/labels/flotilla.label").and_then(Value::as_str) == Some(&r.label))
         {
             self.check_existing_request(&v, size, &policy)?;
+            // Re-adoption returns the observed stopped/error state unchanged;
+            // provision does not implicitly resume an existing label.
             let mut row = self.environment(v)?;
             if matches!(row.environment.state, Observation::Running) {
                 self.bootstrap(&row.environment.id, c).await?;
@@ -610,6 +618,14 @@ impl Provider for Daytona {
                     return Err(refused("Daytona sandbox name belongs to a different label"));
                 }
                 self.check_existing_request(&v, size, &policy)?;
+                let existing = self.environment(v.clone())?;
+                if matches!(
+                    existing.environment.state,
+                    Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }
+                ) {
+                    return Ok(Provisioned::Existing(existing));
+                }
+
                 let row = self.wait_started(text(&v, "id")?, c).await?;
                 self.bootstrap(&row.id, c).await?;
                 return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
@@ -649,13 +665,13 @@ impl Provider for Daytona {
 #[async_trait]
 impl SuspendResume for Daytona {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        if !matches!(self.inspect(id, c).await?.environment.state, Observation::Stopped { .. }) {
+        if !matches!(self.lifecycle_state(id, c).await?, Observation::Stopped { .. }) {
             self.call(Method::POST, self.sandbox_url(id, Some("stop"))?, None, c).await?;
         }
         // This deterministic continuation marker binds provider and id; it is
         // not an access credential. Every resume still requires the API key.
         for _ in 0..60 {
-            if matches!(self.inspect(id, c).await?.environment.state, Observation::Stopped { .. }) {
+            if matches!(self.lifecycle_state(id, c).await?, Observation::Stopped { .. }) {
                 return Ok(ResumeToken { token: Secret::new(name("resume", &format!("{}\0{id}", self.name))) });
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -666,13 +682,12 @@ impl SuspendResume for Daytona {
         if token.token.expose() != name("resume", &format!("{}\0{id}", self.name)) {
             return Err(refused("resume token belongs to another environment"));
         }
-        if matches!(self.inspect(id, c).await?.environment.state, Observation::Running) {
+        if matches!(self.lifecycle_state(id, c).await?, Observation::Running) {
             return self.bootstrap(id, c).await;
         }
         self.call(Method::POST, self.sandbox_url(id, Some("start"))?, None, c).await?;
         self.wait_started(id, c).await?;
         self.bootstrap(id, c).await?;
-        self.inspect(id, c).await?;
         Ok(())
     }
 }
@@ -754,13 +769,19 @@ impl UsageOperation for Daytona {
         if !valid_decimal(&price) {
             return Err(bad_response());
         }
+        let currency = match v.get("currency") {
+            None => "USD",
+            Some(value) => {
+                value.as_str().filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_uppercase())).ok_or_else(|| bad_value(&v))?
+            }
+        };
         Ok(Usage {
             period,
             environment_hours: vec![],
             measurements: Some(UsageMeasurements {
                 scope: UsageScope::Organization { id: self.settings.organization_id.clone() },
                 resources,
-                cost: Some(Cost { amount: price, currency: "USD".into() }),
+                cost: Some(Cost { amount: price, currency: currency.into() }),
             }),
         })
     }
@@ -793,9 +814,7 @@ fn parse_analytics(bytes: &[u8]) -> Result<Value> {
 // JSON permits scientific notation. Expand it using decimal digits alone,
 // bounding the output so a malformed vendor response cannot allocate unboundedly.
 fn decimal_lexeme(raw: &str) -> Option<String> {
-    let Some((mantissa, exponent)) = raw.split_once(['e', 'E']) else {
-        return valid_decimal(raw).then(|| raw.into());
-    };
+    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
     if !valid_decimal(mantissa) {
         return None;
     }
@@ -805,13 +824,17 @@ fn decimal_lexeme(raw: &str) -> Option<String> {
     }
     let point = mantissa.find('.').unwrap_or(mantissa.len()) as i32 + exponent;
     let digits = mantissa.replace('.', "");
-    Some(if point <= 0 {
+    let expanded = if point <= 0 {
         format!("0.{}{}", "0".repeat((-point) as usize), digits)
     } else if point as usize >= digits.len() {
         format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
     } else {
         format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
-    })
+    };
+    let (integer, fraction) = expanded.split_once('.').unwrap_or((&expanded, ""));
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    Some(if fraction.is_empty() { integer.into() } else { format!("{integer}.{fraction}") })
 }
 
 // Prefer the exceeded throttler's documented delay; otherwise use an exhausted
@@ -844,6 +867,9 @@ mod tests {
         assert_eq!(bounded(&vec![b'x'; 20000]).len(), 16384);
         assert_eq!(decimal_lexeme("1.23e-7").as_deref(), Some("0.000000123"));
         assert_eq!(decimal_lexeme("1.23e+5").as_deref(), Some("123000"));
+        assert_eq!(decimal_lexeme("0.5e1").as_deref(), Some("5"));
+        assert_eq!(decimal_lexeme("0.001e2").as_deref(), Some("0.1"));
+        assert_eq!(decimal_lexeme("0e3").as_deref(), Some("0"));
         assert!(decimal_lexeme("1e99999").is_none());
         for invalid in ["-1e2", ".5e1", "1.e2", "1ee2", "1e", "NaN", "", "1e-99999"] {
             assert!(decimal_lexeme(invalid).is_none(), "{invalid}");

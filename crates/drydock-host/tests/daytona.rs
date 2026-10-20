@@ -23,6 +23,7 @@ struct State {
     failure: Option<u16>,
     executed: Vec<String>,
     probe: Option<Value>,
+    currency: Option<String>,
     hide_label_once: bool,
     activations: usize,
     inactive_reads: usize,
@@ -249,10 +250,11 @@ impl StandIn {
             ),
             ("GET", "/organization/org-1/usage/aggregated") => {
                 assert!(request.url().query_pairs().any(|(k, v)| k == "from" && v == "2026-10-19T00:00:00Z"));
-                response(
-                    200,
-                    json!({"totalCPUSeconds":7200,"totalRAMGBSeconds":14400,"totalDiskGBSeconds":36000,"totalGPUSeconds":0,"totalPrice":0.0123,"sandboxCount":1}),
-                )
+                let mut usage = json!({"totalCPUSeconds":7200,"totalRAMGBSeconds":14400,"totalDiskGBSeconds":36000,"totalGPUSeconds":0,"totalPrice":0.0123,"sandboxCount":1});
+                if let Some(currency) = &s.currency {
+                    usage["currency"] = json!(currency);
+                }
+                response(200, usage)
             }
             _ => panic!("unexpected vendor request: {method} {path}"),
         }
@@ -379,7 +381,11 @@ async fn lifecycle_and_credential_modes() {
         assert_eq!(quota.resources[0].in_use, 2.0);
         assert_eq!(quota.resources[0].limit, Some(10.0));
         let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-20T00:00:00Z".parse().unwrap()).unwrap();
-        assert_eq!(ops.usage.unwrap().usage(period, &c).await.unwrap().measurements.unwrap().cost.unwrap().amount, "0.0123");
+        let cost = ops.usage.unwrap().usage(period.clone(), &c).await.unwrap().measurements.unwrap().cost.unwrap();
+        assert_eq!(cost.amount, "0.0123");
+        assert_eq!(cost.currency, "USD");
+        http.0.lock().unwrap().currency = Some("EUR".into());
+        assert_eq!(ops.usage.unwrap().usage(period, &c).await.unwrap().measurements.unwrap().cost.unwrap().currency, "EUR");
         p.destroy(&id, &c).await.unwrap();
         p.destroy(&id, &c).await.unwrap();
         assert!(p.list(&c).await.unwrap().is_empty());
@@ -573,10 +579,14 @@ async fn name_conflict_readopts_without_retrying_creation() {
     let id = row(p.provision(r.clone(), &c).await.unwrap()).id;
     http.0.lock().unwrap().hide_label_once = true;
     let other = provider(http.clone()).await;
-    let result = other.provision(r, &c).await.unwrap();
+    let result = other.provision(r.clone(), &c).await.unwrap();
     assert!(matches!(result, Provisioned::Existing(_)));
     assert_eq!(row(result).id, id);
     assert_eq!(http.0.lock().unwrap().creates, 1);
+    http.0.lock().unwrap().rows.get_mut(&id).unwrap()["state"] = json!("stopped");
+    http.0.lock().unwrap().hide_label_once = true;
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), other.provision(r, &c)).await.unwrap().unwrap();
+    assert!(matches!(row(stopped).state, Observation::Stopped { .. }));
 }
 
 // Concurrent prepare at independent hosts converges on the digest-pair name;
@@ -912,4 +922,25 @@ async fn missing_python_has_a_public_bootstrap_diagnostic() {
     };
     assert!(reason.contains("missing python3"));
     assert_eq!(output.expose(), "missing-python3\n");
+}
+
+// Lifecycle state checks must not invoke isolation probes. Even a failing probe
+// cannot block stop; resume performs only the agent bootstrap exec, with the
+// host responsible for consuming a subsequent explicit measurement.
+#[tokio::test]
+async fn lifecycle_state_checks_do_not_probe() {
+    let http = Arc::new(StandIn::default());
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
+    let env = row(p.provision(request(prep, "probe-independent-stop"), &c).await.unwrap());
+    http.0.lock().unwrap().probe_exit = Some(1);
+    let before = http.0.lock().unwrap().executed.len();
+    let sr = p.operations().suspend_resume.unwrap();
+    let token = sr.suspend(&env.id, &c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().executed.len(), before);
+    sr.resume(&env.id, token, &c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().executed.len(), before + 1);
+    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { .. })));
 }

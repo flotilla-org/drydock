@@ -326,7 +326,7 @@ when the policy has listed destinations:
 For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
 is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
 real externally verified reachable services; never print constants as evidence.
-Provision, resume and explicit inspect measure the claim. Cheap list/poll calls
+Provision, host resume completion and explicit inspect measure the claim. Cheap list/poll calls
 do not exec; the host carries its last measured claim for at most 60 seconds while running and clears
 it on stopped/gone/unknown state. Out-of-band policy changes may retain the old claim until that expiry; explicit
 inspect refreshes the evidence immediately. Cheap inventory never extends its age. A negative proof is Advisory; malformed
@@ -354,7 +354,8 @@ outside route admission; sharing an organization also shares these limits.
 Quota reports structured region/class/resource keys with UCUM capacity units.
 Analytics reports organization-scoped neutral resource measurements, integrated
 UCUM units and exact decimal cost with currency code. Money is parsed from the
-original decimal lexeme before numeric conversion. `environment_hours` stays
+original decimal lexeme before numeric conversion. An analytics currency code is
+used when present; the documented USD denomination is the fallback. `environment_hours` stays
 empty because aggregates cannot recover size distribution. Scope IDs are opaque.
 The conformance checker explicitly diagnoses organization aggregates as unable
 to establish one sandbox's stopped billing; it does not compare their CPU with
@@ -368,7 +369,8 @@ stand-in spend is **$0**; live conformance and live spend are operator acceptanc
 Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
 and contain no URL credentials, query or fragment. REST and analytics default to Daytona's public endpoints. Toolbox routing uses
 each sandbox's required `toolboxProxyUrl` plus sandbox ID; `toolbox_url` is an
-explicit override only.
+explicit override only. Deployments requiring a fixed toolbox destination can
+set that override instead of following the API-supplied proxy route.
 
 Daytona toolbox `/process/execute` returns a buffered, merged `result` and an
 `exitCode`; it supplies neither separate stderr nor a live stdin/output stream.
