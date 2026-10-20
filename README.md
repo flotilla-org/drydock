@@ -36,7 +36,18 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
-Protocol version 2 changes snapshot reconciliation semantics. Clients must check
+Protocol version 4 adds transitional observations and scoped resource measurements
+with UCUM units, exact decimal money plus currency, and structured quota keys.
+The host retains the last stable billing state across known progress samples;
+Unknown breaks that baseline. Resource vocabulary additions require a version bump.
+
+Protocol version 3 adds returned `CommandFailed` errors (HTTP 424, typed exit
+code and redacted merged output) and `DestroyedAtProvider` causes. Version 2
+clients cannot decode these new enum variants, so the exact hello gate rejects
+them until upgraded. Version 3 also includes the generic host-only destination
+and optional persistence, resource-quota and aggregate-usage data.
+
+Protocol version 2 changed snapshot reconciliation semantics. Clients must check
 `hello.protocol_version` for an exact match before using any provider or event
 route (ADR 0070). Version 1 clients must not consume version 2 snapshots: ignoring
 `unavailable_providers` could turn unavailable inventory into false deletions or

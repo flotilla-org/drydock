@@ -98,6 +98,7 @@ impl Provider for Reference {
             checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
             workspace_root: "/workspace".into(),
             suspend_resume: true,
+            suspend_preserves_memory: Some(true),
             export: true,
             egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::Open], enforcement: Enforcement::Advisory },
             fallback_runner: true,
@@ -125,7 +126,7 @@ impl Provider for Reference {
         self.check()?;
         let mut state = self.state.recover();
         if let Some(s) = state.environments.values().find(|s| s.label.as_deref() == Some(&r.label)) {
-            return Ok(Provisioned::Existing(s.clone()));
+            return Ok(Provisioned::Existing(s.clone().into()));
         }
         if !state.prepared.values().any(|p| p == &r.prepared) {
             return Err(refused("unknown prepared form"));
@@ -144,26 +145,35 @@ impl Provider for Reference {
         };
         state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());
-        Ok(Provisioned::Created(s))
+        Ok(Provisioned::Created(s.into()))
     }
     async fn list(&self, _: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.check()?;
         let state = self.state.recover();
         if state.inventory_error {
-            return Err(ProtocolError::Unavailable { reason: "fixture inventory unavailable".into(), retry_after: None });
+            return Err(ProtocolError::Unavailable {
+                provider_error: None,
+                reason: "fixture inventory unavailable".into(),
+                retry_after: None,
+            });
         }
         Ok(state
             .environments
             .values()
             .cloned()
-            .map(|environment| ObservedEnvironment { environment, timestamp: state.provider_timestamp })
+            .map(|environment| ObservedEnvironment {
+                egress_policy: None,
+                egress_measured: true,
+                environment,
+                timestamp: state.provider_timestamp,
+            })
             .collect())
     }
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
         self.check()?;
         let environment = self.find(id)?;
         let timestamp = self.state.recover().provider_timestamp;
-        Ok(ObservedEnvironment { environment, timestamp })
+        Ok(ObservedEnvironment { egress_policy: None, egress_measured: true, environment, timestamp })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
@@ -355,7 +365,7 @@ impl UsageOperation for Reference {
                 }
             }
         }
-        Ok(Usage { period, environment_hours })
+        Ok(Usage { period, environment_hours, measurements: None })
     }
 }
 
@@ -364,6 +374,7 @@ impl QuotaOperation for Reference {
     async fn quota(&self, _: &Credentials) -> Result<Quota> {
         self.check()?;
         Ok(Quota {
+            resources: vec![],
             credits_remaining: None,
             credit_unit: None,
             concurrency_in_use: Some(

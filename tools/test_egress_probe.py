@@ -40,6 +40,12 @@ class ProbeContract(unittest.TestCase):
                                                         "unlisted_canary": False, "raw_dns": False})
             self.assertEqual(result.stderr, b"")
 
+    # Deny-all does not resolve or connect a nonexistent listed destination.
+    def test_deny_all_without_listed_destination(self):
+        result = subprocess.run([sys.executable, str(PATH), "unused", "0", "127.0.0.1", "1", "127.0.0.2"],
+            env={**os.environ, "DRYDOCK_PROBE_DENY_ALL":"1"}, capture_output=True, timeout=10, check=True)
+        self.assertIsNone(json.loads(result.stdout)["listed_direct"])
+
 
 if __name__ == "__main__":
     unittest.main()

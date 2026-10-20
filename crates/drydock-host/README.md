@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol version 2 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 4 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
@@ -228,3 +228,184 @@ consolidation are tracked in #21.
 Unix UID admission failures return a bare 403 before protocol handling, just as
 Rigging's TCP authentication failures return transport-level statuses. These are
 not module or `/v1` ProtocolError outcomes.
+
+## Daytona module
+
+The binary also registers `daytona`; embedders can register `daytona::DaytonaModule`.
+It uses the published [REST](https://www.daytona.io/docs/openapi.json),
+[toolbox](https://www.daytona.io/docs/toolbox-openapi.json) and
+[analytics](https://www.daytona.io/docs/analytics-openapi.json) contracts, checked
+2026-10-20. Configuration example (no credentials in settings):
+
+```json
+{
+  "modules": [{"name":"cloud", "entrypoint":"daytona"}],
+  "providers": [{
+    "name":"daytona-eu", "module":"cloud",
+    "settings": {
+      "organization_id":"YOUR_ORGANIZATION_ID",
+      "region":"eu", "tier":1,
+      "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
+      "agent_command":"/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock"
+    },
+    "credential":{"mode":"direct", "credential_reference":"daytona-key"}
+  }]
+}
+```
+
+Deliver the organisation API key through credential refresh. Proxied mode sends
+its placeholder as the bearer token on REST, toolbox and analytics calls, using
+the host's injected HTTP client. There are no module retries or ambient credentials.
+The key needs sandbox creation/modification/deletion, snapshot creation and billing
+read access. API-key scope is the organisation; this is not isolation between
+sandboxes in that organisation.
+
+`agent_command` is the fixed startup command of **your baked image**, not a
+per-environment argument. The example binary is illustrative; the checked-in
+Flotilla vessel agent is still a skeleton, so an image must provide a working
+agent/listener before live acceptance. Bake the tools, `flock` and Python 3
+(for listener liveness checks) into the public image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
+prepare. A deterministic provider snapshot name tags the digest pair; subsequent
+prepare calls look it up and wait for `active`. The module sets the container
+class explicitly. No tools are uploaded. Prepare observes a build for up to four
+minutes; callers may call prepare again to continue observation of that same
+snapshot. Size requests must use whole vCPU and GiB within the default 4 vCPU,
+8 GiB RAM and 10 GiB disk cap; incompatible requests are refused rather than rounded.
+
+Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
+disables auto-stop/auto-pause and auto-delete, waits for started, then launches
+the fixed command through toolbox exec. A guest `flock` serialises bootstrap;
+bootstrap succeeds only when a connection to `/run/drydock/agent.sock` succeeds.
+A stale socket with no listener is removed and the fixed agent command is restarted.
+`agent_command` is a trusted operator shell fragment interpreted by `sh`; unlike
+`ExecRequest.command` and the probe argv, it is not quoted as one executable.
+
+The toolbox budget is 25 seconds, covering the eight-second flock wait, five-second
+readiness loop and bounded one-second liveness connects; ordinary exec/probes get
+20 seconds (the current protocol `ExecRequest` has no timeout field). The agent should
+replace that socket when it starts. Drydock subsequently pushes egress, CA and
+features over its control connection. A failed bootstrap leaves a labelled
+resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
+resource; size or egress mismatches (including missing policy evidence) are refused
+with guidance to use a new label. They never change the existing resource's policy.
+Vendor name uniqueness arbitrates concurrent creates, so one slow startup does not
+hold a provider-wide creation mutex.
+
+Suspend is stop, resume is start plus bootstrap. The whole filesystem persists;
+memory and resident processes do not. `suspend_preserves_memory: false` declares
+this explicitly. There is no pause operation on the container class. Resume
+removes the old stopped process's socket before bootstrapping; repeated resume of
+an already running sandbox checks the listener and restarts a dead agent without
+disturbing a live socket.
+The deterministic resume token is an id-bound continuation marker, not an access
+credential; every call still requires the organisation API key. It uses `Secret`
+because that is the protocol's resume-token representation.
+
+Every reach call requests a fresh five-minute SSH token. Daytona authenticates it
+as the gateway username, so `Reach::Ssh.user` now uses the redacting `Secret` type
+(the JSON is still a string). Supply the SSH gateway's host public key verified
+out of band: the mint route does not supply one. `ssh_endpoint` defaults to
+`ssh.app.daytona.io:22`; no host key is discovered through unauthenticated scanning.
+Never log or record a mint response or the serialized reach recipe.
+
+Egress always supplies exactly one networking control, avoiding Daytona's default
+allowlist: `networkBlockAll: true` for deny-all, `networkAllowList` for IPv4 CIDRs
+(or `0.0.0.0/0` for Open), and `domainAllowList` for host-only requests. Native
+domain rules follow Daytona's DNS updates; the module does no DNS pinning or
+AAAA rejection of dual-stack names. IPv6 literals/CIDRs, port-specific entries
+and mixed domain/CIDR requests are refused. Label retries compare normalized
+requested policies, not the results of a new DNS lookup.
+
+The provider capability remains Advisory, including on low tiers where vendor
+organization restrictions may take precedence. Individual running sandboxes
+become Enforced only after an operator-configured `egress_probe` executes as root
+and proves blocked unlisted canary and raw DNS, plus successful listed access
+when the policy has listed destinations:
+
+```json
+{"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
+```
+
+For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
+is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
+real externally verified reachable services; never print constants as evidence.
+Provision, host resume completion and explicit inspect measure the claim. Cheap
+list/poll calls do not exec. Every Daytona observation carries an opaque effective
+policy fingerprint; the host retains measured evidence while running with the
+same fingerprint, and invalidates it on policy change, stopped/gone/unknown state
+or disappearance. A changed-back policy requires another measurement. Providers
+without policy fingerprints retain the conservative 60-second fallback TTL.
+A negative proof is Advisory. Probe command/transport/malformed-proof failures
+leave successful provision/resume Advisory and emit a tracing diagnostic with the
+typed error class; explicit inspect still returns the typed error. Open/nonrunning
+rows are Advisory. Transport outages return Unavailable, not adaptor-bug Internal.
+
+Observation polls every 30 seconds, with complete cursor pagination, provider
+`updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The host
+owns all state diffs and event emission. Error reasons map OOM/eviction to loss
+causes, unreachable to host-unreachable, and other provider errors to API-error;
+known progress maps to `Transitioning` phases; unestablished states alone are
+Unknown. The host keeps stable billing state across progress samples. No webhooks.
+
+The module declares per-organization Tier 1–4 general/create/lifecycle limits
+(10k/300/10k through 50k/600/50k per minute). Optional `rate_limits` overrides
+accept explicit host `RateLimit` rows for Enterprise contracts. A 429 reads
+`Retry-After-{throttler}`, falling back to the exhausted bucket's
+`X-RateLimit-Reset-{throttler}` remaining seconds (or plain Retry-After). It never retries.
+Unused cached rate-window state was removed: the host does not yet dynamically
+adjust its admission budget using successful responses' observed limit/remaining
+counters. That is an explicit gap, not global quota coordination. Completion
+waits, pagination, toolbox routing lookups and probes consume additional calls
+outside route admission; sharing an organization also shares these limits.
+
+Quota reports structured region/class/resource keys with UCUM capacity units.
+Analytics reports organization-scoped neutral resource measurements, integrated
+UCUM units and exact decimal cost with currency code. Analytics GBSeconds are
+interpreted as reserved GiB integrated over time, using Daytona's documented
+[resource units](https://www.daytona.io/docs/en/sandboxes/#resources), and converted
+to By.s with 2^30. This interpretation of the analytics field naming remains a
+live metering acceptance assumption. Money is parsed from the
+original decimal lexeme before numeric conversion and uses the documented USD
+denomination, without inventing a vendor currency field. `environment_hours` is
+filled from the documented per-sandbox usage totals and usage-period routes,
+clipping each size period to the requested window. Scope IDs are opaque.
+Conformance uses size-hours when measurements are aggregate and isolated CPU
+measurements when explicitly environment-scoped. Size-hours are still grouped
+by size across the organization: use an otherwise idle organization or a unique
+size for live transition attribution; aggregation cannot distinguish unrelated
+sandboxes with the same size. Empty usage windows yield zero size-hours. Aggregate measurements and per-sandbox
+periods are separate sequential reads, not an atomic provider snapshot; eventual
+updates or ongoing state changes can make them disagree. Compare settled windows
+and allow for vendor accounting delay during live conformance. Usage currently
+fans out sequentially across all IDs returned for the organization/window;
+individual-call budgeting and bounded fan-out are tracked in drydock#35.
+
+For operator acceptance, configure a real baked agent image, pinned gateway key,
+matching root/network/reach probes, and run conformance including egress. Retain
+`usage.measurements.cost` from the JSON report as spend evidence. This crew's
+stand-in spend is **$0**; live conformance and live spend are operator acceptance.
+
+Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
+and contain no URL credentials, query or fragment. REST and analytics default to Daytona's public endpoints. Toolbox routing uses
+each sandbox's required `toolboxProxyUrl` plus sandbox ID; `toolbox_url` is an
+explicit override only. Deployments requiring a fixed toolbox destination can
+set that override instead of following the API-supplied proxy route.
+
+Daytona toolbox `/process/execute` returns a buffered, merged `result` and an
+`exitCode`; it supplies neither separate stderr nor a live stdin/output stream.
+Fallback exec preserves that contract: successful merged output is exposed through
+the Drydock byte stream after completion; nonzero exits return `CommandFailed`
+(HTTP 424) with a typed `exit_code` and sensitive `output` wrapped in `Secret`.
+This is a diagnostic runner, not an interactive terminal. Empty output is valid.
+Snapshot activation is submitted once and then observed by paced reads. Terminal
+sandbox start failures are returned immediately. A provider-reported `destroyed`
+without eviction metadata is `DestroyedAtProvider`, rather than claiming that the
+guest powered itself off; confirmed Drydock deletion still uses the host's
+`DestroyedByRequest` event cause.
+
+The module's bounded completion waits are distinct from the host's observation
+poller: prepare permits up to 120 successful state reads at two-second intervals,
+and start/stop permit up to 60. A failed GET exits immediately; the caller owns
+failure retries. These internal reads do not currently consume separate host
+route-budget slots. That is a known limitation under the required rate-window
+review work, not an additional module observation/reconciliation loop.

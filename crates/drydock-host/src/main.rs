@@ -7,7 +7,9 @@ async fn main() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut host = Host::new(reference::registry());
+    let mut registry = reference::registry();
+    registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
+    let mut host = Host::new(registry);
     if let Ok(path) = std::env::var("DRYDOCK_PROXY_CA") {
         host = host.with_proxy_ca(std::fs::read(path)?);
     }

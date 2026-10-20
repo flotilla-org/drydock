@@ -6,7 +6,8 @@ pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// Errors are serialized to authenticated host clients, including snapshot readers.
-/// Modules must exclude credentials from reasons and raw provider error text.
+/// Modules must exclude credentials from reasons. Raw diagnostics may contain
+/// sensitive vendor text and must use the protocol Secret fields.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
@@ -46,20 +47,25 @@ pub enum ObservationMode {
 /// Optional provider time travels separately from the environment wire representation.
 #[derive(Clone, Debug)]
 pub struct ObservedEnvironment {
+    /// True only when this call measured the isolation claim; conversion from
+    /// a bare Environment conservatively supplies no measurement evidence.
+    pub egress_measured: bool,
+    /// Opaque effective-policy identity, present on every cheap observation when supported.
+    pub egress_policy: Option<String>,
     pub environment: Environment,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl From<Environment> for ObservedEnvironment {
     fn from(environment: Environment) -> Self {
-        Self { environment, timestamp: None }
+        Self { environment, timestamp: None, egress_measured: false, egress_policy: None }
     }
 }
 pub enum Provisioned {
-    Created(Environment),
-    Existing(Environment),
+    Created(ObservedEnvironment),
+    Existing(ObservedEnvironment),
 }
 pub enum Connection {
-    Ssh { endpoint: String, user: String, host_key: String },
+    Ssh { endpoint: String, user: Secret, host_key: String },
     Dial { url: String, token: Secret, expires_at: Timestamp },
     Relay,
 }
@@ -101,6 +107,10 @@ pub trait Provider: Send + Sync {
     /// still visible but no billable Running transition can be inferred.
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>>;
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment>;
+    /// Lifecycle enrichment must not turn a completed lifecycle into a probe failure.
+    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+        self.inspect(id, c).await
+    }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()>;
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection>;
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream>;

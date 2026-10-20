@@ -9,7 +9,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "2";
+pub const PROTOCOL_VERSION: &str = "4";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -124,6 +124,9 @@ pub struct Capabilities {
     pub checkout_strategies: Vec<CheckoutStrategy>,
     pub workspace_root: String,
     pub suspend_resume: bool,
+    /// Whether suspend retains running processes/memory, when supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend_preserves_memory: Option<bool>,
     pub export: bool,
     pub egress: EgressCapability,
     pub fallback_runner: bool,
@@ -188,8 +191,17 @@ impl Default for EgressRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Destination {
-    HostPort { host: HostAddress, port: Port },
-    Cidr { cidr: Cidr },
+    /// All ports to this host name; how the provider enforces the name is the provider's choice.
+    Host {
+        host: HostAddress,
+    },
+    HostPort {
+        host: HostAddress,
+        port: Port,
+    },
+    Cidr {
+        cidr: Cidr,
+    },
 }
 /// Preparation is look-up-or-build at the provider, keyed by both digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -248,7 +260,8 @@ pub struct Environment {
 pub enum Reach {
     Ssh {
         endpoint: String,
-        user: String,
+        /// May contain a short-lived gateway token; always redact diagnostics.
+        user: Secret,
         host_key: String,
     },
     Dial {
@@ -267,8 +280,21 @@ pub enum Observation {
     Running,
     Stopped { cause: StopCause },
     Gone { cause: GoneCause },
+    Transitioning { phase: TransitionPhase },
     Unknown { reason: UnknownReason },
 }
+/// Generic phases describe progress, not billing transitions. The host retains
+/// its last stable billing observation until another stable observation arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionPhase {
+    Preparing,
+    Starting,
+    Stopping,
+    Reconfiguring,
+    Destroying,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StopCause {
@@ -286,6 +312,8 @@ pub enum GoneCause {
         code: i32,
     },
     GuestPoweredOff,
+    /// The provider explicitly reports destruction without an attributed client request.
+    DestroyedAtProvider,
     /// A previously known environment is absent from an authoritative complete list.
     MissingOnList,
     /// The provider confirmed deletion requested by the client.
@@ -294,6 +322,8 @@ pub enum GoneCause {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownReason {
+    /// The provider explicitly reports an unknown state, without an API failure.
+    ProviderStateUnknown,
     HostUnreachable,
     ProviderApiError,
     GuestUnresponsive,
@@ -361,11 +391,118 @@ pub struct Period {
     #[schema(format = DateTime)]
     end: Timestamp,
 }
+/// Initial provider-neutral vocabulary. Adding a resource is a protocol change,
+/// rather than inventing provider-specific encodings inside resource names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Cpu,
+    Memory,
+    Disk,
+    Gpu,
+    SnapshotStorage,
+    VolumeStorage,
+    Environments,
+}
+
+impl ResourceKind {
+    /// Initial vocabulary's capacity and integrated-usage UCUM units.
+    pub fn accepts_unit(self, unit: &str) -> bool {
+        match self {
+            Self::Cpu => matches!(unit, "{vCPU}" | "{vCPU}.s"),
+            Self::Memory | Self::Disk | Self::SnapshotStorage | Self::VolumeStorage => matches!(unit, "By" | "By.s"),
+            Self::Gpu => matches!(unit, "{GPU}" | "{GPU}.s"),
+            Self::Environments => matches!(unit, "1" | "s"),
+        }
+    }
+}
+/// UCUM code. Providers use `By`, `By.s`, `{vCPU}`, `{vCPU}.s`,
+/// `{GPU}.s`, and `1` for dimensionless counts. New resource variants require
+/// a protocol version bump; scope ids are opaque to consumers.
+pub type ResourceUnit = String;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Quantity {
+    pub amount: f64,
+    pub unit: ResourceUnit,
+}
+
+/// Currency is explicit, e.g. USD or EUR; the field name fixes no currency.
+/// A missing cost is unknown, whereas an amount of zero is a known zero cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Cost {
+    #[serde(deserialize_with = "decimal_amount")]
+    pub amount: String,
+    pub currency: String,
+}
+
+/// Aggregated usage must say what population it measured. In particular,
+/// organisation totals cannot prove that one suspended environment stopped billing.
+/// Organization and environment IDs are provider-opaque; consumers only compare them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageScope {
+    Provider,
+    Organization { id: String },
+    Environment { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageMeasurements {
+    pub scope: UsageScope,
+    pub resources: BTreeMap<ResourceKind, Quantity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
+}
+
+/// Retain the original sandbox-hours-by-size slice. Optional measurements can
+/// reconcile other provider data without fabricating a distribution over sizes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
     pub period: Period,
     pub environment_hours: Vec<SizeUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<UsageMeasurements>,
 }
+
+/// Scope is data, never an opaque "region/class/resource" string. Missing scope
+/// components mean the provider reports the resource at a broader scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QuotaKey {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    pub resource: ResourceKind,
+}
+
+/// The same unit applies to current use and limit. Unknown limits stay unknown.
+/// A vector of these rows keeps structured keys representable as ordinary JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ResourceQuota {
+    pub key: QuotaKey,
+    pub unit: ResourceUnit,
+    pub in_use: f64,
+    pub limit: Option<f64>,
+}
+
+/// Nonnegative exact decimal money: no exponent, binary float, or NaN.
+fn decimal_amount<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    if !valid_decimal(&value) {
+        return Err(serde::de::Error::custom("expected nonnegative exact decimal"));
+    }
+    Ok(value)
+}
+pub fn valid_decimal(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or("");
+    !integer.is_empty()
+        && integer.bytes().all(|b| b.is_ascii_digit())
+        && parts.next().is_none_or(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_none()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SizeUsage {
     pub size: Size,
@@ -373,6 +510,8 @@ pub struct SizeUsage {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Quota {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceQuota>,
     pub credits_remaining: Option<f64>,
     pub credit_unit: Option<String>,
     pub concurrency_in_use: Option<u64>,
@@ -408,6 +547,9 @@ pub enum ProtocolError {
     Unavailable {
         reason: String,
         retry_after: Option<u64>,
+        /// Optional bounded provider/transport detail; never include it in public logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_error: Option<Secret>,
     },
     RateLimited {
         reason: String,
@@ -418,6 +560,13 @@ pub enum ProtocolError {
     },
     CredentialRejected {
         reason: String,
+    },
+    /// A completed guest command failed, distinct from a vendor/transport outage.
+    CommandFailed {
+        reason: String,
+        exit_code: i32,
+        /// Vendor-merged guest output. Sensitive diagnostics; never log it.
+        output: Secret,
     },
     Internal {
         reason: String,
@@ -448,6 +597,7 @@ impl ProtocolError {
             Self::RateLimited { .. } => "rate_limited",
             Self::QuotaExhausted { .. } => "quota_exhausted",
             Self::CredentialRejected { .. } => "credential_rejected",
+            Self::CommandFailed { .. } => "command_failed",
             Self::Internal { .. } => "internal",
         }
     }
@@ -462,6 +612,7 @@ impl ProtocolError {
             Self::RateLimited { .. } => 429,
             Self::QuotaExhausted { .. } => 402,
             Self::CredentialRejected { .. } => 502,
+            Self::CommandFailed { .. } => 424,
             Self::Internal { .. } => 500,
         }
     }

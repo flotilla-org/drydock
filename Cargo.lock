@@ -426,6 +426,7 @@ dependencies = [
  "rigging-tls",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -1425,7 +1426,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1439,10 +1440,12 @@ dependencies = [
 [[package]]
 name = "rigging-http-serve"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
  "libc",
  "sha2",
  "subtle",
@@ -1453,7 +1456,7 @@ dependencies = [
 [[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "async-trait",
  "libc",
@@ -1466,7 +1469,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "async-trait",
  "axum",
@@ -1487,7 +1490,7 @@ dependencies = [
 [[package]]
 name = "rigging-stream"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "tokio",
 ]
@@ -1495,7 +1498,7 @@ dependencies = [
 [[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=9c553b12c9922ade32ef66185884be2114c1981b#9c553b12c9922ade32ef66185884be2114c1981b"
+source = "git+https://github.com/flotilla-org/rigging?rev=f1f49fb7558dd61e13180a8519169e11cae0e416#f1f49fb7558dd61e13180a8519169e11cae0e416"
 dependencies = [
  "reqwest",
  "rustls",

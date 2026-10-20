@@ -61,13 +61,14 @@ fn every_route_carries_typed_error_statuses() {
         ProtocolError::NotFound { reason: "r".into() },
         ProtocolError::MethodNotAllowed { reason: "r".into() },
         ProtocolError::Refused { reason: "r".into() },
-        ProtocolError::Unavailable { reason: "r".into(), retry_after: None },
+        ProtocolError::Unavailable { provider_error: None, reason: "r".into(), retry_after: None },
         ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },
         ProtocolError::QuotaExhausted { reason: "r".into() },
         ProtocolError::CredentialRejected { reason: "r".into() },
         ProtocolError::Internal { reason: "r".into(), provider_error: Secret::new("sensitive") },
+        ProtocolError::CommandFailed { reason: "r".into(), exit_code: 7, output: Secret::new("sensitive") },
     ];
-    assert_eq!(errors.iter().map(ProtocolError::status).collect::<Vec<_>>(), [404, 405, 422, 503, 429, 402, 502, 500]);
+    assert_eq!(errors.iter().map(ProtocolError::status).collect::<Vec<_>>(), [404, 405, 422, 503, 429, 402, 502, 500, 424]);
     let document = serde_json::to_value(openapi::document()).unwrap();
     for path in document["paths"].as_object().unwrap().values() {
         for operation in path.as_object().unwrap().values() {

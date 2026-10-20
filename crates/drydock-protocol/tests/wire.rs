@@ -16,6 +16,7 @@ fn tagged_wire_fixtures() {
         json!({"state":"stopped","cause":"paused_by_provider"}),
         json!({"state":"gone","cause":{"kind":"missing_on_list"}}),
         json!({"state":"unknown","reason":"provider_api_error"}),
+        json!({"state":"unknown","reason":"provider_state_unknown"}),
     ] {
         fixture::<Observation>(value);
     }
@@ -122,8 +123,38 @@ fn hello_requires_exact_protocol_version() {
     // Version 1 assumes every snapshot is complete and must reject version 2 semantics.
     let old = Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], providers: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "3", "2.0.0", "2 "] {
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4.0.0", "4 "] {
         let hello = Hello { protocol_version: version.into(), host_version: "test".into(), modules: vec![], providers: vec![] };
         assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
+}
+
+// Approved protocol 4 uses explicit progress phases, UCUM units and exact
+// decimal money. Resource additions are gated by the exact protocol version.
+#[test]
+fn progress_and_neutral_resource_wire() {
+    for phase in ["preparing", "starting", "stopping", "reconfiguring", "destroying"] {
+        fixture::<Observation>(json!({"state":"transitioning","phase":phase}));
+    }
+    fixture::<UsageMeasurements>(
+        json!({"scope":{"kind":"organization","id":"opaque/eu"},"resources":{"cpu":{"amount":123.0,"unit":"{vCPU}.s"}},"cost":{"amount":"9007199254740993.000001","currency":"USD"}}),
+    );
+    fixture::<ResourceQuota>(json!({"key":{"region":"eu","class":"container","resource":"memory"},"unit":"By","in_use":0.0,"limit":null}));
+    for amount in [json!(0.12), json!("NaN"), json!("-1"), json!("1e3"), json!(""), json!("1.")] {
+        assert!(serde_json::from_value::<Cost>(json!({"amount":amount,"currency":"USD"})).is_err());
+    }
+    assert!(serde_json::from_value::<ResourceKind>(json!("vendor_magic")).is_err());
+}
+
+// Exact decimal strings roundtrip without arithmetic. The generator spans all
+// u64 whole parts, including values beyond 2^53, plus nine fractional digits.
+#[hegel::test]
+fn exact_cost_roundtrips(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let whole = tc.draw(gs::integers::<u64>());
+    let cost = Cost { amount: format!("{whole}.123456789"), currency: "EUR".into() };
+    let encoded = serde_json::to_string(&cost).unwrap();
+    assert_eq!(serde_json::from_str::<Cost>(&encoded).unwrap(), cost);
+    assert!(!ResourceKind::Cpu.accepts_unit("By"));
+    assert!(ResourceKind::Memory.accepts_unit("By.s"));
 }

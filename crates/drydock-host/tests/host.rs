@@ -387,6 +387,7 @@ struct Control {
     execute_http: std::sync::atomic::AtomicBool,
     disable_exec: std::sync::atomic::AtomicBool,
     skip_list_timestamp: std::sync::atomic::AtomicBool,
+    skip_egress_measurement: std::sync::atomic::AtomicBool,
     timestamp: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     global_limit: std::sync::atomic::AtomicBool,
     list_limit: std::sync::atomic::AtomicU32,
@@ -514,11 +515,10 @@ impl drydock_host::module::Provider for ControlledProvider {
             let url = self.control.http_url.lock().unwrap().clone().unwrap_or_else(|| "https://vendor.example/prepare".into());
             let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
             request.headers_mut().insert("Authorization", format!("Bearer {}", c.token().unwrap().expose()).parse().unwrap());
-            let response = self
-                .http
-                .execute(request, &rigging_http_client::http_channel_label("GET", &url))
-                .await
-                .map_err(|_| ProtocolError::Unavailable { reason: "transport failure".into(), retry_after: None })?;
+            let response =
+                self.http.execute(request, &rigging_http_client::http_channel_label("GET", &url)).await.map_err(|_| {
+                    ProtocolError::Unavailable { provider_error: None, reason: "transport failure".into(), retry_after: None }
+                })?;
             if response.status() == 401 {
                 return Err(ProtocolError::CredentialRejected { reason: "vendor rejected credential".into() });
             }
@@ -548,10 +548,12 @@ impl drydock_host::module::Provider for ControlledProvider {
             return Err(ProtocolError::CredentialRejected { reason: "vendor credential rejected".into() });
         }
         if vendor.0 {
-            return Err(ProtocolError::Unavailable { reason: "vendor unavailable".into(), retry_after: None });
+            return Err(ProtocolError::Unavailable { provider_error: None, reason: "vendor unavailable".into(), retry_after: None });
         }
         if let Some(row) = vendor.1 {
             rows.push(ObservedEnvironment {
+                egress_policy: None,
+                egress_measured: !self.control.skip_egress_measurement.load(SeqCst),
                 environment: row,
                 timestamp: if self.control.skip_list_timestamp.load(SeqCst) { None } else { *self.control.timestamp.lock().unwrap() },
             });
@@ -564,7 +566,12 @@ impl drydock_host::module::Provider for ControlledProvider {
     }
     async fn inspect(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<ObservedEnvironment> {
         if let Some(row) = self.control.vendor.lock().unwrap().row.clone().filter(|row| row.id == id) {
-            return Ok(ObservedEnvironment { environment: row, timestamp: *self.control.timestamp.lock().unwrap() });
+            return Ok(ObservedEnvironment {
+                egress_policy: None,
+                egress_measured: true,
+                environment: row,
+                timestamp: *self.control.timestamp.lock().unwrap(),
+            });
         }
         self.inner.inspect(id, c).await
     }
@@ -575,7 +582,7 @@ impl drydock_host::module::Provider for ControlledProvider {
             self.control.destroy_release.notified().await;
         }
         if self.control.fail_destroy.load(std::sync::atomic::Ordering::SeqCst) {
-            Err(ProtocolError::Unavailable { reason: "ambiguous vendor failure".into(), retry_after: None })
+            Err(ProtocolError::Unavailable { provider_error: None, reason: "ambiguous vendor failure".into(), retry_after: None })
         } else {
             Ok(())
         }
@@ -1448,4 +1455,88 @@ async fn unix_peer_admission_fault_matrix() {
         let result = drydock::conformance::unix_peer_admission(&drydock::client::Client::unix(&h.path).unwrap()).await;
         assert_eq!(result.is_ok(), !admits_this_uid);
     }
+}
+
+// Known progress samples preserve the last stable billing baseline, while
+// authoritative inventory still exposes progress. Unknown breaks that baseline.
+#[tokio::test]
+async fn progress_retains_billing_baseline_and_inventory() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let environment = Environment {
+        id: "progress".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Stopped { cause: StopCause::SuspendedByRequest },
+        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 }),
+        egress: Enforcement::Advisory,
+    };
+    control.vendor.lock().unwrap().row = Some(environment.clone());
+    // Wait for the initial stable state, then progress must appear in snapshots
+    // without inserting an Unknown state or emitting an extra billing event.
+    loop {
+        if let ObserveRecord::Event { event } = events.next().await
+            && matches!(event.event, EventKind::Stopped { .. })
+        {
+            break;
+        }
+    }
+    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Transitioning { phase: TransitionPhase::Starting };
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let ObserveRecord::Snapshot { environments, .. } = h.stream(None).await.next().await else { panic!("snapshot") };
+    assert!(matches!(environments[0].state, Observation::Transitioning { phase: TransitionPhase::Starting }));
+    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Running;
+    let mut kinds = vec![];
+    while kinds.len() < 2 {
+        if let ObserveRecord::Event { event } = events.next().await {
+            kinds.push(event.event);
+        }
+    }
+    assert!(matches!(kinds[0], EventKind::Resumed));
+    assert!(matches!(kinds[1], EventKind::Running { .. }));
+}
+
+// Cheap polling retains explicit inspect's measured claim while running, and
+// clears it when stopped. No network probe is needed for each inventory sample.
+#[tokio::test]
+async fn cheap_inventory_carries_measured_egress() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    control.skip_egress_measurement.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let env = Environment {
+        id: "measured".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Running,
+        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 }),
+        egress: Enforcement::Enforced,
+    };
+    control.vendor.lock().unwrap().row = Some(env);
+    h.ok(Method::GET, "/providers/a/environments/measured", Value::Null, 200).await;
+    control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Advisory;
+    let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
+    assert_eq!(rows[0].egress, Enforcement::Enforced);
+    // Cheap inventory cannot extend evidence indefinitely after an unmeasured
+    // policy change. Expiry is inclusive at exactly sixty seconds.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
+    assert_eq!(rows[0].egress, Enforcement::Advisory);
+    // A fresh measurement repairs expiry; an observed stop invalidates that
+    // fresh claim immediately rather than waiting for the next deadline.
+    control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Enforced;
+    h.ok(Method::GET, "/providers/a/environments/measured", Value::Null, 200).await;
+    control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Advisory;
+    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+    let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
+    assert_eq!(rows[0].egress, Enforcement::Advisory);
 }
