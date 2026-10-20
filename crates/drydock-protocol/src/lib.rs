@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 pub mod openapi;
+/// Pending owner ruling; not used by active routes or provider implementations.
+pub mod proposal;
 pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
