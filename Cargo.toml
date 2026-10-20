@@ -13,12 +13,12 @@ repository = "https://github.com/flotilla-org/drydock"
 reqwest = { version = "0.13", default-features = false }
 http = "1"
 sha2 = "0.10"
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "3860eb778d44f75663e14fdea9198bdf632e70d2" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "f1f49fb7558dd61e13180a8519169e11cae0e416" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 utoipa = "5.4"

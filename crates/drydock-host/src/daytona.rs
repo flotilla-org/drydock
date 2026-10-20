@@ -778,10 +778,12 @@ fn number(v: &Value, key: &str) -> Result<f64> {
 #[async_trait]
 impl UsageOperation for Daytona {
     async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
+        let from_text = String::from(period.start().clone());
+        let to_text = String::from(period.end().clone());
+        let from = from_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period start"))?;
+        let to = to_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period end"))?;
         let mut url = self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "usage", "aggregated"])?;
-        url.query_pairs_mut()
-            .append_pair("from", &String::from(period.start().clone()))
-            .append_pair("to", &String::from(period.end().clone()));
+        url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
         let v = self.request(Method::GET, url, None, c, false, ResponseFormat::Analytics).await?.ok_or_else(bad_response)?;
         // Daytona's reserved memory/disk quantities are GiB:
         // https://www.daytona.io/docs/en/sandboxes/#resources
@@ -807,10 +809,7 @@ impl UsageOperation for Daytona {
         let mut environment_hours = Vec::new();
         let mut sandboxes =
             self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "usage", "sandbox"])?;
-        sandboxes
-            .query_pairs_mut()
-            .append_pair("from", &String::from(period.start().clone()))
-            .append_pair("to", &String::from(period.end().clone()));
+        sandboxes.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
         let totals = self.call(Method::GET, sandboxes, None, c).await?;
         let mut seen = BTreeSet::new();
         for sandbox in totals.as_array().ok_or_else(|| bad_value(&totals))? {
@@ -820,9 +819,7 @@ impl UsageOperation for Daytona {
             }
             let mut url =
                 self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "sandbox", id, "usage"])?;
-            url.query_pairs_mut()
-                .append_pair("from", &String::from(period.start().clone()))
-                .append_pair("to", &String::from(period.end().clone()));
+            url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
             let periods = self.call(Method::GET, url, None, c).await?;
             for row in periods.as_array().ok_or_else(|| bad_value(&periods))? {
                 let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
@@ -830,12 +827,12 @@ impl UsageOperation for Daytona {
                 if end < start {
                     return Err(bad_value(row));
                 }
-                let from: chrono::DateTime<chrono::Utc> = String::from(period.start().clone()).parse().map_err(|_| bad_value(row))?;
-                let to: chrono::DateTime<chrono::Utc> = String::from(period.end().clone()).parse().map_err(|_| bad_value(row))?;
-                let seconds = (end.min(to) - start.max(from)).num_milliseconds().max(0) as f64 / 1000.0;
-                if seconds == 0.0 {
+                let start = start.max(from);
+                let end = end.min(to);
+                if end <= start {
                     continue;
                 }
+                let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
                 let bytes = |key| -> Result<u64> {
                     row.get(key).and_then(Value::as_u64).and_then(|v| v.checked_mul(GIB)).ok_or_else(|| bad_value(row))
                 };

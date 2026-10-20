@@ -373,7 +373,12 @@ Conformance uses size-hours when measurements are aggregate and isolated CPU
 measurements when explicitly environment-scoped. Size-hours are still grouped
 by size across the organization: use an otherwise idle organization or a unique
 size for live transition attribution; aggregation cannot distinguish unrelated
-sandboxes with the same size. Empty usage windows yield zero size-hours.
+sandboxes with the same size. Empty usage windows yield zero size-hours. Aggregate measurements and per-sandbox
+periods are separate sequential reads, not an atomic provider snapshot; eventual
+updates or ongoing state changes can make them disagree. Compare settled windows
+and allow for vendor accounting delay during live conformance. Usage currently
+fans out sequentially across all IDs returned for the organization/window;
+individual-call budgeting and bounded fan-out are tracked in drydock#35.
 
 For operator acceptance, configure a real baked agent image, pinned gateway key,
 matching root/network/reach probes, and run conformance including egress. Retain
