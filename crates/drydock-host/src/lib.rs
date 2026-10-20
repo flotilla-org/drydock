@@ -837,20 +837,46 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
     if r.prepared.provider != p {
         return Err(refused("invalid size, label or prepared provider").into());
     }
+    let instance = h.instance(&p).await?;
     let result = h.call(&p, Gate::Provision, |p, c| async move { p.provision(r, &c).await }).await?;
+    let (Provisioned::Created(env) | Provisioned::Existing(env)) = &result;
+    instance.inspected.recover().insert(env.id.clone(), env.clone().into());
     Ok(match result {
         Provisioned::Created(s) => (StatusCode::CREATED, Json(s)),
         Provisioned::Existing(s) => (StatusCode::OK, Json(s)),
     }
     .into_response())
 }
+// Only explicit measurements replace a measured claim. Cheap inventory carries
+// the last claim while running; stopped/gone rows invalidate it.
+fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
+    let mut measured = instance.inspected.recover();
+    for row in rows {
+        if row.egress_measured {
+            if row.timestamp.is_none() {
+                row.timestamp =
+                    measured.get(&row.environment.id).filter(|old| old.environment == row.environment).and_then(|old| old.timestamp);
+            }
+            measured.insert(row.environment.id.clone(), row.clone());
+        } else if matches!(row.environment.state, Observation::Running) {
+            if let Some(old) = measured.get(&row.environment.id).filter(|r| matches!(r.environment.state, Observation::Running)) {
+                row.environment.egress = old.environment.egress.clone();
+            }
+        } else if !matches!(row.environment.state, Observation::Transitioning { .. }) {
+            measured.remove(&row.environment.id);
+        }
+    }
+}
 async fn list(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Vec<Environment>>> {
-    Ok(Json(h.call(&p, Gate::List, |p, c| async move { p.list(&c).await }).await?.into_iter().map(|r| r.environment).collect()))
+    let instance = h.instance(&p).await?;
+    let mut rows = instance.call(Gate::List, |p, c| async move { p.list(&c).await }).await?;
+    carry_egress(&instance, &mut rows);
+    Ok(Json(rows.into_iter().map(|r| r.environment).collect()))
 }
 async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Environment>> {
     let instance = h.instance(&p).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&id, &c).await }).await?;
-    if row.timestamp.is_some() && instance.poll_interval.is_some() {
+    if instance.poll_interval.is_some() {
         instance.inspected.recover().insert(row.environment.id.clone(), row.clone());
     }
     Ok(Json(row.environment))
@@ -885,7 +911,11 @@ async fn resume(
     ApiPath((p, id)): ApiPath<(String, String)>,
     ApiJson(token): ApiJson<ResumeToken>,
 ) -> ApiResult<StatusCode> {
-    h.call(&p, Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
+    let instance = h.instance(&p).await?;
+    let inspect_id = id.clone();
+    instance.call(Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
+    let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&inspect_id, &c).await }).await?;
+    instance.inspected.recover().insert(row.environment.id.clone(), row);
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {

@@ -41,5 +41,5 @@ def dns(address):
 
 if __name__ == "__main__":
     listed, listed_port, canary, canary_port, resolver = sys.argv[1:]
-    print(json.dumps({"uid": os.geteuid(), "listed_direct": tcp(listed, listed_port),
+    print(json.dumps({"uid": os.geteuid(), "listed_direct": None if os.environ.get("DRYDOCK_PROBE_DENY_ALL") == "1" else tcp(listed, listed_port),
                       "unlisted_canary": tcp(canary, canary_port), "raw_dns": dns(resolver)}))

@@ -6,12 +6,11 @@ use utoipa::ToSchema;
 
 pub mod openapi;
 /// Pending owner ruling; not used by active routes or provider implementations.
-pub mod proposal;
 pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "3";
+pub const PROTOCOL_VERSION: &str = "4";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -282,8 +281,21 @@ pub enum Observation {
     Running,
     Stopped { cause: StopCause },
     Gone { cause: GoneCause },
+    Transitioning { phase: TransitionPhase },
     Unknown { reason: UnknownReason },
 }
+/// Generic phases describe progress, not billing transitions. The host retains
+/// its last stable billing observation until another stable observation arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionPhase {
+    Preparing,
+    Starting,
+    Stopping,
+    Reconfiguring,
+    Destroying,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StopCause {
@@ -378,31 +390,118 @@ pub struct Period {
     #[schema(format = DateTime)]
     end: Timestamp,
 }
+/// Initial provider-neutral vocabulary. Adding a resource is a protocol change,
+/// rather than inventing provider-specific encodings inside resource names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Cpu,
+    Memory,
+    Disk,
+    Gpu,
+    SnapshotStorage,
+    VolumeStorage,
+    Environments,
+}
+
+impl ResourceKind {
+    /// Initial vocabulary's capacity and integrated-usage UCUM units.
+    pub fn accepts_unit(self, unit: &str) -> bool {
+        match self {
+            Self::Cpu => matches!(unit, "{vCPU}" | "{vCPU}.s"),
+            Self::Memory | Self::Disk | Self::SnapshotStorage | Self::VolumeStorage => matches!(unit, "By" | "By.s"),
+            Self::Gpu => matches!(unit, "{GPU}" | "{GPU}.s"),
+            Self::Environments => matches!(unit, "1" | "s"),
+        }
+    }
+}
+/// UCUM code. Providers use `By`, `By.s`, `{vCPU}`, `{vCPU}.s`,
+/// `{GPU}.s`, and `1` for dimensionless counts. New resource variants require
+/// a protocol version bump; scope ids are opaque to consumers.
+pub type ResourceUnit = String;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Quantity {
+    pub amount: f64,
+    pub unit: ResourceUnit,
+}
+
+/// Currency is explicit, e.g. USD or EUR; the field name fixes no currency.
+/// A missing cost is unknown, whereas an amount of zero is a known zero cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct Cost {
+    #[serde(deserialize_with = "decimal_amount")]
+    pub amount: String,
+    pub currency: String,
+}
+
+/// Aggregated usage must say what population it measured. In particular,
+/// organisation totals cannot prove that one suspended environment stopped billing.
+/// Organization and environment IDs are provider-opaque; consumers only compare them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageScope {
+    Provider,
+    Organization { id: String },
+    Environment { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageMeasurements {
+    pub scope: UsageScope,
+    pub resources: BTreeMap<ResourceKind, Quantity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
+}
+
+/// Retain the original sandbox-hours-by-size slice. Optional measurements can
+/// reconcile other provider data without fabricating a distribution over sizes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Usage {
-    /// Organization aggregates; these cannot be reconstructed as hours by size.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub totals: Option<UsageTotals>,
     pub period: Period,
     pub environment_hours: Vec<SizeUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<UsageMeasurements>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct UsageTotals {
-    pub cpu_seconds: u64,
-    pub memory_gib_seconds: u64,
-    pub disk_gib_seconds: u64,
-    pub gpu_seconds: u64,
-    /// Vendor's totalPrice, denominated in USD.
-    pub cost_usd: f64,
-    pub environments: u64,
+
+/// Scope is data, never an opaque "region/class/resource" string. Missing scope
+/// components mean the provider reports the resource at a broader scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct QuotaKey {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    pub resource: ResourceKind,
 }
+
+/// The same unit applies to current use and limit. Unknown limits stay unknown.
+/// A vector of these rows keeps structured keys representable as ordinary JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ResourceQuota {
-    pub resource: String,
-    pub unit: String,
+    pub key: QuotaKey,
+    pub unit: ResourceUnit,
     pub in_use: f64,
-    pub limit: f64,
+    pub limit: Option<f64>,
 }
+
+/// Nonnegative exact decimal money: no exponent, binary float, or NaN.
+fn decimal_amount<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    if !valid_decimal(&value) {
+        return Err(serde::de::Error::custom("expected nonnegative exact decimal"));
+    }
+    Ok(value)
+}
+pub fn valid_decimal(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or("");
+    !integer.is_empty()
+        && integer.bytes().all(|b| b.is_ascii_digit())
+        && parts.next().is_none_or(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_none()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SizeUsage {
     pub size: Size,

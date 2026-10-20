@@ -421,6 +421,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                     client,
                     provider,
                     &client.inspect(provider, &row.id).await.map_err(SafeError::category)?.granted_size.ok_or("missing granted size")?,
+                    &row.id,
                     options.billing_sample_millis,
                     false,
                 )

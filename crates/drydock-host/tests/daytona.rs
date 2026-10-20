@@ -33,34 +33,81 @@ struct State {
     exec_timeouts: Vec<u64>,
 }
 #[derive(Default)]
-struct StandIn(Mutex<State>);
-#[async_trait]
-impl HttpClient for StandIn {
-    async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
-        tokio::task::yield_now().await;
-        let mut s = self.0.lock().unwrap();
+struct StandIn(Arc<Mutex<State>>, tokio::sync::OnceCell<rigging_replay_testkit::http_contract::StandIn>);
+impl StandIn {
+    async fn network(&self) -> &rigging_replay_testkit::http_contract::StandIn {
+        self.1
+            .get_or_init(|| async {
+                rigging_tls::install_default_provider();
+                let router = || {
+                    let state = self.0.clone();
+                    axum::Router::new().fallback(axum::routing::any(move |r: axum::extract::Request| {
+                        let state = state.clone();
+                        async move {
+                            let (parts, body) = r.into_parts();
+                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            // Adapt the received wire request to the contract validator;
+                            // serialization and header/query encoding happened on TCP.
+                            let mut request =
+                                reqwest::Request::new(parts.method, format!("https://received.invalid{}", parts.uri).parse().unwrap());
+                            *request.headers_mut() = parts.headers;
+                            *request.body_mut() = Some(bytes.to_vec().into());
+                            let response = Self::respond(&state, request).unwrap();
+                            let (parts, body) = response.into_parts();
+                            http::Response::from_parts(parts, axum::body::Body::from(body))
+                        }
+                    }))
+                };
+                rigging_replay_testkit::http_contract::StandIn::start_many([
+                    ("https://app.daytona.io", router()),
+                    ("https://runner.invalid", router()),
+                    ("https://analytics.app.daytona.io", router()),
+                ])
+                .await
+            })
+            .await
+    }
+    fn respond(state: &Mutex<State>, request: reqwest::Request) -> std::result::Result<http::Response<Bytes>, String> {
+        let mut s = state.lock().unwrap();
         s.requests += 1;
         // Daytona requires bearer auth for both API and toolbox requests.
-        assert!(matches!(
+        let authorized = matches!(
             request.headers().get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer key-a" | "Bearer key-b" | "Bearer placeholder")
-        ));
-        let response = |status, body: Value| {
-            Ok(http::Response::builder()
+        );
+        let response = |status, mut body: Value| {
+            // Schema-valid vendor fixtures, independent of the module request.
+            if let Some(rows) = body.get_mut("items").and_then(Value::as_array_mut) {
+                for row in rows {
+                    *row = schema_row(row.clone());
+                }
+            } else if body.get("cpu").is_some() {
+                body = schema_row(body);
+            }
+
+            let mut response = http::Response::builder()
                 .status(status)
                 .header("x-ratelimit-limit-authenticated", "10000")
-                .header("x-ratelimit-remaining-authenticated", "9999")
-                .header("x-ratelimit-reset-authenticated", "60")
-                .header("retry-after", "17")
-                .body(Bytes::from(body.to_string()))
-                .unwrap())
+                .header("x-ratelimit-remaining-authenticated", if status == 429 { "0" } else { "9999" });
+            if status == 429 {
+                response = response.header("retry-after-sandbox-create", "17");
+            }
+            Ok(response.body(Bytes::from(body.to_string())).unwrap())
         };
+        if !authorized {
+            return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
+        }
         if let Some(status) = s.failure.take() {
-            return response(status, json!({"statusCode":status,"message":"key-a must never be echoed"}));
+            return response(status, json!({"statusCode":status,"message":"key-a must never be echoed","error":"Too Many Requests"}));
         }
         let method = request.method().as_str();
         let path = request.url().path();
-        let body: Value = request.body().and_then(|b| b.as_bytes()).map(|v| serde_json::from_slice(v).unwrap()).unwrap_or(Value::Null);
+        let body: Value = request
+            .body()
+            .and_then(|b| b.as_bytes())
+            .filter(|b| !b.is_empty())
+            .map(|v| serde_json::from_slice(v).unwrap())
+            .unwrap_or(Value::Null);
         if method == "POST" {
             assert_eq!(request.headers().get("content-type").is_some(), !body.is_null());
         }
@@ -124,37 +171,35 @@ impl HttpClient for StandIn {
                 response(200, json!({"items":rows,"nextCursor":next}))
             }
             ("POST", "/api/sandbox") => {
-                for key in [
-                    "snapshot",
-                    "labels",
-                    "target",
-                    "cpu",
-                    "memory",
-                    "disk",
-                    "networkAllowList",
-                    "networkBlockAll",
-                    "autoStopInterval",
-                    "autoDeleteInterval",
-                ] {
-                    assert!(!body[key].is_null(), "missing {key}");
+                let mut body = body;
+
+                // CreateSandbox has no required fields. Validate documented
+                // mutual exclusion and IPv4 CIDR syntax, not our caller's choices.
+                if ["networkAllowList", "domainAllowList", "networkBlockAll"].iter().filter(|k| !body[**k].is_null()).count() > 1 {
+                    return response(400, json!({"statusCode":400,"message":"network rules are mutually exclusive","error":"Bad Request"}));
                 }
-                assert_eq!(body["autoStopInterval"], 0);
-                assert_eq!(body["autoDeleteInterval"], -1);
-                let list = body["networkAllowList"].as_str().unwrap();
-                for cidr in list.split(',').filter(|c| !c.is_empty()) {
-                    let (ip, bits) = cidr.split_once('/').unwrap();
-                    ip.parse::<std::net::Ipv4Addr>().unwrap();
-                    assert!(bits.parse::<u8>().unwrap() <= 32);
+                if let Some(list) = body["networkAllowList"].as_str() {
+                    for cidr in list.split(',') {
+                        let valid = cidr.split_once('/').is_some_and(|(ip, bits)| {
+                            ip.parse::<std::net::Ipv4Addr>().is_ok() && bits.parse::<u8>().is_ok_and(|n| n <= 32)
+                        });
+                        if !valid {
+                            return response(400, json!({"statusCode":400,"message":"invalid CIDR","error":"Bad Request"}));
+                        }
+                    }
                 }
-                if list.is_empty() {
-                    assert_eq!(body["networkBlockAll"], true);
+                let defaults = json!({"name":format!("auto-{}",s.creates+1),"labels":{},"cpu":1,"memory":1,"disk":3});
+                for (key, value) in defaults.as_object().unwrap() {
+                    if body[key].is_null() {
+                        body[key] = value.clone();
+                    }
                 }
                 if s.rows.values().any(|v| v["name"] == body["name"]) {
                     return response(409, json!({"statusCode":409,"message":"name already exists"}));
                 }
                 s.creates += 1;
                 let id = format!("sandbox-{}", s.creates);
-                let row = json!({"id":id,"name":body["name"],"labels":body["labels"],"state":s.created_state.clone().unwrap_or_else(||"started".into()),"cpu":body["cpu"],"memory":body["memory"],"disk":body["disk"],"networkAllowList":body["networkAllowList"],"networkBlockAll":body["networkBlockAll"],"updatedAt":"2026-10-19T12:00:00Z"});
+                let row = json!({"id":id,"name":body["name"],"labels":body["labels"],"state":s.created_state.clone().unwrap_or_else(||"started".into()),"cpu":body["cpu"],"memory":body["memory"],"disk":body["disk"],"networkAllowList":body["networkAllowList"],"networkBlockAll":body["networkBlockAll"].as_bool().unwrap_or(false),"domainAllowList":body["domainAllowList"],"organizationId":"org-1","target":"eu","user":"daytona","public":false,"gpu":0,"env":{},"kvm":false,"toolboxProxyUrl":"https://runner.invalid/toolbox","updatedAt":"2026-10-19T12:00:00Z"});
                 s.rows.insert(id, row.clone());
                 response(201, row)
             }
@@ -212,6 +257,27 @@ impl HttpClient for StandIn {
         }
     }
 }
+#[async_trait]
+impl HttpClient for StandIn {
+    async fn execute(&self, request: reqwest::Request, label: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+        self.network().await.http.execute(request, label).await
+    }
+}
+
+fn schema_row(mut row: Value) -> Value {
+    let defaults = json!({"name":"fixture","labels":{},"cpu":1,"memory":1,"disk":3,"gpu":0,"organizationId":"org-1","target":"eu","user":"daytona","public":false,"env":{},"kvm":false,"networkBlockAll":false,"toolboxProxyUrl":"https://runner.invalid/toolbox"});
+    for (key, value) in defaults.as_object().unwrap() {
+        if row[key].is_null() {
+            row[key] = value.clone();
+        }
+    }
+    let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
+    for key in spec["schemas"]["Sandbox"]["required"].as_array().unwrap() {
+        assert!(!row[key.as_str().unwrap()].is_null(), "invalid vendor fixture missing {key}");
+    }
+    row
+}
+
 fn credentials(proxied: bool) -> Credentials {
     if proxied {
         Credentials::new(CredentialMode::Proxied { proxy_url: "http://proxy".into(), placeholder_token: Secret::new("placeholder") })
@@ -308,9 +374,9 @@ async fn lifecycle_and_credential_modes() {
         }
         let quota = ops.quota.unwrap().quota(&c).await.unwrap();
         assert_eq!(quota.resources[0].in_use, 2.0);
-        assert_eq!(quota.resources[0].limit, 10.0);
+        assert_eq!(quota.resources[0].limit, Some(10.0));
         let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-20T00:00:00Z".parse().unwrap()).unwrap();
-        assert_eq!(ops.usage.unwrap().usage(period, &c).await.unwrap().totals.unwrap().cost_usd, 0.0123);
+        assert_eq!(ops.usage.unwrap().usage(period, &c).await.unwrap().measurements.unwrap().cost.unwrap().amount, "0.0123");
         p.destroy(&id, &c).await.unwrap();
         p.destroy(&id, &c).await.unwrap();
         assert!(p.list(&c).await.unwrap().is_empty());
@@ -326,13 +392,13 @@ async fn vendor_errors() {
     let p = provider(http.clone()).await;
     let c = credentials(false);
     for (status, class) in [
-        (400, "refused"),
+        (400, "internal"),
         (401, "credential_rejected"),
         (402, "quota_exhausted"),
         (403, "credential_rejected"),
         (404, "not_found"),
-        (409, "refused"),
-        (422, "refused"),
+        (409, "internal"),
+        (422, "internal"),
         (429, "rate_limited"),
         (500, "unavailable"),
     ] {
@@ -340,7 +406,7 @@ async fn vendor_errors() {
         let before = http.0.lock().unwrap().requests;
         let e = p.list(&c).await.unwrap_err();
         assert_eq!(e.class(), class);
-        assert!(!serde_json::to_string(&e).unwrap().contains("key-a"));
+        assert!(!format!("{e:?}").contains("key-a"));
         if status == 429 {
             assert_eq!(e.retry_after(), Some(17));
         }
@@ -476,7 +542,7 @@ async fn observations_are_typed() {
         ("error", "runner unreachable", Observation::Unknown { reason: UnknownReason::HostUnreachable }),
         ("build_failed", "unknown vendor error", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
         ("paused", "", Observation::Stopped { cause: StopCause::PausedByProvider }),
-        ("creating", "", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+        ("creating", "", Observation::Transitioning { phase: TransitionPhase::Preparing }),
         ("destroyed", "", Observation::Gone { cause: GoneCause::DestroyedAtProvider }),
     ] {
         http.0
@@ -532,7 +598,7 @@ async fn preparation_converges_by_digest_pair() {
 
 // Activation is submitted once, then its lagging state is observed with paced
 // reads. Repeated activate POSTs cannot make that transition progress faster.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn inactive_snapshot_activates_once_then_polls() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
@@ -567,7 +633,7 @@ async fn bootstrap_budget_and_command_failure() {
 
 // A terminal start/build failure must return immediately, rather than spending
 // the entire successful-operation observation budget polling an impossible start.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
     for state in ["error", "build_failed", "destroyed"] {
         let http = Arc::new(StandIn::default());
@@ -604,7 +670,7 @@ async fn failing_probe_only_downgrades_its_row() {
     r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
     let env = row(p.provision(r, &c).await.unwrap());
     http.0.lock().unwrap().probe_exit = Some(1);
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { .. })));
     assert_eq!(p.list(&c).await.unwrap().len(), 1);
 }
 
@@ -612,6 +678,9 @@ async fn failing_probe_only_downgrades_its_row() {
 // Execute the actual emitted guest script in a disposable local directory.
 #[tokio::test]
 async fn stale_socket_fails_bootstrap_liveness() {
+    if std::process::Command::new("flock").arg("--version").output().is_err() {
+        return;
+    }
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials(false);
@@ -624,7 +693,7 @@ async fn stale_socket_fails_bootstrap_liveness() {
     assert!(socket.exists());
     let status = tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(script.replace("/run/drydock", dir.path().to_str().unwrap()))
+        .arg(script.replace("agent --socket /run/drydock/agent.sock", "true").replace("/run/drydock", dir.path().to_str().unwrap()))
         .status()
         .await
         .unwrap();
@@ -632,7 +701,7 @@ async fn stale_socket_fails_bootstrap_liveness() {
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let status = tokio::process::Command::new("sh")
         .arg("-c")
-        .arg(script.replace("/run/drydock", dir.path().to_str().unwrap()))
+        .arg(script.replace("agent --socket /run/drydock/agent.sock", "true").replace("/run/drydock", dir.path().to_str().unwrap()))
         .status()
         .await
         .unwrap();
@@ -714,7 +783,7 @@ async fn slow_start_does_not_queue_other_labels() {
 // Polling uses at most four concurrent probes, so one slow guest cannot
 // serialize every sandbox's inventory; row failures still preserve inventory.
 #[tokio::test]
-async fn list_probes_have_bounded_concurrency() {
+async fn list_never_runs_guest_probes() {
     let vendor = Arc::new(StandIn::default());
     let http = Arc::new(Latency::new(vendor.clone(), false, true));
     let p = provider_with_probe(http.clone(), true).await;
@@ -727,7 +796,7 @@ async fn list_probes_have_bounded_concurrency() {
     }
     vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
     assert_eq!(p.list(&c).await.unwrap().len(), 7);
-    assert_eq!(http.peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert_eq!(http.peak.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 // Reusing a label cannot silently return a wider network policy or a different
@@ -747,4 +816,80 @@ async fn existing_labels_surface_size_and_egress_mismatches() {
     changed.egress = EgressRequest::Open;
     assert!(matches!(p.provision(changed, &c).await, Err(ProtocolError::Refused { .. })));
     assert!(matches!(p.provision(r, &c).await.unwrap(), Provisioned::Existing(_)));
+}
+
+// Deny-all has no listed destination: a root proof of blocked canary/DNS is
+// enough, but missing facts, non-root execution and probe errors never enforce.
+#[tokio::test]
+async fn deny_all_proof_and_probe_diagnostics() {
+    let http = Arc::new(StandIn::default());
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
+    let env = row(p.provision(request(prep, "deny-all"), &c).await.unwrap());
+    assert_eq!(env.egress, Enforcement::Enforced);
+    assert!(http.0.lock().unwrap().executed.iter().any(|s| s.contains("DRYDOCK_PROBE_DENY_ALL=1")));
+    let before = http.0.lock().unwrap().executed.len();
+    p.list(&c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().executed.len(), before);
+    http.0.lock().unwrap().probe = Some(json!({"uid":1000,"unlisted_canary":false,"raw_dns":false}));
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":true,"raw_dns":false}));
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    http.0.lock().unwrap().probe_exit = Some(2);
+    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { exit_code: 2, .. })));
+}
+
+// Native host rules preserve request identity without consulting current DNS.
+// Mixed CIDR/domain requests are refused rather than weakening either policy.
+#[tokio::test]
+async fn native_domains_are_idempotent_and_mixed_rules_refused() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let mut r = request(prep, "domains");
+    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Host { host: "dual-stack.example".parse().unwrap() }] };
+    let env = row(p.provision(r.clone(), &c).await.unwrap());
+    assert_eq!(http.0.lock().unwrap().rows[&env.id]["domainAllowList"], "dual-stack.example");
+    assert!(matches!(p.provision(r.clone(), &c).await.unwrap(), Provisioned::Existing(_)));
+    let EgressRequest::DenyAll { direct } = &mut r.egress else { unreachable!() };
+    direct.push(Destination::Cidr { cidr: "192.0.2.0/24".parse().unwrap() });
+    assert!(matches!(p.provision(r, &c).await, Err(ProtocolError::Refused { .. })));
+}
+
+// The HTTP stand-in validates actual wire auth and networking rules. Empty
+// CreateSandbox is schema-valid; conflicting policies and malformed CIDRs aren't.
+#[tokio::test]
+async fn standin_enforces_vendor_wire_contract() {
+    let http = Arc::new(StandIn::default());
+    let network = http.network().await;
+    let client = rigging_tls::client_builder().build().unwrap();
+    for (token, body, expected) in [
+        ("wrong", json!({}), 401),
+        ("key-a", json!({"networkBlockAll":true,"networkAllowList":"0.0.0.0/0"}), 400),
+        ("key-a", json!({"networkAllowList":"not-a-cidr"}), 400),
+        ("key-a", json!({}), 201),
+    ] {
+        let r = client.post("https://app.daytona.io/api/sandbox").bearer_auth(token).json(&body).build().unwrap();
+        assert_eq!(network.http.execute(r, &ChannelLabel::Default).await.unwrap().status(), expected);
+    }
+    let p = provider(http.clone()).await;
+    let mut c = credentials(false);
+    c.value = Some(Secret::new("wrong"));
+    assert!(matches!(p.list(&c).await, Err(ProtocolError::CredentialRejected { .. })));
+}
+
+// Unknown HTTP responses retain bounded sensitive vendor evidence. Debug output
+// must redact it, but the authenticated supervisor can inspect the Secret.
+#[tokio::test]
+async fn internal_retains_vendor_body() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    http.0.lock().unwrap().failure = Some(400);
+    let error = p.list(&credentials(false)).await.unwrap_err();
+    assert!(!format!("{error:?}").contains("key-a"));
+    let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
+    assert!(provider_error.expose().contains("key-a must never be echoed"));
 }

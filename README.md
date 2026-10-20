@@ -36,9 +36,10 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
-Candidate transitional-observation and generic-resource shapes are documented
-in [the protocol proposal](docs/protocol-proposal-34.md). They are isolated from
-the active wire API, whose compatibility contract is described below.
+Protocol version 4 adds transitional observations and scoped resource measurements
+with UCUM units, exact decimal money plus currency, and structured quota keys.
+The host retains the last stable billing state across known progress samples;
+Unknown breaks that baseline. Resource vocabulary additions require a version bump.
 
 Protocol version 3 adds returned `CommandFailed` errors (HTTP 424, typed exit
 code and redacted merged output) and `DestroyedAtProvider` causes. Version 2

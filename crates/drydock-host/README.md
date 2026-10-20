@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol version 3 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 4 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
@@ -305,69 +305,70 @@ out of band: the mint route does not supply one. `ssh_endpoint` defaults to
 `ssh.app.daytona.io:22`; no host key is discovered through unauthenticated scanning.
 Never log or record a mint response or the serialized reach recipe.
 
-Egress always sets `networkAllowList` explicitly. Empty deny-all also sets
-`networkBlockAll: true`; Open sets `0.0.0.0/0`. CIDRs accept IPv4 only. The new
-`{"kind":"host","host":"example.com"}` destination resolves once during
-provision and pins every returned IPv4 address as `/32`; any IPv6 result or empty
-resolution refuses the request. DNS changes are **not** followed: provision a new
-label to refresh pinned addresses. Host-and-port entries are refused because
-Daytona cannot represent their port restriction.
+Egress always supplies exactly one networking control, avoiding Daytona's default
+allowlist: `networkBlockAll: true` for deny-all, `networkAllowList` for IPv4 CIDRs
+(or `0.0.0.0/0` for Open), and `domainAllowList` for host-only requests. Native
+domain rules follow Daytona's DNS updates; the module does no DNS pinning or
+AAAA rejection of dual-stack names. IPv6 literals/CIDRs, port-specific entries
+and mixed domain/CIDR requests are refused. Label retries compare normalized
+requested policies, not the results of a new DNS lookup.
 
-Egress is Advisory unless `egress_probe` is configured as an `ExecRequest`, e.g.
-`{"command":["/usr/local/bin/root-egress-probe"]}`. For each running restricted
-sandbox returned by provision/list/inspect, the module executes that command
-behind an explicit root UID check and requires exactly:
+The provider capability remains Advisory, including on low tiers where vendor
+organization restrictions may take precedence. Individual running sandboxes
+become Enforced only after an operator-configured `egress_probe` executes as root
+and proves blocked unlisted canary and raw DNS, plus successful listed access
+when the policy has listed destinations:
 
 ```json
 {"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
 ```
 
-The command must actually test the listed destination, an operator-controlled
-unlisted canary and raw DNS; it is trusted operator code, like the conformance
-checker's probe. **Do not substitute a command that prints constants.** Only this
-successful result returns Enforced. A nonmatching result returns Advisory, and a
-failed/invalid guest probe downgrades only that row to Advisory. Authentication
-rejections and organisation throttling still propagate as typed failures; failed
-inventory retrieval is never published as a complete list. Open, empty deny-all
-and nonrunning sandboxes remain Advisory.
-Inventory runs at most four probes concurrently. Probe on every observation
-avoids carrying a stale claim after an out-of-band
-policy change. Configuring a probe declares the Enforced capability so the
-conformance checker requires and tests the claim. Probe calls consume vendor
-requests in addition to inventory calls.
+For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
+is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
+real externally verified reachable services; never print constants as evidence.
+Provision, resume and explicit inspect measure the claim. Cheap list/poll calls
+do not exec; the host carries its last measured claim while running and clears
+it on stopped/gone/unknown state. Out-of-band policy changes need explicit
+inspect to refresh that evidence. A negative proof is Advisory; malformed
+proofs and toolbox failures surface typed diagnostics instead of silently
+flapping the claim or erasing inventory. Open/nonrunning rows are Advisory.
 
 Observation polls every 30 seconds, with complete cursor pagination, provider
 `updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The host
 owns all state diffs and event emission. Error reasons map OOM/eviction to loss
 causes, unreachable to host-unreachable, and other provider errors to API-error;
-unknown/transitional states never masquerade as running or gone. No webhooks.
+known progress maps to `Transitioning` phases; unestablished states alone are
+Unknown. The host keeps stable billing state across progress samples. No webhooks.
 
-The module declares the documented per-organisation Tier 1–4 general, creation
-and lifecycle limits (10k/300/10k through 50k/600/50k per minute). Each response
-reads the suffixed X-RateLimit limit/remaining/reset counters; 429 propagates
-Retry-After seconds without retry. Provision/build observation requests and guest
-probes also count toward the organisation's vendor limits. Other hosts sharing
-that organisation share those limits; host route budgets are not a global vendor
-quota reservation.
+The module declares per-organization Tier 1–4 general/create/lifecycle limits
+(10k/300/10k through 50k/600/50k per minute). Optional `rate_limits` overrides
+accept explicit host `RateLimit` rows for Enterprise contracts. A 429 reads
+`Retry-After-{throttler}`, falling back to the exhausted bucket's
+`X-RateLimit-Reset-{throttler}` remaining seconds (or plain Retry-After). It never retries.
+Unused cached rate-window state was removed: the host does not yet dynamically
+adjust its admission budget using successful responses' observed limit/remaining
+counters. That is an explicit gap, not global quota coordination. Completion
+waits, pagination, toolbox routing lookups and probes consume additional calls
+outside route admission; sharing an organization also shares these limits.
 
-Quota maps `/organizations/{id}/usage` into `Quota.resources` with current use,
-limits and units per region/class plus snapshots and volumes. Usage calls the
-analytics aggregated route and exposes CPU/RAM/disk/GPU seconds, count and USD
-cost in `Usage.totals`; `environment_hours` is empty because aggregates do not
-preserve sizes. These optional protocol fields keep older wire documents valid.
-The checker validates both forms and compares aggregate CPU when supplied.
+Quota reports structured region/class/resource keys with UCUM capacity units.
+Analytics reports organization-scoped neutral resource measurements, integrated
+UCUM units and exact decimal cost with currency code. Money is parsed from the
+original decimal lexeme before numeric conversion. `environment_hours` stays
+empty because aggregates cannot recover size distribution. Scope IDs are opaque.
+The conformance checker explicitly diagnoses organization aggregates as unable
+to establish one sandbox's stopped billing; it does not compare their CPU with
+one environment. Isolated environment metering remains unavailable on this route.
 
-For operator acceptance, configure an otherwise idle organisation, a real baked
-agent image, a pinned gateway key and matching root/network/reach probes. Run the
-standard conformance checker including the egress scenario; use a billing sample
-long enough for whole-second vendor aggregation and transition deadlines above
-the 30-second polling interval. Retain the JSON report's `usage.totals.cost_usd`
-as spend evidence. This crew's stand-in tests spend **$0**; live conformance and
-live cost remain operator acceptance, not claimed by the stand-in run.
+For operator acceptance, configure a real baked agent image, pinned gateway key,
+matching root/network/reach probes, and run conformance including egress. Retain
+`usage.measurements.cost` from the JSON report as spend evidence. This crew's
+stand-in spend is **$0**; live conformance and live spend are operator acceptance.
 
 Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
-and contain no URL credentials, query or fragment. Defaults are Daytona's public
-REST, toolbox proxy and analytics endpoints.
+and contain no URL credentials, query or fragment. REST and analytics default to Daytona's public endpoints. Toolbox routing uses
+each sandbox's required `toolboxProxyUrl` plus sandbox ID; `toolbox_url` is an
+explicit override only.
 
 Daytona toolbox `/process/execute` returns a buffered, merged `result` and an
 `exitCode`; it supplies neither separate stderr nor a live stdin/output stream.

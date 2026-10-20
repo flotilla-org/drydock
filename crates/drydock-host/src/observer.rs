@@ -80,7 +80,8 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
     })
 }
 
-fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironment>, rows: Vec<ObservedEnvironment>) {
+fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironment>, mut rows: Vec<ObservedEnvironment>) {
+    carry_egress(instance, &mut rows);
     let mut pending = vec![];
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.environment.id.clone(), row)).collect();
     {
@@ -154,6 +155,15 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, ObservedEnvironmen
     // retains an absent row awaiting a concurrent deletion outcome.
     instance.events.commit(current.values().cloned().collect(), pending);
     current.extend(deferred);
+    // Inventory records progress, while billing retains the last stable row
+    // across known transitions only. Unknown deliberately breaks that baseline.
+    for (id, row) in &mut current {
+        if matches!(row.environment.state, Observation::Transitioning { .. })
+            && let Some(old) = seen.get(id)
+        {
+            *row = old.clone();
+        }
+    }
     *seen = current;
 }
 

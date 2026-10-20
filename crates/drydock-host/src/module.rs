@@ -6,7 +6,8 @@ pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// Errors are serialized to authenticated host clients, including snapshot readers.
-/// Modules must exclude credentials from reasons and raw provider error text.
+/// Modules must exclude credentials from reasons. Raw diagnostics may contain
+/// sensitive vendor text and must use the protocol Secret fields.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
@@ -46,12 +47,14 @@ pub enum ObservationMode {
 /// Optional provider time travels separately from the environment wire representation.
 #[derive(Clone, Debug)]
 pub struct ObservedEnvironment {
+    /// False for cheap inventory that did not re-measure the isolation claim.
+    pub egress_measured: bool,
     pub environment: Environment,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl From<Environment> for ObservedEnvironment {
     fn from(environment: Environment) -> Self {
-        Self { environment, timestamp: None }
+        Self { environment, timestamp: None, egress_measured: true }
     }
 }
 pub enum Provisioned {

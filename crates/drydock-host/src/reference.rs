@@ -157,14 +157,14 @@ impl Provider for Reference {
             .environments
             .values()
             .cloned()
-            .map(|environment| ObservedEnvironment { environment, timestamp: state.provider_timestamp })
+            .map(|environment| ObservedEnvironment { egress_measured: true, environment, timestamp: state.provider_timestamp })
             .collect())
     }
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
         self.check()?;
         let environment = self.find(id)?;
         let timestamp = self.state.recover().provider_timestamp;
-        Ok(ObservedEnvironment { environment, timestamp })
+        Ok(ObservedEnvironment { egress_measured: true, environment, timestamp })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
@@ -356,7 +356,7 @@ impl UsageOperation for Reference {
                 }
             }
         }
-        Ok(Usage { period, environment_hours, totals: None })
+        Ok(Usage { period, environment_hours, measurements: None })
     }
 }
 

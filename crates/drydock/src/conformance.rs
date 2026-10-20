@@ -272,7 +272,10 @@ fn valid_usage(usage: &Usage, period: &Period) -> Result<()> {
     require(&usage.period == period, "usage period differs from request")?;
     require(
         usage.environment_hours.iter().all(|row| row.hours.is_finite() && row.hours >= 0.0 && valid_size(&row.size))
-            && usage.totals.as_ref().is_none_or(|totals| totals.cost_usd.is_finite() && totals.cost_usd >= 0.0),
+            && usage.measurements.as_ref().is_none_or(|m| {
+                m.resources.iter().all(|(kind, q)| q.amount.is_finite() && q.amount >= 0.0 && kind.accepts_unit(&q.unit))
+                    && m.cost.as_ref().is_none_or(|c| valid_decimal(&c.amount) && !c.currency.is_empty())
+            }),
         "invalid usage size or hours",
     )
 }
@@ -283,7 +286,10 @@ fn valid_quota(quota: &Quota) -> Result<()> {
     require(quota.credits_remaining.is_none_or(f64::is_finite), "nonfinite credits")?;
     require(
         quota.resources.iter().all(|r| {
-            !r.resource.is_empty() && !r.unit.is_empty() && r.in_use.is_finite() && r.in_use >= 0.0 && r.limit.is_finite() && r.limit >= 0.0
+            r.key.resource.accepts_unit(&r.unit)
+                && r.in_use.is_finite()
+                && r.in_use >= 0.0
+                && r.limit.is_none_or(|limit| limit.is_finite() && limit >= 0.0)
         }),
         "invalid resource quota",
     )
@@ -371,7 +377,9 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         if options.selected(Scenario::Refusal) {
             target.refusal(&mut report, &mut owned_ids).await;
         }
-        if options.selected(Scenario::Egress) && caps.egress.enforcement == Enforcement::Enforced {
+        if options.selected(Scenario::Egress)
+            && (caps.egress.enforcement == Enforcement::Enforced || environment.egress == Enforcement::Enforced)
+        {
             report.record("enforced_egress", egress(client, provider, environment, &options).await);
         }
         if options.selected(Scenario::HostFixtures) {
@@ -395,18 +403,21 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     report.elapsed_seconds = start.elapsed().as_secs_f64();
     report
 }
-async fn billing_window(client: &Client, provider: &str, size: &Size, millis: u64, running: bool) -> Result<()> {
+async fn billing_window(client: &Client, provider: &str, size: &Size, id: &str, millis: u64, running: bool) -> Result<()> {
     require((1..=60000).contains(&millis), "billing sample must be 1..60000 milliseconds")?;
     let start = chrono::Utc::now();
     tokio::time::sleep(Duration::from_millis(millis)).await;
     let period = Period::new(start.into(), chrono::Utc::now().into()).map_err(str::to_owned)?;
     let usage = client.usage(provider, &period).await.map_err(SafeError::category)?;
     valid_usage(&usage, &period)?;
-    if let Some(totals) = &usage.totals {
-        return require(
-            if running { totals.cpu_seconds > 0 } else { totals.cpu_seconds == 0 },
-            "vendor aggregate CPU disagrees with billing transition",
-        );
+    if let Some(m) = &usage.measurements {
+        // Aggregate organization usage cannot establish one sandbox's billing.
+        require(
+            matches!(&m.scope, UsageScope::Environment { id: measured } if measured == id),
+            "billing sample is organization/provider scoped or for another environment; isolated usage unavailable",
+        )?;
+        let cpu = m.resources.get(&ResourceKind::Cpu).filter(|q| q.unit == "{vCPU}.s").ok_or("isolated CPU seconds unavailable")?;
+        return require(if running { cpu.amount > 0.0 } else { cpu.amount == 0.0 }, "isolated CPU usage disagrees with billing transition");
     }
     let hours: f64 = usage.environment_hours.iter().filter(|row| &row.size == size).map(|row| row.hours).sum();
     require(if running { hours > 0.0 } else { hours == 0.0 }, "vendor usage disagrees with billing transition")
@@ -642,7 +653,10 @@ impl Target<'_> {
         if caps.usage
             && let Some(size) = &environment.granted_size
         {
-            report.record("billing_running", billing_window(client, provider, size, options.billing_sample_millis, true).await);
+            report.record(
+                "billing_running",
+                billing_window(client, provider, size, &environment.id, options.billing_sample_millis, true).await,
+            );
         }
         if caps.suspend_resume
             && let Some(token) = report.capture(
@@ -699,7 +713,10 @@ impl Target<'_> {
             if caps.usage
                 && let Some(size) = &environment.granted_size
             {
-                report.record("billing_suspended", billing_window(client, provider, size, options.billing_sample_millis, false).await);
+                report.record(
+                    "billing_suspended",
+                    billing_window(client, provider, size, &environment.id, options.billing_sample_millis, false).await,
+                );
             }
             if report
                 .capture(
@@ -1026,12 +1043,13 @@ async fn reach(client: &Client, provider: &str, id: &str, options: &Options) -> 
 }
 async fn egress(client: &Client, provider: &str, environment: &Environment, options: &Options) -> Result<()> {
     require(environment.egress == Enforcement::Enforced, "Enforced declaration downgraded")?;
-    require(
-        matches!(&options.request.egress, EgressRequest::DenyAll { direct } if direct.len() == 1),
-        "Enforced check requires DenyAll with exactly one destination",
-    )?;
-    let command = options.egress_probe.as_ref().ok_or("Enforced check requires root guest probe")?;
-    let mut stream = client.exec(provider, &environment.id, command).await.map_err(SafeError::category)?;
+    let EgressRequest::DenyAll { direct } = &options.request.egress else { return Err("Enforced check requires DenyAll".into()) };
+    let deny_all = direct.is_empty();
+    let mut command = options.egress_probe.clone().ok_or("Enforced check requires root guest probe")?;
+    if deny_all {
+        command.command.splice(0..0, ["env".into(), "DRYDOCK_PROBE_DENY_ALL=1".into()]);
+    }
+    let mut stream = client.exec(provider, &environment.id, &command).await.map_err(SafeError::category)?;
     let mut bytes = Vec::new();
     tokio::time::timeout(Duration::from_secs(options.timeouts.probe_seconds), (&mut stream).take(4097).read_to_end(&mut bytes))
         .await
@@ -1040,7 +1058,7 @@ async fn egress(client: &Client, provider: &str, environment: &Environment, opti
     require(bytes.len() <= 4096, "oversized guest probe output")?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(SafeError::category)?;
     require(
-        value == serde_json::json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}),
+        value["uid"] == 0 && value["unlisted_canary"] == false && value["raw_dns"] == false && (deny_all || value["listed_direct"] == true),
         "root egress probe violated isolation",
     )
 }
@@ -1178,7 +1196,7 @@ mod tests {
         let period = Period::new("2026-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();
         for value in [f64::NEG_INFINITY, -1., -0., 0., f64::MIN_POSITIVE, 1., f64::MAX, f64::INFINITY, f64::NAN] {
             let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
-            let usage = Usage { totals: None, period: period.clone(), environment_hours: vec![SizeUsage { size, hours: value }] };
+            let usage = Usage { measurements: None, period: period.clone(), environment_hours: vec![SizeUsage { size, hours: value }] };
             assert_eq!(valid_usage(&usage, &period).is_ok(), value.is_finite() && value >= 0.);
             let quota = Quota {
                 resources: vec![],
@@ -1193,27 +1211,29 @@ mod tests {
             let aggregate = Usage {
                 period: period.clone(),
                 environment_hours: vec![],
-                totals: Some(UsageTotals {
-                    cpu_seconds: 0,
-                    memory_gib_seconds: 0,
-                    disk_gib_seconds: 0,
-                    gpu_seconds: 0,
-                    cost_usd: value,
-                    environments: 0,
+                measurements: Some(UsageMeasurements {
+                    scope: UsageScope::Provider,
+                    resources: [(ResourceKind::Cpu, Quantity { amount: value, unit: "{vCPU}.s".into() })].into(),
+                    cost: None,
                 }),
             };
             assert_eq!(valid_usage(&aggregate, &period).is_ok(), value.is_finite() && value >= 0.0);
             let resources = Quota {
-                resources: vec![ResourceQuota { resource: "cpu".into(), unit: "vCPU".into(), in_use: value, limit: 10.0 }],
+                resources: vec![ResourceQuota {
+                    key: QuotaKey { region: None, class: None, resource: ResourceKind::Cpu },
+                    unit: "{vCPU}".into(),
+                    in_use: value,
+                    limit: Some(10.0),
+                }],
                 credits_remaining: None,
                 ..quota
             };
             assert_eq!(valid_quota(&resources).is_ok(), value.is_finite() && value >= 0.0);
             assert_eq!(valid_size(&Size { cpus: value, memory_bytes: 0, disk_bytes: 0 }), value.is_finite() && value > 0.);
         }
-        assert!(valid_usage(&Usage { totals: None, period: period.clone(), environment_hours: vec![] }, &period).is_ok());
+        assert!(valid_usage(&Usage { measurements: None, period: period.clone(), environment_hours: vec![] }, &period).is_ok());
         let other = Period::new("2025-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();
-        assert!(valid_usage(&Usage { totals: None, period: other, environment_hours: vec![] }, &period).is_err());
+        assert!(valid_usage(&Usage { measurements: None, period: other, environment_hours: vec![] }, &period).is_err());
     }
 }
 

@@ -125,7 +125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "3", "host_version": "fixture", "modules": modules,
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "4", "host_version": "fixture", "modules": modules,
                 "providers": [{"provider": name, "module": config["module"], "readiness": {"status": readiness.get(name, "ready"), **({"reason": "missing"} if readiness.get(name) == "missing_credential" else {})},
                                "capabilities": capabilities, "rate_limits": []} for name, config in providers.items()]})
         if parsed.path == "/v1/config":

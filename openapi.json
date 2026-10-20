@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "3"
+    "version": "4"
   },
   "paths": {
     "/v1/config": {
@@ -1168,6 +1168,22 @@
         "description": "A validated IPv4/IPv6 CIDR, preserving the caller's wire spelling.",
         "pattern": "^(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:[0-9]|[12][0-9]|3[0-2])|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
       },
+      "Cost": {
+        "type": "object",
+        "description": "Currency is explicit, e.g. USD or EUR; the field name fixes no currency.\nA missing cost is unknown, whereas an amount of zero is a known zero cost.",
+        "required": [
+          "amount",
+          "currency"
+        ],
+        "properties": {
+          "amount": {
+            "type": "string"
+          },
+          "currency": {
+            "type": "string"
+          }
+        }
+      },
       "CredentialMode": {
         "oneOf": [
           {
@@ -1853,6 +1869,24 @@
           {
             "type": "object",
             "required": [
+              "phase",
+              "state"
+            ],
+            "properties": {
+              "phase": {
+                "$ref": "#/components/schemas/TransitionPhase"
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "transitioning"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "reason",
               "state"
             ],
@@ -2284,6 +2318,22 @@
           }
         }
       },
+      "Quantity": {
+        "type": "object",
+        "required": [
+          "amount",
+          "unit"
+        ],
+        "properties": {
+          "amount": {
+            "type": "number",
+            "format": "double"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/String"
+          }
+        }
+      },
       "Quota": {
         "type": "object",
         "properties": {
@@ -2321,6 +2371,30 @@
             "items": {
               "$ref": "#/components/schemas/ResourceQuota"
             }
+          }
+        }
+      },
+      "QuotaKey": {
+        "type": "object",
+        "description": "Scope is data, never an opaque \"region/class/resource\" string. Missing scope\ncomponents mean the provider reports the resource at a broader scope.",
+        "required": [
+          "resource"
+        ],
+        "properties": {
+          "class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource": {
+            "$ref": "#/components/schemas/ResourceKind"
           }
         }
       },
@@ -2512,28 +2586,44 @@
           }
         ]
       },
+      "ResourceKind": {
+        "type": "string",
+        "description": "Initial provider-neutral vocabulary. Adding a resource is a protocol change,\nrather than inventing provider-specific encodings inside resource names.",
+        "enum": [
+          "cpu",
+          "memory",
+          "disk",
+          "gpu",
+          "snapshot_storage",
+          "volume_storage",
+          "environments"
+        ]
+      },
       "ResourceQuota": {
         "type": "object",
+        "description": "The same unit applies to current use and limit. Unknown limits stay unknown.\nA vector of these rows keeps structured keys representable as ordinary JSON.",
         "required": [
-          "resource",
+          "key",
           "unit",
-          "in_use",
-          "limit"
+          "in_use"
         ],
         "properties": {
           "in_use": {
             "type": "number",
             "format": "double"
           },
+          "key": {
+            "$ref": "#/components/schemas/QuotaKey"
+          },
           "limit": {
-            "type": "number",
+            "type": [
+              "number",
+              "null"
+            ],
             "format": "double"
           },
-          "resource": {
-            "type": "string"
-          },
           "unit": {
-            "type": "string"
+            "$ref": "#/components/schemas/String"
           }
         }
       },
@@ -2601,6 +2691,9 @@
           "guest_halted"
         ]
       },
+      "String": {
+        "type": "string"
+      },
       "Timestamp": {
         "type": "string",
         "format": "date-time",
@@ -2613,6 +2706,17 @@
           "adaptor"
         ]
       },
+      "TransitionPhase": {
+        "type": "string",
+        "description": "Generic phases describe progress, not billing transitions. The host retains\nits last stable billing observation until another stable observation arrives.",
+        "enum": [
+          "preparing",
+          "starting",
+          "stopping",
+          "reconfiguring",
+          "destroying"
+        ]
+      },
       "UnknownReason": {
         "type": "string",
         "enum": [
@@ -2623,6 +2727,7 @@
       },
       "Usage": {
         "type": "object",
+        "description": "Retain the original sandbox-hours-by-size slice. Optional measurements can\nreconcile other provider data without fabricating a distribution over sizes.",
         "required": [
           "period",
           "environment_hours"
@@ -2634,64 +2739,116 @@
               "$ref": "#/components/schemas/SizeUsage"
             }
           },
-          "period": {
-            "$ref": "#/components/schemas/Period"
-          },
-          "totals": {
+          "measurements": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/UsageTotals",
-                "description": "Organization aggregates; these cannot be reconstructed as hours by size."
+                "$ref": "#/components/schemas/UsageMeasurements"
               }
             ]
+          },
+          "period": {
+            "$ref": "#/components/schemas/Period"
           }
         }
       },
-      "UsageTotals": {
+      "UsageMeasurements": {
         "type": "object",
         "required": [
-          "cpu_seconds",
-          "memory_gib_seconds",
-          "disk_gib_seconds",
-          "gpu_seconds",
-          "cost_usd",
-          "environments"
+          "scope",
+          "resources"
         ],
         "properties": {
-          "cost_usd": {
-            "type": "number",
-            "format": "double",
-            "description": "Vendor's totalPrice, denominated in USD."
+          "cost": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Cost"
+              }
+            ]
           },
-          "cpu_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "resources": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Quantity"
+            },
+            "propertyNames": {
+              "type": "string",
+              "description": "Initial provider-neutral vocabulary. Adding a resource is a protocol change,\nrather than inventing provider-specific encodings inside resource names.",
+              "enum": [
+                "cpu",
+                "memory",
+                "disk",
+                "gpu",
+                "snapshot_storage",
+                "volume_storage",
+                "environments"
+              ]
+            }
           },
-          "disk_gib_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "environments": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "gpu_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "memory_gib_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "scope": {
+            "$ref": "#/components/schemas/UsageScope"
           }
         }
+      },
+      "UsageScope": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "provider"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "organization"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "environment"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Aggregated usage must say what population it measured. In particular,\norganisation totals cannot prove that one suspended environment stopped billing.\nOrganization and environment IDs are provider-opaque; consumers only compare them."
       }
     },
     "responses": {
