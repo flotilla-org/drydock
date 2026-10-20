@@ -129,6 +129,55 @@ impl Client {
     async fn get<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T> {
         self.call::<T, ()>(Method::GET, segments, None).await
     }
+    /// TCP hosts reject missing tokens and same-length tokens differing at every
+    /// position. This is a functional check, not a proof of constant-time execution.
+    /// Unix peer-credential policy must be checked by a process with another UID.
+    pub async fn authentication_check(&self) -> Result<()> {
+        let Some(token) = &self.bearer else {
+            return Ok(());
+        };
+        let mut candidates = vec![None];
+        for index in 0..token.expose().len() {
+            let mut bytes = token.expose().as_bytes().to_vec();
+            bytes[index] = if bytes[index] == b'a' { b'b' } else { b'a' };
+            if let Ok(value) = String::from_utf8(bytes) {
+                candidates.push(Some(value));
+            }
+        }
+        for candidate in candidates {
+            let mut request =
+                self.transport.get(self.base.join("v1/hello").map_err(|_| Error::InvalidRequest)?).timeout(Duration::from_secs(5));
+            if let Some(candidate) = candidate {
+                request = request.bearer_auth(candidate);
+            }
+            if request.send().await.map_err(|_| Error::Transport)?.status() != http::StatusCode::UNAUTHORIZED {
+                return Err(Error::InvalidResponse);
+            }
+        }
+        Ok(())
+    }
+    /// Inspect the JSON wire contract, including status and explicit null fields.
+    /// Uses the same endpoint, authentication and injectable HTTP port as typed calls.
+    pub async fn wire(
+        &self,
+        method: &str,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<(u16, serde_json::Value)> {
+        let method = Method::from_bytes(method.as_bytes()).map_err(|_| Error::InvalidRequest)?;
+        let mut request = self.request(method, segments)?.query(query).timeout(Duration::from_secs(30));
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = http_execute!(self.http, request.build().map_err(|_| Error::InvalidRequest)?).map_err(|_| Error::Transport)?;
+        let value = if response.status() == http::StatusCode::NO_CONTENT {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?
+        };
+        Ok((response.status().as_u16(), value))
+    }
     pub async fn hello(&self) -> Result<Hello> {
         let hello: Hello = self.get(&["v1", "hello"]).await?;
         if !hello.is_compatible() {

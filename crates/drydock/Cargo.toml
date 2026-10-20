@@ -11,9 +11,10 @@ rigging-process.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net", "io-util", "process"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
+chrono = "0.4"
 libc = "0.2"
 
 [dev-dependencies]

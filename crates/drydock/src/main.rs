@@ -15,6 +15,16 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Run destructive ADR 0070 checks using a unique label from a JSON options file.
+    Conformance {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        options: PathBuf,
+        /// Explicit consent to provision resources and incur provider charges.
+        #[arg(long)]
+        live: bool,
+    },
     Hosts,
     Instances,
     List {
@@ -55,7 +65,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if selected.is_some_and(|name| !specs.iter().any(|s| &s.name == name)) {
         return Err("unknown host".into());
     }
+    if let Command::Conformance { provider, live, .. } = &args.command {
+        let matching: Vec<_> = specs.iter().filter(|s| s.configuration.providers.iter().any(|p| &p.name == provider)).collect();
+        if matching.len() != 1 {
+            return Err("conformance provider must identify exactly one configured host".into());
+        }
+        // Provider names do not establish whether a module is hermetic.
+        if !live
+            && matching[0]
+                .configuration
+                .providers
+                .iter()
+                .filter(|p| &p.name == provider)
+                .any(|p| !matching[0].configuration.modules.iter().any(|m| m.name == p.module && m.entrypoint == "reference"))
+        {
+            return Err("live-provider conformance requires --live".into());
+        }
+    }
     for spec in specs {
+        if let Command::Conformance { provider, .. } = &args.command
+            && !spec.configuration.providers.iter().any(|p| &p.name == provider)
+        {
+            continue;
+        }
         if selected.is_some_and(|name| &spec.name != name) {
             continue;
         }
@@ -63,6 +95,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let mut handle = supervisor.start(spec).await?;
         let status = handle.ready(Duration::from_secs(15)).await;
         match &args.command {
+            Command::Conformance { provider, options, .. } => {
+                status?;
+                instance_ready(&handle, provider)?;
+                let options: drydock::conformance::Options =
+                    serde_json::from_slice(&tokio::fs::read(options).await?).map_err(|_| "invalid conformance options")?;
+                let report = drydock::conformance::run(&handle.client, provider, &options).await;
+                println!("{}", serde_json::to_string(&report)?);
+                if !report.passed() {
+                    return Err("provider failed conformance".into());
+                }
+            }
             Command::Hosts => {
                 let current = handle.status.borrow().clone();
                 println!("{}", serde_json::json!({"host":name,"readiness":current.readiness}));

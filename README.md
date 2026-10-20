@@ -128,3 +128,93 @@ no Display implementation. Explicit-null serialization is part of protocol v1.
 Exec intentionally uses POST with a 101 upgrade, while relay uses GET; some HTTP
 proxies and generated clients handle POST upgrades poorly, so hosts and clients
 must use a transport that preserves the upgrade rather than changing the method.
+
+## Conformance
+
+`drydock conformance --provider NAME --options probe.json` runs destructive
+ADR 0070 scenarios against exactly one provider in the normal `--config` host
+configuration. Unix sockets, managed host binaries and authenticated loopback
+TCP hosts all use the same client and scenario list. A built-in provider can
+expose that same endpoint without a special test interface. The Rust reference
+binary and a small independent Python socket fixture run this list in CI; the
+fixture also deliberately violates each behavioural check. Existing deterministic
+polling, Unix peer-credential and TCP upgrade tests remain in the host suite.
+
+For example, after preparing an image through the provider:
+
+```json
+{
+  "request": {
+    "label": "conformance-unique-run-id",
+    "prepared": {
+      "provider": "reference", "id": "prepared-1",
+      "image_digest": "sha256:image", "tools_digest": "sha256:tools"
+    },
+    "size": {"cpus": 1, "memory_bytes": 1024, "disk_bytes": 0},
+    "egress": {"mode": "deny_all", "direct": []},
+    "ssh_public_key": null
+  },
+  "echo_relay": true,
+  "reach_probe": null,
+  "egress_probe": null
+}
+```
+
+```sh
+drydock --config hosts.json --runtime-directory /private/runtime \
+  conformance --provider reference --options probe.json
+# Vendor modules require explicit consent to charges:
+drydock --config hosts.json --runtime-directory /private/runtime \
+  conformance --provider daytona --options daytona-probe.json --live
+```
+
+Use a unique label and an idle test account. The runner provisions, suspends and
+resumes when supported, and destroys its environment, including after failed
+checks. It returns nonzero if any check fails and prints a JSON report with
+individual verdicts, elapsed resource exposure, provider-reported usage for the
+run period, before/after quota, and a credit delta when available in the same
+unit. Missing cost data is `null`, never an assertion of zero spend. These account
+figures can include concurrent workloads and delayed vendor accounting; they are
+not a monetary estimate. Preparation is explicit so the operator controls the
+image, tools and preparation spend. Live Daytona and then Namespace validation
+are operator runs once their modules and test credentials exist.
+
+`echo_relay` is only for fixtures whose relay is an echo server. Real agents have
+a protocol: provide `reach_probe: ["/absolute/path/to/round-trip-probe", ...]`.
+It receives the returned SSH, Dial or Relay recipe as JSON on stdin, establishes
+and authenticates the recipe, exchanges bytes with the agent, then exits zero
+only on success. It owns SSH private-key material matching `ssh_public_key`.
+The runner suppresses probe output and never puts recipe secrets in argv or
+reports. Missing probes fail the stream check rather than silently accepting a
+recipe declaration. The same seam supports every declared recipe as providers
+are added; it does not assume arbitrary agent streams echo input.
+
+An `Enforced` provider must also use `DenyAll` with exactly one direct destination
+and supply `egress_probe: {"command": [...]}`. Copy
+[`tools/egress-probe.py`](tools/egress-probe.py) into the prepared guest and run it
+through exec as root, with these arguments: listed IP, listed port, unlisted
+canary IP, canary port, and raw DNS server IP. Use IP literals and independently
+verify that both TCP services and the DNS server are reachable outside the
+sandbox before the run. This avoids confusing an unavailable canary with an
+enforced policy. The probe bypasses process proxy settings with direct sockets
+and sends an actual UDP DNS query. Its entire output must be:
+
+```json
+{"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
+```
+
+Any other result, missing root evidence, missing probe, refusal of the required
+allowlist, or downgrade to Advisory fails an Enforced claim. Providers without
+exec can supply the probe through a guest bridge when that tooling is available;
+currently this check requires exec and cannot silently pass without it.
+
+TCP authentication checks reject absent tokens and tokens changed at each byte
+position. Constant-time execution additionally requires source review: network
+timing tests cannot prove it. The Rust host delegates to pinned
+`rigging-http-serve`, which compares fixed-length SHA-256 digests using
+`subtle::ConstantTimeEq`; the independent fixture uses `hmac.compare_digest`.
+Other hosts must provide equivalent source evidence alongside their run. Unix
+peer rejection still runs under a mismatched UID in the host tests. Explicit-null
+checks inspect raw JSON, while typed decoders check event timestamp/source,
+granted sizes and loss enums. The runner owns usage/quota range validation
+rather than trusting a successful decode of floating-point fields.

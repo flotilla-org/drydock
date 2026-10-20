@@ -58,6 +58,26 @@ async fn cli_lifecycle_against_reference_host() {
         serde_json::from_str(&run(vec!["launch".into(), "rust".into(), "a".into(), request.to_string_lossy().into_owned()]).await).unwrap();
     let list: Vec<Environment> = serde_json::from_str(&run(vec!["list".into(), "rust".into(), "a".into()]).await).unwrap();
     assert_eq!(list, vec![environment.clone()]);
+    let options = drydock::conformance::Options {
+        request: ProvisionRequest {
+            label: "cli-conformance".into(),
+            prepared: client.prepare("a", &PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }).await.unwrap(),
+            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            egress: EgressRequest::default(),
+            ssh_public_key: None,
+        },
+        echo_relay: true,
+        reach_probe: None,
+        egress_probe: None,
+    };
+    let options_file = dir.path().join("conformance.json");
+    std::fs::write(&options_file, serde_json::to_vec(&options).unwrap()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(
+        &run(vec!["conformance".into(), "--provider".into(), "a".into(), "--options".into(), options_file.to_string_lossy().into_owned()])
+            .await,
+    )
+    .unwrap();
+    assert!(report["checks"].as_array().unwrap().iter().all(|check| check["passed"] == true));
     run(vec!["destroy".into(), "rust".into(), "a".into(), environment.id]).await;
     assert!(client.list("a").await.unwrap().is_empty());
     server.abort();
