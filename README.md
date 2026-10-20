@@ -36,6 +36,16 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
+Protocol version 2 changes snapshot reconciliation semantics. Clients must check
+`hello.protocol_version` for an exact match before using any provider or event
+route (ADR 0070). Version 1 clients must not consume version 2 snapshots: ignoring
+`unavailable_providers` could turn unavailable inventory into false deletions or
+billing transitions. Upgrade snapshot reconciliation before accepting version 2.
+The HTTP route namespace remains `/v1`; the hello version is the compatibility gate.
+Snapshot errors retain the same typed details as route errors, including vendor
+reasons and raw `Internal` error text. They are visible to authenticated host clients;
+modules must exclude credentials from error text. The host does not sanitize it.
+
 Wire conventions chosen for this first protocol version:
 
 - Names follow the ADR amendment: configured `providers` load `modules`;

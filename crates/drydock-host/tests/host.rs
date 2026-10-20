@@ -850,6 +850,35 @@ async fn unready_polled_provider_has_snapshot_marker() {
     assert!(control.list_calls.load(SeqCst) >= 1);
 }
 
+// Cached polling rows are withheld, with a marker, after the provider becomes
+// unready. Recovery restores the inventory without inferring a deletion.
+#[tokio::test]
+async fn unready_polled_provider_withholds_cached_inventory() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    control.poll.store(true, SeqCst);
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let prepared = h.prepared("a").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let environment = h.provision("a", "cached", &prepared, 201).await;
+    for _ in 0..2 {
+        events.next().await;
+    }
+    let mut cached = h.stream(None).await;
+    assert!(matches!(cached.next().await, ObserveRecord::Snapshot { environments, .. } if environments == vec![environment.clone()]));
+    control.missing_tool.store(true, SeqCst);
+    let mut unavailable = h.stream(None).await;
+    let record = serde_json::to_value(unavailable.next().await).unwrap();
+    assert_eq!(record["environments"], json!([]));
+    assert_eq!(record["unavailable_providers"]["a"]["kind"], "unavailable");
+    control.missing_tool.store(false, SeqCst);
+    let mut repaired = h.stream(None).await;
+    assert!(matches!(repaired.next().await, ObserveRecord::Snapshot { environments, unavailable_providers, .. }
+        if environments == vec![environment] && unavailable_providers.is_empty()));
+}
+
 // A rejected proxy remains callable for repair. Events must both isolate a
 // persistent rejection and repair a push provider once its list probe succeeds.
 #[tokio::test]

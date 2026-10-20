@@ -440,7 +440,10 @@ impl Host {
             for mut task in tasks {
                 if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
                     task.abort();
-                    tracing::warn!(route = "shutdown", "observer did not stop within grace period");
+                    tracing::warn!(
+                        route = "shutdown",
+                        "observer exceeded grace period; aborted without waiting, non-yielding work may remain"
+                    );
                     // Abort is cooperative: never await a task that may not yield.
                 }
             }
@@ -529,19 +532,20 @@ impl Host {
             {
                 // A poll's inventory and its events are committed under this same lock.
                 let log = self.events.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let pending = instances.iter().fold(false, |pending, i| {
+                let mut pending = false;
+                for i in &instances {
                     if i.poll_interval.is_none()
                         || unavailable_providers.contains_key(&i.config.name)
                         || log.inventories.contains_key(&i.config.name)
                     {
-                        return pending;
+                        continue;
                     }
                     if let Some(error) = i.poll_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
                         unavailable_providers.insert(i.config.name.clone(), error);
-                        return pending;
+                        continue;
                     }
-                    true
-                });
+                    pending = true;
+                }
                 if !pending {
                     let mut environments: Vec<_> = log
                         .inventories
@@ -1069,5 +1073,41 @@ mod tests {
         drop(release_tx);
         let _ = done_tx.send(());
         worker.join().unwrap();
+    }
+    // A configure queued at commit when shutdown starts must observe the stop
+    // under the write lock and leave neither providers nor observers behind.
+    #[tokio::test]
+    async fn shutdown_racing_configuration_commit_leaves_no_providers() {
+        let host = Host::new(reference::registry());
+        let request = serde_json::from_value(serde_json::json!({
+            "modules": [{"name":"memory", "entrypoint":"reference"}],
+            "providers": [{"name":"a", "module":"memory", "settings":{}, "credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        let held = host.config.read().await;
+        let configuring = tokio::spawn(configure(State(host.clone()), ApiJson(request)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            // Tokio's write-preferring lock refuses new reads once commit queues.
+            while host.config.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configure must reach commit");
+        // Queue a reader after commit but before shutdown's clear, so it can
+        // detect even a transient forbidden commit rather than only final state.
+        let config = host.config.clone();
+        let committed_state = tokio::spawn(async move { config.read().await.providers.is_empty() });
+        tokio::task::yield_now().await;
+        let shutdown = tokio::spawn(host.shutdown(async {}));
+        let mut stopping = host.stopping.subscribe();
+        stopping.wait_for(|stopped| *stopped).await.unwrap();
+        drop(held);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), configuring).await.unwrap().unwrap();
+        assert!(matches!(result, Err(ApiError(ProtocolError::Unavailable { .. }))));
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown).await.unwrap().unwrap();
+        assert!(host.config.read().await.providers.is_empty());
+        assert!(host.tasks.lock().unwrap().is_empty());
+        assert!(committed_state.await.unwrap(), "a stopping configure must never commit providers");
     }
 }

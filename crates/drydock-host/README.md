@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol v1 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 2 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
@@ -120,13 +120,15 @@ Snapshot rows mark a metering gap and do not create extra billing transitions.
 
 Snapshots omit inventory for unready providers and failed push lists, reporting
 those providers in an optional `unavailable_providers` map of name to typed error.
+Cached poll rows are also withheld when that provider is unready; a ready provider's
+cached inventory remains available through transient polling failures.
 The map is absent for a complete snapshot. Consumers must preserve previous inventory
 for marked providers: missing rows are not evidence of deletion or a billing transition.
 Healthy providers continue streaming. Push lists use the normal call gate, so a
 successful list repairs a proxied rejection without requiring a separate route call.
 Direct credentials still require refresh. Poll providers repair through normal polling.
 Retained-cursor replay does not list. Host stopping still returns an initial typed
-HTTP error or ends an existing stream. V1 defines no terminal NDJSON error record.
+HTTP error or ends an existing stream. The protocol defines no terminal NDJSON error record.
 Polling cannot report transitions hidden entirely between samples; modules with
 event streams declare Push.
 
