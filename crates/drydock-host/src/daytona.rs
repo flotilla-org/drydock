@@ -328,7 +328,8 @@ impl Daytona {
         Ok(())
     }
     async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        // Observe an asynchronous operation, never retry a failed vendor request.
+        // Observe only successful asynchronous operations. Any failed GET exits
+        // immediately; retrying failures is the caller's policy, not this loop's.
         for _ in 0..60 {
             let raw = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
             match text(&raw, "state")? {

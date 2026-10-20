@@ -380,3 +380,10 @@ sandbox start failures are returned immediately. A provider-reported `destroyed`
 without eviction metadata is `DestroyedAtProvider`, rather than claiming that the
 guest powered itself off; confirmed Drydock deletion still uses the host's
 `DestroyedByRequest` event cause.
+
+The module's bounded completion waits are distinct from the host's observation
+poller: prepare permits up to 120 successful state reads at two-second intervals,
+and start/stop permit up to 60. A failed GET exits immediately; the caller owns
+failure retries. These internal reads do not currently consume separate host
+route-budget slots. That is a known limitation under the required rate-window
+review work, not an additional module observation/reconciliation loop.
