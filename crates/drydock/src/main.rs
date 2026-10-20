@@ -120,6 +120,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 status?;
                 instance_ready(&handle, provider)?;
                 let options = conformance_options.as_ref().ok_or("missing conformance options")?;
+                if options.billing_settle_millis > 0 {
+                    eprintln!(
+                        "Billing checks wait {} ms after each sample for vendor accounting to settle.",
+                        options.billing_settle_millis
+                    );
+                }
                 let report = drydock::conformance::run(&handle.client, provider, options).await;
                 println!("{}", serde_json::to_string(&report)?);
                 if !report.passed() {

@@ -587,6 +587,11 @@ impl TryFrom<UncheckedPeriod> for Period {
     }
 }
 impl ProtocolError {
+    /// Retryable unavailability without sensitive provider diagnostics.
+    pub fn unavailable(reason: impl Into<String>, retry_after: Option<u64>) -> Self {
+        Self::Unavailable { provider_error: None, reason: reason.into(), retry_after }
+    }
+
     /// Static diagnostics label; never exposes vendor error text.
     pub const fn class(&self) -> &'static str {
         match self {

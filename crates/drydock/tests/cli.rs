@@ -28,10 +28,14 @@ async fn cli_lifecycle_against_reference_host() {
                 .arg(config)
                 .arg("--runtime-directory")
                 .arg(runtime)
-                .args(args)
+                .args(&args)
                 .output()
                 .await
                 .unwrap();
+            if args.first().is_some_and(|arg| arg == "conformance") {
+                // Settle progress belongs on stderr; the caller still parses stdout as one JSON report.
+                assert!(String::from_utf8_lossy(&output.stderr).contains("Billing checks wait 1 ms"));
+            }
             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
             String::from_utf8(output.stdout).unwrap()
         }
@@ -78,6 +82,7 @@ async fn cli_lifecycle_against_reference_host() {
         ],
         fixture_configuration: None,
         billing_sample_millis: 25,
+        billing_settle_millis: 1,
         null_environment_id: None,
         auth_audit: None,
         timeouts: Default::default(),

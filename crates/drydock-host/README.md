@@ -115,6 +115,11 @@ use DestroyedByRequest; unexplained absence uses MissingOnList. If a list observ
 absence while destroy is pending, the host defers the billing cause until the call
 confirms or fails. Failure/cancellation is never promoted to confirmed deletion.
 
+The default `inspect_after_lifecycle` reads the complete inventory to avoid guest
+probes on a completed lifecycle. This costs O(inventory); providers with a cheap
+per-environment read can override it, as Daytona does, retaining that observation
+if optional enrichment fails. Explicit inspect remains strict.
+
 Modules return `ObservedEnvironment` from list/inspect: the environment plus an optional
 typed provider timestamp. Polling uses that time, including matching inspect
 metadata when list has none; otherwise the host stamps first observation with
@@ -368,7 +373,9 @@ live metering acceptance assumption. Money is parsed from the
 original decimal lexeme before numeric conversion and uses the documented USD
 denomination, without inventing a vendor currency field. `environment_hours` is
 filled from the documented per-sandbox usage totals and usage-period routes,
-clipping each size period to the requested window. Scope IDs are opaque.
+clipping each size period to the requested window. Missing `endAt` denotes an
+ongoing period clipped to the earlier of the window end and the current time;
+zero-CPU periods are skipped. Scope IDs are opaque.
 Conformance uses size-hours when measurements are aggregate and isolated CPU
 measurements when explicitly environment-scoped. Size-hours are still grouped
 by size across the organization: use an otherwise idle organization or a unique
@@ -376,8 +383,20 @@ size for live transition attribution; aggregation cannot distinguish unrelated
 sandboxes with the same size. Empty usage windows yield zero size-hours. Aggregate measurements and per-sandbox
 periods are separate sequential reads, not an atomic provider snapshot; eventual
 updates or ongoing state changes can make them disagree. Compare settled windows
-and allow for vendor accounting delay during live conformance. Usage currently
-fans out sequentially across all IDs returned for the organization/window;
+with conformance options `billing_sample_millis` (default 25, range 1..60000)
+and `billing_settle_millis` (default 0, range 0..86400000).
+For both running and suspended checks,
+conformance records the start, waits the sample duration, records the end, then
+waits the settle duration before querying that exact period. This wait is separate
+from the request/event deadlines in `timeouts`, including host-fixture billing
+checks, and adds that duration to each billing check. It keeps the sandbox
+in the sampled lifecycle state while waiting. For example,
+`"billing_sample_millis": 60000, "billing_settle_millis": 120000` reads a roughly
+60-second window that ended at least two minutes before the usage request.
+Choose the settle duration to cover vendor accounting delay during live acceptance.
+The CLI announces a nonzero per-sample settle delay on stderr; stdout remains the
+JSON conformance report.
+Usage currently fans out sequentially across all IDs returned for the organization/window;
 individual-call budgeting and bounded fan-out are tracked in drydock#35.
 
 For operator acceptance, configure a real baked agent image, pinned gateway key,

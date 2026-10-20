@@ -515,10 +515,11 @@ impl drydock_host::module::Provider for ControlledProvider {
             let url = self.control.http_url.lock().unwrap().clone().unwrap_or_else(|| "https://vendor.example/prepare".into());
             let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
             request.headers_mut().insert("Authorization", format!("Bearer {}", c.token().unwrap().expose()).parse().unwrap());
-            let response =
-                self.http.execute(request, &rigging_http_client::http_channel_label("GET", &url)).await.map_err(|_| {
-                    ProtocolError::Unavailable { provider_error: None, reason: "transport failure".into(), retry_after: None }
-                })?;
+            let response = self
+                .http
+                .execute(request, &rigging_http_client::http_channel_label("GET", &url))
+                .await
+                .map_err(|_| ProtocolError::unavailable("transport failure", None))?;
             if response.status() == 401 {
                 return Err(ProtocolError::CredentialRejected { reason: "vendor rejected credential".into() });
             }
@@ -548,7 +549,7 @@ impl drydock_host::module::Provider for ControlledProvider {
             return Err(ProtocolError::CredentialRejected { reason: "vendor credential rejected".into() });
         }
         if vendor.0 {
-            return Err(ProtocolError::Unavailable { provider_error: None, reason: "vendor unavailable".into(), retry_after: None });
+            return Err(ProtocolError::unavailable("vendor unavailable", None));
         }
         if let Some(row) = vendor.1 {
             rows.push(ObservedEnvironment {
@@ -582,7 +583,7 @@ impl drydock_host::module::Provider for ControlledProvider {
             self.control.destroy_release.notified().await;
         }
         if self.control.fail_destroy.load(std::sync::atomic::Ordering::SeqCst) {
-            Err(ProtocolError::Unavailable { provider_error: None, reason: "ambiguous vendor failure".into(), retry_after: None })
+            Err(ProtocolError::unavailable("ambiguous vendor failure", None))
         } else {
             Ok(())
         }

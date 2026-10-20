@@ -106,7 +106,7 @@ fn loss_cases() -> Vec<(&'static str, GoneCause)> {
 fn error_cases() -> Vec<ProtocolError> {
     vec![
         ProtocolError::Refused { reason: "fixture".into() },
-        ProtocolError::Unavailable { provider_error: None, reason: "fixture".into(), retry_after: Some(3) },
+        ProtocolError::unavailable("fixture", Some(3)),
         ProtocolError::RateLimited { reason: "fixture".into(), retry_after: Some(7) },
         ProtocolError::QuotaExhausted { reason: "fixture".into() },
         ProtocolError::CredentialRejected { reason: "fixture".into() },
@@ -423,6 +423,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                     &client.inspect(provider, &row.id).await.map_err(SafeError::category)?.granted_size.ok_or("missing granted size")?,
                     &row.id,
                     options.billing_sample_millis,
+                    options.billing_settle_millis,
                     false,
                 )
                 .await
