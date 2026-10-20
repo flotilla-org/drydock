@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 drydock-protocol = { path = "../drydock-protocol" }
+futures = "0.3"
 rigging-http-client.workspace = true
 rigging-http-serve.workspace = true
 rigging-stream.workspace = true
@@ -30,7 +31,6 @@ rigging-tls.workspace = true
 rigging-replay-testkit.workspace = true
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query"] }
-futures = "0.3"
 hegeltest = "=0.48.1"
 http = "1"
 bytes = "1"

@@ -123,3 +123,16 @@ fn generated_request_semantics(tc: hegel::TestCase) {
     assert_eq!(serde_json::from_value::<ExecRequest>(json!({"command":[text,""]})).is_ok(), nonempty);
     assert!(serde_json::from_value::<ExecRequest>(json!({"command":[]})).is_err());
 }
+
+// Proxy placeholder tokens have the same non-empty wire constraint as refreshed
+// credentials. The generator spans empty, one-byte, and longer placeholder values.
+#[hegel::test]
+fn proxy_placeholder_requires_a_value(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(64));
+    let token = "x".repeat(length);
+    let result = serde_json::from_value::<CredentialMode>(json!({
+        "mode":"proxied", "placeholder_token":token, "proxy_url":"http://localhost:1234"
+    }));
+    assert_eq!(result.is_ok(), length > 0);
+}

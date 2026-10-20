@@ -73,7 +73,7 @@ pub struct PushContext {
 }
 /// No host-side provider lock. Implementations own any internal synchronization.
 /// Capability declarations are stable. The host gates optional calls in one place;
-/// implement every method explicitly, even when a capability is disabled.
+/// optional ports are stable for the configured lifetime. Omit unsupported ports.
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Lifetime of a push observer. Poll providers never receive this hook.
@@ -82,6 +82,9 @@ pub trait Provider: Send + Sync {
             let _ = context.stopping.changed().await;
         }
         Ok(())
+    }
+    fn operations(&self) -> Operations<'_> {
+        Operations::default()
     }
     fn capabilities(&self) -> Capabilities;
     fn observation(&self) -> ObservationMode;
@@ -101,11 +104,36 @@ pub trait Provider: Send + Sync {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()>;
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection>;
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream>;
-    async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream>;
-    async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken>;
-    async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()>;
-    async fn export(&self, id: &str, c: &Credentials) -> Result<Export>;
-    async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage>;
-    async fn quota(&self, c: &Credentials) -> Result<Quota>;
 }
 pub type Registry = BTreeMap<String, Arc<dyn Module>>;
+
+/// Borrowed optional ports; calls retain shared-reference concurrency.
+#[derive(Default)]
+pub struct Operations<'a> {
+    pub exec: Option<&'a dyn Exec>,
+    pub suspend_resume: Option<&'a dyn SuspendResume>,
+    pub export: Option<&'a dyn ExportOperation>,
+    pub usage: Option<&'a dyn UsageOperation>,
+    pub quota: Option<&'a dyn QuotaOperation>,
+}
+#[async_trait]
+pub trait Exec: Send + Sync {
+    async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream>;
+}
+#[async_trait]
+pub trait SuspendResume: Send + Sync {
+    async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken>;
+    async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()>;
+}
+#[async_trait]
+pub trait ExportOperation: Send + Sync {
+    async fn export(&self, id: &str, c: &Credentials) -> Result<Export>;
+}
+#[async_trait]
+pub trait UsageOperation: Send + Sync {
+    async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage>;
+}
+#[async_trait]
+pub trait QuotaOperation: Send + Sync {
+    async fn quota(&self, c: &Credentials) -> Result<Quota>;
+}

@@ -1145,7 +1145,9 @@
                 ]
               },
               "placeholder_token": {
-                "$ref": "#/components/schemas/Secret"
+                "type": "string",
+                "format": "password",
+                "minLength": 1
               },
               "proxy_url": {
                 "type": "string"
