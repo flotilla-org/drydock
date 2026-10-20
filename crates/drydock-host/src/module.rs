@@ -50,12 +50,14 @@ pub struct ObservedEnvironment {
     /// True only when this call measured the isolation claim; conversion from
     /// a bare Environment conservatively supplies no measurement evidence.
     pub egress_measured: bool,
+    /// Opaque effective-policy identity, present on every cheap observation when supported.
+    pub egress_policy: Option<String>,
     pub environment: Environment,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl From<Environment> for ObservedEnvironment {
     fn from(environment: Environment) -> Self {
-        Self { environment, timestamp: None, egress_measured: false }
+        Self { environment, timestamp: None, egress_measured: false, egress_policy: None }
     }
 }
 pub enum Provisioned {
@@ -105,6 +107,10 @@ pub trait Provider: Send + Sync {
     /// still visible but no billable Running transition can be inferred.
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>>;
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment>;
+    /// Lifecycle enrichment must not turn a completed lifecycle into a probe failure.
+    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+        self.inspect(id, c).await
+    }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()>;
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection>;
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream>;

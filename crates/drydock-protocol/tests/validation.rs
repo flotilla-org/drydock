@@ -61,7 +61,7 @@ fn every_route_carries_typed_error_statuses() {
         ProtocolError::NotFound { reason: "r".into() },
         ProtocolError::MethodNotAllowed { reason: "r".into() },
         ProtocolError::Refused { reason: "r".into() },
-        ProtocolError::Unavailable { reason: "r".into(), retry_after: None },
+        ProtocolError::Unavailable { provider_error: None, reason: "r".into(), retry_after: None },
         ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },
         ProtocolError::QuotaExhausted { reason: "r".into() },
         ProtocolError::CredentialRejected { reason: "r".into() },

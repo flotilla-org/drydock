@@ -329,12 +329,16 @@ when the policy has listed destinations:
 For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
 is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
 real externally verified reachable services; never print constants as evidence.
-Provision, host resume completion and explicit inspect measure the claim. Cheap list/poll calls
-do not exec; the host carries its last measured claim for at most 60 seconds while running and clears
-it on stopped/gone/unknown state. Out-of-band policy changes may retain the old claim until that expiry; explicit
-inspect refreshes the evidence immediately. Cheap inventory never extends its age. A negative proof is Advisory; malformed
-proofs and toolbox failures surface typed diagnostics instead of silently
-flapping the claim or erasing inventory. Open/nonrunning rows are Advisory.
+Provision, host resume completion and explicit inspect measure the claim. Cheap
+list/poll calls do not exec. Every Daytona observation carries an opaque effective
+policy fingerprint; the host retains measured evidence while running with the
+same fingerprint, and invalidates it on policy change, stopped/gone/unknown state
+or disappearance. A changed-back policy requires another measurement. Providers
+without policy fingerprints retain the conservative 60-second fallback TTL.
+A negative proof is Advisory. Probe command/transport/malformed-proof failures
+leave successful provision/resume Advisory and emit a tracing diagnostic with the
+typed error class; explicit inspect still returns the typed error. Open/nonrunning
+rows are Advisory. Transport outages return Unavailable, not adaptor-bug Internal.
 
 Observation polls every 30 seconds, with complete cursor pagination, provider
 `updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The host
@@ -361,12 +365,15 @@ interpreted as reserved GiB integrated over time, using Daytona's documented
 [resource units](https://www.daytona.io/docs/en/sandboxes/#resources), and converted
 to By.s with 2^30. This interpretation of the analytics field naming remains a
 live metering acceptance assumption. Money is parsed from the
-original decimal lexeme before numeric conversion. An analytics currency code is
-used when present; the documented USD denomination is the fallback. `environment_hours` stays
-empty because aggregates cannot recover size distribution. Scope IDs are opaque.
-The conformance checker explicitly diagnoses organization aggregates as unable
-to establish one sandbox's stopped billing; it does not compare their CPU with
-one environment. Isolated environment metering remains unavailable on this route.
+original decimal lexeme before numeric conversion and uses the documented USD
+denomination, without inventing a vendor currency field. `environment_hours` is
+filled from the documented per-sandbox usage totals and usage-period routes,
+clipping each size period to the requested window. Scope IDs are opaque.
+Conformance uses size-hours when measurements are aggregate and isolated CPU
+measurements when explicitly environment-scoped. Size-hours are still grouped
+by size across the organization: use an otherwise idle organization or a unique
+size for live transition attribution; aggregation cannot distinguish unrelated
+sandboxes with the same size. Empty usage windows yield zero size-hours.
 
 For operator acceptance, configure a real baked agent image, pinned gateway key,
 matching root/network/reach probes, and run conformance including egress. Retain

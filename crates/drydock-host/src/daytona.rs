@@ -78,17 +78,7 @@ impl Module for DaytonaModule {
             return Err(refused("Daytona requires organization_id, ssh_host_key, agent_command, region and tier 1..4"));
         }
         for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
-            let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
-            if url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || !url.path().ends_with('/')
-            {
-                return Err(refused("Daytona endpoints must be HTTPS base URLs ending in / without credentials, query or fragment"));
-            }
+            endpoint_url(endpoint, true)?;
         }
         Ok(Arc::new(Daytona { name: config.name.clone(), settings, http }))
     }
@@ -138,9 +128,10 @@ impl Daytona {
             request.headers_mut().insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
             *request.body_mut() = Some(body.to_string().into());
         }
-        let response = rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Internal {
+        let response = rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Unavailable {
+            provider_error: Some(Secret::new(bounded(error.as_bytes()))),
             reason: "Daytona transport failed".into(),
-            provider_error: Secret::new(bounded(error.as_bytes())),
+            retry_after: None,
         })?;
         let retry_after = retry_delay(response.headers());
         let status = response.status().as_u16();
@@ -156,8 +147,12 @@ impl Daytona {
                 404 => ProtocolError::NotFound { reason: "Daytona resource not found".into() },
                 402 => ProtocolError::QuotaExhausted { reason: "Daytona quota exhausted".into() },
                 429 => ProtocolError::RateLimited { reason: "Daytona organization rate limit".into(), retry_after },
-                408 => ProtocolError::Unavailable { reason: "Daytona command or request timed out".into(), retry_after: None },
-                500..=599 => ProtocolError::Unavailable { reason: "Daytona API unavailable".into(), retry_after },
+                408 => ProtocolError::Unavailable {
+                    provider_error: None,
+                    reason: "Daytona command or request timed out".into(),
+                    retry_after: None,
+                },
+                500..=599 => ProtocolError::Unavailable { provider_error: None, reason: "Daytona API unavailable".into(), retry_after },
                 _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: Secret::new(raw) },
             });
         }
@@ -196,14 +191,12 @@ impl Daytona {
     fn environment(&self, v: Value) -> Result<ObservedEnvironment> {
         let state = match text(&v, "state")? {
             "started" => Observation::Running,
-            "creating" | "pulling_snapshot" | "pending_build" | "building_snapshot" | "initializing" => {
+            "creating" | "pulling_snapshot" | "pending_build" | "building_snapshot" => {
                 Observation::Transitioning { phase: TransitionPhase::Preparing }
             }
             "starting" | "restoring" | "resuming" => Observation::Transitioning { phase: TransitionPhase::Starting },
             "stopping" | "archiving" | "pausing" => Observation::Transitioning { phase: TransitionPhase::Stopping },
-            "resizing" | "recovering" | "replacing" | "snapshotting" | "forking" => {
-                Observation::Transitioning { phase: TransitionPhase::Reconfiguring }
-            }
+            "resizing" | "snapshotting" | "forking" => Observation::Transitioning { phase: TransitionPhase::Reconfiguring },
             "destroying" => Observation::Transitioning { phase: TransitionPhase::Destroying },
             "stopped" | "archived" => Observation::Stopped { cause: StopCause::SuspendedByRequest },
             "paused" => Observation::Stopped { cause: StopCause::PausedByProvider },
@@ -221,7 +214,7 @@ impl Daytona {
                 reason if reason.contains("unreachable") => Observation::Unknown { reason: UnknownReason::HostUnreachable },
                 _ => Observation::Unknown { reason: UnknownReason::ProviderApiError },
             },
-            _ => Observation::Unknown { reason: UnknownReason::ProviderApiError },
+            _ => Observation::Unknown { reason: UnknownReason::ProviderStateUnknown },
         };
         let size =
             match (v.get("cpu").and_then(Value::as_u64), v.get("memory").and_then(Value::as_u64), v.get("disk").and_then(Value::as_u64)) {
@@ -238,7 +231,10 @@ impl Daytona {
             .and_then(Value::as_str)
             .map(|s| s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response()))
             .transpose()?;
+        let policy = json!({"block":v.get("networkBlockAll"),"cidrs":v.get("networkAllowList"),"domains":v.get("domainAllowList")});
+        let fingerprint = format!("{:x}", Sha256::digest(policy.to_string().as_bytes()));
         Ok(ObservedEnvironment {
+            egress_policy: Some(fingerprint),
             egress_measured: false,
             environment: Environment {
                 id: text(&v, "id")?.into(),
@@ -315,15 +311,7 @@ impl Daytona {
                 text(&row, "toolboxProxyUrl")?.to_owned()
             }
         };
-        let mut base = Url::parse(&base).map_err(|_| bad_response())?;
-        if base.scheme() != "https"
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(bad_response());
-        }
+        let mut base = endpoint_url(&base, false).map_err(|_| bad_response())?;
         base.path_segments_mut().map_err(|_| bad_response())?.pop_if_empty().extend([id, "process", "execute"]);
         let url = base;
         let v = self.call(Method::POST, url, Some(json!({"command": command, "timeout": timeout})), c).await?;
@@ -384,7 +372,7 @@ impl Daytona {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Err(ProtocolError::Unavailable { reason: "Daytona sandbox has not started".into(), retry_after: Some(5) })
+        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona sandbox has not started".into(), retry_after: Some(5) })
     }
 }
 const GIB: u64 = 1 << 30;
@@ -393,6 +381,20 @@ fn bad_value(value: &Value) -> ProtocolError {
         reason: "incomplete Daytona response".into(),
         provider_error: Secret::new(bounded(value.to_string().as_bytes())),
     }
+}
+fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
+    let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (trailing_slash && !url.path().ends_with('/'))
+    {
+        return Err(refused("Daytona endpoints must be HTTPS without credentials, query or fragment; configured bases must end in /"));
+    }
+    Ok(url)
 }
 fn bad_response() -> ProtocolError {
     ProtocolError::Internal {
@@ -578,7 +580,7 @@ impl Provider for Daytona {
             tokio::time::sleep(Duration::from_secs(2)).await;
             snapshot = self.call(Method::GET, self.path(&self.settings.api_url, &["snapshots", &id])?, None, c).await?;
         }
-        Err(ProtocolError::Unavailable { reason: "Daytona snapshot is still building".into(), retry_after: Some(5) })
+        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona snapshot is still building".into(), retry_after: Some(5) })
     }
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         if r.prepared.provider != self.name {
@@ -610,7 +612,7 @@ impl Provider for Daytona {
             let mut row = self.environment(v)?;
             if matches!(row.environment.state, Observation::Running) {
                 self.bootstrap(&row.environment.id, c).await?;
-                row = self.inspect(&row.environment.id, c).await?;
+                row = self.inspect_after_lifecycle(&row.environment.id, c).await?;
             }
             return Ok(Provisioned::Existing(row));
         }
@@ -638,19 +640,31 @@ impl Provider for Daytona {
 
                 let row = self.wait_started(text(&v, "id")?, c).await?;
                 self.bootstrap(&row.id, c).await?;
-                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
+                return Ok(Provisioned::Existing(self.inspect_after_lifecycle(&row.id, c).await?));
             }
             Some(v) => v,
         };
         let row = self.wait_started(text(&v, "id")?, c).await?;
         self.bootstrap(&row.id, c).await?;
-        Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
+        Ok(Provisioned::Created(self.inspect_after_lifecycle(&row.id, c).await?))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.inventory(None, c).await?.into_iter().map(|v| self.environment(v)).collect()
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
         self.observed(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?, c).await
+    }
+    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+        let value = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
+        let fallback = self.environment(value.clone())?;
+        match self.observed(value, c).await {
+            Ok(row) => Ok(row),
+            Err(error) => {
+                // Typed category reaches host diagnostics; guest/vendor text stays secret.
+                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), error = ?error, "lifecycle succeeded; egress measurement failed");
+                Ok(fallback)
+            }
+        }
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
@@ -689,7 +703,7 @@ impl SuspendResume for Daytona {
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        Err(ProtocolError::Unavailable { reason: "Daytona sandbox has not stopped".into(), retry_after: Some(5) })
+        Err(ProtocolError::Unavailable { provider_error: None, reason: "Daytona sandbox has not stopped".into(), retry_after: Some(5) })
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         if token.token.expose() != name("resume", &format!("{}\0{id}", self.name)) {
@@ -789,19 +803,59 @@ impl UsageOperation for Daytona {
         if !valid_decimal(&price) {
             return Err(bad_response());
         }
-        let currency = match v.get("currency") {
-            None => "USD",
-            Some(value) => {
-                value.as_str().filter(|s| s.len() == 3 && s.bytes().all(|b| b.is_ascii_uppercase())).ok_or_else(|| bad_value(&v))?
+        // Analytics prices are denominated in USD; there is no currency field.
+        let mut environment_hours = Vec::new();
+        let mut sandboxes =
+            self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "usage", "sandbox"])?;
+        sandboxes
+            .query_pairs_mut()
+            .append_pair("from", &String::from(period.start().clone()))
+            .append_pair("to", &String::from(period.end().clone()));
+        let totals = self.call(Method::GET, sandboxes, None, c).await?;
+        let mut seen = BTreeSet::new();
+        for sandbox in totals.as_array().ok_or_else(|| bad_value(&totals))? {
+            let id = text(sandbox, "sandboxId")?;
+            if !seen.insert(id) {
+                continue;
             }
-        };
+            let mut url =
+                self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "sandbox", id, "usage"])?;
+            url.query_pairs_mut()
+                .append_pair("from", &String::from(period.start().clone()))
+                .append_pair("to", &String::from(period.end().clone()));
+            let periods = self.call(Method::GET, url, None, c).await?;
+            for row in periods.as_array().ok_or_else(|| bad_value(&periods))? {
+                let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
+                let end = text(row, "endAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
+                if end < start {
+                    return Err(bad_value(row));
+                }
+                let from: chrono::DateTime<chrono::Utc> = String::from(period.start().clone()).parse().map_err(|_| bad_value(row))?;
+                let to: chrono::DateTime<chrono::Utc> = String::from(period.end().clone()).parse().map_err(|_| bad_value(row))?;
+                let seconds = (end.min(to) - start.max(from)).num_milliseconds().max(0) as f64 / 1000.0;
+                if seconds == 0.0 {
+                    continue;
+                }
+                let bytes = |key| -> Result<u64> {
+                    row.get(key).and_then(Value::as_u64).and_then(|v| v.checked_mul(GIB)).ok_or_else(|| bad_value(row))
+                };
+                let cpus = number(row, "cpu")?;
+                if cpus == 0.0 {
+                    return Err(bad_value(row));
+                }
+                environment_hours.push(SizeUsage {
+                    size: Size { cpus, memory_bytes: bytes("ramGB")?, disk_bytes: bytes("diskGB")? },
+                    hours: seconds / 3600.0,
+                });
+            }
+        }
         Ok(Usage {
             period,
-            environment_hours: vec![],
+            environment_hours,
             measurements: Some(UsageMeasurements {
                 scope: UsageScope::Organization { id: self.settings.organization_id.clone() },
                 resources,
-                cost: Some(Cost { amount: price, currency: currency.into() }),
+                cost: Some(Cost { amount: price, currency: "USD".into() }),
             }),
         })
     }

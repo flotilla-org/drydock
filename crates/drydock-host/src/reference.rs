@@ -151,20 +151,29 @@ impl Provider for Reference {
         self.check()?;
         let state = self.state.recover();
         if state.inventory_error {
-            return Err(ProtocolError::Unavailable { reason: "fixture inventory unavailable".into(), retry_after: None });
+            return Err(ProtocolError::Unavailable {
+                provider_error: None,
+                reason: "fixture inventory unavailable".into(),
+                retry_after: None,
+            });
         }
         Ok(state
             .environments
             .values()
             .cloned()
-            .map(|environment| ObservedEnvironment { egress_measured: true, environment, timestamp: state.provider_timestamp })
+            .map(|environment| ObservedEnvironment {
+                egress_policy: None,
+                egress_measured: true,
+                environment,
+                timestamp: state.provider_timestamp,
+            })
             .collect())
     }
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
         self.check()?;
         let environment = self.find(id)?;
         let timestamp = self.state.recover().provider_timestamp;
-        Ok(ObservedEnvironment { egress_measured: true, environment, timestamp })
+        Ok(ObservedEnvironment { egress_policy: None, egress_measured: true, environment, timestamp })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;

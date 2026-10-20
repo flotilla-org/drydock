@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 pub mod openapi;
-/// Pending owner ruling; not used by active routes or provider implementations.
 pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
@@ -192,7 +191,7 @@ impl Default for EgressRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Destination {
-    /// Resolve once when applying a provider policy; no port restriction.
+    /// All ports to this host name; how the provider enforces the name is the provider's choice.
     Host {
         host: HostAddress,
     },
@@ -323,6 +322,8 @@ pub enum GoneCause {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownReason {
+    /// The provider explicitly reports an unknown state, without an API failure.
+    ProviderStateUnknown,
     HostUnreachable,
     ProviderApiError,
     GuestUnresponsive,
@@ -546,6 +547,9 @@ pub enum ProtocolError {
     Unavailable {
         reason: String,
         retry_after: Option<u64>,
+        /// Optional bounded provider/transport detail; never include it in public logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_error: Option<Secret>,
     },
     RateLimited {
         reason: String,

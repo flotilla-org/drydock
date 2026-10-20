@@ -410,7 +410,9 @@ async fn billing_window(client: &Client, provider: &str, size: &Size, id: &str, 
     let period = Period::new(start.into(), chrono::Utc::now().into()).map_err(str::to_owned)?;
     let usage = client.usage(provider, &period).await.map_err(SafeError::category)?;
     valid_usage(&usage, &period)?;
-    if let Some(m) = &usage.measurements {
+    if let Some(m) = &usage.measurements
+        && matches!(&m.scope, UsageScope::Environment { .. })
+    {
         // Aggregate organization usage cannot establish one sandbox's billing.
         require(
             matches!(&m.scope, UsageScope::Environment { id: measured } if measured == id),

@@ -1248,7 +1248,7 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "Resolve once when applying a provider policy; no port restriction.",
+            "description": "All ports to this host name; how the provider enforces the name is the provider's choice.",
             "required": [
               "host",
               "kind"
@@ -2100,6 +2100,17 @@
                   "unavailable"
                 ]
               },
+              "provider_error": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Secret",
+                    "description": "Optional bounded provider/transport detail; never include it in public logs."
+                  }
+                ]
+              },
               "reason": {
                 "type": "string"
               },
@@ -2720,6 +2731,7 @@
       "UnknownReason": {
         "type": "string",
         "enum": [
+          "provider_state_unknown",
           "host_unreachable",
           "provider_api_error",
           "guest_unresponsive"
@@ -3109,6 +3121,17 @@
                   "type": "string",
                   "enum": [
                     "unavailable"
+                  ]
+                },
+                "provider_error": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Secret",
+                      "description": "Optional bounded provider/transport detail; never include it in public logs."
+                    }
                   ]
                 },
                 "reason": {

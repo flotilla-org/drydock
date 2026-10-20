@@ -106,7 +106,7 @@ fn loss_cases() -> Vec<(&'static str, GoneCause)> {
 fn error_cases() -> Vec<ProtocolError> {
     vec![
         ProtocolError::Refused { reason: "fixture".into() },
-        ProtocolError::Unavailable { reason: "fixture".into(), retry_after: Some(3) },
+        ProtocolError::Unavailable { provider_error: None, reason: "fixture".into(), retry_after: Some(3) },
         ProtocolError::RateLimited { reason: "fixture".into(), retry_after: Some(7) },
         ProtocolError::QuotaExhausted { reason: "fixture".into() },
         ProtocolError::CredentialRejected { reason: "fixture".into() },

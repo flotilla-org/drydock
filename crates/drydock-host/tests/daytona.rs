@@ -15,6 +15,8 @@ use tokio::io::AsyncReadExt;
 #[derive(Default)]
 struct State {
     snapshots: BTreeMap<String, Value>,
+    snapshot_requests: Vec<Value>,
+    ssh_expiries: Vec<Option<String>>,
     rows: BTreeMap<String, Value>,
     creates: usize,
     bootstraps: usize,
@@ -23,7 +25,9 @@ struct State {
     failure: Option<u16>,
     executed: Vec<String>,
     probe: Option<Value>,
-    currency: Option<String>,
+    violations: Vec<String>,
+    fixture_rows: Vec<Value>,
+    usage_periods: Option<Value>,
     hide_label_once: bool,
     activations: usize,
     inactive_reads: usize,
@@ -34,6 +38,7 @@ struct State {
     command_output: Option<String>,
     require_bootstrap_budget: bool,
     probe_exit: Option<i32>,
+    probe_http_failure: Option<u16>,
     exec_timeouts: Vec<u64>,
 }
 #[derive(Default)]
@@ -43,35 +48,41 @@ impl StandIn {
         self.1
             .get_or_init(|| async {
                 rigging_tls::install_default_provider();
-                let router = || {
+                let router = |origin: &'static str| {
                     let state = self.0.clone();
                     axum::Router::new().fallback(axum::routing::any(move |r: axum::extract::Request| {
                         let state = state.clone();
                         async move {
                             let (parts, body) = r.into_parts();
-                            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                            let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
+                                Ok(bytes) => bytes,
+                                Err(_) => return http::Response::builder().status(400).body(axum::body::Body::empty()).unwrap(),
+                            };
                             // Adapt the received wire request to the contract validator;
                             // serialization and header/query encoding happened on TCP.
-                            let mut request =
-                                reqwest::Request::new(parts.method, format!("https://received.invalid{}", parts.uri).parse().unwrap());
+                            let mut request = reqwest::Request::new(parts.method, format!("{origin}{}", parts.uri).parse().unwrap());
                             *request.headers_mut() = parts.headers;
                             *request.body_mut() = Some(bytes.to_vec().into());
-                            let response = Self::respond(&state, request).unwrap();
+                            let response = Self::respond(&state, request);
                             let (parts, body) = response.into_parts();
+                            if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                                let rows = value.get("items").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![value]);
+                                state.lock().unwrap().fixture_rows.extend(rows.into_iter().filter(|r| r.get("cpu").is_some()));
+                            }
                             http::Response::from_parts(parts, axum::body::Body::from(body))
                         }
                     }))
                 };
                 rigging_replay_testkit::http_contract::StandIn::start_many([
-                    ("https://app.daytona.io", router()),
-                    ("https://runner.invalid", router()),
-                    ("https://analytics.app.daytona.io", router()),
+                    ("https://app.daytona.io", router("https://app.daytona.io")),
+                    ("https://runner.invalid", router("https://runner.invalid")),
+                    ("https://analytics.app.daytona.io", router("https://analytics.app.daytona.io")),
                 ])
                 .await
             })
             .await
     }
-    fn respond(state: &Mutex<State>, request: reqwest::Request) -> std::result::Result<http::Response<Bytes>, String> {
+    fn respond(state: &Mutex<State>, request: reqwest::Request) -> http::Response<Bytes> {
         let mut s = state.lock().unwrap();
         s.requests += 1;
         // Daytona requires bearer auth for both API and toolbox requests.
@@ -96,7 +107,7 @@ impl StandIn {
             if status == 429 {
                 response = response.header("retry-after-sandbox-create", "17");
             }
-            Ok(response.body(Bytes::from(body.to_string())).unwrap())
+            response.body(Bytes::from(body.to_string())).unwrap()
         };
         if !authorized {
             return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
@@ -106,14 +117,34 @@ impl StandIn {
         }
         let method = request.method().as_str();
         let path = request.url().path();
-        let body: Value = request
-            .body()
-            .and_then(|b| b.as_bytes())
-            .filter(|b| !b.is_empty())
-            .map(|v| serde_json::from_slice(v).unwrap())
-            .unwrap_or(Value::Null);
-        if method == "POST" {
-            assert_eq!(request.headers().get("content-type").is_some(), !body.is_null());
+        macro_rules! reject {
+            ($message:expr) => {{
+                s.violations.push($message.to_string());
+                return response(400, json!({"statusCode":400,"message":$message,"error":"Bad Request"}));
+            }};
+        }
+        let origin = request.url().origin().ascii_serialization();
+        let permitted = match origin.as_str() {
+            "https://app.daytona.io" => path.starts_with("/api/"),
+            "https://runner.invalid" => path.starts_with("/toolbox/"),
+            "https://analytics.app.daytona.io" => path.starts_with("/organization/"),
+            _ => false,
+        };
+        if !permitted {
+            reject!(format!("wrong origin for {path}: {origin}"));
+        }
+        if origin == "https://analytics.app.daytona.io"
+            && (!request.url().query_pairs().any(|(k, _)| k == "from") || !request.url().query_pairs().any(|(k, _)| k == "to"))
+        {
+            reject!("missing analytics time range");
+        }
+        let body = request.body().and_then(|b| b.as_bytes()).filter(|b| !b.is_empty()).map(serde_json::from_slice::<Value>).transpose();
+        let body = match body {
+            Ok(value) => value.unwrap_or(Value::Null),
+            Err(_) => reject!("invalid JSON"),
+        };
+        if method == "POST" && request.headers().get("content-type").is_some() == body.is_null() {
+            reject!("content-type does not match body");
         }
         match (method, path) {
             ("GET", p) if p.starts_with("/api/snapshots/") => {
@@ -134,13 +165,11 @@ impl StandIn {
             ("POST", p) if p.ends_with("/activate") => {
                 s.activations += 1;
                 // Activation is asynchronous; a successful POST may still say inactive.
-                response(200, s.snapshots.values().next().unwrap().clone())
+                response(200, s.snapshots.values().next().cloned().unwrap_or(Value::Null))
             }
             ("POST", "/api/snapshots") => {
-                assert!(body["imageName"].as_str().unwrap().contains("@sha256:"));
-                assert_eq!(body["sandboxClass"], "container");
-                assert_eq!(body["regionId"], "eu");
-                let name = body["name"].as_str().unwrap();
+                let Some(name) = body["name"].as_str() else { reject!("missing snapshot name"); };
+                s.snapshot_requests.push(body.clone());
                 if s.snapshots.contains_key(name) {
                     return response(409, json!({"statusCode":409}));
                 }
@@ -154,7 +183,8 @@ impl StandIn {
                     return response(200, json!({"items":[],"nextCursor":null}));
                 }
                 let labels =
-                    request.url().query_pairs().find(|(k, _)| k == "labels").map(|(_, v)| serde_json::from_str::<Value>(&v).unwrap());
+                    request.url().query_pairs().find(|(k, _)| k == "labels").map(|(_, v)| serde_json::from_str::<Value>(&v)).transpose();
+                let labels = match labels { Ok(v) => v, Err(_) => reject!("invalid labels JSON") };
                 let mut rows: Vec<_> = s
                     .rows
                     .values()
@@ -219,8 +249,8 @@ impl StandIn {
                         _ => None,
                     };
                     if let Some(next) = next {
-                        let key = row["id"].as_str().unwrap();
-                        s.rows.get_mut(key).unwrap()["state"] = json!(next);
+                        let Some(key) = row["id"].as_str() else { reject!("fixture missing id"); };
+                        if let Some(row) = s.rows.get_mut(key) { row["state"] = json!(next); }
                         s.complete_transition_on_read = false;
                     }
                 }
@@ -231,26 +261,30 @@ impl StandIn {
                 response(if row.is_some() { 200 } else { 404 }, row.unwrap_or(Value::Null))
             }
             ("POST", p) if p.ends_with("/ssh-access") => {
-                assert!(request.url().query_pairs().any(|(k, v)| k == "expiresInMinutes" && v == "5"));
+                s.ssh_expiries.push(request.url().query_pairs().find(|(k,_)|k=="expiresInMinutes").map(|(_,v)|v.into_owned()));
                 s.mints += 1;
                 response(200, json!({"token":format!("ephemeral-{}",s.mints),"expiresAt":"2026-10-19T12:05:00Z"}))
             }
             ("POST", p) if p.ends_with("/stop") || p.ends_with("/start") => {
                 s.lifecycle_posts.push(p.into());
                 let id = p.trim_start_matches("/api/sandbox/").split('/').next().unwrap();
-                let row = s.rows.get_mut(id).unwrap();
+                let Some(row) = s.rows.get_mut(id) else { return response(404,json!({"statusCode":404,"message":"Not Found","error":"Not Found"})); };
                 row["state"] = json!(if p.ends_with("/stop") { "stopped" } else { "started" });
                 response(200, row.clone())
             }
             ("POST", p) if p.starts_with("/toolbox/") && p.ends_with("/process/execute") => {
-                let command = body["command"].as_str().unwrap();
-                s.exec_timeouts.push(body["timeout"].as_u64().unwrap());
-                if s.require_bootstrap_budget && command.contains("nohup") && body["timeout"].as_u64().unwrap() < 20 {
+                let Some(command) = body["command"].as_str() else { reject!("missing command"); };
+                let Some(timeout) = body["timeout"].as_u64() else { reject!("missing timeout"); };
+                s.exec_timeouts.push(timeout);
+                if command.starts_with("test \"$(id -u)\"") && let Some(status) = s.probe_http_failure {
+                    return response(status, json!({"statusCode":status,"message":"Bad Gateway","error":"Bad Gateway"}));
+                }
+                if s.require_bootstrap_budget && command.contains("nohup") && timeout < 20 {
                     return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
                 }
                 if command.contains("nohup") {
                     s.bootstraps += 1;
-                    assert!(command.contains("--socket /run/drydock/agent.sock"));
+                    if !command.contains("--socket /run/drydock/agent.sock") { reject!("bootstrap missing socket flag"); }
                 }
                 s.executed.push(command.into());
                 let output = if command.starts_with("test \"$(id -u)\"") {
@@ -266,14 +300,36 @@ impl StandIn {
                 json!({"regionUsage":[{"regionId":"eu","sandboxClass":"container","currentCpuUsage":2,"totalCpuQuota":10,"currentMemoryUsage":4,"totalMemoryQuota":20,"currentDiskUsage":10,"totalDiskQuota":30}],"currentSnapshotUsage":1,"totalSnapshotQuota":100,"currentVolumeUsage":0,"totalVolumeQuota":100}),
             ),
             ("GET", "/organization/org-1/usage/aggregated") => {
-                assert!(request.url().query_pairs().any(|(k, v)| k == "from" && v == "2026-10-19T00:00:00Z"));
-                let mut usage = json!({"totalCPUSeconds":7200,"totalRAMGBSeconds":14400,"totalDiskGBSeconds":36000,"totalGPUSeconds":0,"totalPrice":0.0123,"sandboxCount":1});
-                if let Some(currency) = &s.currency {
-                    usage["currency"] = json!(currency);
-                }
+                if !request.url().query_pairs().any(|(k, _)| k == "from") || !request.url().query_pairs().any(|(k, _)| k == "to") { reject!("missing analytics time range"); }
+                let usage = json!({"totalCPUSeconds":7200,"totalRAMGBSeconds":14400,"totalDiskGBSeconds":36000,"totalGPUSeconds":0,"totalPrice":0.0123,"sandboxCount":1});
                 response(200, usage)
             }
-            _ => panic!("unexpected vendor request: {method} {path}"),
+            ("GET", "/organization/org-1/usage/sandbox") => response(200,json!([{"sandboxId":"sandbox-1"}])),
+            ("GET", "/organization/org-1/sandbox/sandbox-1/usage") => response(200,s.usage_periods.clone().unwrap_or_else(||json!([
+                {"cpu":2,"ramGB":4,"diskGB":10,"gpu":0,"price":0.0123,"startAt":"2026-10-19T00:00:00Z","endAt":"2026-10-19T01:00:00Z"}
+            ]))),
+            _ => reject!(format!("unexpected vendor request: {method} {path}")),
+        }
+    }
+}
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let state = self.0.lock().unwrap();
+            assert!(state.violations.is_empty(), "vendor contract violations: {:?}", state.violations);
+            for body in &state.snapshot_requests {
+                assert!(body["imageName"].as_str().is_some_and(|v| v.contains("@sha256:")), "snapshot must pin the image digest");
+                assert_eq!(body["sandboxClass"], "container");
+                assert_eq!(body["regionId"], "eu");
+            }
+            assert!(state.ssh_expiries.iter().all(|v| v.as_deref() == Some("5")), "reach must request a short expiry");
+            assert!(state.executed.iter().filter(|c| c.contains("nohup")).all(|c| c.contains("--socket /run/drydock/agent.sock")));
+            let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
+            for row in &state.fixture_rows {
+                for key in spec["schemas"]["Sandbox"]["required"].as_array().unwrap() {
+                    assert!(!row[key.as_str().unwrap()].is_null(), "invalid vendor fixture missing {key}");
+                }
+            }
         }
     }
 }
@@ -290,10 +346,6 @@ fn schema_row(mut row: Value) -> Value {
         if row[key].is_null() {
             row[key] = value.clone();
         }
-    }
-    let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
-    for key in spec["schemas"]["Sandbox"]["required"].as_array().unwrap() {
-        assert!(!row[key.as_str().unwrap()].is_null(), "invalid vendor fixture missing {key}");
     }
     row
 }
@@ -405,8 +457,10 @@ async fn lifecycle_and_credential_modes() {
         let cost = measurements.cost.unwrap();
         assert_eq!(cost.amount, "0.0123");
         assert_eq!(cost.currency, "USD");
-        http.0.lock().unwrap().currency = Some("EUR".into());
-        assert_eq!(ops.usage.unwrap().usage(period, &c).await.unwrap().measurements.unwrap().cost.unwrap().currency, "EUR");
+        let usage = ops.usage.unwrap().usage(period, &c).await.unwrap();
+        assert_eq!(usage.environment_hours.len(), 1);
+        assert_eq!(usage.environment_hours[0].hours, 1.0);
+        assert_eq!(usage.environment_hours[0].size.cpus, 2.0);
         p.destroy(&id, &c).await.unwrap();
         p.destroy(&id, &c).await.unwrap();
         assert!(p.list(&c).await.unwrap().is_empty());
@@ -550,6 +604,11 @@ async fn root_egress_claim_is_measured_each_time() {
     http.0.lock().unwrap().probe = Some(good.clone());
     let env = row(p.provision(r, &c).await.unwrap());
     assert_eq!(env.egress, Enforcement::Enforced);
+    let original_policy = p.inspect(&env.id, &c).await.unwrap().egress_policy;
+    assert!(original_policy.is_some());
+    assert_eq!(p.list(&c).await.unwrap()[0].egress_policy, original_policy);
+    http.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["networkAllowList"] = json!("198.51.100.0/24");
+    assert_ne!(p.list(&c).await.unwrap()[0].egress_policy, original_policy);
     for (key, bad) in [("uid", json!(1000)), ("listed_direct", json!(false)), ("unlisted_canary", json!(true)), ("raw_dns", json!(true))] {
         let mut result = good.clone();
         result[key] = bad;
@@ -578,6 +637,7 @@ async fn observations_are_typed() {
         ("error", "evicted by provider", Observation::Gone { cause: GoneCause::EvictedByProvider }),
         ("error", "runner unreachable", Observation::Unknown { reason: UnknownReason::HostUnreachable }),
         ("build_failed", "unknown vendor error", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+        ("unknown", "", Observation::Unknown { reason: UnknownReason::ProviderStateUnknown }),
         ("paused", "", Observation::Stopped { cause: StopCause::PausedByProvider }),
         ("creating", "", Observation::Transitioning { phase: TransitionPhase::Preparing }),
         ("destroyed", "", Observation::Gone { cause: GoneCause::DestroyedAtProvider }),
@@ -998,4 +1058,107 @@ async fn lifecycle_retries_wait_for_existing_transition() {
     sr.resume(&env.id, token, &c).await.unwrap();
     assert!(http.0.lock().unwrap().lifecycle_posts.is_empty());
     assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.state, Observation::Running);
+}
+
+// A transport outage is retryable Unavailable, never an adaptor-bug Internal.
+#[tokio::test]
+async fn transport_outages_are_unavailable() {
+    struct Offline;
+    #[async_trait]
+    impl HttpClient for Offline {
+        async fn execute(&self, _: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+            Err("connection reset: private transport detail".into())
+        }
+    }
+    let p = provider(Arc::new(Offline)).await;
+    let error = p.list(&credentials(false)).await.unwrap_err();
+    assert!(matches!(error, ProtocolError::Unavailable { .. }));
+    assert!(!format!("{error:?}").contains("private transport detail"));
+    let ProtocolError::Unavailable { provider_error: Some(detail), .. } = error else { panic!("missing protected transport diagnostic") };
+    assert!(detail.expose().contains("private transport detail"));
+}
+
+// Probe command failure and malformed proof leave successful creation/re-adoption
+// and resume enrichment Advisory. Explicit inspect still exposes the typed error.
+#[tokio::test]
+async fn lifecycle_success_is_independent_of_probe_failure() {
+    for failure in 0..3 {
+        let http = Arc::new(StandIn::default());
+        let p = provider_with_probe(http.clone(), true).await;
+        let c = credentials(false);
+        let prep = prepared(p.as_ref(), &c).await;
+        if failure == 1 {
+            http.0.lock().unwrap().probe_exit = Some(1);
+        }
+        if failure == 2 {
+            http.0.lock().unwrap().probe_http_failure = Some(502);
+        }
+        let mut request = request(prep, "broken-probe");
+        request.egress = EgressRequest::DenyAll { direct: vec![] };
+        for _ in 0..2 {
+            let result = p.provision(request.clone(), &c).await.unwrap();
+            let (Provisioned::Created(row) | Provisioned::Existing(row)) = result;
+            assert_eq!(row.environment.egress, Enforcement::Advisory);
+            assert!(!row.egress_measured);
+            assert!(p.inspect(&row.environment.id, &c).await.is_err());
+            let port = p.operations().suspend_resume.unwrap();
+            let token = port.suspend(&row.environment.id, &c).await.unwrap();
+            port.resume(&row.environment.id, token, &c).await.unwrap();
+            let resumed = p.inspect_after_lifecycle(&row.environment.id, &c).await.unwrap();
+            assert!(matches!(resumed.environment.state, Observation::Running));
+            assert_eq!(resumed.environment.egress, Enforcement::Advisory);
+            assert!(!resumed.egress_measured);
+        }
+    }
+}
+
+// Size-hours clip vendor periods to the requested window, ignore boundary-only
+// intersections, retain size changes, and reject reversed or malformed periods.
+#[tokio::test]
+async fn sandbox_usage_periods_are_clipped_and_validated() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let port = p.operations().usage.unwrap();
+    let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-19T02:00:00Z".parse().unwrap()).unwrap();
+    http.0.lock().unwrap().usage_periods = Some(json!([
+        {"cpu":1,"ramGB":2,"diskGB":3,"startAt":"2026-10-18T23:00:00Z","endAt":"2026-10-19T01:00:00Z"},
+        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T03:00:00Z"},
+        {"cpu":2,"ramGB":4,"diskGB":5,"startAt":"2026-10-19T02:00:00Z","endAt":"2026-10-19T03:00:00Z"}
+    ]));
+    let usage = port.usage(period.clone(), &credentials(false)).await.unwrap();
+    assert_eq!(usage.environment_hours.len(), 2);
+    assert_eq!(usage.environment_hours.iter().map(|r| r.hours).sum::<f64>(), 2.0);
+    assert_eq!(usage.environment_hours[1].size.memory_bytes, 4 << 30);
+    for value in [json!([]), json!([{"startAt":"bad"}]), json!([{"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T00:00:00Z"}])] {
+        http.0.lock().unwrap().usage_periods = Some(value.clone());
+        let result = port.usage(period.clone(), &credentials(false)).await;
+        if value.as_array().unwrap().is_empty() {
+            assert!(result.unwrap().environment_hours.is_empty());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+// Each origin rejects another service's routes and malformed required fields
+// produce 4xx plus a recorded violation, rather than a dropped connection/panic.
+#[tokio::test]
+async fn standin_origin_and_contract_errors_are_observable() {
+    let http = StandIn::default();
+    let network = http.network().await;
+    let client = rigging_tls::client_builder().build().unwrap();
+    for (url, body) in [
+        ("https://app.daytona.io/toolbox/sandbox-1/process/execute", json!({"command":"true","timeout":20})),
+        ("https://runner.invalid/api/sandbox", json!({})),
+        ("https://analytics.app.daytona.io/api/sandbox", json!({})),
+        ("https://app.daytona.io/api/snapshots", json!({"imageName":"unpinned"})),
+    ] {
+        let request = client.post(url).bearer_auth("key-a").json(&body).build().unwrap();
+        let response = network.http.execute(request, &ChannelLabel::Default).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(http.0.lock().unwrap().violations.len(), 1);
+        http.0.lock().unwrap().violations.clear(); // expected negative contract case
+    }
+    let request = client.get("https://app.daytona.io/api/sandbox").bearer_auth("key-a").build().unwrap();
+    assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
 }

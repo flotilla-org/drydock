@@ -237,7 +237,11 @@ impl Instance {
             {
                 return Err(error);
             }
-            Err(ProtocolError::Unavailable { reason: "provider is not ready; inspect hello".into(), retry_after: None })
+            Err(ProtocolError::Unavailable {
+                provider_error: None,
+                reason: "provider is not ready; inspect hello".into(),
+                retry_after: None,
+            })
         }
     }
 
@@ -267,7 +271,11 @@ impl Instance {
             // A pending observation reservation can safely survive unready time:
             // no route can resume while polling remains disabled by readiness.
             if !self.availability(&auth).may_call {
-                return Err(ProtocolError::Unavailable { reason: "provider is not ready; inspect hello".into(), retry_after: None });
+                return Err(ProtocolError::Unavailable {
+                    provider_error: None,
+                    reason: "provider is not ready; inspect hello".into(),
+                    retry_after: None,
+                });
             }
             (auth.credentials.clone(), auth.generation)
         };
@@ -530,7 +538,7 @@ impl Host {
         let mut changed = self.events.changed.subscribe();
         let mut stopping = self.stopping.subscribe();
         if *stopping.borrow() {
-            return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
+            return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None });
         }
         let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
         let mut push_errors = BTreeMap::new();
@@ -543,12 +551,14 @@ impl Host {
         let lists = instances.iter().filter(|i| matches!(i.observation, ObservationMode::Push)).map(|instance| async move {
             let result = tokio::time::timeout_at(deadline, instance.call(Gate::List, |p, c| async move { p.list(&c).await }))
                 .await
-                .unwrap_or_else(|_| Err(ProtocolError::Unavailable { reason: "snapshot list timed out".into(), retry_after: None }));
+                .unwrap_or_else(|_| {
+                    Err(ProtocolError::Unavailable { provider_error: None, reason: "snapshot list timed out".into(), retry_after: None })
+                });
             (instance.config.name.clone(), result)
         });
         let results = tokio::select! {
             results = futures::future::join_all(lists) => results,
-            _ = stopping.changed() => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }),
+            _ = stopping.changed() => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }),
         };
         let mut push_rows = vec![];
         for (name, result) in results {
@@ -561,7 +571,7 @@ impl Host {
         }
         loop {
             if *stopping.borrow() {
-                return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None });
+                return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None });
             }
             let mut unavailable_providers = push_errors.clone();
             for instance in &instances {
@@ -607,7 +617,7 @@ impl Host {
             }
             tokio::select! {
                 _ = changed.changed() => {},
-                _ = stopping.changed() => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }),
+                _ = stopping.changed() => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }),
             }
         }
     }
@@ -681,11 +691,11 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
     let mut stopping = host.stopping.subscribe();
     let _transaction = tokio::select! {
         biased;
-        _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into()),
+        _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into()),
         guard = host.configuring.lock() => guard,
     };
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
     }
     let mut config = host.config.read().await.clone();
     // Exact repeats preserve resources and delivered credentials. Changes to live providers
@@ -737,7 +747,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         let sink = EventSink { shared: host.events.clone(), provider: p.name.clone() };
         let provider = tokio::select! {
             biased;
-            _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into()),
+            _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into()),
             result = module.configure(p, http) => result?,
         };
         let (credential_changes, _) = watch::channel(credentials.clone());
@@ -789,14 +799,14 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         .collect();
     let mut committed = host.config.write().await;
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
     }
     *committed = config;
     drop(committed);
     // Serialize registration with shutdown's drain, including its stop check.
     let mut tasks = host.tasks.recover();
     if *host.stopping.borrow() {
-        return Err(ProtocolError::Unavailable { reason: "host stopping".into(), retry_after: None }.into());
+        return Err(ProtocolError::Unavailable { provider_error: None, reason: "host stopping".into(), retry_after: None }.into());
     }
     for instance in observers {
         tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
@@ -852,8 +862,8 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
     }
     .into_response())
 }
-// This maximum evidence age bounds the out-of-band policy-change limitation
-// documented in the provider README. Cheap inventory never extends it.
+// Providers without effective-policy identities use this conservative fallback
+// evidence age. Fingerprinted policies are invalidated by observed identity changes.
 const EGRESS_EVIDENCE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn cache_observation(instance: &Instance, row: &ObservedEnvironment, generation: u64) {
@@ -884,8 +894,8 @@ fn evict_observation(instance: &Instance, id: &str) {
     inspected.remove(id);
     times.remove(id);
 }
-// Only explicit measurements replace a measured claim. Cheap inventory carries
-// the last claim while running; stopped/gone rows invalidate it.
+// Only explicit measurements replace a measured claim. Policy fingerprints
+// permit indefinite carry while unchanged; providers without them use a TTL.
 fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generation: u64) {
     if instance.poll_interval.is_none() {
         return;
@@ -903,6 +913,12 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generatio
     measured.retain(|id, _| listed.contains(id.as_str()));
     times.retain(|id, _| measured.contains_key(id));
     for row in rows {
+        if !row.egress_measured && measured.get(&row.environment.id).is_some_and(|old| old.egress_policy != row.egress_policy) {
+            // A changed policy permanently invalidates old evidence, even if it
+            // later changes back. Only another measurement can restore a claim.
+            measured.remove(&row.environment.id);
+            times.remove(&row.environment.id);
+        }
         if row.egress_measured {
             times.insert(row.environment.id.clone(), tokio::time::Instant::now());
             // This cache also preserves a matching inspect's provider timestamp
@@ -915,7 +931,11 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment], generatio
         } else if matches!(row.environment.state, Observation::Running) {
             if let Some(old) = measured.get(&row.environment.id).filter(|r| {
                 matches!(r.environment.state, Observation::Running)
-                    && times.get(&row.environment.id).is_some_and(|t| t.elapsed() < EGRESS_EVIDENCE_MAX_AGE)
+                    && match (&r.egress_policy, &row.egress_policy) {
+                        (Some(old), Some(current)) => old == current,
+                        (None, None) => times.get(&row.environment.id).is_some_and(|t| t.elapsed() < EGRESS_EVIDENCE_MAX_AGE),
+                        _ => false,
+                    }
             }) {
                 row.environment.egress = old.environment.egress.clone();
             }
@@ -975,7 +995,7 @@ async fn resume(
     let inspect_id = id.clone();
     let generation = *instance.observation_generation.recover();
     instance.call(Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
-    let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&inspect_id, &c).await }).await?;
+    let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect_after_lifecycle(&inspect_id, &c).await }).await?;
     cache_observation(&instance, &row, generation);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1419,6 +1439,7 @@ mod operation_tests {
             let i = Arc::get_mut(&mut owner).unwrap();
             i.poll_interval = polling.then_some(std::time::Duration::from_secs(30));
             let mut row = ObservedEnvironment {
+                egress_policy: None,
                 environment: Environment {
                     id: "e".into(),
                     provider: "a".into(),
@@ -1461,5 +1482,51 @@ mod operation_tests {
             assert!(i.inspected.recover().is_empty());
             assert!(i.egress_measured_at.recover().is_empty());
         }
+    }
+    // Identical effective policies preserve evidence beyond the fallback TTL;
+    // mutation, removal, and stop invalidate it until a new measurement occurs.
+    #[tokio::test(start_paused = true)]
+    async fn policy_identity_controls_egress_carry() {
+        let mut owner = instance("list").await;
+        let i = Arc::get_mut(&mut owner).unwrap();
+        i.poll_interval = Some(std::time::Duration::from_secs(30));
+        let row = ObservedEnvironment {
+            environment: Environment {
+                id: "e".into(),
+                provider: "a".into(),
+                label: None,
+                state: Observation::Running,
+                granted_size: None,
+                egress: Enforcement::Enforced,
+            },
+            timestamp: None,
+            egress_measured: true,
+            egress_policy: Some("policy-a".into()),
+        };
+        let generation = *i.observation_generation.recover();
+        cache_observation(i, &row, generation);
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        let mut cheap = row.clone();
+        cheap.egress_measured = false;
+        cheap.environment.egress = Enforcement::Advisory;
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        assert_eq!(cheap.environment.egress, Enforcement::Enforced);
+        cheap.egress_policy = Some("policy-b".into());
+        cheap.environment.egress = Enforcement::Advisory;
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        assert_eq!(cheap.environment.egress, Enforcement::Advisory);
+        cheap.egress_policy = row.egress_policy.clone();
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        assert_eq!(cheap.environment.egress, Enforcement::Advisory);
+        cache_observation(i, &row, generation);
+        cheap.environment.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        cheap.environment.state = Observation::Running;
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        assert_eq!(cheap.environment.egress, Enforcement::Advisory);
+        cache_observation(i, &row, generation);
+        cheap.egress_policy = None;
+        carry_egress(i, std::slice::from_mut(&mut cheap), generation);
+        assert_eq!(cheap.environment.egress, Enforcement::Advisory);
     }
 }

@@ -515,11 +515,10 @@ impl drydock_host::module::Provider for ControlledProvider {
             let url = self.control.http_url.lock().unwrap().clone().unwrap_or_else(|| "https://vendor.example/prepare".into());
             let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
             request.headers_mut().insert("Authorization", format!("Bearer {}", c.token().unwrap().expose()).parse().unwrap());
-            let response = self
-                .http
-                .execute(request, &rigging_http_client::http_channel_label("GET", &url))
-                .await
-                .map_err(|_| ProtocolError::Unavailable { reason: "transport failure".into(), retry_after: None })?;
+            let response =
+                self.http.execute(request, &rigging_http_client::http_channel_label("GET", &url)).await.map_err(|_| {
+                    ProtocolError::Unavailable { provider_error: None, reason: "transport failure".into(), retry_after: None }
+                })?;
             if response.status() == 401 {
                 return Err(ProtocolError::CredentialRejected { reason: "vendor rejected credential".into() });
             }
@@ -549,10 +548,11 @@ impl drydock_host::module::Provider for ControlledProvider {
             return Err(ProtocolError::CredentialRejected { reason: "vendor credential rejected".into() });
         }
         if vendor.0 {
-            return Err(ProtocolError::Unavailable { reason: "vendor unavailable".into(), retry_after: None });
+            return Err(ProtocolError::Unavailable { provider_error: None, reason: "vendor unavailable".into(), retry_after: None });
         }
         if let Some(row) = vendor.1 {
             rows.push(ObservedEnvironment {
+                egress_policy: None,
                 egress_measured: !self.control.skip_egress_measurement.load(SeqCst),
                 environment: row,
                 timestamp: if self.control.skip_list_timestamp.load(SeqCst) { None } else { *self.control.timestamp.lock().unwrap() },
@@ -566,7 +566,12 @@ impl drydock_host::module::Provider for ControlledProvider {
     }
     async fn inspect(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<ObservedEnvironment> {
         if let Some(row) = self.control.vendor.lock().unwrap().row.clone().filter(|row| row.id == id) {
-            return Ok(ObservedEnvironment { egress_measured: true, environment: row, timestamp: *self.control.timestamp.lock().unwrap() });
+            return Ok(ObservedEnvironment {
+                egress_policy: None,
+                egress_measured: true,
+                environment: row,
+                timestamp: *self.control.timestamp.lock().unwrap(),
+            });
         }
         self.inner.inspect(id, c).await
     }
@@ -577,7 +582,7 @@ impl drydock_host::module::Provider for ControlledProvider {
             self.control.destroy_release.notified().await;
         }
         if self.control.fail_destroy.load(std::sync::atomic::Ordering::SeqCst) {
-            Err(ProtocolError::Unavailable { reason: "ambiguous vendor failure".into(), retry_after: None })
+            Err(ProtocolError::Unavailable { provider_error: None, reason: "ambiguous vendor failure".into(), retry_after: None })
         } else {
             Ok(())
         }

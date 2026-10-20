@@ -16,6 +16,7 @@ fn tagged_wire_fixtures() {
         json!({"state":"stopped","cause":"paused_by_provider"}),
         json!({"state":"gone","cause":{"kind":"missing_on_list"}}),
         json!({"state":"unknown","reason":"provider_api_error"}),
+        json!({"state":"unknown","reason":"provider_state_unknown"}),
     ] {
         fixture::<Observation>(value);
     }
