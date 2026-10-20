@@ -34,7 +34,7 @@ pub(super) async fn host_fixtures(
             let mut invalid = configuration.clone();
             invalid.modules.push(ModuleConfiguration { name: "invalid".into(), entrypoint: "unknown".into() });
             let (status, _) = client
-                .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(invalid).expect("config")))
+                .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(invalid).map_err(SafeError::category)?))
                 .await
                 .map_err(SafeError::category)?;
             let after = client.hello().await.map_err(SafeError::category)?;
@@ -79,7 +79,11 @@ pub(super) async fn host_fixtures(
                     client,
                     provider,
                     &environment.id,
-                    &["state".into(), row.id.clone(), serde_json::to_string(&Observation::Gone { cause: cause.clone() }).expect("cause")],
+                    &[
+                        "state".into(),
+                        row.id.clone(),
+                        serde_json::to_string(&Observation::Gone { cause: cause.clone() }).map_err(SafeError::category)?,
+                    ],
                 )
                 .await?;
                 let event =
@@ -120,11 +124,17 @@ pub async fn error_contract(client: &Client, base: &HostConfiguration, report: &
     };
     let mut configuration = base.clone();
     for error in error_cases() {
+        let settings = match serde_json::from_value(json!({"fault":error,"fixture":true,"fixture_push":true,"poll_interval_ms":100000})) {
+            Ok(value) => value,
+            Err(error) => {
+                report.record("host_configuration", Err(error.category()));
+                return;
+            }
+        };
         configuration.providers.push(ProviderConfiguration {
             name: format!("error-{}", error.class()),
             module: module.name.clone(),
-            settings: serde_json::from_value(json!({"fault":error,"fixture":true,"fixture_push":true,"poll_interval_ms":100000}))
-                .expect("settings"),
+            settings,
             credential: CredentialMode::Direct { credential_reference: "fixture".into() },
         });
     }
@@ -315,14 +325,14 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                 &[
                     "state".into(),
                     row.id.clone(),
-                    serde_json::to_string(&Observation::Stopped { cause: StopCause::PausedByProvider }).expect("state"),
+                    serde_json::to_string(&Observation::Stopped { cause: StopCause::PausedByProvider }).map_err(SafeError::category)?,
                 ],
             )
             .await?;
             let event =
                 transition(&mut records, provider, &row.id, |kind| matches!(kind, EventKind::Paused { .. }), &options.timeouts).await?;
             require(
-                event.timestamp == timestamp.parse::<Timestamp>().expect("timestamp")
+                event.timestamp == timestamp.parse::<Timestamp>().map_err(|_| "invalid fixture timestamp".to_owned())?
                     && event.timestamp_source == TimestampSource::Provider,
                 "poll did not preserve provider timestamp/source",
             )
@@ -387,7 +397,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                     &[
                         "state".into(),
                         row.id.clone(),
-                        serde_json::to_string(&Observation::Stopped { cause: cause.clone() }).expect("state"),
+                        serde_json::to_string(&Observation::Stopped { cause: cause.clone() }).map_err(SafeError::category)?,
                     ],
                 )
                 .await?;
@@ -552,7 +562,7 @@ pub async fn configuration_contract(
     let entry = changed.providers.iter_mut().find(|entry| entry.name == provider).ok_or("missing provider")?;
     entry.settings.insert("changed".into(), json!(true));
     let (status, _) = client
-        .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(changed).expect("configuration")))
+        .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(changed).map_err(SafeError::category)?))
         .await
         .map_err(SafeError::category)?;
     require(status == 422 && client.hello().await.map_err(SafeError::category)? == before, "incompatible configuration was not atomic")

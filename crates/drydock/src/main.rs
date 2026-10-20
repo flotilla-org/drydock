@@ -119,7 +119,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Command::Conformance { provider, .. } => {
                 status?;
                 instance_ready(&handle, provider)?;
-                let options = conformance_options.as_ref().expect("parsed conformance options");
+                let options = conformance_options.as_ref().ok_or("missing conformance options")?;
                 let report = drydock::conformance::run(&handle.client, provider, options).await;
                 println!("{}", serde_json::to_string(&report)?);
                 if !report.passed() {

@@ -29,7 +29,8 @@ pub struct Options {
     #[serde(default)]
     pub echo_relay: bool,
     /// Command must exercise the returned reach recipe and exit only after a byte round trip.
-    /// Receives the recipe on stdin, never argv or logs. For SSH it owns the matching key.
+    /// Receives the full recipe verbatim on stdin, including any credentials, never argv or logs.
+    /// For SSH it owns the matching key.
     pub reach_probe: Option<Vec<String>>,
     /// Root guest probe: emit exactly the documented JSON and close the stream.
     /// The exec byte-stream protocol has no process exit-status channel.
@@ -949,13 +950,19 @@ async fn finish_report(
         }
     }
     if caps.usage {
-        let period = Period::new(period_start.into(), chrono::Utc::now().max(period_start).into()).expect("ordered run timestamps");
-        match client.usage(provider, &period).await {
+        let usage = async {
+            let period = Period::new(period_start.into(), chrono::Utc::now().max(period_start).into()).map_err(str::to_owned)?;
+            let usage = client.usage(provider, &period).await.map_err(SafeError::category)?;
+            valid_usage(&usage, &period)?;
+            Ok(usage)
+        }
+        .await;
+        match usage {
             Ok(usage) => {
-                report.record("usage", valid_usage(&usage, &period));
+                report.record("usage", Ok(()));
                 report.usage = Some(usage);
             }
-            Err(e) => report.record("usage", Err(e.category())),
+            Err(e) => report.record("usage", Err(e)),
         }
     }
     report.credits_spent = report
@@ -1026,7 +1033,13 @@ async fn egress(client: &Client, provider: &str, environment: &Environment, opti
 }
 
 async fn semantic_requests(client: &Client, provider: &str, options: &Options, owned_ids: &mut Resources, report: &mut Report) {
-    let original = serde_json::to_value(&options.request).expect("provision request");
+    let original = match serde_json::to_value(&options.request) {
+        Ok(value) => value,
+        Err(error) => {
+            report.record("semantic_requests", Err(error.category()));
+            return;
+        }
+    };
     // Boundary generator: negative, zero, overflow and wrong-type values cross
     // the CPU and unsigned byte-size domains, including JSON exponent overflow.
     for (field, values) in [
