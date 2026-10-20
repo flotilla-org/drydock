@@ -116,7 +116,7 @@ async fn independent_host_and_deliberate_violations() {
         ("auth", "authentication"),
         ("idempotent", "idempotent_label"),
         ("label", "list_readoption"),
-        ("size", "running_event"),
+        ("size", "running_state"),
         ("timestamp", "running_event"),
         ("gap", "gap_snapshot"),
         ("loss", "typed_loss"),
@@ -165,4 +165,15 @@ async fn configurable_transition_deadlines() {
     let long = conformance::Timeouts { record_seconds: 3, transition_seconds: 3, ..Default::default() };
     let report = python_report_with("slow", long).await;
     assert!(report.passed(), "{report:?}");
+}
+
+// A temporary inspect failure is a state-check failure, not a missing event.
+// The retained Running event still drives replay and subsequent cursor checks.
+#[tokio::test]
+async fn running_state_failure_preserves_replay_checks() {
+    let report = python_report("inspect").await;
+    assert!(report.checks.iter().any(|c| c.name == "running_state" && !c.passed && c.detail == "http 503 unavailable"));
+    for name in ["running_event", "cursor_resume", "resume_stream", "stopped_event", "cleanup"] {
+        assert!(report.checks.iter().any(|c| c.name == name && c.passed), "{name}: {report:?}");
+    }
 }

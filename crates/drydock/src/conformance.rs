@@ -316,26 +316,33 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     let running = report.capture(
         "running_event",
         async {
-            let event = transition(
+            transition(
                 records.as_mut().ok_or("cannot observe")?,
                 provider,
                 &environment.id,
                 |e| matches!(e, EventKind::Running { .. }),
                 timeouts,
             )
-            .await?;
-            let EventKind::Running { granted_size } = &event.event else { unreachable!() };
-            let current = client.inspect(provider, &environment.id).await.map_err(transport)?;
-            require(
-                valid_size(granted_size)
-                    && current.granted_size.as_ref() == Some(granted_size)
-                    && matches!(current.state, Observation::Running),
-                "running event has wrong granted size or billing state",
-            )?;
-            Ok(event)
+            .await
         }
         .await,
     );
+    if let Some(event) = &running {
+        report.record(
+            "running_state",
+            async {
+                let EventKind::Running { granted_size } = &event.event else { unreachable!() };
+                let current = client.inspect(provider, &environment.id).await.map_err(transport)?;
+                require(
+                    valid_size(granted_size)
+                        && current.granted_size.as_ref() == Some(granted_size)
+                        && matches!(current.state, Observation::Running),
+                    "running event has wrong granted size or billing state",
+                )
+            }
+            .await,
+        );
+    }
     // Replay a known predecessor to check exclusive resume without depending on
     // optional suspend support. Snapshot fallback explicitly marks a metering gap.
     if let (Some(created), Some(running)) = (&created, &running) {

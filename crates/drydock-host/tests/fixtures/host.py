@@ -14,6 +14,7 @@ import urllib.parse
 fault = sys.argv[2] if len(sys.argv) > 2 else "none"
 rows = {}
 delete_attempts = {}
+inspect_attempts = {}
 events = []
 condition = threading.Condition()
 size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
@@ -211,6 +212,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 emit(row, "gone", cause={"kind": "destroyed_by_request"})
             return self.respond(204)
         if row:
+            count = inspect_attempts.get(identifier, 0)
+            inspect_attempts[identifier] = count + 1
+            if fault == "inspect" and count == 0:
+                return self.respond(503, {"kind": "unavailable", "reason": "inspect not ready", "retry_after": None})
             return self.respond(200, row)
         self.respond(404, {"kind": "not_found", "reason": "absent"})
 
