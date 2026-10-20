@@ -414,7 +414,7 @@ async fn vendor_errors() {
     }
 }
 
-// CIDR/host rules are IPv4-only and ports are never silently widened. The
+// CIDRs/literals are IPv4-only and ports are never silently widened. The
 // matrix spans empty/open/duplicate rules, IPv6 and exact port restrictions.
 #[tokio::test]
 async fn egress_and_sizes() {
@@ -660,7 +660,7 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
 
 // A failed row-local guest probe cannot erase a healthy authoritative inventory.
 #[tokio::test]
-async fn failing_probe_only_downgrades_its_row() {
+async fn probe_failures_surface_without_erasing_inventory() {
     let http = Arc::new(StandIn::default());
     let p = provider_with_probe(http.clone(), true).await;
     let c = credentials(false);
@@ -780,8 +780,8 @@ async fn slow_start_does_not_queue_other_labels() {
     assert!(slow.await.unwrap().is_ok());
 }
 
-// Polling uses at most four concurrent probes, so one slow guest cannot
-// serialize every sandbox's inventory; row failures still preserve inventory.
+// Polling does not execute guest probes, so inventory cost does not grow with
+// probe latency or interfere with observation cadence.
 #[tokio::test]
 async fn list_never_runs_guest_probes() {
     let vendor = Arc::new(StandIn::default());
