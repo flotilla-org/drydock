@@ -47,19 +47,20 @@ pub enum ObservationMode {
 /// Optional provider time travels separately from the environment wire representation.
 #[derive(Clone, Debug)]
 pub struct ObservedEnvironment {
-    /// False for cheap inventory that did not re-measure the isolation claim.
+    /// True only when this call measured the isolation claim; conversion from
+    /// a bare Environment conservatively supplies no measurement evidence.
     pub egress_measured: bool,
     pub environment: Environment,
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl From<Environment> for ObservedEnvironment {
     fn from(environment: Environment) -> Self {
-        Self { environment, timestamp: None, egress_measured: true }
+        Self { environment, timestamp: None, egress_measured: false }
     }
 }
 pub enum Provisioned {
-    Created(Environment),
-    Existing(Environment),
+    Created(ObservedEnvironment),
+    Existing(ObservedEnvironment),
 }
 pub enum Connection {
     Ssh { endpoint: String, user: Secret, host_key: String },

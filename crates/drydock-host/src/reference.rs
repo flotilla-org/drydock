@@ -126,7 +126,7 @@ impl Provider for Reference {
         self.check()?;
         let mut state = self.state.recover();
         if let Some(s) = state.environments.values().find(|s| s.label.as_deref() == Some(&r.label)) {
-            return Ok(Provisioned::Existing(s.clone()));
+            return Ok(Provisioned::Existing(s.clone().into()));
         }
         if !state.prepared.values().any(|p| p == &r.prepared) {
             return Err(refused("unknown prepared form"));
@@ -145,7 +145,7 @@ impl Provider for Reference {
         };
         state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());
-        Ok(Provisioned::Created(s))
+        Ok(Provisioned::Created(s.into()))
     }
     async fn list(&self, _: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.check()?;

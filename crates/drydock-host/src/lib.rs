@@ -841,18 +841,45 @@ async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r
     }
     let instance = h.instance(&p).await?;
     let result = h.call(&p, Gate::Provision, |p, c| async move { p.provision(r, &c).await }).await?;
-    let (Provisioned::Created(env) | Provisioned::Existing(env)) = &result;
-    instance.inspected.recover().insert(env.id.clone(), env.clone().into());
-    instance.egress_measured_at.recover().insert(env.id.clone(), tokio::time::Instant::now());
+    let (Provisioned::Created(row) | Provisioned::Existing(row)) = &result;
+    cache_observation(&instance, row);
     Ok(match result {
-        Provisioned::Created(s) => (StatusCode::CREATED, Json(s)),
-        Provisioned::Existing(s) => (StatusCode::OK, Json(s)),
+        Provisioned::Created(s) => (StatusCode::CREATED, Json(s.environment)),
+        Provisioned::Existing(s) => (StatusCode::OK, Json(s.environment)),
     }
     .into_response())
+}
+// This maximum evidence age bounds the out-of-band policy-change limitation
+// documented in the provider README. Cheap inventory never extends it.
+const EGRESS_EVIDENCE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn cache_observation(instance: &Instance, row: &ObservedEnvironment) {
+    if instance.poll_interval.is_none() {
+        return;
+    }
+    // Lock order for both caches is always inspected, then egress_measured_at.
+    let mut inspected = instance.inspected.recover();
+    let mut times = instance.egress_measured_at.recover();
+    if row.egress_measured {
+        times.insert(row.environment.id.clone(), tokio::time::Instant::now());
+    } else {
+        times.remove(&row.environment.id);
+    }
+    inspected.insert(row.environment.id.clone(), row.clone());
+}
+fn evict_observation(instance: &Instance, id: &str) {
+    let mut inspected = instance.inspected.recover();
+    let mut times = instance.egress_measured_at.recover();
+    inspected.remove(id);
+    times.remove(id);
 }
 // Only explicit measurements replace a measured claim. Cheap inventory carries
 // the last claim while running; stopped/gone rows invalidate it.
 fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
+    if instance.poll_interval.is_none() {
+        return;
+    }
+    // Same inspected -> egress_measured_at lock order as cache/eviction.
     let mut measured = instance.inspected.recover();
     let mut times = instance.egress_measured_at.recover();
     times.retain(|id, _| measured.contains_key(id));
@@ -867,7 +894,7 @@ fn carry_egress(instance: &Instance, rows: &mut [ObservedEnvironment]) {
         } else if matches!(row.environment.state, Observation::Running) {
             if let Some(old) = measured.get(&row.environment.id).filter(|r| {
                 matches!(r.environment.state, Observation::Running)
-                    && times.get(&row.environment.id).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+                    && times.get(&row.environment.id).is_some_and(|t| t.elapsed() < EGRESS_EVIDENCE_MAX_AGE)
             }) {
                 row.environment.egress = old.environment.egress.clone();
             }
@@ -886,18 +913,17 @@ async fn list(State(h): State<Host>, ApiPath(p): ApiPath<String>) -> ApiResult<J
 async fn inspect(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Environment>> {
     let instance = h.instance(&p).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&id, &c).await }).await?;
-    if instance.poll_interval.is_some() {
-        instance.inspected.recover().insert(row.environment.id.clone(), row.clone());
-        instance.egress_measured_at.recover().insert(row.environment.id.clone(), tokio::time::Instant::now());
-    }
+    cache_observation(&instance, &row);
     Ok(Json(row.environment))
 }
 async fn destroy(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<StatusCode> {
     let instance = h.instance(&p).await?;
     let mut attempt = DestroyAttempt::begin(instance.clone(), id.clone());
+    let evicted_id = id.clone();
     let result = instance.call(Gate::Destroy, |p, c| async move { p.destroy(&id, &c).await }).await;
     attempt.finish(result.is_ok());
     result?;
+    evict_observation(&instance, &evicted_id);
     Ok(StatusCode::NO_CONTENT)
 }
 async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Reach>> {
@@ -926,8 +952,7 @@ async fn resume(
     let inspect_id = id.clone();
     instance.call(Gate::Resume, |p, c| async move { operation_port(p.operations().suspend_resume)?.resume(&id, token, &c).await }).await?;
     let row = instance.call(Gate::Inspect, |p, c| async move { p.inspect(&inspect_id, &c).await }).await?;
-    instance.egress_measured_at.recover().insert(row.environment.id.clone(), tokio::time::Instant::now());
-    instance.inspected.recover().insert(row.environment.id.clone(), row);
+    cache_observation(&instance, &row);
     Ok(StatusCode::NO_CONTENT)
 }
 async fn export(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {
@@ -1359,6 +1384,44 @@ mod operation_tests {
         for gate in [Gate::Exec, Gate::Suspend, Gate::Resume, Gate::Export, Gate::Usage, Gate::Quota] {
             let result: Result<()> = i.call(gate, |_, _| async { panic!("unsupported port must never be invoked") }).await;
             assert!(matches!(result, Err(ProtocolError::Refused { .. })));
+        }
+    }
+    // One cache path is shared by provision, inspect and resume. Only explicit
+    // evidence gets an age stamp; push providers retain no polling metadata.
+    #[tokio::test(start_paused = true)]
+    async fn measurement_cache_requires_evidence_and_polling() {
+        for polling in [false, true] {
+            let mut owner = instance("list").await;
+            let i = Arc::get_mut(&mut owner).unwrap();
+            i.poll_interval = polling.then_some(std::time::Duration::from_secs(30));
+            let mut row = ObservedEnvironment {
+                environment: Environment {
+                    id: "e".into(),
+                    provider: "a".into(),
+                    label: None,
+                    state: Observation::Running,
+                    granted_size: None,
+                    egress: Enforcement::Enforced,
+                },
+                timestamp: None,
+                egress_measured: true,
+            };
+            cache_observation(i, &row);
+            assert_eq!(i.egress_measured_at.recover().contains_key("e"), polling);
+            tokio::time::advance(EGRESS_EVIDENCE_MAX_AGE).await;
+            row.egress_measured = false;
+            cache_observation(i, &row);
+            assert!(!i.egress_measured_at.recover().contains_key("e"));
+            let mut cheap = row.clone();
+            cheap.environment.egress = Enforcement::Advisory;
+            carry_egress(i, std::slice::from_mut(&mut cheap));
+            assert_eq!(cheap.environment.egress, Enforcement::Advisory);
+            assert_eq!(i.inspected.recover().contains_key("e"), polling);
+            row.egress_measured = true;
+            cache_observation(i, &row);
+            evict_observation(i, "e");
+            assert!(i.inspected.recover().is_empty());
+            assert!(i.egress_measured_at.recover().is_empty());
         }
     }
 }

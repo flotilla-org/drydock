@@ -315,7 +315,7 @@ fn request(prepared: Prepared, label: &str) -> ProvisionRequest {
 }
 fn row(p: Provisioned) -> Environment {
     match p {
-        Provisioned::Created(e) | Provisioned::Existing(e) => e,
+        Provisioned::Created(e) | Provisioned::Existing(e) => e.environment,
     }
 }
 
@@ -331,6 +331,8 @@ async fn lifecycle_and_credential_modes() {
         let r = request(prep, "label-a");
         let (a, b) = tokio::join!(p.provision(r.clone(), &c), p.provision(r.clone(), &c));
         let a = a.unwrap();
+        let (Provisioned::Created(observation) | Provisioned::Existing(observation)) = &a;
+        assert!(!observation.egress_measured, "no probe means no measured evidence");
         let b = b.unwrap();
         assert!(matches!(
             (&a, &b),

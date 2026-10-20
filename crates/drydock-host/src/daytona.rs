@@ -293,8 +293,8 @@ impl Daytona {
             {
                 row.environment.egress = Enforcement::Enforced;
             }
+            row.egress_measured = true;
         }
-        row.egress_measured = true;
         Ok(row)
     }
     async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<String> {
@@ -589,10 +589,10 @@ impl Provider for Daytona {
             .find(|v| v.pointer("/labels/flotilla.label").and_then(Value::as_str) == Some(&r.label))
         {
             self.check_existing_request(&v, size, &policy)?;
-            let mut row = self.environment(v)?.environment;
-            if matches!(row.state, Observation::Running) {
-                self.bootstrap(&row.id, c).await?;
-                row = self.inspect(&row.id, c).await?.environment;
+            let mut row = self.environment(v)?;
+            if matches!(row.environment.state, Observation::Running) {
+                self.bootstrap(&row.environment.id, c).await?;
+                row = self.inspect(&row.environment.id, c).await?;
             }
             return Ok(Provisioned::Existing(row));
         }
@@ -612,13 +612,13 @@ impl Provider for Daytona {
                 self.check_existing_request(&v, size, &policy)?;
                 let row = self.wait_started(text(&v, "id")?, c).await?;
                 self.bootstrap(&row.id, c).await?;
-                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?.environment));
+                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
             }
             Some(v) => v,
         };
         let row = self.wait_started(text(&v, "id")?, c).await?;
         self.bootstrap(&row.id, c).await?;
-        Ok(Provisioned::Created(self.inspect(&row.id, c).await?.environment))
+        Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
         self.inventory(None, c).await?.into_iter().map(|v| self.environment(v)).collect()
