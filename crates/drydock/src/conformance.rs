@@ -227,9 +227,14 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             let records = records.as_mut().ok_or("cannot observe")?;
             let event = transition(records, provider, &environment.id, |e| matches!(e, EventKind::Running { .. })).await?;
             let EventKind::Running { granted_size } = &event.event else { unreachable!() };
+            // Provision may return an environment still booting. Compare granted
+            // size against current inventory after Running, not the creation reply.
+            let running = client.inspect(provider, &environment.id).await.map_err(transport)?;
             require(
-                valid_size(granted_size) && environment.granted_size.as_ref() == Some(granted_size),
-                "running event has wrong granted size",
+                valid_size(granted_size)
+                    && running.granted_size.as_ref() == Some(granted_size)
+                    && matches!(running.state, Observation::Running),
+                "running event has wrong granted size or billing state",
             )?;
             // Typed decoding requires timestamp and its source; reconnect is exclusive or a marked snapshot.
             let mut resumed = observe(client, Some(&event.cursor)).await?;

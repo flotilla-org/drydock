@@ -89,7 +89,7 @@ async fn python_report(fault: &str) -> conformance::Report {
 async fn independent_host_and_deliberate_violations() {
     let healthy = python_report("none").await;
     assert!(healthy.passed(), "{}", serde_json::to_string_pretty(&healthy).unwrap());
-    for fault in ["paused", "egress-healthy"] {
+    for fault in ["paused", "booting", "egress-healthy"] {
         let report = python_report(fault).await;
         assert!(report.passed(), "{fault}: {}", serde_json::to_string_pretty(&report).unwrap());
     }

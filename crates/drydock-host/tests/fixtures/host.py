@@ -51,6 +51,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def respond(self, status, value=None):
+        if fault == "booting" and self.command == "POST" and self.path == "/v1/providers/a/environments" and isinstance(value, dict) and "id" in value:
+            value = {**value, "granted_size": None, "state": {"state": "unknown", "reason": "provider_api_error"}}
         body = b"" if status == 204 else json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
