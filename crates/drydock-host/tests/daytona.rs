@@ -197,14 +197,20 @@ impl StandIn {
                 response(if row.is_some() { 200 } else { 404 }, row.cloned().unwrap_or(Value::Null))
             }
             ("POST", p) if p.ends_with("/activate") => {
+                let id = p.strip_prefix("/api/snapshots/").and_then(|p| p.strip_suffix("/activate"));
+                let snapshot = id.and_then(|id| s.snapshots.values().find(|v| v["id"].as_str() == Some(id))).cloned();
+                let Some(snapshot) = snapshot else {
+                    return response(404, json!({"statusCode":404,"message":"Snapshot not found"}));
+                };
                 s.activations += 1;
                 // Activation is asynchronous; a successful POST may still say inactive.
-                response(200, s.snapshots.values().next().cloned().unwrap_or(Value::Null))
+                response(200, snapshot)
             }
             ("POST", "/api/snapshots") => {
                 if !snapshot_schema_valid(&body, "CreateSnapshot", true) {
                     reject!("invalid CreateSnapshot body");
                 }
+                // CreateSnapshot validation above guarantees a required string name.
                 let name = body["name"].as_str().unwrap();
                 s.snapshot_requests.push(body.clone());
                 if s.snapshots.contains_key(name) {
@@ -1342,54 +1348,81 @@ async fn standin_origin_and_contract_errors_are_observable() {
     assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
 }
 
+// Stored state mutations in lifecycle tests model valid vendor states and are
+// validated on readback. Unknown-state robustness cases must use a separate raw
+// HTTP response double so they deliberately bypass this vendor contract.
 // Snapshot wire bodies follow the pinned OpenAPI, including referenced enums,
 // required-but-nullable response fields, and integer request resources.
 fn snapshot_schema_valid(value: &Value, name: &str, request: bool) -> bool {
-    let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
-    fn valid(v: &Value, schema: &Value, spec: &Value, strict: bool) -> bool {
-        if v.is_null() && schema["nullable"] == true {
-            return true;
-        }
-        if let Some(reference) = schema["$ref"].as_str() {
-            return valid(v, &spec["schemas"][reference.rsplit('/').next().unwrap()], spec, strict);
-        }
-        if let Some(parts) = schema["allOf"].as_array()
-            && !parts.iter().all(|s| valid(v, s, spec, strict))
-        {
-            return false;
-        }
-        if let Some(choices) = schema["enum"].as_array()
-            && !choices.contains(v)
-        {
-            return false;
-        }
-        match schema["type"].as_str() {
-            Some("object") => {
-                let Some(object) = v.as_object() else {
-                    return false;
-                };
-                if schema["required"].as_array().is_some_and(|keys| keys.iter().any(|k| !object.contains_key(k.as_str().unwrap()))) {
-                    return false;
-                }
-                object.iter().all(|(k, v)| match schema["properties"].get(k) {
-                    Some(s) => valid(v, s, spec, strict),
-                    None => !strict,
-                })
-            }
-            Some("array") => v.as_array().is_some_and(|items| items.iter().all(|v| valid(v, &schema["items"], spec, strict))),
-            Some("integer") => v.is_i64() || v.is_u64(),
-            Some("number") => v.is_number(),
-            Some("boolean") => v.is_boolean(),
-            Some("string") => {
-                v.as_str().is_some_and(|s| schema["format"] != "date-time" || chrono::DateTime::parse_from_rfc3339(s).is_ok())
-            }
-            None => true,
-            kind => panic!("unsupported snapshot schema type {kind:?}"),
-        }
-    }
+    static SPEC: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap());
     // Unknown request members are rejected deliberately: OpenAPI permits them by
     // default, but accepting a renamed resource would hide caller/schema drift.
-    valid(value, &spec["schemas"][name], &spec, request)
+    snapshot_value_valid(value, spec["schemas"].get(name).expect("pinned snapshot schema"), spec, request)
+}
+
+fn snapshot_value_valid(v: &Value, schema: &Value, spec: &Value, strict: bool) -> bool {
+    if v.is_null() && schema["nullable"] == true {
+        return true;
+    }
+    if let Some(reference) = schema["$ref"].as_str() {
+        // The fixture stores components/schemas under its top-level schemas key.
+        let name = reference.strip_prefix("#/components/schemas/").expect("local schema reference");
+        return snapshot_value_valid(v, spec["schemas"].get(name).expect("pinned referenced schema"), spec, strict);
+    }
+    if let Some(parts) = schema["allOf"].as_array()
+        && !parts.iter().all(|s| snapshot_value_valid(v, s, spec, strict))
+    {
+        return false;
+    }
+    if let Some(parts) = schema["oneOf"].as_array()
+        && parts.iter().filter(|s| snapshot_value_valid(v, s, spec, strict)).count() != 1
+    {
+        return false;
+    }
+    if let Some(parts) = schema["anyOf"].as_array()
+        && !parts.iter().any(|s| snapshot_value_valid(v, s, spec, strict))
+    {
+        return false;
+    }
+    if let Some(choices) = schema["enum"].as_array()
+        && !choices.contains(v)
+    {
+        return false;
+    }
+    match schema["type"].as_str() {
+        Some("object") => {
+            let Some(object) = v.as_object() else {
+                return false;
+            };
+            if schema["required"].as_array().is_some_and(|keys| keys.iter().any(|k| !object.contains_key(k.as_str().unwrap()))) {
+                return false;
+            }
+            object.iter().all(|(k, v)| match schema["properties"].get(k) {
+                Some(s) => snapshot_value_valid(v, s, spec, strict),
+                None => !strict,
+            })
+        }
+        Some("array") => v.as_array().is_some_and(|items| items.iter().all(|v| snapshot_value_valid(v, &schema["items"], spec, strict))),
+        Some("integer") => v.is_i64() || v.is_u64(),
+        Some("number") => v.is_number(),
+        Some("boolean") => v.is_boolean(),
+        Some("string") => v.as_str().is_some_and(|s| schema["format"] != "date-time" || chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        None => true,
+        kind => panic!("unsupported snapshot schema type {kind:?}"),
+    }
+}
+// Composition follows JSON Schema: anyOf accepts a match; oneOf needs exactly
+// one. Integer values overlap the integer and number branches; strings match neither.
+#[test]
+fn snapshot_schema_composition_requires_matching_branches() {
+    let spec = json!({});
+    for value in [json!(1), json!(1.5), json!("1")] {
+        let any = json!({"anyOf":[{"type":"integer"},{"type":"number"}]});
+        let one = json!({"oneOf":[{"type":"integer"},{"type":"number"}]});
+        assert_eq!(snapshot_value_valid(&value, &any, &spec, false), value.is_number());
+        assert_eq!(snapshot_value_valid(&value, &one, &spec, false), value.is_number() && !value.is_i64());
+    }
 }
 
 // Exercise absent, unknown, and every mistyped resource field at the HTTP boundary.
@@ -1398,6 +1431,10 @@ fn snapshot_schema_valid(value: &Value, name: &str, request: bool) -> bool {
 async fn standin_validates_snapshot_create_schema() {
     let http = StandIn::default();
     let client = reqwest::Client::new();
+    // Activation requires the addressed snapshot, even when another snapshot exists.
+    let req = client.post("https://app.daytona.io/api/snapshots/missing/activate").bearer_auth("key-a").build().unwrap();
+    assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 404);
+    assert_eq!(http.0.lock().unwrap().activations, 0);
     let base =
         json!({"name":"fixture","imageName":"image@sha256:abc","regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
     let mut invalid = vec![json!({}), json!(null)];
@@ -1421,6 +1458,9 @@ async fn standin_validates_snapshot_create_schema() {
     let response = http.execute(req, &ChannelLabel::Default).await.unwrap();
     assert_eq!(response.status(), 201);
     let row: Value = serde_json::from_slice(response.body()).unwrap();
+    let req = client.post("https://app.daytona.io/api/snapshots/missing/activate").bearer_auth("key-a").build().unwrap();
+    assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 404);
+    assert_eq!(http.0.lock().unwrap().activations, 0);
     assert!(snapshot_schema_valid(&row, "SnapshotDto", false));
     for key in ["gpu", "general", "size", "entrypoint", "createdAt"] {
         let mut missing = row.clone();
