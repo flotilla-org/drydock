@@ -238,7 +238,11 @@ pub async fn optional_contract(
     let prepared = client
         .prepare(
             provider,
-            &PrepareRequest { image_digest: request.prepared.image_digest.clone(), tools_digest: request.prepared.tools_digest.clone() },
+            &PrepareRequest {
+                size: request.size.clone(),
+                image_digest: request.prepared.image_digest.clone(),
+                tools_digest: request.prepared.tools_digest.clone(),
+            },
         )
         .await
         .map_err(SafeError::category)?;
@@ -247,7 +251,11 @@ pub async fn optional_contract(
             == client
                 .prepare(
                     provider,
-                    &PrepareRequest { image_digest: prepared.image_digest.clone(), tools_digest: prepared.tools_digest.clone() },
+                    &PrepareRequest {
+                        size: request.size.clone(),
+                        image_digest: prepared.image_digest.clone(),
+                        tools_digest: prepared.tools_digest.clone(),
+                    },
                 )
                 .await
                 .map_err(SafeError::category)?,
@@ -448,7 +456,12 @@ pub async fn poll_contract(client: &Client, provider: &str, options: &Options, m
 pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &str, steps: &[(bool, usize, bool)]) -> Result<()> {
     let mut resources = [Resources::new(base), Resources::new(base)];
     let result = async {
-        let preparation = PrepareRequest { image_digest: "sequence-image".into(), tools_digest: "sequence-tools".into() };
+        // Reference-host scenarios accept tiny sizes; vendor conformance uses options.request.size.
+        let preparation = PrepareRequest {
+            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            image_digest: "sequence-image".into(),
+            tools_digest: "sequence-tools".into(),
+        };
         let prepared = [
             client.prepare(providers[0], &preparation).await.map_err(SafeError::category)?,
             client.prepare(providers[1], &preparation).await.map_err(SafeError::category)?,
@@ -509,7 +522,14 @@ async fn provider_isolation(client: &Client, providers: [&str; 2], main: &Enviro
     let mut resources = Resources::new(&options.request.label);
     let result = async {
         let prepared = client
-            .prepare(providers[1], &PrepareRequest { image_digest: "isolation-image".into(), tools_digest: "isolation-tools".into() })
+            .prepare(
+                providers[1],
+                &PrepareRequest {
+                    size: options.request.size.clone(),
+                    image_digest: "isolation-image".into(),
+                    tools_digest: "isolation-tools".into(),
+                },
+            )
             .await
             .map_err(SafeError::category)?;
         let mut request = options.request.clone();

@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "4"
+    "version": "5"
   },
   "paths": {
     "/v1/config": {
@@ -1990,8 +1990,9 @@
       },
       "PrepareRequest": {
         "type": "object",
-        "description": "Preparation is look-up-or-build at the provider, keyed by both digests.",
+        "description": "Preparation is look-up-or-build at the provider. Modules choose their key;\nproviders that fix resources at prepare include size alongside both digests.",
         "required": [
+          "size",
           "image_digest",
           "tools_digest"
         ],
@@ -1999,6 +2000,9 @@
           "image_digest": {
             "type": "string",
             "minLength": 1
+          },
+          "size": {
+            "$ref": "#/components/schemas/Size"
           },
           "tools_digest": {
             "type": "string",

@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol version 4 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 5 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
@@ -270,10 +270,11 @@ per-environment argument. The example binary is illustrative; the checked-in
 Flotilla vessel agent is still a skeleton, so an image must provide a working
 agent/listener before live acceptance. Bake the tools, `flock` and Python 3
 (for listener liveness checks) into the public image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
-prepare. A deterministic provider snapshot name tags the digest pair; subsequent
-prepare calls look it up and wait for `active`. The module sets the container
-class explicitly. No tools are uploaded. Prepare observes a build for up to four
-minutes; callers may call prepare again to continue observation of that same
+prepare along with the requested size. A deterministic provider snapshot name tags
+the digest pair and size; subsequent prepare calls look it up and wait for `active`. The module sets the container
+class and snapshot resources explicitly. Provision inherits those resources and
+refuses a size that differs from the prepared key. No tools are uploaded. Prepare
+observes a build for up to four minutes; callers may call prepare again to continue observation of that same
 snapshot. Size requests must use whole vCPU and GiB within the default 4 vCPU,
 8 GiB RAM and 10 GiB disk cap; incompatible requests are refused rather than rounded.
 

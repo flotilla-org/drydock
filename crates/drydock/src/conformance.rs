@@ -355,7 +355,7 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     .any(|scenario| options.selected(scenario));
     let mut options = options.clone();
     if options.selected(Scenario::Prepare) || needs_environment || options.selected(Scenario::Semantics) {
-        if let Some(prepared) = report.capture("prepare", prepare(client, provider, &options.request.prepared).await) {
+        if let Some(prepared) = report.capture("prepare", prepare(client, provider, &options.request).await) {
             options.request.prepared = prepared;
         } else {
             return report;
@@ -444,8 +444,13 @@ async fn billing_window(
     let hours: f64 = usage.environment_hours.iter().filter(|row| &row.size == size).map(|row| row.hours).sum();
     require(if running { hours > 0.0 } else { hours == 0.0 }, "vendor usage disagrees with billing transition")
 }
-async fn prepare(client: &Client, provider: &str, prepared: &Prepared) -> Result<Prepared> {
-    let request = PrepareRequest { image_digest: prepared.image_digest.clone(), tools_digest: prepared.tools_digest.clone() };
+async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) -> Result<Prepared> {
+    let prepared = &provision.prepared;
+    let request = PrepareRequest {
+        size: provision.size.clone(),
+        image_digest: prepared.image_digest.clone(),
+        tools_digest: prepared.tools_digest.clone(),
+    };
     let first = client.prepare(provider, &request).await.map_err(SafeError::category)?;
     let second = client.prepare(provider, &request).await.map_err(SafeError::category)?;
     require(

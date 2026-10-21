@@ -119,7 +119,13 @@ fn generated_request_semantics(tc: hegel::TestCase) {
     assert_eq!(serde_json::from_value::<Size>(json!({"cpus":cpus,"memory_bytes":0,"disk_bytes":0})).is_ok(), cpus > 0);
     let nonempty = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) != 0;
     let text = if nonempty { "ok" } else { "" };
-    assert_eq!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":text,"tools_digest":"tools"})).is_ok(), nonempty);
+    assert_eq!(
+        serde_json::from_value::<PrepareRequest>(
+            json!({"image_digest":text,"tools_digest":"tools","size":{"cpus":2.0,"memory_bytes":4294967296u64,"disk_bytes":10737418240u64}})
+        )
+        .is_ok(),
+        nonempty
+    );
     assert_eq!(serde_json::from_value::<CredentialRefresh>(json!({"value":text})).is_ok(), nonempty);
     assert_eq!(serde_json::from_value::<ExecRequest>(json!({"command":[text,""]})).is_ok(), nonempty);
     assert!(serde_json::from_value::<ExecRequest>(json!({"command":[]})).is_err());
@@ -136,4 +142,13 @@ fn proxy_placeholder_requires_a_value(tc: hegel::TestCase) {
         "mode":"proxied", "placeholder_token":token, "proxy_url":"http://localhost:1234"
     }));
     assert_eq!(result.is_ok(), length > 0);
+}
+
+// Size is mandatory at prepare, and its existing CPU constraints apply there too.
+#[test]
+fn preparation_requires_valid_size() {
+    for size in [json!(null), json!({"cpus":0,"memory_bytes":0,"disk_bytes":0})] {
+        assert!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":"image","tools_digest":"tools","size":size})).is_err());
+    }
+    assert!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":"image","tools_digest":"tools"})).is_err());
 }

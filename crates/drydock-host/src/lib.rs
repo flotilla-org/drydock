@@ -1415,7 +1415,15 @@ mod operation_tests {
         i.capabilities = i.provider.capabilities();
         assert!(
             i.call(Gate::Prepare, |p, c| async move {
-                p.prepare(PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }, &c).await
+                p.prepare(
+                    PrepareRequest {
+                        size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                        image_digest: "image".into(),
+                        tools_digest: "tools".into(),
+                    },
+                    &c,
+                )
+                .await
             })
             .await
             .is_ok()
