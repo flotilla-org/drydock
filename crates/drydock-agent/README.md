@@ -13,7 +13,9 @@ The provider supplies a protected, host-facing socket directory, and protects
 vsock access where used. There is no token or per-vessel startup configuration.
 The Unix listener accepts native connections or a host-initiated yamux session;
 the latter also carries reverse streams without a second guest socket. vsock is
-Linux-only. Both listeners share one control state. Live provider isolation and
+Linux-only. Both listeners share one control state. Native Unix reverse connections use
+the fixed host socket `/run/drydock/host.sock` (`HOST_SOCKET` in the binary);
+host-initiated yamux requires no reverse socket. Live provider isolation and
 startup/supervision are verified in the provider integration work (#54).
 
 The host constructs `Client::connect(transport, expected_fingerprint)`. The
@@ -41,16 +43,25 @@ The host-facing `Purpose::Control` stream carries HTTP/2 through
 | PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
 | POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
 
-JSON byte fields are arrays of integers. Requests are limited to 128 MiB;
+I/O failures distinguish missing paths (404), permissions (403), conflicts (409), malformed input (400) and internal errors (500).
+
+JSON byte fields are arrays of integers. Requests and read-back are limited to
+128 MiB (oversized reads return 413 before buffering);
 large general file operations, archives, directory traversal and diffs belong
 to #50. Empty writes and arbitrary binary read-back are supported. File writes
-replace the entire file atomically; the optional executable flag sets mode 755.
+replace the entire file atomically; new non-executable files use mode 644,
+replacements preserve the existing mode/owner, and the optional executable flag
+sets mode 755. A destination symlink is replaced rather than followed.
 `flush` can also sync a parent directory. Routes use paths directly within the
 vessel, which is already controlled by the trusted caller.
 
 Configuration replaces egress, CA, enabled features, process environment and
 guest forwards together. Invalid configuration leaves the previous state intact;
-unchanged listeners and their streams survive replacement. In this slice the
+unchanged listeners and their streams survive replacement. Listeners consult the
+current control opener for each connection, so host reconnection does not leave
+a stale session. TCP-only changes reuse the Unix binding. Transient accept errors
+back off; finished listener tasks are rebuilt on the next configuration push.
+In this slice the
 feature list and egress/CA values are stored configuration for consumers, not
 switches that claim to activate capture. The host pushes CA files via the files
 API and names their paths through the process environment.
@@ -61,7 +72,10 @@ inherits the pushed environment, including proxy, CA variables and placeholder
 tokens. Output is streamed incrementally and ordered independently per stdout
 and stderr; `Exit` follows their drained output, with `None` for a signal exit.
 Output spools into unlinked temporary files so agent exit/re-exec cannot deliver
-SIGPIPE to the child. Disk use grows with a command's output until it exits;
+SIGPIPE to the child. Idle polling backs off, reuses a buffer, and stops tailing
+when the client disconnects (the child is still reaped). The provider may set
+the agent’s standard `TMPDIR` to place spools on disk instead of tmpfs. Disk use
+grows with a command's output until it exits;
 callers should manage long-running service logs. Dropping a stream does not kill
 the process. On Linux, startup reaps children inherited across re-exec after they
 exit. The provider's init reaps children orphaned by an agent crash.
@@ -70,7 +84,9 @@ Upgrade uses only `/hello` and `/upgrade`: stage with PUT, activate with POST,
 reconnect with a fresh provider transport, then verify the new fingerprint. The
 activation acknowledgement is advisory: a lost response requires reconnecting
 and checking hello. A short acknowledgement grace period precedes shutdown;
-the binary path remains stable across repeated upgrades. Re-exec drops control
+the binary path remains stable across repeated upgrades. The previous executable
+is retained as `.prev` and restored if direct `execv` rejects the replacement.
+Re-exec drops control
 and forward streams, removes owned guest sockets, and resets configuration.
 Stale socket inodes from a crash are reclaimed only when they refuse a connection; live listeners and ordinary files are preserved.
 The host pushes it again after hello. Children continue running with their

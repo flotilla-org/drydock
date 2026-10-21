@@ -142,6 +142,19 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     })
     .await
     .expect("inherited child must be reaped after exiting");
+    // An executable rejected by exec(2) must restore and re-run the previous
+    // generation, rather than leaving a vessel without its control agent.
+    upgraded.upgrade(b"not an executable".to_vec()).await.unwrap();
+    drop(upgraded);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while executable.with_extension("prev").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed exec must restore the previous binary");
+    let upgraded = connect(&socket, &new).await;
+    assert!(upgraded.is_compatible());
     let crash_socket = dir.path().join("crash-forward");
     let crash_target = dir.path().join("crash-target");
     let _crash_listener = tokio::net::UnixListener::bind(&crash_target).unwrap();

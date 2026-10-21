@@ -17,17 +17,58 @@ use tokio::{
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 type ApiError = (StatusCode, String);
-fn api(error: impl std::fmt::Display) -> ApiError {
-    (StatusCode::BAD_REQUEST, error.to_string())
+enum Failure {
+    Message(String),
+    Io(io::Error),
+}
+impl From<&str> for Failure {
+    fn from(s: &str) -> Self {
+        Self::Message(s.into())
+    }
+}
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+fn api(error: impl Into<Failure>) -> ApiError {
+    match error.into() {
+        Failure::Message(message) => (StatusCode::BAD_REQUEST, message),
+        Failure::Io(error) => {
+            let status = match error.kind() {
+                io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => StatusCode::BAD_REQUEST,
+                io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, error.to_string())
+        }
+    }
+}
+struct GuestSocket {
+    listener: UnixListener,
+    path: PathBuf,
+}
+impl Drop for GuestSocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 struct Listener {
     task: tokio::task::JoinHandle<()>,
-    path: PathBuf,
+    unix: Arc<GuestSocket>,
+    tcp: Option<(std::net::SocketAddr, Arc<TcpListener>)>,
+}
+impl Listener {
+    async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 impl Drop for Listener {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 #[derive(Default)]
@@ -38,7 +79,7 @@ struct Settings {
 }
 struct Shared {
     hello: Hello,
-    opener: Mutex<Opener>,
+    opener: Arc<Mutex<Opener>>,
     settings: Mutex<Settings>,
     executable: PathBuf,
     staged: Mutex<Option<PathBuf>>,
@@ -55,7 +96,7 @@ impl Agent {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             hello: Hello { fingerprint, features: FEATURES.iter().map(|s| (*s).into()).collect() },
-            opener: Mutex::new(transport.opener.clone()),
+            opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),
             executable,
             staged: Mutex::new(None),
@@ -91,7 +132,10 @@ impl Agent {
                     let incoming = match transport.accept().await {
                         Ok(Some(incoming)) => incoming,
                         Ok(None) => break,
-                        Err(_) => continue,
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
                     };
                     if tx.send((incoming, transport.opener.clone())).await.is_err() {
                         break;
@@ -106,7 +150,8 @@ impl Agent {
                     tasks.shutdown().await;
                     // Remove owned guest socket paths before exec discards the
                     // runtime. Aborting tasks alone does not synchronously drop them.
-                    self.shared.settings.lock().await.listeners.clear();
+                    let listeners = std::mem::take(&mut self.shared.settings.lock().await.listeners);
+                    for (_, listener) in listeners { listener.stop().await; }
                     return path.ok_or_else(|| io::Error::other("upgrade channel closed"));
                 },
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
@@ -151,8 +196,10 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
         if prepared.contains_key(&forward.id) {
             return Err(api("duplicate forward ID"));
         }
-        let unchanged = settings.config.forwards.iter().any(|old| old == forward);
-        let listener = if unchanged { None } else { Some(listen(forward, s.opener.lock().await.clone()).await.map_err(api)?) };
+        let unchanged = settings.config.forwards.iter().any(|old| old == forward)
+            && settings.listeners.get(&forward.id).is_some_and(|listener| !listener.task.is_finished());
+        let listener =
+            if unchanged { None } else { Some(listen(forward, s.opener.clone(), settings.listeners.get(&forward.id)).await.map_err(api)?) };
         prepared.insert(forward.id.clone(), listener);
     }
     let mut listeners = HashMap::new();
@@ -161,49 +208,77 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
             listeners.insert(id, listener);
         }
     }
-    settings.listeners = listeners;
+    let old = std::mem::replace(&mut settings.listeners, listeners);
+    for (_, listener) in old {
+        listener.stop().await;
+    }
     settings.config = config;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn listen(forward: &GuestForward, opener: Opener) -> io::Result<Listener> {
+async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<&Listener>) -> io::Result<Listener> {
     if forward.tcp.is_some_and(|addr| !addr.ip().is_loopback()) {
         return Err(invalid("guest TCP listener must be loopback"));
     }
     // Bind before publishing the new listener into the configuration.
     let tcp = if let Some(address) = forward.tcp {
-        let listener = std::net::TcpListener::bind(address)?;
-        listener.set_nonblocking(true)?;
-        Some(TcpListener::from_std(listener)?)
+        if let Some((_, listener)) = old.and_then(|old| old.tcp.as_ref()).filter(|(previous, _)| *previous == address) {
+            Some((address, listener.clone()))
+        } else {
+            let listener = std::net::TcpListener::bind(address)?;
+            listener.set_nonblocking(true)?;
+            Some((address, Arc::new(TcpListener::from_std(listener)?)))
+        }
     } else {
         None
     };
-    let unix = match UnixListener::bind(&forward.unix) {
-        Ok(listener) => listener,
-        Err(error) => {
-            use std::os::unix::fs::FileTypeExt;
-            let stale = std::fs::symlink_metadata(&forward.unix).is_ok_and(|m| m.file_type().is_socket())
-                && matches!(tokio::time::timeout(std::time::Duration::from_millis(100), tokio::net::UnixStream::connect(&forward.unix)).await,
+    let unix = if let Some(old) = old.filter(|old| old.unix.path == forward.unix) {
+        old.unix.clone()
+    } else {
+        let unix = match UnixListener::bind(&forward.unix) {
+            Ok(listener) => listener,
+            Err(error) => {
+                use std::os::unix::fs::FileTypeExt;
+                let stale = std::fs::symlink_metadata(&forward.unix).is_ok_and(|m| m.file_type().is_socket())
+                    && matches!(tokio::time::timeout(std::time::Duration::from_millis(100), tokio::net::UnixStream::connect(&forward.unix)).await,
                     Ok(Err(ref error)) if error.kind() == io::ErrorKind::ConnectionRefused);
-            if !stale {
-                return Err(error);
+                if !stale {
+                    return Err(error);
+                }
+                std::fs::remove_file(&forward.unix)?;
+                UnixListener::bind(&forward.unix)?
             }
-            std::fs::remove_file(&forward.unix)?;
-            UnixListener::bind(&forward.unix)?
-        }
+        };
+        Arc::new(GuestSocket { listener: unix, path: forward.unix.clone() })
     };
+    let owned_unix = unix.clone();
+    let owned_tcp = tcp.clone();
     let id = forward.id.clone();
     let task = tokio::spawn(async move {
         let mut streams = JoinSet::new();
         loop {
             let accepted: io::Result<ByteStream> = tokio::select! {
                 Some(_) = streams.join_next(), if !streams.is_empty() => continue,
-                result = unix.accept() => result.map(|(s,_)| Box::new(s) as ByteStream),
-                result = async { tcp.as_ref().unwrap().accept().await }, if tcp.is_some() => result.map(|(s,_)| Box::new(s) as ByteStream),
+                result = unix.listener.accept() => result.map(|(s,_)| Box::new(s) as ByteStream),
+                result = async { tcp.as_ref().unwrap().1.accept().await }, if tcp.is_some() => result.map(|(s,_)| Box::new(s) as ByteStream),
             };
-            let Ok(mut stream) = accepted else {
-                break;
+            let mut stream = match accepted {
+                Ok(stream) => stream,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::OutOfMemory
+                    ) || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(_) => break,
             };
-            let opener = opener.clone();
+            let opener = opener.lock().await.clone();
             let id = id.clone();
             streams.spawn(async move {
                 if let Ok(mut remote) = opener.open(Purpose::Forward { id }).await {
@@ -212,7 +287,7 @@ async fn listen(forward: &GuestForward, opener: Opener) -> io::Result<Listener> 
             });
         }
     });
-    Ok(Listener { task, path: forward.unix.clone() })
+    Ok(Listener { task, unix: owned_unix, tcp: owned_tcp })
 }
 async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForward>) -> Result<StatusCode, ApiError> {
     check_id(&forward.id).map_err(api)?;
@@ -220,14 +295,16 @@ async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForwar
     if settings.listeners.contains_key(&forward.id) {
         return Err(api("forward ID already exists"));
     }
-    let listener = listen(&forward, s.opener.lock().await.clone()).await.map_err(api)?;
+    let listener = listen(&forward, s.opener.clone(), None).await.map_err(api)?;
     settings.listeners.insert(forward.id.clone(), listener);
     settings.config.forwards.push(forward);
     Ok(StatusCode::NO_CONTENT)
 }
 async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> StatusCode {
     let mut settings = s.settings.lock().await;
-    settings.listeners.remove(&id);
+    if let Some(listener) = settings.listeners.remove(&id) {
+        listener.stop().await;
+    }
     settings.config.forwards.retain(|f| f.id != id);
     StatusCode::NO_CONTENT
 }
@@ -257,9 +334,17 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) ->
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut file = tokio::fs::File::from_std(temporary.reopen()?);
     file.write_all(bytes).await?;
-    if executable {
-        file.set_permissions(std::fs::Permissions::from_mode(0o755)).await?;
+    let existing = std::fs::symlink_metadata(path).ok().filter(|m| !m.file_type().is_symlink());
+    if let Some(metadata) = &existing {
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        // SAFETY: the temporary file owns this open descriptor. Preserve the
+        // destination's owner before chmod (chown may clear permission bits).
+        if unsafe { libc::fchown(temporary.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
+    let mode = if executable { 0o755 } else { existing.map_or(0o644, |m| m.permissions().mode()) };
+    file.set_permissions(std::fs::Permissions::from_mode(mode)).await?;
     file.sync_all().await?;
     temporary.persist(path).map_err(|error| error.error)?;
     tokio::fs::File::open(parent).await?.sync_all().await
@@ -269,7 +354,18 @@ async fn write_file(Json(file): Json<FileWrite>) -> Result<StatusCode, ApiError>
     Ok(StatusCode::NO_CONTENT)
 }
 async fn read_file(Json(file): Json<FilePath>) -> Result<Vec<u8>, ApiError> {
-    tokio::fs::read(file.path).await.map_err(api)
+    use tokio::io::AsyncReadExt;
+    const LIMIT: u64 = 128 * 1024 * 1024;
+    let input = tokio::fs::File::open(file.path).await.map_err(api)?;
+    if input.metadata().await.map_err(api)?.len() > LIMIT {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "read exceeds 128 MiB".into()));
+    }
+    let mut bytes = Vec::new();
+    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(api)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "read exceeds 128 MiB".into()));
+    }
+    Ok(bytes)
 }
 async fn flush_file(Json(file): Json<FilePath>) -> Result<StatusCode, ApiError> {
     tokio::fs::File::open(file.path).await.map_err(api)?.sync_all().await.map_err(api)?;
@@ -289,6 +385,13 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, Ap
     let mut staged = s.staged.lock().await;
     let path = staged.take().ok_or_else(|| api("no staged agent"))?;
     // Keep the installed path stable over successive upgrades.
+    let previous = s.executable.with_extension("prev");
+    match tokio::fs::remove_file(&previous).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(api(error)),
+    }
+    tokio::fs::hard_link(&s.executable, &previous).await.map_err(api)?;
     tokio::fs::rename(&path, &s.executable).await.map_err(api)?;
     if let Some(parent) = s.executable.parent() {
         tokio::fs::File::open(parent).await.map_err(api)?.sync_all().await.map_err(api)?;
@@ -301,4 +404,38 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, Ap
         let _ = tx.send(path).await;
     });
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // A finished listener is rebuilt even when desired configuration is identical.
+    // Aborting the task stands in for a fatal listener boundary failure.
+    #[tokio::test]
+    async fn identical_configuration_recovers_finished_listener() {
+        let (a, b) = tokio::io::duplex(4096);
+        let (host, guest) = tokio::join!(
+            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
+            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
+        );
+        let mut host = host.unwrap();
+        let guest = guest.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::new(guest, "build".into(), dir.path().join("agent"));
+        let f = GuestForward { id: "recover".into(), unix: dir.path().join("socket"), tcp: None };
+        let config = Configuration { forwards: vec![f.clone()], ..Configuration::default() };
+        configure(State(agent.shared.clone()), Json(config.clone())).await.unwrap();
+        {
+            let mut settings = agent.shared.settings.lock().await;
+            let listener = settings.listeners.get_mut("recover").unwrap();
+            listener.task.abort();
+            while !listener.task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        configure(State(agent.shared.clone()), Json(config)).await.unwrap();
+        let _stream = tokio::net::UnixStream::connect(f.unix).await.unwrap();
+        let incoming = tokio::time::timeout(std::time::Duration::from_secs(2), host.accept()).await.unwrap().unwrap().unwrap();
+        assert_eq!(incoming.purpose, Purpose::Forward { id: "recover".into() });
+    }
 }

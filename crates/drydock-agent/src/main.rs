@@ -1,13 +1,14 @@
 use drydock_agent::Agent;
 use drydock_transport::{Limits, Transport, native::UnixConnections};
-use std::{io, os::unix::process::CommandExt, path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf, sync::Arc};
 use tokio::net::UnixListener;
+const HOST_SOCKET: &str = "/run/drydock/host.sock";
 #[tokio::main]
 async fn main() -> io::Result<()> {
     if std::process::id() == 1 {
         return Err(io::Error::other("drydock-agent must not be PID 1"));
     }
-    reap_inherited_children()?;
+    reap_inherited_children();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
@@ -38,7 +39,7 @@ async fn main() -> io::Result<()> {
         }
     }
     let listener = UnixListener::bind(&socket)?;
-    let transport = Transport::native(Arc::new(UnixConnections::new(listener, "/run/drydock/host.sock")), Limits::default())?;
+    let transport = Transport::native(Arc::new(UnixConnections::new(listener, HOST_SOCKET)), Limits::default())?;
     let executable = std::env::current_exe()?;
     let fingerprint = drydock_agent::fingerprint()?;
     let mut agent = Agent::new(transport, fingerprint, executable);
@@ -55,16 +56,21 @@ async fn main() -> io::Result<()> {
     }
     let path = agent.run().await?;
     let _ = std::fs::remove_file(socket);
-    Err(std::process::Command::new(path).args(args).exec())
+    let error = replace_image(&path, &args);
+    let previous = path.with_extension("prev");
+    if previous.exists() {
+        std::fs::rename(previous, &path)?;
+        return Err(replace_image(&path, &args));
+    }
+    Err(error)
 }
 
 // Re-exec keeps the PID and its children, but loses Tokio's old Child handles.
 // Reap only the children inherited at startup, so this cannot steal statuses
 // from commands launched by the new runtime. Provider init owns crash orphans.
 #[cfg(target_os = "linux")]
-fn reap_inherited_children() -> io::Result<()> {
-    let children = std::fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))?;
-    let mut children: Vec<libc::pid_t> = children.split_whitespace().filter_map(|pid| pid.parse().ok()).collect();
+fn reap_inherited_children() {
+    let mut children = inherited_children(std::path::Path::new("/proc/self/task"));
     if !children.is_empty() {
         tokio::spawn(async move {
             while !children.is_empty() {
@@ -78,9 +84,59 @@ fn reap_inherited_children() -> io::Result<()> {
             }
         });
     }
-    Ok(())
 }
 #[cfg(not(target_os = "linux"))]
-fn reap_inherited_children() -> io::Result<()> {
-    Ok(())
+fn reap_inherited_children() {}
+
+// execv deliberately does not apply execvp's ENOEXEC shell-script fallback.
+// A rejected agent image must return here so the previous binary can recover.
+fn replace_image(path: &std::path::Path, args: &[std::ffi::OsString]) -> io::Error {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let strings: Result<Vec<_>, _> =
+        std::iter::once(path.as_os_str()).chain(args.iter().map(|arg| arg.as_os_str())).map(|arg| CString::new(arg.as_bytes())).collect();
+    let strings = match strings {
+        Ok(strings) => strings,
+        Err(error) => return io::Error::new(io::ErrorKind::InvalidInput, error),
+    };
+    let mut pointers: Vec<_> = strings.iter().map(|arg| arg.as_ptr()).collect();
+    pointers.push(std::ptr::null());
+    // SAFETY: all C strings and the null-terminated argv remain live for execv.
+    unsafe {
+        libc::execv(strings[0].as_ptr(), pointers.as_ptr());
+    }
+    io::Error::last_os_error()
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_children(root: &std::path::Path) -> Vec<libc::pid_t> {
+    let mut children = std::collections::HashSet::new();
+    if let Ok(tasks) = std::fs::read_dir(root) {
+        for task in tasks.flatten() {
+            if let Ok(pids) = std::fs::read_to_string(task.path().join("children")) {
+                children.extend(pids.split_whitespace().filter_map(|pid| pid.parse::<libc::pid_t>().ok()));
+            }
+        }
+    }
+    children.into_iter().collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    // Fake procfs boundary: child lists can belong to any thread, overlap, or
+    // disappear while scanning. Missing CONFIG_PROC_CHILDREN must not bar startup.
+    #[test]
+    fn proc_children_scan_all_threads_and_tolerate_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for (thread, pids) in [("main", "11 22"), ("worker", "22 33"), ("vanished", "")] {
+            std::fs::create_dir(dir.path().join(thread)).unwrap();
+            if !pids.is_empty() {
+                std::fs::write(dir.path().join(thread).join("children"), pids).unwrap();
+            }
+        }
+        let mut pids = inherited_children(dir.path());
+        pids.sort();
+        assert_eq!(pids, vec![11, 22, 33]);
+        assert!(inherited_children(&dir.path().join("missing")).is_empty());
+    }
 }

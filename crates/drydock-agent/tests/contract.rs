@@ -324,3 +324,84 @@ async fn configured_forwards_and_tcp_endpoints() {
         task.abort();
     }
 }
+
+// A new host control session must redirect an unchanged guest listener to the
+// new per-vessel registry, rather than retaining the disconnected session.
+#[tokio::test]
+async fn unchanged_forward_uses_reconnected_host() {
+    async fn pair() -> (Transport, Transport) {
+        let (a, b) = tokio::io::duplex(4096);
+        let (a, b) =
+            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+        (a.unwrap(), b.unwrap())
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (host1, guest1) = pair().await;
+    let (host2, guest2) = pair().await;
+    let mut agent = Agent::new(guest1, "test-build".into(), dir.path().join("agent"));
+    agent.add_transport(guest2);
+    let task = tokio::spawn(agent.run());
+    let first = Client::connect(host1, "test-build").await.unwrap();
+    let target1 = dir.path().join("target1");
+    let listener1 = UnixListener::bind(&target1).unwrap();
+    let f = GuestForward { id: "same".into(), unix: dir.path().join("forward"), tcp: None };
+    first.add_guest_forward(f.clone(), Endpoint::Unix(target1)).await.unwrap();
+    let config = first.configuration().await.unwrap();
+    drop(first);
+    drop(listener1);
+    let second = Client::connect(host2, "test-build").await.unwrap();
+    let target2 = dir.path().join("target2");
+    let listener2 = UnixListener::bind(&target2).unwrap();
+    second.register_host_endpoint("same".into(), Endpoint::Unix(target2)).unwrap();
+    second.configure(config).await.unwrap();
+    let echo_task = tokio::spawn(echo(listener2));
+    let mut guest: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
+    exchange(&mut guest, b"new host session").await;
+    task.abort();
+    echo_task.abort();
+}
+
+// Non-executable pushes default to a CA-readable 0644; replacement preserves
+// existing mode/owner, while an explicit executable push uses 0755. Oversized
+// reads fail up front, and absent paths have a distinct HTTP error.
+#[tokio::test]
+async fn file_modes_and_bounded_read_errors() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let h = harness(false, "test-build").await;
+    let path = h.dir.path().join("ca");
+    h.client.write(path.clone(), b"CA".to_vec(), false).await.unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    h.client.write(path.clone(), b"replacement".to_vec(), false).await.unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!((after.mode() & 0o777, after.uid(), after.gid()), (0o640, before.uid(), before.gid()));
+    h.client.write(path.clone(), vec![], true).await.unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+    assert!(h.client.read(h.dir.path().join("absent")).await.unwrap_err().to_string().contains("404"));
+    let large = h.dir.path().join("large");
+    std::fs::File::create(&large).unwrap().set_len(128 * 1024 * 1024 + 1).unwrap();
+    assert!(h.client.read(large).await.unwrap_err().to_string().contains("413"));
+}
+
+// Changing only TCP preserves the Unix socket binding. Removing and adding the
+// optional TCP listener cannot fail because the Unix path is already bound.
+#[tokio::test]
+async fn tcp_only_configuration_changes_reuse_unix_listener() {
+    let h = harness(false, "test-build").await;
+    let target = h.dir.path().join("target");
+    let echo_task = tokio::spawn(echo(UnixListener::bind(&target).unwrap()));
+    let f = forward(&h, "changing");
+    h.client.add_guest_forward(f.clone(), Endpoint::Unix(target)).await.unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let mut changed = f.clone();
+    changed.tcp = Some(port);
+    h.client.configure(Configuration { forwards: vec![changed], ..Configuration::default() }).await.unwrap();
+    let mut tcp: ByteStream = Box::new(tokio::net::TcpStream::connect(port).await.unwrap());
+    exchange(&mut tcp, b"added TCP").await;
+    h.client.configure(Configuration { forwards: vec![f.clone()], ..Configuration::default() }).await.unwrap();
+    assert!(tokio::net::TcpStream::connect(port).await.is_err());
+    let mut unix: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
+    exchange(&mut unix, b"retained Unix").await;
+    echo_task.abort();
+}

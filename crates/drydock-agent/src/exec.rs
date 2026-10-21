@@ -34,15 +34,20 @@ pub(crate) fn launch(request: Exec, environment: BTreeMap<String, String>) -> io
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
         let mut status = None;
+        let mut buffer = [0; 8192];
+        let mut idle = Duration::from_millis(10);
         loop {
+            if tx.is_closed() {
+                let _ = child.wait().await;
+                break;
+            }
             let mut emitted = false;
             for (file, is_out) in [(&mut stdout, true), (&mut stderr, false)] {
-                let mut bytes = vec![0; 8192];
-                match file.read(&mut bytes).await {
+                match file.read(&mut buffer).await {
                     Ok(0) => {}
                     Ok(n) => {
                         emitted = true;
-                        bytes.truncate(n);
+                        let bytes = buffer[..n].to_vec();
                         let event = if is_out { ExecEvent::Stdout(bytes) } else { ExecEvent::Stderr(bytes) };
                         // On disconnect continue reaping; never kill the detached child.
                         let _ = tx.send(event).await;
@@ -62,7 +67,10 @@ pub(crate) fn launch(request: Exec, environment: BTreeMap<String, String>) -> io
                 }
             }
             if !emitted {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(idle).await;
+                idle = (idle * 2).min(Duration::from_millis(250));
+            } else {
+                idle = Duration::from_millis(10);
             }
         }
     });
