@@ -31,8 +31,11 @@ enum Command {
         provider: String,
         image_digest: String,
         tools_digest: String,
+        #[arg(long)]
         cpus: f64,
+        #[arg(long)]
         memory_bytes: u64,
+        #[arg(long)]
         disk_bytes: u64,
     },
     Hosts,

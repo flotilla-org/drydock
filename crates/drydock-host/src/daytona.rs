@@ -558,6 +558,13 @@ impl Provider for Daytona {
         for _ in 0..120 {
             match text(&snapshot, "state")? {
                 "active" => {
+                    // SnapshotDto uses `mem` for RAM, unlike CreateSnapshot's `memory`.
+                    if number(&snapshot, "cpu")? != r.size.cpus
+                        || number(&snapshot, "mem")? != (r.size.memory_bytes / GIB) as f64
+                        || number(&snapshot, "disk")? != (r.size.disk_bytes / GIB) as f64
+                    {
+                        return Err(refused("Daytona snapshot resources do not match the requested size"));
+                    }
                     return Ok(Prepared {
                         provider: self.name.clone(),
                         id: snapshot_name,
@@ -931,6 +938,7 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         })
 }
 // The provider records the prepared form under this deterministic resource key.
+// Call only after validate_size: whole positive CPUs make the integer cast lossless.
 fn snapshot_name(image: &str, tools: &str, size: &Size) -> String {
     name("snapshot", &format!("{image}\0{tools}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
 }

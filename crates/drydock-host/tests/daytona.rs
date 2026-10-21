@@ -69,7 +69,11 @@ impl StandIn {
                             let (parts, body) = response.into_parts();
                             if let Ok(value) = serde_json::from_slice::<Value>(&body) {
                                 let rows = value.get("items").and_then(Value::as_array).cloned().unwrap_or_else(|| vec![value]);
-                                state.lock().unwrap().fixture_rows.extend(rows.into_iter().filter(|r| r.get("cpu").is_some()));
+                                state
+                                    .lock()
+                                    .unwrap()
+                                    .fixture_rows
+                                    .extend(rows.into_iter().filter(|r| r.get("cpu").is_some() && r.get("mem").is_none()));
                             }
                             http::Response::from_parts(parts, axum::body::Body::from(body))
                         }
@@ -108,7 +112,7 @@ impl StandIn {
                 for row in rows {
                     *row = schema_row(row.clone());
                 }
-            } else if body.get("cpu").is_some() {
+            } else if body.get("cpu").is_some() && body.get("mem").is_none() {
                 body = schema_row(body);
             }
 
@@ -195,7 +199,7 @@ impl StandIn {
                 if s.snapshots.contains_key(name) {
                     return response(409, json!({"statusCode":409}));
                 }
-                let snapshot = json!({"id":format!("snap-{}",s.snapshots.len()+1),"name":name,"state":"active","cpu":body["cpu"],"memory":body["memory"],"disk":body["disk"]});
+                let snapshot = json!({"id":format!("snap-{}",s.snapshots.len()+1),"name":name,"state":"active","cpu":body["cpu"],"mem":body["memory"],"disk":body["disk"]});
                 s.snapshots.insert(name.into(), snapshot.clone());
                 response(201, snapshot)
             }
@@ -250,7 +254,7 @@ impl StandIn {
                 if let Some(snapshot) = body["snapshot"].as_str().and_then(|name| s.snapshots.get(name)) {
                     let snapshot = snapshot.clone();
                     for key in ["cpu", "memory", "disk"] {
-                        body[key] = snapshot[key].clone();
+                        body[key] = snapshot[if key == "memory" { "mem" } else { key }].clone();
                     }
                 }
                 let defaults = json!({"name":format!("auto-{}",s.creates+1),"labels":{},"cpu":1,"memory":1,"disk":3});
@@ -403,9 +407,12 @@ async fn provider_with_probe(http: Arc<dyn HttpClient>, probe: bool) -> Arc<dyn 
     }
     DaytonaModule.configure(&config, http).await.unwrap()
 }
+fn daytona_size() -> Size {
+    Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 }
+}
 async fn prepared(p: &dyn Provider, c: &Credentials) -> Prepared {
     let request = PrepareRequest {
-        size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+        size: daytona_size(),
         image_digest: format!("docker.io/test/image@sha256:{}", "a".repeat(64)),
         tools_digest: "sha256:tools".into(),
     };
@@ -414,13 +421,7 @@ async fn prepared(p: &dyn Provider, c: &Credentials) -> Prepared {
     first
 }
 fn request(prepared: Prepared, label: &str) -> ProvisionRequest {
-    ProvisionRequest {
-        label: label.into(),
-        prepared,
-        size: Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-        egress: EgressRequest::default(),
-        ssh_public_key: None,
-    }
+    ProvisionRequest { label: label.into(), prepared, size: daytona_size(), egress: EgressRequest::default(), ssh_public_key: None }
 }
 fn row(p: Provisioned) -> Environment {
     match p {
@@ -723,11 +724,8 @@ async fn preparation_converges_by_digest_pair() {
     let a = provider(http.clone()).await;
     let b = provider(http.clone()).await;
     let c = credentials(false);
-    let mut r = PrepareRequest {
-        size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-        image_digest: format!("image@sha256:{}", "b".repeat(64)),
-        tools_digest: "tools-a".into(),
-    };
+    let mut r =
+        PrepareRequest { size: daytona_size(), image_digest: format!("image@sha256:{}", "b".repeat(64)), tools_digest: "tools-a".into() };
     let (x, y) = tokio::join!(a.prepare(r.clone(), &c), b.prepare(r.clone(), &c));
     let x = x.unwrap();
     assert_eq!(x, y.unwrap());
@@ -737,16 +735,9 @@ async fn preparation_converges_by_digest_pair() {
     assert_ne!(x.id, other.id);
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 2);
     assert!(
-        a.prepare(
-            PrepareRequest {
-                size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-                image_digest: "image:latest".into(),
-                tools_digest: "tools".into()
-            },
-            &c
-        )
-        .await
-        .is_err()
+        a.prepare(PrepareRequest { size: daytona_size(), image_digest: "image:latest".into(), tools_digest: "tools".into() }, &c)
+            .await
+            .is_err()
     );
 }
 
@@ -794,6 +785,22 @@ fn prepared_sizes_route_to_snapshots(tc: hegel::TestCase) {
         }
         assert_eq!(http.0.lock().unwrap().snapshots.len(), 4);
     });
+}
+
+// An active snapshot created out of band under our deterministic name must not
+// be adopted if any vendor resource differs (SnapshotDto calls RAM `mem`).
+#[tokio::test]
+async fn preparation_refuses_existing_snapshot_resource_mismatch() {
+    for key in ["cpu", "mem", "disk"] {
+        let http = Arc::new(StandIn::default());
+        let p = provider(http.clone()).await;
+        let c = credentials(false);
+        let prep = prepared(p.as_ref(), &c).await;
+        http.0.lock().unwrap().snapshots.get_mut(&prep.id).unwrap()[key] = json!(1);
+        let r = PrepareRequest { image_digest: prep.image_digest, tools_digest: prep.tools_digest, size: daytona_size() };
+        assert!(matches!(p.prepare(r, &c).await, Err(ProtocolError::Refused { .. })));
+        assert_eq!(http.0.lock().unwrap().snapshot_requests.len(), 1);
+    }
 }
 
 // Preparation refuses unsupported resources without creating a snapshot. Both
@@ -857,16 +864,8 @@ async fn inactive_snapshot_activates_once_then_polls() {
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!("inactive");
     let start = tokio::time::Instant::now();
-    let result = p
-        .prepare(
-            PrepareRequest {
-                size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-                image_digest: prep.image_digest,
-                tools_digest: prep.tools_digest,
-            },
-            &c,
-        )
-        .await;
+    let result =
+        p.prepare(PrepareRequest { size: daytona_size(), image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await;
     assert!(result.is_ok());
     assert_eq!(http.0.lock().unwrap().activations, 1);
     assert!(start.elapsed() >= std::time::Duration::from_secs(2));
@@ -912,15 +911,7 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!(state);
         assert!(matches!(
-            p.prepare(
-                PrepareRequest {
-                    size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-                    image_digest: prep.image_digest,
-                    tools_digest: prep.tools_digest
-                },
-                &c
-            )
-            .await,
+            p.prepare(PrepareRequest { size: daytona_size(), image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await,
             Err(ProtocolError::Refused { .. })
         ));
     }

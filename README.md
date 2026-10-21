@@ -71,8 +71,9 @@ Wire conventions chosen for this first protocol version:
   placeholders. Direct credential values are sent separately through the
   authenticated credential refresh route, including initial delivery.
 - Prepare is look-up-or-build by a module-defined key (Daytona: image/tools
-  digests and size); a prepared form belongs to its named provider. Hosts must refuse cross-provider use. Baking and upload
-  start the agent with fixed flags, without per-vessel configuration.
+  digests and size); a prepared form belongs to its named provider. Hosts must
+  refuse cross-provider use. Baking and upload start the agent with fixed flags,
+  without per-vessel configuration.
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
   unsupported destinations are refused, never widened. The result records
   enforced versus advisory protection.
@@ -213,7 +214,14 @@ figures can include concurrent workloads and delayed vendor accounting; they are
 not a monetary estimate. The runner prepares the selected image/tools digests twice and checks
 look-up-or-build identity before provisioning; the input prepared ID is replaced.
 Operators can also obtain a complete prepared form with
-`drydock --config hosts.json prepare HOST NAME IMAGE_DIGEST TOOLS_DIGEST CPUS MEMORY_BYTES DISK_BYTES`.
+
+```sh
+drydock --config hosts.json --runtime-directory /tmp/my-drydock prepare \
+  HOST NAME IMAGE_DIGEST TOOLS_DIGEST \
+  --cpus 2 --memory-bytes 4294967296 --disk-bytes 10737418240
+```
+
+The size flags are required; byte counts are explicit and their order is flexible.
 Preparation can incur provider charges. Live Daytona and then Namespace validation
 are operator runs once their modules and test credentials exist.
 

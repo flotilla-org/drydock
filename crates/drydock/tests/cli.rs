@@ -43,6 +43,12 @@ async fn cli_lifecycle_against_reference_host() {
     assert!(run(vec!["hosts".into()]).await.contains("ready"));
     assert!(run(vec!["instances".into()]).await.contains("\"instance\":\"a\""));
     let client = drydock::client::Client::unix(socket).unwrap();
+    let help = run(vec!["prepare".into(), "--help".into()]).await;
+    for flag in ["--cpus", "--memory-bytes", "--disk-bytes"] {
+        assert!(help.contains(flag));
+    }
+    // The reference host accepts byte-sized RAM and zero disk; Daytona does not.
+    // Named size flags can be supplied in any order.
     let prepared: Prepared = serde_json::from_str(
         &run(vec![
             "prepare".into(),
@@ -50,9 +56,12 @@ async fn cli_lifecycle_against_reference_host() {
             "a".into(),
             "sha256:image".into(),
             "sha256:tools".into(),
-            "1".into(),
-            "1024".into(),
+            "--disk-bytes".into(),
             "0".into(),
+            "--cpus".into(),
+            "1".into(),
+            "--memory-bytes".into(),
+            "1024".into(),
         ])
         .await,
     )

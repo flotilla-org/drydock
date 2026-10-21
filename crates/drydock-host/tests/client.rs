@@ -22,6 +22,7 @@ fn spec() -> HostSpec {
         credentials: BTreeMap::from([("test".into(), CredentialReference::Env { name: "PATH".into() })]),
     }
 }
+// Reference accepts byte-sized RAM and zero disk; vendor modules apply their own limits.
 async fn prepare(client: &Client) -> Prepared {
     client
         .prepare(

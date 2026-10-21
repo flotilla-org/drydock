@@ -24,6 +24,7 @@ async fn reference_binary_passes_conformance() {
         )
         .await
         .unwrap();
+    // Tiny sizes exercise the reference module; these are not Daytona resource requests.
     let options = Options {
         request: ProvisionRequest {
             label: "conformance".into(),
