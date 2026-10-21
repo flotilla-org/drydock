@@ -38,15 +38,19 @@ egress = "open"
 settings = {
   organization_id = "YOUR_ORGANIZATION_ID",
   ssh_host_key = "ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
-  agent_command = "/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock",
+  agent_command = "/opt/drydock/drydock-agent",
 }
 ```
 
-The image must carry today's operator-baked agent and its fixed `agent_command`.
-[Tools image #53](https://github.com/flotilla-org/drydock/issues/53) replaces
-this interim setup; [bare-image launch #54](https://github.com/flotilla-org/drydock/issues/54)
-adds checks for images such as `ubuntu:24.04` after that image exists. Nobody types
-a tools digest: `build_tools_digest()` selects the interim `operator-baked-agent-v1`.
+Drydock's release build selects its own immutable tools image; users never name
+its digest. The tools image contains only `/opt/drydock/drydock-agent`. Prepare
+layers these files onto the selected Ubuntu base without changing its entrypoint,
+command or init. Each module starts and supervises the agent alongside the base.
+Daytona's provider integration and removal of `agent_command` are tracked in
+[bare-image launch #54](https://github.com/flotilla-org/drydock/issues/54).
+See [tools image builds and module contract](ci/tools-image/README.md) for the
+release sequence and the container acceptance checks. Source builds without
+`DRYDOCK_TOOLS_IMAGE` can inspect providers but refuse `launch` and `prepare`.
 
 ```sh
 drydock providers

@@ -234,6 +234,27 @@ Unix UID admission failures return a bare 403 before protocol handling, just as
 Rigging's TCP authentication failures return transport-level statuses. These are
 not module or `/v1` ProtocolError outcomes.
 
+## Tools prepare and startup contract
+
+`PrepareRequest.tools_digest` is the immutable, registry-qualified OCI index
+reference of the agent image selected by this drydock build. Prepare adds its
+files under `/opt/drydock` to the base, without changing the base entrypoint,
+command or init. Build at the provider where possible, otherwise append the
+layer; record the resulting prepared form there. `BootstrapRoute::Upload` sends
+the same files to `/opt/drydock` instead. Each module chooses a key including both
+digests and its prepare-time constraints (Daytona adds size), and refuses a
+provision that does not match. This carries ADR 0070's #44 key amendment forward.
+
+The module starts `/opt/drydock/drydock-agent` with no flags, alongside the base's
+own processes using the provider's mechanism. It must not be PID 1 or become part
+of the base init. Readiness is its hello; restore it after a crash and every
+start/resume. Keep the install directory writable for sibling upgrade and
+rollback files. See the [build and conformance guide](../../ci/tools-image/README.md).
+`drydock::conformance::vessel_tools` accepts a module-specific exec probe and
+checks the initial, post-crash and post-resume evidence. The reference host uses
+an explicitly simulated guest for this scenario; it does not claim to run an OCI
+image. The stock-Ubuntu CI test is separate.
+
 ## Daytona module
 
 The binary also registers `daytona`; embedders can register `daytona::DaytonaModule`.
@@ -251,7 +272,7 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
       "organization_id":"YOUR_ORGANIZATION_ID",
       "region":"eu", "tier":1,
       "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
-      "agent_command":"/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock"
+      "agent_command":"/opt/drydock/drydock-agent"
     },
     "credential":{"mode":"direct", "credential_reference":"daytona-key"}
   }]
@@ -265,12 +286,14 @@ The key needs sandbox creation/modification/deletion, snapshot creation and bill
 read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
 
-`agent_command` is the fixed startup command of **your baked image**, not a
-per-environment argument. The example binary is illustrative; the checked-in
-Flotilla vessel agent is still a skeleton, so an image must provide a working
-agent/listener before live acceptance. Bake the tools, `flock` and Python 3
-(for listener liveness checks) into the public image, and pass `registry/image@sha256:<64 hex digits>` and its tools digest to
-prepare along with the requested size. A deterministic provider snapshot name tags
+Drydock's agent is supplied by the tools OCI image described above; its build
+selects the matching tools digest. Daytona still accepts the fixed `agent_command`
+setting. Its tools-image layering/start integration and removal of that setting
+are tracked in #54; this image-build change does not implement those provider
+operations. The current Daytona bootstrap also needs `flock` and Python 3 for
+listener liveness checks.
+
+A deterministic provider snapshot name tags
 the digest pair and size; subsequent prepare calls look it up and wait for `active`. The module sets the container
 class and snapshot resources explicitly. Provision inherits those resources and
 refuses a size that differs from the prepared key. No tools are uploaded. Prepare

@@ -2017,7 +2017,7 @@
       },
       "PrepareRequest": {
         "type": "object",
-        "description": "Preparation is look-up-or-build at the provider. Modules choose their key;\nproviders that fix resources at prepare include size alongside both digests.",
+        "description": "Preparation is look-up-or-build at the provider: append the tools image's\nfiles under /opt/drydock to the base, preserving its entrypoint, command and\ninit. tools_digest is the immutable OCI index reference of this drydock build's\nagent image. Build at the provider where possible, otherwise append its layer;\nUpload bootstrap installs those same files under /opt/drydock.\nModules choose their own provider-recorded key including both digests and any\nprepare-time constraints (Daytona also includes size); configuration is not a\nkey. Provision must match the recorded prepared form. See ADR 0070 Vessel tools.",
         "required": [
           "size",
           "image_digest",

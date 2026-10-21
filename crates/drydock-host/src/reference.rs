@@ -55,6 +55,7 @@ struct Memory {
     environments: BTreeMap<String, Environment>,
     tokens: BTreeMap<String, ResumeToken>,
     next: u64,
+    tools_generation: BTreeMap<String, u64>,
     provider_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     inventory_error: bool,
     running_since: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
@@ -177,6 +178,7 @@ impl Provider for Reference {
         state.stop_billing(id);
         state.environments.remove(id);
         state.tokens.remove(id);
+        state.tools_generation.remove(id);
         Ok(())
     }
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Connection> {
@@ -226,6 +228,27 @@ impl Exec for Reference {
             let action = r.command.get(1).map(String::as_str).unwrap_or("");
             let target = r.command.get(2).map(String::as_str).unwrap_or(id);
             let value = match action {
+                // Guest/process boundary model only: reference has no filesystem
+                // or agent. Real-agent process tests and OCI CI prove those parts.
+                "tools" => {
+                    if !matches!(target, "initial" | "crash" | "resumed") {
+                        return Err(refused("unknown tools probe phase"));
+                    }
+                    if !state.environments.get(id).is_some_and(|e| matches!(e.state, Observation::Running)) {
+                        return Err(refused("tools model has no hello while stopped"));
+                    }
+                    let generation = state.tools_generation.entry(id.into()).or_insert(2);
+                    if target == "crash" {
+                        *generation += 1;
+                    }
+                    serde_json::json!({
+                        "files": ["/opt/drydock/drydock-agent"],
+                        "base_entrypoint": ["base-init"], "prepared_entrypoint": ["base-init"],
+                        "base_command": ["base-command"], "prepared_command": ["base-command"],
+                        "command": ["/opt/drydock/drydock-agent"], "pid": *generation,
+                        "incarnation": format!("reference-model-{generation}"), "fingerprint": "reference-model"
+                    })
+                }
                 "null_environment" => {
                     let row = Environment {
                         id: format!("null-{id}"),

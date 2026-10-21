@@ -68,6 +68,8 @@ async fn cli(config: &std::path::Path, socket: &std::path::Path, shim: &std::pat
         .arg(config)
         .arg("--socket")
         .arg(socket)
+        // Runtime environment cannot override the build-owned image selection.
+        .env("DRYDOCK_TOOLS_IMAGE", "runtime.invalid/override@sha256:".to_owned() + &"b".repeat(64))
         .env("DRYDOCK_DAEMON_BIN", shim)
         .env("DRYDOCK_HOST_BIN", "/not-installed/drydock-host")
         .args(args)
@@ -79,6 +81,8 @@ async fn cli_xdg(xdg: &std::path::Path, shim: &std::path::Path, args: &[&str]) -
     tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
         .env("XDG_CONFIG_HOME", xdg)
         .env_remove("DRYDOCK_ROOT")
+        // Runtime environment cannot override the build-owned image selection.
+        .env("DRYDOCK_TOOLS_IMAGE", "runtime.invalid/override@sha256:".to_owned() + &"b".repeat(64))
         .env("DRYDOCK_DAEMON_BIN", shim)
         .args(args)
         .output()
@@ -130,13 +134,26 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     let mut records = client.observe(None).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(2), records.next()).await.unwrap().unwrap().unwrap();
     assert!(matches!(first, ObserveRecord::Snapshot { .. }));
+    // Unstamped development builds must refuse to invent an image pin. The
+    // release-stamped branch below is exercised with DRYDOCK_TOOLS_IMAGE at build.
+    if drydock::launch::build_tools_digest().is_err() {
+        let output = cli_xdg(&xdg, &shim, &["launch", "demo"]).await;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("this drydock build has no tools image"));
+        let output = cli_xdg(&xdg, &shim, &["prepare", "demo"]).await;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("this drydock build has no tools image"));
+        assert!(client.list("demo").await.unwrap().is_empty());
+        task.abort();
+        return;
+    }
     let environment: Environment = serde_json::from_value(json(cli_xdg(&xdg, &shim, &["launch", "demo"]).await)).unwrap();
     assert_eq!(environment.granted_size, Some(Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 }));
     assert_eq!(environment.egress, Enforcement::Advisory);
     let label = environment.label.as_ref().unwrap();
     let request: ProvisionRequest =
         serde_json::from_slice(&std::fs::read(run.join("keys").join(label).join("request.json")).unwrap()).unwrap();
-    assert_eq!(request.prepared.tools_digest, drydock::launch::build_tools_digest());
+    assert_eq!(request.prepared.tools_digest, drydock::launch::build_tools_digest().unwrap());
     assert!(request.ssh_public_key.unwrap().starts_with("ssh-ed25519 "));
     assert_eq!(request.egress, EgressRequest::Open);
     // Change provider state directly while no CLI process is running. The host
@@ -190,6 +207,26 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     task.abort();
 }
 
+// Routing tests use the host's explicit reference prepared form when the CLI
+// was built without release metadata; the separate CLI test checks that refusal.
+async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Environment {
+    if drydock::launch::build_tools_digest().is_ok() {
+        return daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    }
+    let host = Client::unix(socket).unwrap();
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let prepared = host
+        .prepare("demo", &PrepareRequest { size: size.clone(), image_digest: "routing-image".into(), tools_digest: "routing-tools".into() })
+        .await
+        .unwrap();
+    host.provision(
+        "demo",
+        &ProvisionRequest { label: "routing-fixture".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None },
+    )
+    .await
+    .unwrap()
+}
+
 // Contract: the embedded and socket forms route the same provider API, isolate
 // provider IDs, expose streaming upgrades, refuse host-control routes, and keep
 // unknown modules visible. External hosts remain alive after daemon drop.
@@ -230,8 +267,7 @@ async fn daemon_routes_provider_api_and_streams() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let options = drydock::launch::LaunchOptions::default();
-    let env = daemon.launch("demo", &options).await.unwrap();
+    let env = routing_environment(&daemon, &socket).await;
     assert_eq!(client.inspect("demo", &env.id).await.unwrap(), env);
     let response =
         ProviderApi::request(daemon.as_ref(), Method::GET, &["v1", "providers", "demo", "environments"], &[], None).await.unwrap();
@@ -425,7 +461,10 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
         config.clone(),
         &run,
         run.join("keys"),
-        vec![HostOption { name: "rust".into(), optional: false, connection: HostConnection::ExternalUnix { path: socket } }, broken(true)],
+        vec![
+            HostOption { name: "rust".into(), optional: false, connection: HostConnection::ExternalUnix { path: socket.clone() } },
+            broken(true),
+        ],
         std::sync::Arc::new(Resolver),
     )
     .await
@@ -438,7 +477,7 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
         ProviderApi::list(daemon.as_ref(), "python").await,
         Err(drydock::client::Error::NotReady(Readiness::MissingTool { .. }))
     ));
-    let environment = daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    let environment = routing_environment(&daemon, &socket).await;
     assert_eq!(ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), vec![environment]);
     let required_run = dir.path().join("required");
     let error = Daemon::start(config, &required_run, required_run.join("keys"), vec![broken(false)]).await.err().unwrap();

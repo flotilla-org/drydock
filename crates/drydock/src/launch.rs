@@ -12,10 +12,12 @@ use std::{
     time::Duration,
 };
 
-/// Build-owned selection point. Issue #53 replaces this interim identifier with
-/// the tools image matching the agent build. Today's modules use operator-baked tools.
-pub fn build_tools_digest() -> &'static str {
-    "operator-baked-agent-v1"
+/// Immutable tools index selected when this drydock build was compiled.
+/// Source builds without release metadata can inspect providers, but cannot launch
+/// or prepare until rebuilt with the matching published tools image.
+pub fn build_tools_digest() -> Result<&'static str, Error> {
+    option_env!("DRYDOCK_TOOLS_IMAGE")
+        .ok_or_else(|| refused("this drydock build has no tools image; rebuild with DRYDOCK_TOOLS_IMAGE from the tools-image CI artifact"))
 }
 #[derive(Clone, Default, Deserialize, Serialize, clap::Args)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +189,7 @@ pub async fn prepare(
     options: &LaunchOptions,
     resolver: &dyn ImageResolver,
 ) -> Result<(Prepared, Size), Error> {
+    let tools_digest = build_tools_digest()?;
     let size = options.size(provider, minimum).map_err(refused)?;
     let image =
         options.image.as_deref().or(provider.image.as_deref()).ok_or_else(|| refused("provider needs a default image or --image"))?;
@@ -194,7 +197,7 @@ pub async fn prepare(
     let prepared = client
         .clone()
         .with_request_timeout(Duration::from_secs(600))
-        .prepare(name, &PrepareRequest { size: size.clone(), image_digest, tools_digest: build_tools_digest().into() })
+        .prepare(name, &PrepareRequest { size: size.clone(), image_digest, tools_digest: tools_digest.into() })
         .await?;
     Ok((prepared, size))
 }

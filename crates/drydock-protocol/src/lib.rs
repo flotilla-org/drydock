@@ -215,8 +215,14 @@ pub enum Destination {
         cidr: Cidr,
     },
 }
-/// Preparation is look-up-or-build at the provider. Modules choose their key;
-/// providers that fix resources at prepare include size alongside both digests.
+/// Preparation is look-up-or-build at the provider: append the tools image's
+/// files under /opt/drydock to the base, preserving its entrypoint, command and
+/// init. tools_digest is the immutable OCI index reference of this drydock build's
+/// agent image. Build at the provider where possible, otherwise append its layer;
+/// Upload bootstrap installs those same files under /opt/drydock.
+/// Modules choose their own provider-recorded key including both digests and any
+/// prepare-time constraints (Daytona also includes size); configuration is not a
+/// key. Provision must match the recorded prepared form. See ADR 0070 Vessel tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
     pub size: Size,

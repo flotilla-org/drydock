@@ -31,7 +31,11 @@ impl Drop for ReleaseOnDrop {
 #[tokio::test]
 async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let dir = tempfile::tempdir().unwrap();
-    let executable = dir.path().join("drydock-agent");
+    // Match the tools layer's installation layout, leaving room beside the
+    // executable for .prev, .upgrade and .probation during upgrade/rollback.
+    let install = dir.path().join("opt/drydock");
+    std::fs::create_dir_all(&install).unwrap();
+    let executable = install.join("drydock-agent");
     let binary = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
     let old = format!("{:x}", Sha256::digest(&binary));
     std::fs::write(&executable, &binary).unwrap();
@@ -118,6 +122,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     assert_eq!(child.id(), Some(pid));
     assert!(child.try_wait().unwrap().is_none());
     assert_eq!(upgraded.hello().fingerprint, new);
+    assert_eq!(std::fs::read(executable.with_extension("prev")).unwrap(), binary);
     assert!(!guest_socket.exists(), "old forward paths must be removed before re-exec");
     assert_eq!(upgraded.configuration().await.unwrap(), Configuration::default());
     std::fs::write(gate, []).unwrap();
