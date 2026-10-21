@@ -1,5 +1,5 @@
 """Builder boundary tests: no daemon is needed to exercise export/publish policy."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
 import subprocess
@@ -36,8 +36,9 @@ class ToolsImage(unittest.TestCase):
     # local builds leave an OCI archive and never contact a registry to push.
     def test_buildx_boundary(self):
         for publish in [False, True]:
-            cmd = image.build_command(Path("context"), "host/tools", Path("meta"), Path("out.tar"), publish)
+            cmd = image.build_command(Path("context"), "host/tools", Path("meta"), Path("out.tar"), publish, "1.99.0")
             self.assertEqual(cmd[cmd.index("--platform") + 1], "linux/amd64,linux/arm64")
+            self.assertEqual(cmd[cmd.index("--build-arg") + 1], "RUST_VERSION=1.99.0")
             output = cmd[cmd.index("--output") + 1]
             self.assertEqual(output, "type=image,name=host/tools,push=true,push-by-digest=true,name-canonical=true" if publish else "type=oci,dest=out.tar")
             self.assertEqual(cmd[-1], "context")
@@ -54,6 +55,8 @@ class ToolsImage(unittest.TestCase):
                 commands = []
                 def execute(command, **kwargs):
                     commands.append(command)
+                    if command[:2] == ["tar", "-x"]:
+                        (Path(command[-1]) / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.99.0"\n')
                     if command[:3] == ["docker", "buildx", "build"]:
                         Path(command[command.index("--metadata-file") + 1]).write_text(json.dumps({"containerimage.digest": "sha256:" + "a" * 64}))
                 argv = ["tools_image.py", "--revision", "merged", "--output", tmp]
@@ -65,13 +68,48 @@ class ToolsImage(unittest.TestCase):
                 self.assertEqual((output / "revision.txt").read_text(), "a" * 40 + "\n")
                 self.assertEqual((output / "tools-image.txt").read_text(), image.DEFAULT_REGISTRY + "/drydock-tools@sha256:" + "a" * 64 + "\n")
                 self.assertEqual(any(c[:3] == ["git", "merge-base", "--is-ancestor"] for c in commands), publish)
+                tags = [c for c in commands if c[:4] == ["docker", "buildx", "imagetools", "create"]]
+                self.assertEqual(len(tags), int(publish))
+                if publish:
+                    self.assertEqual(tags[0][-2:], [image.DEFAULT_REGISTRY + "/drydock-tools:rev-" + "a" * 40 + "-" + "a" * 64,
+                                                   (output / "tools-image.txt").read_text().strip()])
+                archive.wait.assert_called_once()
+                self.assertTrue(archive.stdout.closed)
 
     def test_unmerged_revision_cannot_publish(self):
         with patch("sys.argv", ["tools_image.py", "--revision", "unmerged", "--publish"]), patch.object(image.subprocess, "check_output", return_value="b" * 40), patch.object(image.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "git")) as execute:
-            with self.assertRaises(subprocess.CalledProcessError):
+            error = io.StringIO()
+            with redirect_stderr(error), self.assertRaises(SystemExit) as raised:
                 image.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("git fetch origin main", error.getvalue())
             self.assertEqual(execute.call_count, 1)
             self.assertEqual(execute.call_args.args[0][:3], ["git", "merge-base", "--is-ancestor"])
+
+    # Extraction failure must reap git archive before propagating the error.
+    def test_extraction_failure_reaps_archive(self):
+        archive = MagicMock()
+        archive.stdout = io.BytesIO(b"archive")
+        archive.wait.return_value = 1
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.argv", ["tools_image.py", "--revision", "main", "--output", tmp]), patch.object(image.subprocess, "check_output", return_value="a" * 40), patch.object(image.subprocess, "Popen", return_value=archive), patch.object(image.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "tar")):
+            with self.assertRaises(subprocess.CalledProcessError):
+                image.main()
+        archive.wait.assert_called_once()
+        self.assertTrue(archive.stdout.closed)
+
+    # The archived manifest is the only version source for both image stages.
+    # Channel aliases, incomplete pins and injected FROM syntax are refused.
+    def test_exact_toolchain_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            context = Path(tmp)
+            manifest = context / "rust-toolchain.toml"
+            for version in ["1.99.0", "1.100.1"]:
+                manifest.write_text(f'[toolchain]\nchannel = "{version}"\n')
+                self.assertEqual(image.toolchain_version(context), version)
+            for version in ["stable", "nightly", "1.99", "1.99.0-bookworm", "1.99.0 AS injected"]:
+                manifest.write_text(f'[toolchain]\nchannel = "{version}"\n')
+                with self.subTest(version=version), self.assertRaises(ValueError):
+                    image.toolchain_version(context)
 
     # The exported scratch filesystem must not contain any base OS, traversal,
     # whiteout or symlink escape. Parent directories alone are harmless.

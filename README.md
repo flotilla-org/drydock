@@ -43,14 +43,10 @@ settings = {
 ```
 
 Drydock's release build selects its own immutable tools image; users never name
-its digest. The tools image contains only `/opt/drydock/drydock-agent`. Prepare
-layers these files onto the selected Ubuntu base without changing its entrypoint,
-command or init. Each module starts and supervises the agent alongside the base.
-Daytona's provider integration and removal of `agent_command` are tracked in
-[bare-image launch #54](https://github.com/flotilla-org/drydock/issues/54).
-See [tools image builds and module contract](ci/tools-image/README.md) for the
-release sequence and the container acceptance checks. Source builds without
-`DRYDOCK_TOOLS_IMAGE` can inspect providers but refuse `launch` and `prepare`.
+its digest. See the [tools image build and module contract](ci/tools-image/README.md)
+for preparation, startup and conformance. Source builds without
+`DRYDOCK_TOOLS_IMAGE` refuse `launch` and `prepare`. Daytona's provider integration
+and removal of `agent_command` remain in [#54](https://github.com/flotilla-org/drydock/issues/54).
 
 ```sh
 drydock providers

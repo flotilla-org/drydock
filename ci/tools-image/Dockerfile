@@ -1,6 +1,8 @@
 # Debian bookworm's glibc 2.36 is compatible with Ubuntu 24.04's glibc 2.39.
 # BuildKit selects the target architecture (native workers or QEMU/binfmt).
-FROM rust:1.99.0-bookworm AS build
+# tools_image.py supplies the archived rust-toolchain.toml version.
+ARG RUST_VERSION
+FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p drydock-agent --bins --example tools_probe

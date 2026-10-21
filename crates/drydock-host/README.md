@@ -236,24 +236,12 @@ not module or `/v1` ProtocolError outcomes.
 
 ## Tools prepare and startup contract
 
-`PrepareRequest.tools_digest` is the immutable, registry-qualified OCI index
-reference of the agent image selected by this drydock build. Prepare adds its
-files under `/opt/drydock` to the base, without changing the base entrypoint,
-command or init. Build at the provider where possible, otherwise append the
-layer; record the resulting prepared form there. `BootstrapRoute::Upload` sends
-the same files to `/opt/drydock` instead. Each module chooses a key including both
-digests and its prepare-time constraints (Daytona adds size), and refuses a
-provision that does not match. This carries ADR 0070's #44 key amendment forward.
-
-The module starts `/opt/drydock/drydock-agent` with no flags, alongside the base's
-own processes using the provider's mechanism. It must not be PID 1 or become part
-of the base init. Readiness is its hello; restore it after a crash and every
-start/resume. Keep the install directory writable for sibling upgrade and
-rollback files. See the [build and conformance guide](../../ci/tools-image/README.md).
-`drydock::conformance::vessel_tools` accepts a module-specific exec probe and
-checks the initial, post-crash and post-resume evidence. The reference host uses
-an explicitly simulated guest for this scenario; it does not claim to run an OCI
-image. The stock-Ubuntu CI test is separate.
+Module authors should follow the [tools prepare/start contract and conformance
+guide](../../ci/tools-image/README.md). It defines the OCI tools reference,
+provider-owned prepared keys, preservation of base configuration, agent startup
+and upgrade layout, and the `drydock::conformance::vessel_tools` probe. The
+reference module supplies explicitly simulated guest evidence; stock-Ubuntu OCI
+acceptance runs separately in CI.
 
 ## Daytona module
 

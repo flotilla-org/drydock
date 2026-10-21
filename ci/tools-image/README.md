@@ -3,11 +3,13 @@
 The tools image is drydock's agent, built for linux/amd64 and linux/arm64 as one
 OCI index. Its final stage is scratch: only `/opt/drydock/drydock-agent`, with no
 base OS, entrypoint, command, init, cleat or Flotilla CLI. Debian bookworm glibc
-2.36 builds run on Ubuntu 24.04 (glibc 2.39). Static builds are deferred.
+2.36 builds run on Ubuntu 24.04 (glibc 2.39). Both build stages receive the exact
+Rust version from the revision's `rust-toolchain.toml`; there is no second pin in
+the Dockerfile. Static builds are deferred.
 
 ## Build and release
 
-With Docker Buildx and native workers or QEMU/binfmt installed:
+With Python 3.11+, Docker Buildx and native workers or QEMU/binfmt installed:
 
 ```sh
 python3 ci/tools_image.py --revision HEAD
@@ -27,7 +29,10 @@ DRYDOCK_TOOLS_IMAGE="$(cat target/tools-image/tools-image.txt)" \
 ```
 
 `--registry` is configuration, with default `ghcr.io/flotilla-org`. Publishing
-uses Buildx's push-by-digest output; no mutable tag is used for tools selection.
+uses Buildx's push-by-digest output, then creates a `rev-<commit>-<index-sha256>` retention tag
+for that same index. Including the index hash also retains earlier images if a
+revision is rebuilt against an updated builder image. Never prune these revision tags or their manifests while
+any drydock release references them. No mutable tag is used for tools selection.
 `tools-image.txt` contains the canonical registry/name@sha256 index reference;
 `revision.txt` records the source. Archive these beside the resulting drydock
 binaries. The operator must configure registry visibility to public. CI must
@@ -37,7 +42,9 @@ acceptance; the image's existence does not imply public visibility.
 The first build creates the tools image. The second builds drydock with that
 image reference compiled in through `DRYDOCK_TOOLS_IMAGE`. There is no digest
 cycle: the agent does not embed its own image reference. Unstamped development
-builds refuse prepare/launch rather than inventing a pin. Changing a runtime
+builds refuse prepare/launch rather than inventing a pin. An explicitly empty
+`DRYDOCK_TOOLS_IMAGE=` or malformed reference fails compilation with a diagnostic;
+unset the variable to build an unstamped development binary. Changing a runtime
 variable cannot change the compiled selection. The workflow diff is supplied in
 the implementing PR description for the operator to land.
 
@@ -79,10 +86,14 @@ time to cover the stamped-build prepare/launch path. The default run covers the
 unstamped refusal. A fixture reference is test data, never a release default.
 
 `conformance::vessel_tools` runs a supplied module guest probe via exec. Its
-argv receives `initial`, `crash`, and `resumed`; it must emit `ToolsEvidence` JSON
+argv receives a phase (`initial`, `crash`, or `resumed`) and a fresh challenge;
+it must perform a new hello exchange and emit `ToolsEvidence` JSON
 including layer file inventory, base/prepared entrypoint and command, actual
-agent argv/PID/process incarnation, and the fingerprint read from hello. Crash
-must kill the agent and await provider restart before returning. The suite calls
+agent argv/PID/process incarnation, the fingerprint read from hello, and that
+invocation's `challenge`. A cached response fails the challenge comparison. The
+module's probe is responsible for truthfully measuring the guest, just as it is
+for the filesystem/process evidence; echoing a nonce does not authenticate a
+dishonest probe. Crash must kill the agent and await provider restart before returning. The suite calls
 suspend/resume between the latter samples. Memory-preserving resume can keep the
 process but must return a new hello. Callers own provision/destruction. Unsupported
 or malformed probes fail; there is no silent success for a missing probe.

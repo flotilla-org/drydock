@@ -246,7 +246,8 @@ impl Exec for Reference {
                         "base_entrypoint": ["base-init"], "prepared_entrypoint": ["base-init"],
                         "base_command": ["base-command"], "prepared_command": ["base-command"],
                         "command": ["/opt/drydock/drydock-agent"], "pid": *generation,
-                        "incarnation": format!("reference-model-{generation}"), "fingerprint": "reference-model"
+                        "incarnation": format!("reference-model-{generation}"), "fingerprint": "reference-model",
+                        "challenge": r.command.get(3).ok_or_else(|| refused("missing tools probe challenge"))?
                     })
                 }
                 "null_environment" => {

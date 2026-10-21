@@ -16,8 +16,12 @@ pub struct ToolsEvidence {
     pub incarnation: String,
     /// Must be read from the agent's hello, not a hash of the installed file.
     pub fingerprint: String,
+    /// Echo the per-invocation challenge only after reading a fresh hello.
+    /// Reusing a cached ToolsEvidence response must fail conformance.
+    pub challenge: String,
 }
-fn valid_evidence(e: &ToolsEvidence, fingerprint: &str) -> Result<()> {
+fn valid_evidence(e: &ToolsEvidence, fingerprint: &str, challenge: &str) -> Result<()> {
+    require(e.challenge == challenge, "cached tools evidence: probe challenge differs")?;
     require(!e.files.is_empty() && e.files.iter().any(|s| s == "/opt/drydock/drydock-agent"), "agent missing from tools layer")?;
     require(
         e.files.iter().all(|s| s.starts_with("/opt/drydock/") && !s.split('/').any(|p| p == ".." || p.starts_with(".wh."))),
@@ -31,7 +35,9 @@ fn valid_evidence(e: &ToolsEvidence, fingerprint: &str) -> Result<()> {
     )
 }
 /// Runs a module-supplied guest probe through exec. Appends `initial`, `crash`
-/// or `resumed` to its argv. `crash` must SIGKILL the agent, then wait for its
+/// or `resumed`, followed by a fresh challenge, to its argv. Echo the challenge
+/// only after a new hello exchange; cached evidence must not satisfy the probe.
+/// `crash` must SIGKILL the agent, then wait for its
 /// provider supervisor and read a fresh hello. Other phases wait for hello.
 /// The JSON result is ToolsEvidence. Failures and unsupported probes fail closed.
 /// The caller owns preparation, provisioning and destruction of this environment.
@@ -45,14 +51,15 @@ pub async fn vessel_tools(
 ) -> Result<()> {
     let sample = |phase: &'static str| {
         let mut command = probe.clone();
-        command.command.push(phase.into());
+        let challenge = uuid::Uuid::new_v4().to_string();
+        command.command.extend([phase.into(), challenge.clone()]);
         async move {
             let mut stream = client.exec(provider, id, &command).await.map_err(SafeError::category)?;
             let mut bytes = Vec::new();
             (&mut stream).take(16385).read_to_end(&mut bytes).await.map_err(SafeError::category)?;
             require(bytes.len() <= 16384, "oversized tools probe result")?;
             let evidence: ToolsEvidence = serde_json::from_slice(&bytes).map_err(SafeError::category)?;
-            valid_evidence(&evidence, fingerprint)?;
+            valid_evidence(&evidence, fingerprint, &challenge)?;
             Ok::<_, String>(evidence)
         }
     };
@@ -62,10 +69,10 @@ pub async fn vessel_tools(
         require(crashed.incarnation != initial.incarnation, "agent did not restart after crash")?;
         let token = client.suspend(provider, id).await.map_err(SafeError::category)?;
         client.resume(provider, id, &token).await.map_err(SafeError::category)?;
-        let resumed = sample("resumed").await?;
-        // A memory-preserving resume can keep the process; every resume must
-        // nevertheless serve hello. Crash above always requires a new process.
-        require(resumed.fingerprint == crashed.fingerprint, "resume changed the agent build")
+        // A memory-preserving resume may keep the same incarnation. Its probe
+        // must still return fresh, challenge-bound hello evidence.
+        sample("resumed").await?;
+        Ok(())
     })
     .await
     .map_err(SafeError::category)?
@@ -93,9 +100,10 @@ mod tests {
             pid,
             incarnation: "2:100".into(),
             fingerprint: fingerprint.clone(),
+            challenge: "this-invocation".into(),
         };
-        assert!(valid_evidence(&good, &fingerprint).is_ok());
-        for case in 0..9 {
+        assert!(valid_evidence(&good, &fingerprint, "this-invocation").is_ok());
+        for case in 0..10 {
             let mut bad = good.clone();
             match case {
                 0 => bad.files.clear(),
@@ -106,9 +114,10 @@ mod tests {
                 5 => bad.command.push("--extra".into()),
                 6 => bad.pid = 1,
                 7 => bad.incarnation.clear(),
-                _ => bad.fingerprint = "wrong".into(),
+                8 => bad.fingerprint = "wrong".into(),
+                _ => bad.challenge = "cached-invocation".into(),
             }
-            assert!(valid_evidence(&bad, &fingerprint).is_err(), "case {case}");
+            assert!(valid_evidence(&bad, &fingerprint, "this-invocation").is_err(), "case {case}");
         }
     }
 }

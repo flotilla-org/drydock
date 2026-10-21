@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 import tempfile
 import uuid
+from tools_image import toolchain_version
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -94,6 +95,7 @@ def main():
                 # never part of the tools image or the prepared form.
                 subprocess.run(["docker", "buildx", "build", "--platform", platform, "--target", "probe",
                                 "--file", str(ROOT / "ci/tools-image/Dockerfile"),
+                                "--build-arg", f"RUST_VERSION={toolchain_version(ROOT)}",
                                 "--output", f"type=local,dest={tmp / 'probe'}", str(ROOT)], check=True)
                 # Stock Ubuntu's bash remains PID 1 and its command is unchanged.
                 container = run("docker", "run", "--platform", platform, "-dit", tag)
