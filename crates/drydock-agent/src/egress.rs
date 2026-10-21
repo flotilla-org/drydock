@@ -424,7 +424,8 @@ fn rules(config: &Configuration) -> String {
     if config.egress.is_none() {
         return rules;
     }
-    rules.push_str(&format!("add chain inet drydock_egress output {{ type nat hook output priority -100; policy accept; }}\nadd rule inet drydock_egress output meta mark {SOCKET_MARK} return\n"));
+    rules.push_str(concat!("add chain inet drydock_egress output { ", "type nat hook output priority -100; policy accept; }\n",));
+    rules.push_str(&format!("add rule inet drydock_egress output meta mark {SOCKET_MARK} return\n"));
     rules.push_str(&format!("add rule inet drydock_egress output ip daddr 127.0.0.1 tcp dport {PROXY_PORT} return\n"));
     for forward in &config.forwards {
         if let Some(addr) = forward.tcp {
@@ -432,7 +433,15 @@ fn rules(config: &Configuration) -> String {
             rules.push_str(&format!("add rule inet drydock_egress output {family} daddr {} tcp dport {} return\n", addr.ip(), addr.port()));
         }
     }
-    rules.push_str(&format!("add rule inet drydock_egress output udp dport 53 redirect to :{DNS_PORT}\nadd rule inet drydock_egress output tcp dport 53 redirect to :{DNS_PORT}\nadd rule inet drydock_egress output meta l4proto tcp redirect to :{CAPTURE_PORT}\n"));
+    rules.push_str(&format!(
+        concat!(
+            "add rule inet drydock_egress output udp dport 53 redirect to :{dns_port}\n",
+            "add rule inet drydock_egress output tcp dport 53 redirect to :{dns_port}\n",
+            "add rule inet drydock_egress output meta l4proto tcp redirect to :{capture_port}\n",
+        ),
+        dns_port = DNS_PORT,
+        capture_port = CAPTURE_PORT,
+    ));
     rules
 }
 
