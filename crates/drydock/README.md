@@ -62,8 +62,13 @@ owners of observations; the daemon's `/v1/events` merges their NDJSON records
 with a vector cursor. A snapshot from one host explicitly omits the other
 providers, preserving the protocol's no-false-deletion rule.
 
+`Daemon::start_with_resolver` injects the image resolver at construction, before
+sharing the daemon. There is no runtime unique-Arc requirement.
+
 `HostOption` chooses the available processes; it is daemon/embedder input, never
-provider config. CLI discovery uses installed companions; the explicit daemon
+provider config. Installed language companions are optional: discovery errors
+are logged and leave unaffected providers available. Explicit external hosts and
+the bundled Rust host are required. CLI discovery uses installed companions; the explicit daemon
 `--external-host` option instead uses externally managed Unix hosts. Embedders
 can also supply existing `HostConnection::External` connections. Their tokens
 remain private regular files owned by the current user; TCP is loopback-only.
@@ -72,4 +77,9 @@ Launch metadata and per-vessel SSH keys live under the private socket directory'
 `keys/UUID` directory. This evidence records the immutable prepared image and
 tools selection; it is not desired state and is never reconciled. Keep these
 keys while their environments need SSH. Config edits take effect on daemon
-restart, and distinct configs should use distinct socket overrides.
+restart, and distinct configs should use distinct socket overrides. Stop the
+foreground daemon or send SIGTERM to its owning process, then the next CLI call
+starts it with the new configuration. Startup rotates `drydock.log` to
+`drydock.log.1` rather than appending across runs. Keys/evidence currently remain
+after errors and destruction; [#61](https://github.com/flotilla-org/drydock/issues/61)
+tracks safe retention and garbage collection.

@@ -36,10 +36,35 @@ pub fn lock(path: &Path) -> Result<std::fs::File, String> {
         .open(path)
         .map_err(|e| e.to_string())?;
     let meta = f.metadata().map_err(|e| e.to_string())?;
+    // SAFETY: geteuid has no preconditions.
     if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
         return Err("unsafe lock file".into());
     }
     Ok(f)
+}
+/// Keep the previous run's diagnostics, replacing any older backup. Called
+/// under the startup lock only after refusing a live endpoint.
+fn rotate_log(path: &Path) -> Result<std::fs::File, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            // SAFETY: geteuid has no preconditions.
+            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+                return Err("unsafe daemon log".into());
+            }
+            let mut previous = path.as_os_str().to_os_string();
+            previous.push(".1");
+            std::fs::rename(path, PathBuf::from(previous)).map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| e.to_string())
 }
 /// Serialize startup, recheck under the lock, and detach only a ready daemon.
 /// Reusing an existing daemon never reads the client-side config file.
@@ -72,13 +97,7 @@ pub async fn connect(config: &Path, socket: &Path) -> Result<Client, String> {
     if tokio::net::UnixStream::connect(socket).await.is_ok() {
         return Err("daemon socket is live but does not serve a compatible API".into());
     }
-    let log = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(parent.join("drydock.log"))
-        .map_err(|e| e.to_string())?;
+    let log = rotate_log(&parent.join("drydock.log"))?;
     let daemon = companion("drydockd", "DRYDOCK_DAEMON_BIN")?;
     let mut child = tokio::process::Command::new(daemon)
         .arg("--config")
@@ -121,5 +140,47 @@ mod tests {
             let other = lock(&socket_lock_path(&dir.path().join(name), ".lock")).unwrap();
             assert!(other.try_lock().is_ok(), "socket {name} aliases another daemon's lock");
         }
+    }
+    // A competing startup lease must time out without spawning or changing the
+    // incumbent's ownership. A paused clock exercises the real 30-second policy.
+    #[tokio::test(start_paused = true)]
+    async fn startup_lock_timeout_preserves_incumbent() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        private_dir(&run).unwrap();
+        let socket = run.join("drydock.sock");
+        let incumbent = lock(&socket_lock_path(&socket, ".startup.lock")).unwrap();
+        incumbent.try_lock().unwrap();
+        let started = tokio::time::Instant::now();
+        let error = connect(&dir.path().join("not-read.toml"), &socket).await.err().unwrap();
+        assert_eq!(error, "daemon startup lock timed out");
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        assert!(!run.join("drydock.log").exists());
+        let contender = lock(&socket_lock_path(&socket, ".startup.lock")).unwrap();
+        assert!(matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        drop(incumbent);
+        contender.try_lock().unwrap();
+    }
+    // Restart rotation preserves the previous run, starts a fresh log and
+    // replaces the older backup; unsafe symlinks never cause target truncation.
+    #[test]
+    fn daemon_logs_rotate_on_restart_and_refuse_symlinks() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drydock.log");
+        for text in ["first run", "second run"] {
+            let mut log = rotate_log(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            log.write_all(text.as_bytes()).unwrap();
+        }
+        let _log = rotate_log(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("drydock.log.1")).unwrap(), "second run");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let target = dir.path().join("target");
+        std::fs::write(&target, "preserve").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(rotate_log(&path).is_err());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "preserve");
     }
 }

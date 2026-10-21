@@ -1,7 +1,7 @@
 //! Provider-only user configuration. Module settings are passed through unchanged.
 use crate::credentials::CredentialReference;
 use drydock_protocol::{EgressRequest, Size};
-use rigging_process::{EnvVars, ProcessEnvVars};
+use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -48,6 +48,8 @@ impl Quantity {
         }
     }
 }
+/// Integer bytes (including numeric strings), or case-sensitive SI/IEC suffixes.
+/// Whitespace between the integer and suffix is accepted, e.g. "5 GiB".
 pub fn parse_bytes(s: &str) -> Result<u64, String> {
     for (suffix, multiplier) in
         [("GiB", 1u64 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10), ("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1000), ("B", 1)]
@@ -126,7 +128,6 @@ impl Config {
                 return Err("provider and module names must not be empty".into());
             }
             p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 })?;
-            p.credential.reference(&ProcessEnvVars)?;
         }
         Ok(config)
     }
@@ -251,5 +252,41 @@ settings = {{
         for bad in ["-1GiB", "1.5GiB", "infinite", "18446744073709551616B"] {
             assert!(parse_bytes(bad).is_err());
         }
+    }
+    // Parsing provider TOML is environment-independent. Only resolving a tilde
+    // credential path requires HOME, supplied through the injected environment.
+    #[test]
+    fn tilde_credential_resolution_is_deferred_until_environment_is_supplied() {
+        // The real process-environment boundary needs a child: never mutate
+        // HOME globally while other tests run in this test binary.
+        if std::env::var_os("DRYDOCK_TEST_PARSE_WITHOUT_HOME").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "config::tests::tilde_credential_resolution_is_deferred_until_environment_is_supplied"])
+                .env_remove("HOME")
+                .env("DRYDOCK_TEST_PARSE_WITHOUT_HOME", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let config = Config::parse(
+            r#"[provider.demo]
+module="reference"
+credential={file="~/token"}
+settings={}
+"#,
+        )
+        .unwrap();
+        let credential = &config.provider["demo"].credential;
+        assert!(credential.reference(&Env(BTreeMap::new())).is_err());
+        assert_eq!(
+            credential.reference(&Env(BTreeMap::from([("HOME".into(), "/injected".into())]))).unwrap(),
+            CredentialReference::File { path: "/injected/token".into(), json_field: None }
+        );
+        for text in ["5GiB", "5 GiB"] {
+            assert_eq!(parse_bytes(text).unwrap(), 5 << 30);
+        }
+        assert_eq!(parse_bytes("12").unwrap(), 12);
+        assert!(parse_bytes("5gib").is_err());
     }
 }

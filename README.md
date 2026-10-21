@@ -63,7 +63,9 @@ drydock prepare daytona --egress deny-all
 Commands connect to the same long-lived daemon, starting the companion `drydockd`
 when absent. It keeps hosts, polling, status caching and credential refresh alive
 between calls. `drydockd` also runs directly in the foreground. The daemon owns
-provider configuration; restart it after edits. Provider settings are opaque to
+provider configuration; restart it after edits. Stop its foreground process or
+send SIGTERM to the owning `drydockd`; the next CLI command starts it again.
+Provider settings are opaque to
 drydock and reach only the module. Credentials are `{ env = "NAME" }` or
 `{ file = "PATH", json_field = "token" }`; only the resolved value is delivered
 by credential refresh on the authenticated host connection.
@@ -74,21 +76,28 @@ to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
 `config/run/drydock.sock`, with a private directory and a kernel peer-UID check.
 `--config PATH` and `--socket PATH` override the defaults; the socket selects the
 daemon, so use distinct sockets for distinct configurations. Startup is serialized
-across concurrent clients. Diagnostics go to `run/drydock.log`.
+across concurrent clients. Diagnostics go to `run/drydock.log`; each daemon
+start rotates the previous run to `drydock.log.1`, replacing the older backup.
 
 Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
 `egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
-such as `2GiB`/`512MiB`. Missing size fields use the module's declared smallest
+such as `2GiB`/`512MiB`. Suffixes are case-sensitive; `"5 GiB"` also works,
+and a numeric string such as `"12"` means bytes. Missing size fields use the module's declared smallest
 size. The standalone default is Open, declared Advisory by today's modules;
 low-level protocol requests retain deny-all as their default. Image tags are
 resolved through the OCI registry at prepare/launch and recorded as immutable
 SHA-256 references in the prepared form and local launch evidence. A key pair
 is generated per vessel under `run/keys`; SSH uses that identity and the recipe's
 pinned host key. Dial/Relay shells refuse with a reason until the agent supports
-them. Progress is on stderr; JSON results are on stdout.
+them. Keys and launch evidence currently remain after errors and destruction;
+[safe retention/GC #61](https://github.com/flotilla-org/drydock/issues/61) tracks
+cleanup without losing access after ambiguous provider outcomes. Progress is on
+stderr; JSON results are on stdout.
 
 The daemon discovers loadable modules from host `hello`, then sends only the
-providers assigned to each host. The Rust host is bundled. TypeScript/Python
+providers assigned to each host. A failed optional host is logged and skipped;
+providers with no available module remain visible with a missing-tool reason.
+The Rust host is bundled. TypeScript/Python
 companions (`drydock-host-typescript`, `drydock-host-python`) become candidates
 when installed beside the daemon and `node`/`uv` are detected; they are not yet
 shipped in this repository. `drydockd --external-host /private/host.sock` uses

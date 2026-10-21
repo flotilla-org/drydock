@@ -36,7 +36,11 @@ async fn run() -> Result<(), String> {
     _lock.try_lock().map_err(|_| "another daemon owns this socket")?;
     let mut options = if args.external_host.is_empty() { HostOption::installed().await? } else { Vec::new() };
     for (i, path) in args.external_host.into_iter().enumerate() {
-        options.push(HostOption { name: format!("external-{i}"), connection: drydock::HostConnection::ExternalUnix { path } });
+        options.push(HostOption {
+            optional: false,
+            name: format!("external-{i}"),
+            connection: drydock::HostConnection::ExternalUnix { path },
+        });
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map_err(|e| e.to_string())?;
     let daemon = Daemon::start(Config::load(&config).await?, run, run.join("keys"), options).await?;

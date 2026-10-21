@@ -30,6 +30,8 @@ pub use crate::api::ProviderApi;
 pub struct HostOption {
     pub name: String,
     pub connection: HostConnection,
+    /// Discovery failures leave other hosts available when true.
+    pub optional: bool,
 }
 impl HostOption {
     /// The Rust host is bundled; language hosts are enabled only when both their
@@ -37,6 +39,7 @@ impl HostOption {
     pub async fn installed() -> Result<Vec<Self>, String> {
         let mut hosts = vec![Self {
             name: "rust".into(),
+            optional: false,
             connection: HostConnection::Managed {
                 command: vec![crate::local::companion("drydock-host", "DRYDOCK_HOST_BIN")?.to_string_lossy().into_owned()],
                 runtime: None,
@@ -53,6 +56,7 @@ impl HostOption {
             {
                 hosts.push(Self {
                     name: name.into(),
+                    optional: true,
                     connection: HostConnection::Managed {
                         command: vec![path.to_string_lossy().into_owned()],
                         runtime: Some(runtime.into()),
@@ -83,12 +87,31 @@ pub struct Daemon {
 }
 impl Daemon {
     pub async fn start(config: Config, run: &FsPath, keys: PathBuf, options: Vec<HostOption>) -> Result<Arc<Self>, String> {
+        let resolver = Arc::new(RegistryResolver::new().map_err(|e| e.to_string())?);
+        Self::start_with_resolver(config, run, keys, options, resolver).await
+    }
+    /// Inject the image boundary before the daemon is shared; no Arc mutation or
+    /// unique-reference runtime precondition is needed.
+    pub async fn start_with_resolver(
+        config: Config,
+        run: &FsPath,
+        keys: PathBuf,
+        options: Vec<HostOption>,
+        resolver: Arc<dyn ImageResolver>,
+    ) -> Result<Arc<Self>, String> {
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
+        let mut failed_optional = Vec::new();
         for option in options {
-            let hello = discover(&option, run).await?;
-            discovered.push((option, hello));
+            match discover(&option, run).await {
+                Ok(hello) => discovered.push((option, hello)),
+                Err(error) if option.optional => {
+                    eprintln!("optional host {} discovery failed: {error}", option.name);
+                    failed_optional.push(format!("{}: {error}", option.name));
+                }
+                Err(error) => return Err(error),
+            }
         }
         let mut assignments: Vec<Vec<String>> = (0..discovered.len()).map(|_| vec![]).collect();
         let mut chosen = BTreeMap::new();
@@ -103,10 +126,11 @@ impl Daemon {
                 assignments[i].push(name.clone());
                 chosen.insert(name.clone(), (i, module.smallest_size.clone()));
             } else {
-                unavailable.insert(
-                    name.clone(),
-                    Readiness::MissingTool { reason: format!("no installed host can load module {}", provider.module) },
-                );
+                let mut reason = format!("no installed host can load module {}", provider.module);
+                if !failed_optional.is_empty() {
+                    reason.push_str(&format!("; optional hosts unavailable: {}", failed_optional.join("; ")));
+                }
+                unavailable.insert(name.clone(), Readiness::MissingTool { reason });
             }
         }
         let mut hosts = Vec::new();
@@ -143,18 +167,7 @@ impl Daemon {
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
-        Ok(Arc::new(Self {
-            config,
-            hosts,
-            placements,
-            unavailable,
-            keys,
-            resolver: Arc::new(RegistryResolver::new().map_err(|e| e.to_string())?),
-            stopping: tokio::sync::watch::channel(false).0,
-        }))
-    }
-    pub fn with_resolver(self: &mut Arc<Self>, resolver: Arc<dyn ImageResolver>) {
-        Arc::get_mut(self).expect("set resolver before sharing daemon").resolver = resolver;
+        Ok(Arc::new(Self { config, hosts, placements, unavailable, keys, resolver, stopping: tokio::sync::watch::channel(false).0 }))
     }
     fn host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let placement = self.placements.get(provider).ok_or_else(|| {
@@ -249,6 +262,7 @@ impl Daemon {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         use rigging_http_serve::{Caller, UnixServer};
+        // SAFETY: geteuid has no preconditions.
         let uid = unsafe { libc::geteuid() };
         let router = self.router().layer(middleware::from_fn(
             move |axum::Extension(caller): axum::Extension<Caller>, req: Request, next: Next| async move {
@@ -296,6 +310,8 @@ impl Daemon {
         tokio::fs::write(dir.join("request.json"), serde_json::to_vec(&request).map_err(|_| Error::InvalidRequest)?)
             .await
             .map_err(|_| Error::Transport)?;
+        // Preparation can outlast a host generation or credential change. Use
+        // this fresh readiness check and its host for the actual provision call.
         let host = self.ready_host(provider)?;
         let result = host.handle.client.clone().with_request_timeout(Duration::from_secs(600)).provision(provider, &request).await;
         let cache = host.cache.lock().await.1.clone();

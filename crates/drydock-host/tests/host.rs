@@ -1651,6 +1651,7 @@ settings = {
         &run,
         run.join("keys"),
         vec![drydock::daemon::HostOption {
+            optional: false,
             name: "rust".into(),
             connection: drydock::HostConnection::Managed {
                 command: vec![env!("CARGO_BIN_EXE_drydock-host").into()],

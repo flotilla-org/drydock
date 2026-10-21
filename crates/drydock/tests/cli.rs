@@ -205,7 +205,7 @@ async fn daemon_routes_provider_api_and_streams() {
         config,
         &run,
         run.join("keys"),
-        vec![HostOption { name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
+        vec![HostOption { optional: false, name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
     )
     .await
     .unwrap();
@@ -237,6 +237,9 @@ async fn daemon_routes_provider_api_and_streams() {
         ProviderApi::request(daemon.as_ref(), Method::GET, &["v1", "providers", "demo", "environments"], &[], None).await.unwrap();
     assert_eq!(response.body, serde_json::to_value(client.list("demo").await.unwrap()).unwrap());
     assert!(client.inspect("other", &env.id).await.is_err());
+    assert!(
+        matches!(client.list("missing").await,Err(drydock::client::Error::Protocol(ProtocolError::Unavailable {reason,..})) if reason.contains("MissingTool"))
+    );
     assert!(client.credential("demo", Secret::new("bad")).await.is_err());
     let mut relay = client.relay("demo", &env.id).await.unwrap();
     relay.write_all(b"hello").await.unwrap();
@@ -291,7 +294,7 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
             Config::parse(&config_text(&token)).unwrap(),
             &run,
             run.join("keys"),
-            vec![HostOption { name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } }],
+            vec![HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } }],
         )
         .await
         .unwrap();
@@ -368,7 +371,7 @@ settings={{fault={{kind="internal",reason="HTTP 400 vendor validation",provider_
         Config::parse(&text).unwrap(),
         &run,
         run.join("keys"),
-        vec![HostOption { name: "rust".into(), connection: HostConnection::ExternalUnix { path: host } }],
+        vec![HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: host } }],
     )
     .await
     .unwrap();
@@ -392,5 +395,54 @@ settings={{fault={{kind="internal",reason="HTTP 400 vendor validation",provider_
     }
     assert!(!text.contains("test-secret-value"));
     server.abort();
+    task.abort();
+}
+
+// Optional language companions can fail without taking down a healthy Rust
+// provider. Failed/unloadable modules stay visible and unusable with a reason.
+// The resolver double stands only at the registry/network boundary.
+#[tokio::test]
+async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported() {
+    struct Resolver;
+    #[async_trait::async_trait]
+    impl drydock::launch::ImageResolver for Resolver {
+        async fn resolve(&self, image: &str) -> Result<String, drydock::client::Error> {
+            Ok(image.into())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, task) = reference(dir.path()).await;
+    let token = dir.path().join("token");
+    std::fs::write(&token, "token").unwrap();
+    let config = Config::parse(&(config_text(&token) + "\n[provider.python]\nmodule='python-only'\ncredential={env='PATH'}\n")).unwrap();
+    let broken = |optional| HostOption {
+        name: "python".into(),
+        optional,
+        connection: HostConnection::Managed { command: vec!["/bin/false".into()], runtime: None, proxy_environment: Default::default() },
+    };
+    let run = dir.path().join("run");
+    let daemon = Daemon::start_with_resolver(
+        config.clone(),
+        &run,
+        run.join("keys"),
+        vec![HostOption { name: "rust".into(), optional: false, connection: HostConnection::ExternalUnix { path: socket } }, broken(true)],
+        std::sync::Arc::new(Resolver),
+    )
+    .await
+    .unwrap();
+    assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
+    let row = daemon.providers().as_array().unwrap().iter().find(|p| p["provider"] == "python").unwrap().clone();
+    assert_eq!(row["readiness"]["status"], "missing_tool");
+    assert!(row["readiness"]["reason"].as_str().unwrap().contains("python: host exited during discovery"));
+    assert!(matches!(
+        ProviderApi::list(daemon.as_ref(), "python").await,
+        Err(drydock::client::Error::NotReady(Readiness::MissingTool { .. }))
+    ));
+    let environment = daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    assert_eq!(ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), vec![environment]);
+    let required_run = dir.path().join("required");
+    let error = Daemon::start(config, &required_run, required_run.join("keys"), vec![broken(false)]).await.err().unwrap();
+    assert!(error.contains("host exited during discovery"));
+    drop(daemon);
     task.abort();
 }
