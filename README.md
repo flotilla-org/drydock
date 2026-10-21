@@ -128,7 +128,11 @@ provider, operation, category, reason, upstream HTTP status and provider message
 A Daytona 401 rejects the key; a 403 is `Refused` for the named operation and
 leaves the provider ready. No additional permission error variant is needed.
 Masking covers literal, JSON-escaped, percent-encoded and base64 echoes, before
-limiting diagnostics to 16 KiB per field. Display escapes control characters.
+limiting diagnostics to 16 KiB per field. Derived patterns are cached when a
+credential is first delivered, rather than rebuilt on every failed call. Base64
+matching covers the complete encoded credential; it does not detect a credential
+embedded within a larger encoded payload (for example `base64(user:key)`) or
+arbitrarily transformed/nested encodings. Display escapes control characters.
 Empty credential values are ignored. Every nonempty value is masked, including
 short placeholders; a short or common value can therefore obscure unrelated
 words in a diagnostic. Use distinctive placeholders for readable diagnostics.

@@ -91,15 +91,18 @@ impl EventSink {
     }
 }
 type PendingEvent = (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, EventKind);
-// Retain old generations to mask delayed vendor echoes. Sort only when adding a
-// unique value, rather than on every failed call. Lifetime is that of this host.
+// Retain old generations to mask delayed vendor echoes. Derive patterns only
+// when adding a unique value, never on failed calls. Lifetime is this host.
 #[derive(Default)]
-struct DiagnosticSecrets(Vec<Secret>);
+struct DiagnosticSecrets {
+    values: Vec<Secret>,
+    masker: DiagnosticMasker,
+}
 impl DiagnosticSecrets {
     fn remember(&mut self, secret: Secret) {
-        if !self.0.contains(&secret) {
-            self.0.push(secret);
-            self.0.sort_by_key(|s| std::cmp::Reverse(s.expose().len()));
+        if !self.values.contains(&secret) {
+            self.masker.remember(secret.expose());
+            self.values.push(secret);
         }
     }
 }
@@ -328,8 +331,7 @@ impl Instance {
         // Retain previous generations too: an in-flight request or a vendor's
         // delayed explanation can still echo an earlier credential.
         let secrets = self.diagnostic_secrets.recover();
-        let values: Vec<&str> = secrets.0.iter().map(Secret::expose).collect();
-        error.diagnostic_context(&self.config.name, operation, &values)
+        secrets.masker.context(error, &self.config.name, operation)
     }
     fn longest_window(&self, operation: &str) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -1626,7 +1628,7 @@ mod operation_tests {
                 configure(State(host.clone()), ApiJson(config.clone())).await.map_err(|e| e.0).unwrap();
             }
         }
-        assert_eq!(host.diagnostic_secrets.recover().0.len(), 1);
+        assert_eq!(host.diagnostic_secrets.recover().values.len(), 1);
         host.shutdown(async {}).await;
     }
 }

@@ -1,6 +1,7 @@
 //! JSON wire contract for ADR 0070 language hosts. No provider or HTTP runtime lives here.
 //! Provider IDs are opaque; labels identify a client's environment for idempotent creation.
 mod diagnostic;
+pub use diagnostic::DiagnosticMasker;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;

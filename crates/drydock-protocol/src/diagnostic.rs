@@ -101,30 +101,52 @@ impl std::fmt::Display for LogText<'_> {
         Ok(())
     }
 }
-impl ProtocolError {
-    /// Mask literal, JSON-escaped, percent-encoded and base64 credential echoes,
-    /// then bound diagnostic fields and attach call context. Command output keeps
-    /// its original size and redacting type.
-    pub fn diagnostic_context(mut self, provider: &str, operation: &str, secrets: &[&str]) -> Self {
-        let patterns = patterns(secrets);
-        let reason = match &mut self {
-            Self::NotFound { reason }
-            | Self::MethodNotAllowed { reason }
-            | Self::Refused { reason }
-            | Self::Unavailable { reason, .. }
-            | Self::RateLimited { reason, .. }
-            | Self::QuotaExhausted { reason }
-            | Self::CredentialRejected { reason }
-            | Self::CommandFailed { reason, .. }
-            | Self::Internal { reason, .. } => reason,
+/// Cached credential patterns for repeated host diagnostics. This type deliberately
+/// has no Debug/Display implementation because patterns include credential values.
+#[derive(Default)]
+pub struct DiagnosticMasker {
+    patterns: Vec<String>,
+}
+impl DiagnosticMasker {
+    /// Add a credential's common literal/encoded forms once, at delivery time.
+    pub fn remember(&mut self, secret: &str) {
+        self.patterns.extend(patterns(&[secret]));
+        self.patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        self.patterns.dedup();
+    }
+    /// Mask complete diagnostics before bounding text or rendering for operators.
+    pub fn context(&self, mut error: ProtocolError, provider: &str, operation: &str) -> ProtocolError {
+        let patterns = &self.patterns;
+        let reason = match &mut error {
+            ProtocolError::NotFound { reason }
+            | ProtocolError::MethodNotAllowed { reason }
+            | ProtocolError::Refused { reason }
+            | ProtocolError::Unavailable { reason, .. }
+            | ProtocolError::RateLimited { reason, .. }
+            | ProtocolError::QuotaExhausted { reason }
+            | ProtocolError::CredentialRejected { reason }
+            | ProtocolError::CommandFailed { reason, .. }
+            | ProtocolError::Internal { reason, .. } => reason,
         };
-        *reason = bounded(mask(&format!("provider {provider} operation {operation}: {reason}"), &patterns));
-        match &mut self {
-            Self::Internal { provider_error, .. } => *provider_error = bounded(mask(provider_error, &patterns)),
-            Self::Unavailable { provider_error: Some(detail), .. } => *detail = bounded(mask(detail, &patterns)),
-            Self::CommandFailed { output, .. } => *output = Secret::new(mask(output.expose(), &patterns)),
+        *reason = bounded(mask(&format!("provider {provider} operation {operation}: {reason}"), patterns));
+        match &mut error {
+            ProtocolError::Internal { provider_error, .. } => *provider_error = bounded(mask(provider_error, patterns)),
+            ProtocolError::Unavailable { provider_error: Some(detail), .. } => *detail = bounded(mask(detail, patterns)),
+            ProtocolError::CommandFailed { output, .. } => *output = Secret::new(mask(output.expose(), patterns)),
             _ => {}
         }
-        self
+        error
+    }
+}
+
+impl ProtocolError {
+    /// Convenience for a single diagnostic. Hosts with retained credential state
+    /// should cache a DiagnosticMasker instead of deriving patterns on each error.
+    pub fn diagnostic_context(self, provider: &str, operation: &str, secrets: &[&str]) -> Self {
+        let mut masker = DiagnosticMasker::default();
+        for secret in secrets {
+            masker.remember(secret);
+        }
+        masker.context(self, provider, operation)
     }
 }

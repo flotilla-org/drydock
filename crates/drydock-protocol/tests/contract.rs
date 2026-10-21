@@ -125,3 +125,32 @@ fn encoded_credential_echoes_and_short_values_are_masked() {
     let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
     assert_eq!(provider_error, "<REDACTED><REDACTED>");
 }
+
+// A retained masker must preserve every earlier credential across insertions,
+// repeated deliveries and insertion order; caching cannot drop old encodings.
+#[test]
+fn cached_masker_retains_all_delivered_credentials() {
+    for sequence in [vec!["old-key", "new-key", "old-key"], vec!["new-key", "old-key", "new-key"], vec!["", "old-key", "new-key"]] {
+        let mut masker = DiagnosticMasker::default();
+        let mut delivered = Vec::new();
+        for secret in sequence {
+            masker.remember(secret);
+            delivered.push(secret);
+            let error = ProtocolError::Internal {
+                reason: "validation old-key new-key".into(),
+                provider_error: "vendor old-key new-key b2xkLWtleQ== bmV3LWtleQ==".into(),
+            };
+            let actual = masker.context(error.clone(), "p", "list");
+            assert_eq!(actual, error.diagnostic_context("p", "list", &delivered));
+            let ProtocolError::Internal { provider_error, .. } = actual else { unreachable!() };
+            if delivered.contains(&"old-key") {
+                assert!(!provider_error.contains("old-key"));
+                assert!(!provider_error.contains("b2xkLWtleQ=="));
+            }
+            if delivered.contains(&"new-key") {
+                assert!(!provider_error.contains("new-key"));
+                assert!(!provider_error.contains("bmV3LWtleQ=="));
+            }
+        }
+    }
+}
