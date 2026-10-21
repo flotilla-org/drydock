@@ -162,7 +162,13 @@ Agent re-exec loses DNS leases; callers must resolve names again.
 
 Capture, explicit-proxy and DNS-TCP connections share a 128-stream budget.
 Overflow connections are accepted and immediately closed, preserving descriptor
-headroom for the control path. Closing a connection releases its slot. DNS TCP
+headroom for the control path. Saturation increments a shared rejection counter
+and warns on the first rejection and powers of two, avoiding a log per rejected
+connection. Closing a connection releases its slot. Opening an upstream forward,
+including its acknowledgment, has a 30-second deadline. Established tunnels have
+no idle/lifetime timeout so long-lived SSH/WebSocket/service streams can remain
+open; the bounded budget still applies. DNS query frames are capped at 4 KiB
+before allocating their payload, matching the UDP receive buffer. DNS TCP
 uses a 30-second per-query timeout, renewed after each completed exchange, rather
 than a total connection deadline. CONNECT upstreams must send a final 2xx reply
 directly; interim 1xx replies are rejected. Fake DNS names must consist of ASCII

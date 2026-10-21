@@ -30,6 +30,7 @@ const FIRST: u32 = u32::from_be_bytes([198, 18, 0, 0]);
 const CAPACITY: u32 = 1 << 17;
 pub(crate) const RESERVED_PORTS: [u16; 3] = [DNS_PORT, CAPTURE_PORT, PROXY_PORT];
 const MAX_CONNECTIONS: usize = 128;
+const MAX_DNS_QUERY: usize = 4096;
 const NFT: &str = "/opt/drydock/bin/nft";
 
 /// One vessel-scoped host forward. No destination policy lives in this table.
@@ -136,10 +137,14 @@ impl FakeDns {
 }
 
 async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<ByteStream> {
-    let opener = opener.lock().await.clone();
-    let mut stream = opener.open(Purpose::Forward { id }).await?;
-    crate::forward::opened(&mut stream).await?;
-    Ok(stream)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let opener = opener.lock().await.clone();
+        let mut stream = opener.open(Purpose::Forward { id }).await?;
+        crate::forward::opened(&mut stream).await?;
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "egress upstream opening timed out"))?
 }
 
 // Read exactly the CONNECT response head, leaving any coalesced tunnel bytes
@@ -187,6 +192,23 @@ struct CaptureState {
     id: Arc<Mutex<String>>,
     map: Arc<Mutex<FakeDns>>,
     slots: Arc<tokio::sync::Semaphore>,
+    rejected: Arc<std::sync::atomic::AtomicU64>,
+}
+impl CaptureState {
+    fn try_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match self.slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let count = self.rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed).wrapping_add(1);
+                // Log the first refusal and powers of two: saturation remains
+                // observable without producing one warning per connection.
+                if count.is_power_of_two() {
+                    tracing::warn!(rejected_connections = count, "egress connection budget exhausted");
+                }
+                None
+            }
+        }
+    }
 }
 
 async fn serve_connection(stream: TcpStream, passthrough: bool, state: CaptureState) -> io::Result<()> {
@@ -215,7 +237,7 @@ async fn serve_capture(listener: TcpListener, passthrough: bool, state: CaptureS
         // Accept and immediately close overflow rather than retaining more
         // sockets or blocking the listener on a permit. All TCP listeners share
         // this budget, leaving descriptor headroom for the control path.
-        let Ok(permit) = state.slots.clone().try_acquire_owned() else {
+        let Some(permit) = state.try_slot() else {
             continue;
         };
         let state = state.clone();
@@ -230,6 +252,9 @@ async fn serve_capture(listener: TcpListener, passthrough: bool, state: CaptureS
 
 async fn dns_exchange(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin), map: &Mutex<FakeDns>) -> io::Result<()> {
     let length = stream.read_u16().await?;
+    if usize::from(length) > MAX_DNS_QUERY {
+        return Err(invalid("oversized DNS query"));
+    }
     let mut bytes = vec![0; length.into()];
     stream.read_exact(&mut bytes).await?;
     let answer = map.lock().unwrap().answer(&bytes, Instant::now())?;
@@ -264,7 +289,7 @@ async fn serve_dns_tcp(listener: TcpListener, state: CaptureState) {
                 continue;
             }
         };
-        let Ok(permit) = state.slots.clone().try_acquire_owned() else {
+        let Some(permit) = state.try_slot() else {
             continue;
         };
         let map = state.map.clone();
@@ -276,7 +301,7 @@ async fn serve_dns_tcp(listener: TcpListener, state: CaptureState) {
 }
 
 async fn serve_dns_udp(socket: UdpSocket, map: Arc<Mutex<FakeDns>>) {
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; MAX_DNS_QUERY];
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((n, peer)) => {
@@ -336,8 +361,13 @@ impl Capture {
         let dns_udp = UdpSocket::from_std(udp.into())?;
         let map = Arc::new(Mutex::new(FakeDns::default()));
         let id = Arc::new(Mutex::new(id));
-        let state =
-            CaptureState { opener, id: id.clone(), map: map.clone(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)) };
+        let state = CaptureState {
+            opener,
+            id: id.clone(),
+            map: map.clone(),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            rejected: Arc::default(),
+        };
         let mut tasks = JoinSet::new();
         tasks.spawn(serve_capture(tcp, false, state.clone()));
         tasks.spawn(serve_capture(explicit, true, state.clone()));
@@ -894,6 +924,47 @@ mod tests {
         stream.read_exact(&mut answer).await.unwrap();
         assert_eq!(Message::from_vec(&answer).unwrap().answers().len(), 1);
         capture.stop().await;
+    }
+
+    // A host endpoint that never acknowledges its forward opening must release
+    // the guest's pending stream after the opening deadline, not pin it forever.
+    #[tokio::test(start_paused = true)]
+    async fn upstream_opening_has_a_deadline() {
+        use drydock_transport::{Limits, Transport};
+        let (a, b) = tokio::io::duplex(4096);
+        let (host, guest) =
+            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+        let (mut host, guest) = (host.unwrap(), guest.unwrap());
+        let opener = Arc::new(AsyncMutex::new(guest.opener.clone()));
+        let pending = tokio::spawn(async move { upstream(&opener, "never-acknowledges".into()).await });
+        // Network-boundary stand-in: accept the real forward but never ack it.
+        let _hung_endpoint = host.accept().await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap().unwrap();
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
+    }
+
+    // Reject over-limit DNS frames from their length prefix, before allocating
+    // or waiting for the payload. The exact limit still accepts a DNS question.
+    #[hegel::test]
+    fn dns_tcp_query_size_is_bounded(tc: hegel::TestCase) {
+        let oversized = tc.draw(gs::integers::<u16>().min_value(MAX_DNS_QUERY as u16 + 1));
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let map = Mutex::new(FakeDns::default());
+            let (mut server, mut client) = tokio::io::duplex(MAX_DNS_QUERY + 2);
+            client.write_u16(oversized).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(dns_exchange(&mut server, &map).await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            let mut query = Message::new();
+            query.add_query(Query::query(Name::from_ascii("size.example.").unwrap(), RecordType::A));
+            let mut bytes = query.to_vec().unwrap();
+            bytes.resize(MAX_DNS_QUERY, 0);
+            let (mut server, mut client) = tokio::io::duplex(MAX_DNS_QUERY + 2);
+            client.write_u16(MAX_DNS_QUERY as u16).await.unwrap();
+            client.write_all(&bytes).await.unwrap();
+            dns_exchange(&mut server, &map).await.unwrap();
+            assert!(client.read_u16().await.unwrap() > 0);
+        });
     }
 
     // The HTTP boundary may reject, truncate, or oversize its CONNECT reply;
