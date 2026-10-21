@@ -2,9 +2,9 @@
 
 The substrate for just launching vessels: isolated environments for AI coding agents, on any provider.
 
-Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a bidirectional stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) embeds it; it is also usable on its own.
+Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a bidirectional stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) can embed the crate or delegate to the same provider API; standalone use runs `drydockd`.
 
-Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace, [`drydock-transport`](crates/drydock-transport), the [Rust reference host](crates/drydock-host), [typed client](crates/drydock-client), and [supervision/CLI](crates/drydock) implemented; vendor modules and the agent are next.
+Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace, [`drydock-transport`](crates/drydock-transport), the [Rust reference host](crates/drydock-host), [typed client](crates/drydock-client), and [daemon/client CLI](crates/drydock), and Daytona module implemented; additional language hosts and the agent/tools image follow.
 
 See the [transport guide](crates/drydock-transport/README.md) for the API, wire format, lifecycle, and transport test instructions.
 
@@ -16,6 +16,94 @@ Project contents and roadmap:
 - a conformance suite runnable against any language host or built-in provider.
 
 Licensed under either of Apache License 2.0 or MIT, at your option.
+
+## Standalone daemon and CLI
+
+Build and install `drydock`, `drydockd` and `drydock-host` together:
+
+```sh
+cargo build -p drydock -p drydock-host --locked
+# Install the three binaries beside one another on PATH.
+```
+
+Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
+
+```toml
+[provider.daytona]
+module = "daytona"
+credential = { file = "~/.config/flotilla/credentials/daytona.token" }
+image = "registry.example/team/agent-image:current"
+size = { cpus = 1, memory = "1GiB", disk = "1GiB" }
+egress = "open"
+settings = {
+  organization_id = "YOUR_ORGANIZATION_ID",
+  ssh_host_key = "ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
+  agent_command = "/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock",
+}
+```
+
+The image must carry today's operator-baked agent and its fixed `agent_command`.
+[Tools image #53](https://github.com/flotilla-org/drydock/issues/53) replaces
+this interim setup; [bare-image launch #54](https://github.com/flotilla-org/drydock/issues/54)
+adds checks for images such as `ubuntu:24.04` after that image exists. Nobody types
+a tools digest: `build_tools_digest()` selects the interim `operator-baked-agent-v1`.
+
+```sh
+drydock providers
+drydock launch daytona
+drydock launch daytona --image registry.example/team/agent-image:current --cpus 2
+drydock list daytona
+drydock inspect daytona PROVIDER_ID
+drydock shell daytona PROVIDER_ID
+drydock destroy daytona PROVIDER_ID
+# Optional warming; launch always prepares implicitly.
+drydock prepare daytona --egress deny-all
+```
+
+Commands connect to the same long-lived daemon, starting the companion `drydockd`
+when absent. It keeps hosts, polling, status caching and credential refresh alive
+between calls. `drydockd` also runs directly in the foreground. The daemon owns
+provider configuration; restart it after edits. Provider settings are opaque to
+drydock and reach only the module. Credentials are `{ env = "NAME" }` or
+`{ file = "PATH", json_field = "token" }`; only the resolved value is delivered
+by credential refresh on the authenticated host connection.
+
+Rigging resolves XDG paths: `XDG_CONFIG_HOME/drydock/drydock.toml`, falling back
+to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
+(config under `$DRYDOCK_ROOT/config`). The socket intentionally lives at
+`config/run/drydock.sock`, with a private directory and a kernel peer-UID check.
+`--config PATH` and `--socket PATH` override the defaults; the socket selects the
+daemon, so use distinct sockets for distinct configurations. Startup is serialized
+across concurrent clients. Diagnostics go to `run/drydock.log`.
+
+Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
+`egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
+such as `2GiB`/`512MiB`. Missing size fields use the module's declared smallest
+size. The standalone default is Open, declared Advisory by today's modules;
+low-level protocol requests retain deny-all as their default. Image tags are
+resolved through the OCI registry at prepare/launch and recorded as immutable
+SHA-256 references in the prepared form and local launch evidence. A key pair
+is generated per vessel under `run/keys`; SSH uses that identity and the recipe's
+pinned host key. Dial/Relay shells refuse with a reason until the agent supports
+them. Progress is on stderr; JSON results are on stdout.
+
+The daemon discovers loadable modules from host `hello`, then sends only the
+providers assigned to each host. The Rust host is bundled. TypeScript/Python
+companions (`drydock-host-typescript`, `drydock-host-python`) become candidates
+when installed beside the daemon and `node`/`uv` are detected; they are not yet
+shipped in this repository. `drydockd --external-host /private/host.sock` uses
+explicit external hosts instead of installed companions. Embedders may supply
+managed or authenticated external TCP `HostOption`s through the crate. Binary
+lookup overrides are `DRYDOCK_DAEMON_BIN`, `DRYDOCK_HOST_BIN`,
+`DRYDOCK_TYPESCRIPT_HOST_BIN` and `DRYDOCK_PYTHON_HOST_BIN`.
+
+The daemon serves `/v1/providers/{provider}/…`, including existing prepare,
+provision, inspect, destroy, reach, optional operations and stream upgrades,
+plus `/v1/providers`, `/launch` and `/shell` conveniences. It never exposes host
+configuration or credential refresh to CLI clients. The public `ProviderApi`
+trait works against the embedded `Daemon` or a Unix-socket `Client`. `/v1/events`
+merges host streams with an opaque vector cursor; partial snapshots explicitly
+mark other hosts' providers unavailable so they cannot imply deletion.
 
 ## Protocol workspace
 
@@ -181,8 +269,8 @@ must use a transport that preserves the upgrade rather than changing the method.
 ## Conformance
 
 `drydock conformance --provider NAME --options probe.json` runs destructive
-ADR 0070 scenarios against exactly one provider in the normal `--config` host
-configuration. Unix sockets, managed host binaries and authenticated loopback
+ADR 0070 scenarios against exactly one provider in the daemon
+provider configuration. Unix sockets, managed host binaries and authenticated loopback
 TCP hosts all use the same client and scenario list. A built-in provider can
 expose that same endpoint without a special test interface. The Rust reference
 binary and a small independent Python socket fixture run this list in CI; the
@@ -215,10 +303,10 @@ For example, choose the image and tools digests in the request:
 ```
 
 ```sh
-drydock --config hosts.json --runtime-directory /private/runtime \
+drydock --config drydock.toml \
   conformance --provider reference --options probe.json
 # Vendor modules require explicit consent to charges:
-drydock --config hosts.json --runtime-directory /private/runtime \
+drydock --config drydock.toml \
   conformance --provider daytona --options daytona-probe.json --live
 ```
 
@@ -246,12 +334,11 @@ look-up-or-build identity before provisioning; the input prepared ID is replaced
 Operators can also obtain a complete prepared form with
 
 ```sh
-drydock --config hosts.json --runtime-directory /tmp/my-drydock prepare \
-  HOST NAME IMAGE_DIGEST TOOLS_DIGEST \
-  --cpus 2 --memory-bytes 4294967296 --disk-bytes 10737418240
+drydock prepare NAME --image registry.example/team/agent-image:current \
+  --cpus 2 --memory 4GiB --disk 10GiB
 ```
 
-The size flags are required; byte counts are explicit and their order is flexible.
+The size flags override per-provider defaults; their order is flexible.
 Preparation can incur provider charges. Live Daytona and then Namespace validation
 are operator runs once their modules and test credentials exist.
 

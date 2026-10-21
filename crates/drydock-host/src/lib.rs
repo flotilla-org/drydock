@@ -752,6 +752,15 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
         protocol_version: PROTOCOL_VERSION.into(),
         host_version: env!("CARGO_PKG_VERSION").into(),
         modules: config.modules.clone(),
+        loadable_modules: host
+            .registry
+            .iter()
+            .map(|(name, module)| LoadableModule {
+                name: name.clone(),
+                version: module.version().into(),
+                smallest_size: module.smallest_size(),
+            })
+            .collect(),
         providers: config
             .providers
             .iter()

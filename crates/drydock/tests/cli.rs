@@ -1,347 +1,396 @@
-use drydock::{HostConnection, HostSpec};
+//! Real process/socket acceptance scenarios. Only the daemon executable boundary
+//! is wrapped to point its external-host option at our real reference host.
+use drydock::{
+    HostConnection,
+    client::{Client, Method},
+    config::Config,
+    daemon::{Daemon, HostOption, ProviderApi},
+};
 use drydock_protocol::*;
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt};
+use std::{os::unix::fs::PermissionsExt, time::Duration};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// All five commands drive a real externally owned Rust reference host. Separate
-// invocations share only provider state; the CLI never creates a local store.
-#[tokio::test]
-async fn cli_lifecycle_against_reference_host() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = dir.path().join("host.sock");
-    let path = socket.clone();
-    let server = tokio::spawn(async move {
+fn config_text(socket_credential: &std::path::Path) -> String {
+    format!(
+        r#"
+[provider.demo]
+module = "reference"
+credential = {{ file = {:?} }}
+image = "image@sha256:{}"
+settings = {{
+  fixture = true,
+  poll_interval_ms = 10,
+}}
+[provider.other]
+module = "reference"
+credential = {{ env = "PATH" }}
+image = "image@sha256:{}"
+settings = {{}}
+"#,
+        socket_credential.to_str().unwrap(),
+        "a".repeat(64),
+        "a".repeat(64)
+    )
+}
+async fn reference(dir: &std::path::Path) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("reference.sock");
+    let socket = path.clone();
+    let task = tokio::spawn(async move {
         drydock_host::Host::new(drydock_host::reference::registry())
-            .serve_unix(path, unsafe { libc::geteuid() }, std::future::pending())
+            .serve_unix(socket, unsafe { libc::geteuid() }, std::future::pending())
             .await
-            .unwrap()
+            .unwrap();
     });
-    let config = dir.path().join("hosts.json");
-    let spec = HostSpec { name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket.clone() }, configuration: serde_json::from_value(serde_json::json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[{"name":"a","module":"memory","settings":{},"credential":{"mode":"direct","credential_reference":"test"}}]})).unwrap(), credentials: BTreeMap::from([("test".into(), drydock::credentials::CredentialReference::Env { name: "PATH".into() })]) };
-    std::fs::write(&config, serde_json::to_vec(&vec![spec]).unwrap()).unwrap();
-    let run = |args: Vec<String>| {
-        let config = config.clone();
-        let runtime = dir.path().join("run");
-        async move {
-            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
-                .arg("--config")
-                .arg(&config)
-                .arg("--runtime-directory")
-                .arg(runtime)
-                .args(&args)
-                .output()
-                .await
-                .unwrap();
-            if args.first().is_some_and(|arg| arg == "conformance") {
-                // Settle progress belongs on stderr; the caller still parses stdout as one JSON report.
-                assert!(String::from_utf8_lossy(&output.stderr).contains("Billing checks wait 1 ms"));
-            }
-            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
-            String::from_utf8(output.stdout).unwrap()
+    for _ in 0..200 {
+        if Client::unix(&path).unwrap().hello().await.is_ok() {
+            return (path, task);
         }
-    };
-    assert!(run(vec!["hosts".into()]).await.contains("ready"));
-    assert!(run(vec!["instances".into()]).await.contains("\"instance\":\"a\""));
-    let client = drydock::client::Client::unix(socket).unwrap();
-    let help = run(vec!["prepare".into(), "--help".into()]).await;
-    for flag in ["--cpus", "--memory-bytes", "--disk-bytes"] {
-        assert!(help.contains(flag));
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    // The reference host accepts byte-sized RAM and zero disk; Daytona does not.
-    // Named size flags can be supplied in any order.
-    let prepared: Prepared = serde_json::from_str(
-        &run(vec![
-            "prepare".into(),
-            "rust".into(),
-            "a".into(),
-            "sha256:image".into(),
-            "sha256:tools".into(),
-            "--disk-bytes".into(),
-            "0".into(),
-            "--cpus".into(),
-            "1".into(),
-            "--memory-bytes".into(),
-            "1024".into(),
-        ])
-        .await,
-    )
-    .unwrap();
-    let request = dir.path().join("launch.json");
-    std::fs::write(
-        &request,
-        serde_json::to_vec(&ProvisionRequest {
-            label: "test".into(),
-            prepared,
-            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
-            egress: EgressRequest::default(),
-            ssh_public_key: None,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    let environment: Environment =
-        serde_json::from_str(&run(vec!["launch".into(), "rust".into(), "a".into(), request.to_string_lossy().into_owned()]).await).unwrap();
-    let list: Vec<Environment> = serde_json::from_str(&run(vec!["list".into(), "rust".into(), "a".into()]).await).unwrap();
-    assert_eq!(list, vec![environment.clone()]);
-    let options = drydock::conformance::Options {
-        request: ProvisionRequest {
-            label: "cli-conformance".into(),
-            prepared: client
-                .prepare(
-                    "a",
-                    &PrepareRequest {
-                        size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
-                        image_digest: "image".into(),
-                        tools_digest: "tools".into(),
-                    },
-                )
-                .await
-                .unwrap(),
-            size: Size { cpus: 2., memory_bytes: 1024, disk_bytes: 0 },
-            egress: EgressRequest::default(),
-            ssh_public_key: None,
-        },
-        scenarios: vec![
-            drydock::conformance::Scenario::Prepare,
-            drydock::conformance::Scenario::Lifecycle,
-            drydock::conformance::Scenario::Observation,
-            drydock::conformance::Scenario::Reach,
-            drydock::conformance::Scenario::Refusal,
-            drydock::conformance::Scenario::Destroy,
-            drydock::conformance::Scenario::Metering,
-        ],
-        fixture_configuration: None,
-        billing_sample_millis: 25,
-        billing_settle_millis: 1,
-        null_environment_id: None,
-        auth_audit: None,
-        timeouts: Default::default(),
-        echo_relay: true,
-        reach_probe: None,
-        egress_probe: None,
-    };
-    let options_file = dir.path().join("conformance.json");
-    std::fs::write(&options_file, serde_json::to_vec(&options).unwrap()).unwrap();
-    let report: serde_json::Value = serde_json::from_str(
-        &run(vec!["conformance".into(), "--provider".into(), "a".into(), "--options".into(), options_file.to_string_lossy().into_owned()])
-            .await,
-    )
-    .unwrap();
-    assert!(report["checks"].as_array().unwrap().iter().all(|check| check["passed"] == true));
-    // A non-reference module must be refused before the CLI starts/configures
-    // any host. The gate uses configured entrypoint, never provider display name.
-    let mut non_reference: serde_json::Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-    non_reference[0]["configuration"]["modules"][0]["entrypoint"] = serde_json::json!("vendor-module");
-    let gated_config = dir.path().join("live-hosts.json");
-    std::fs::write(&gated_config, serde_json::to_vec(&non_reference).unwrap()).unwrap();
-    let refused = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+    panic!("reference did not start");
+}
+struct KillDaemon {
+    socket: std::path::PathBuf,
+    pid: u32,
+}
+impl Drop for KillDaemon {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.pid as i32, libc::SIGTERM);
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+async fn cli(config: &std::path::Path, socket: &std::path::Path, shim: &std::path::Path, args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
         .arg("--config")
-        .arg(gated_config)
-        .arg("--runtime-directory")
-        .arg(dir.path().join("unused"))
-        .args(["conformance", "--provider", "a", "--options"])
-        .arg(&options_file)
+        .arg(config)
+        .arg("--socket")
+        .arg(socket)
+        .env("DRYDOCK_DAEMON_BIN", shim)
+        .env("DRYDOCK_HOST_BIN", "/not-installed/drydock-host")
+        .args(args)
         .output()
         .await
-        .unwrap();
-    assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --live"));
-    assert!(!dir.path().join("unused").exists());
-    run(vec!["destroy".into(), "rust".into(), "a".into(), environment.id]).await;
-    assert!(client.list("a").await.unwrap().is_empty());
-    server.abort();
+        .unwrap()
+}
+async fn cli_xdg(xdg: &std::path::Path, shim: &std::path::Path, args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+        .env("XDG_CONFIG_HOME", xdg)
+        .env_remove("DRYDOCK_ROOT")
+        .env("DRYDOCK_DAEMON_BIN", shim)
+        .args(args)
+        .output()
+        .await
+        .unwrap()
+}
+fn json(output: std::process::Output) -> serde_json::Value {
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+// Contract: provider-only TOML, client starts a missing daemon once, concurrent
+// clients reuse it, and the real host continues polling after the CLI exits.
+#[tokio::test]
+async fn cli_starts_reuses_and_observes_between_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, task) = reference(dir.path()).await;
+    let token = dir.path().join("token");
+    std::fs::write(&token, "test-token").unwrap();
+    let xdg = dir.path().join("xdg");
+    let config_dir = xdg.join("drydock");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("drydock.toml");
+    std::fs::write(&config, config_text(&token)).unwrap();
+    let run = config_dir.join("run");
+    drydock::local::private_dir(&run).unwrap();
+    let socket = run.join("drydock.sock");
+    let pid = dir.path().join("daemon.pid");
+    let shim = dir.path().join("daemon");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\necho $$ >> '{}'\nexec '{}' --external-host '{}' \"$@\"\n",
+            pid.display(),
+            env!("CARGO_BIN_EXE_drydockd"),
+            host.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (a, b) = tokio::join!(cli_xdg(&xdg, &shim, &["providers"]), cli(&config, &socket, &shim, &["list", "demo"]));
+    let providers = json(a);
+    assert_eq!(providers[0]["provider"], "demo");
+    assert_eq!(providers[0]["readiness"]["status"], "ready");
+    assert_eq!(json(b), serde_json::json!([]));
+    let pids = std::fs::read_to_string(&pid).unwrap();
+    assert_eq!(pids.lines().count(), 1);
+    let _cleanup = KillDaemon { socket: socket.clone(), pid: pids.trim().parse().unwrap() };
+    let client = Client::unix(&socket).unwrap();
+    let mut records = client.observe(None).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), records.next()).await.unwrap().unwrap().unwrap();
+    assert!(matches!(first, ObserveRecord::Snapshot { .. }));
+    let environment: Environment = serde_json::from_value(json(cli_xdg(&xdg, &shim, &["launch", "demo"]).await)).unwrap();
+    assert_eq!(environment.granted_size, Some(Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 }));
+    assert_eq!(environment.egress, Enforcement::Advisory);
+    let label = environment.label.as_ref().unwrap();
+    let request: ProvisionRequest =
+        serde_json::from_slice(&std::fs::read(run.join("keys").join(label).join("request.json")).unwrap()).unwrap();
+    assert_eq!(request.prepared.tools_digest, drydock::launch::build_tools_digest());
+    assert!(request.ssh_public_key.unwrap().starts_with("ssh-ed25519 "));
+    assert_eq!(request.egress, EgressRequest::Open);
+    // Change provider state directly while no CLI process is running. The host
+    // poller, rather than a CLI read, must emit the stopped transition.
+    let upstream = Client::unix(host).unwrap();
+    let resume = upstream.suspend("demo", &environment.id).await.unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(ObserveRecord::Event { event }) = records.next().await.unwrap()
+                && event.id == environment.id
+                && matches!(event.event, EventKind::Paused { .. } | EventKind::Stopped { .. })
+            {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(event.provider, "demo");
+    upstream.resume("demo", &environment.id, &resume).await.unwrap();
+    let inspected = json(cli(&config, &socket, &shim, &["inspect", "demo", &environment.id]).await);
+    assert_eq!(inspected["id"], environment.id);
+    let shell = cli(&config, &socket, &shim, &["shell", "demo", &environment.id]).await;
+    assert!(!shell.status.success());
+    assert!(String::from_utf8_lossy(&shell.stderr).contains("vessel agent"));
+    let override_image = format!("image@sha256:{}", "b".repeat(64));
+    let override_env: Environment = serde_json::from_value(json(
+        cli(
+            &config,
+            &socket,
+            &shim,
+            &["launch", "other", "--image", &override_image, "--cpus", "2", "--memory", "2GiB", "--disk", "3GiB", "--egress", "deny-all"],
+        )
+        .await,
+    ))
+    .unwrap();
+    assert_eq!(override_env.granted_size, Some(Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 3 << 30 }));
+    let override_request: ProvisionRequest =
+        serde_json::from_slice(&std::fs::read(run.join("keys").join(override_env.label.as_ref().unwrap()).join("request.json")).unwrap())
+            .unwrap();
+    assert_eq!(override_request.prepared.image_digest, override_image);
+    let warmed: Prepared = serde_json::from_value(json(cli(&config, &socket, &shim, &["prepare", "demo"]).await)).unwrap();
+    assert_eq!(warmed, request.prepared);
+
+    assert!(cli(&config, &socket, &shim, &["destroy", "demo", &environment.id]).await.status.success());
+    assert_eq!(json(cli(&config, &socket, &shim, &["list", "demo"]).await), serde_json::json!([]));
+    // Existing daemon remains authoritative even after config disappears.
+    std::fs::remove_file(config.clone()).unwrap();
+    assert_eq!(json(cli(&config, &socket, &shim, &["list", "other"]).await).as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(&pid).unwrap().lines().count(), 1);
+    task.abort();
 }
 
-// The CLI traverses real host and vendor sockets. This HTTP stand-in supplies
-// validation/permission errors at the vendor boundary; no provider logic is faked.
+// Contract: the embedded and socket forms route the same provider API, isolate
+// provider IDs, expose streaming upgrades, refuse host-control routes, and keep
+// unknown modules visible. External hosts remain alive after daemon drop.
 #[tokio::test]
-async fn cli_full_provider_errors() {
-    use serde_json::json;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU16, Ordering},
-    };
-    let status = Arc::new(AtomicU16::new(200));
-    let current = status.clone();
-    let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
-        let current = current.clone();
-        async move {
-            let status = current.load(Ordering::SeqCst);
-            let body = if status == 200 && uri.path().starts_with("/api/snapshots/") {
-                json!({"id":"fixture-snapshot","name":uri.path().rsplit('/').next().unwrap(),"state":"active","cpu":2,"mem":4,"disk":10})
-            } else if status == 200 {
-                json!({"items":[]})
-            } else {
-                json!({"message":"Cannot specify Sandbox resources when using a snapshot; credential test-secret-value"})
-            };
-            (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(body))
-        }
+async fn daemon_routes_provider_api_and_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, task) = reference(dir.path()).await;
+    let token = dir.path().join("token");
+    std::fs::write(&token, "token").unwrap();
+    let config = Config::parse(&(config_text(&token) + "\n[provider.missing]\nmodule='absent'\ncredential={env='PATH'}\n")).unwrap();
+    let run = dir.path().join("run");
+    let daemon = Daemon::start(
+        config,
+        &run,
+        run.join("keys"),
+        vec![HostOption { name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(daemon.providers()[2]["readiness"]["status"], "ready");
+    let missing = daemon.providers().as_array().unwrap().iter().find(|p| p["provider"] == "missing").unwrap().clone();
+    assert_eq!(missing["readiness"]["status"], "missing_tool");
+    let path = run.join("api.sock");
+    let api = daemon.clone();
+    let bind = path.clone();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        api.serve(&bind, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap();
     });
+    let client = Client::unix(path).unwrap();
+    for _ in 0..200 {
+        if client.hello().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let options = drydock::launch::LaunchOptions::default();
+    let env = daemon.launch("demo", &options).await.unwrap();
+    assert_eq!(client.inspect("demo", &env.id).await.unwrap(), env);
+    let response =
+        ProviderApi::request(daemon.as_ref(), Method::GET, &["v1", "providers", "demo", "environments"], &[], None).await.unwrap();
+    assert_eq!(response.body, serde_json::to_value(client.list("demo").await.unwrap()).unwrap());
+    assert!(client.inspect("other", &env.id).await.is_err());
+    assert!(client.credential("demo", Secret::new("bad")).await.is_err());
+    let mut relay = client.relay("demo", &env.id).await.unwrap();
+    relay.write_all(b"hello").await.unwrap();
+    let mut echo = [0; 5];
+    relay.read_exact(&mut echo).await.unwrap();
+    assert_eq!(&echo, b"hello");
+    drop(relay);
+    let command: ExecRequest = serde_json::from_value(serde_json::json!({"command":["echo","hello"],"env":{},"cwd":null})).unwrap();
+    let mut exec = client.exec("demo", &env.id, &command).await.unwrap();
+    let mut output = Vec::new();
+    exec.read_to_end(&mut output).await.unwrap();
+    assert!(!output.is_empty());
+    client.destroy("demo", &env.id).await.unwrap();
+    client.destroy("demo", &env.id).await.unwrap();
+    assert!(client.list("demo").await.unwrap().is_empty());
+    use futures::StreamExt;
+    let mut embedded_events = ProviderApi::observe(daemon.as_ref(), None).await.unwrap();
+    assert!(embedded_events.next().await.unwrap().is_ok());
+    drop(embedded_events);
+    let mut events = client.observe(None).await.unwrap();
+    assert!(events.next().await.unwrap().is_some());
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+    drop(daemon);
+    assert!(Client::unix(socket).unwrap().hello().await.is_ok());
+    task.abort();
+}
 
-    for reference in [true, false] {
-        for (upstream, class) in [(400, "internal"), (401, "credential_rejected"), (403, "refused"), (0, "unavailable")] {
-            status.store(200, Ordering::SeqCst);
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-            let socket = dir.path().join("host.sock");
-            let path = socket.clone();
-            let vendor = rigging_replay_testkit::http_contract::StandIn::start("https://app.daytona.io", router.clone()).await;
-            let host = drydock_host::Host::new(BTreeMap::from([
-                ("reference".into(), Arc::new(drydock_host::reference::ReferenceModule) as Arc<dyn drydock_host::module::Module>),
-                ("daytona".into(), Arc::new(CliDaytonaModule(vendor.http.clone())) as Arc<dyn drydock_host::module::Module>),
-            ]));
-            let server =
-                tokio::spawn(async move { host.serve_unix(path, unsafe { libc::geteuid() }, std::future::pending()).await.unwrap() });
-            let client = drydock::client::Client::unix(&socket).unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while client.hello().await.is_err() {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap();
-            let credential = dir.path().join("credential");
-            std::fs::write(&credential, "test-secret-value").unwrap();
-            let kind = if reference { "reference" } else { "daytona" };
-            let mut settings = json!({
-                "organization_id":"org", "ssh_host_key":"ssh-ed25519 AAAA", "agent_command":"agent",
-                "rate_limits":[]
-            });
-            if reference {
-                settings = json!({"fixture":true,"fixture_push":true,"poll_interval_ms":3600000,"fault":{
-                    "kind":class, "reason":format!("HTTP {upstream}: vendor validation test-secret-value"),
-                    "provider_error":"vendor explanation test-secret-value", "retry_after":null
-                }});
-            }
-            let configuration: HostConfiguration = serde_json::from_value(json!({
-                "modules":[{"name":"module","entrypoint":kind}],
-                "providers":[{"name":"provider-a","module":"module","settings":settings,
-                    "credential":{"mode":"direct","credential_reference":"test"}}]
-            }))
-            .unwrap();
-            // Configure before invoking the CLI so readiness/polling are exercised too.
-            client.configure(&configuration).await.unwrap();
-            client.credential("provider-a", Secret::new("test-secret-value")).await.unwrap();
-            let prepared_for_launch = if !reference && upstream == 400 {
-                Some(
-                    client
+// Generated operation sequences exercise provider routing and repeat creation
+// labels through the real in-memory reference module. The model checks inventory
+// after every operation, including empty state, duplicates and missing IDs.
+#[hegel::test]
+fn generated_provider_lifecycle(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(9));
+    let steps: Vec<_> = (0..count)
+        .map(|_| {
+            (
+                tc.draw(gs::integers::<usize>().min_value(0).max_value(2)),
+                tc.draw(gs::integers::<usize>().min_value(0).max_value(1)),
+                tc.draw(gs::integers::<usize>().min_value(0).max_value(2)),
+            )
+        })
+        .collect();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, task) = reference(dir.path()).await;
+        let token = dir.path().join("token");
+        std::fs::write(&token, "token").unwrap();
+        let run = dir.path().join("run");
+        let daemon = Daemon::start(
+            Config::parse(&config_text(&token)).unwrap(),
+            &run,
+            run.join("keys"),
+            vec![HostOption { name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } }],
+        )
+        .await
+        .unwrap();
+        let api: &dyn ProviderApi = daemon.as_ref();
+        let mut model = std::collections::BTreeMap::<(usize, usize), Environment>::new();
+        for (operation, p, label) in steps {
+            let provider = ["demo", "other"][p];
+            match operation {
+                0 => {
+                    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+                    let prepared = api
                         .prepare(
-                            "provider-a",
-                            &PrepareRequest {
-                                image_digest: format!("image@sha256:{}", "a".repeat(64)),
-                                tools_digest: "tools".into(),
-                                size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
-                            },
+                            provider,
+                            &PrepareRequest { size: size.clone(), image_digest: "image".into(), tools_digest: "tools".into() },
                         )
                         .await
-                        .unwrap(),
-                )
-            } else {
-                None
-            };
-            if !reference && upstream != 0 {
-                // Let the immediate successful poll settle before injecting the route error.
-                drydock::client::Observer::new(client.clone(), None).next().await.unwrap();
-                status.store(upstream, Ordering::SeqCst);
-            }
-            if upstream == 0 {
-                drop(vendor);
-            }
-            let spec = HostSpec {
-                name: "rust".into(),
-                connection: HostConnection::ExternalUnix { path: socket },
-                configuration,
-                credentials: BTreeMap::from([(
-                    "test".into(),
-                    drydock::credentials::CredentialReference::File { path: credential, json_field: None },
-                )]),
-            };
-            let config = dir.path().join("hosts.json");
-            std::fs::write(&config, serde_json::to_vec(&vec![spec]).unwrap()).unwrap();
-            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
-                .arg("--config")
-                .arg(&config)
-                .arg("--runtime-directory")
-                .arg(dir.path().join("run"))
-                .args(["list", "rust", "provider-a"])
-                .output()
-                .await
-                .unwrap();
-            assert!(!output.status.success());
-            let text = String::from_utf8(output.stderr).unwrap();
-            for expected in [class, "provider-a", "list"] {
-                assert!(text.contains(expected), "{text}");
-            }
-            assert!(!text.contains("test-secret-value"), "{text}");
-            if upstream != 0 {
-                assert!(text.contains(&upstream.to_string()), "{text}");
-                assert!(text.contains(if reference { "vendor validation" } else { "Cannot specify Sandbox resources" }), "{text}");
-                assert!(text.contains("<REDACTED>"), "{text}");
-            } else {
-                assert!(text.contains(if reference { "vendor validation" } else { "transport failed" }), "{text}");
-            }
-            if upstream == 400 {
-                let request = dir.path().join("launch.json");
-                std::fs::write(
-                    &request,
-                    serde_json::to_vec(&ProvisionRequest {
-                        label: "bad-request".into(),
-                        prepared: prepared_for_launch.unwrap_or_else(|| Prepared {
-                            provider: "provider-a".into(),
-                            id: "snapshot".into(),
-                            image_digest: "image".into(),
-                            tools_digest: "tools".into(),
-                        }),
-                        size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                        .unwrap();
+                    let request = ProvisionRequest {
+                        label: format!("label-{label}"),
+                        prepared,
+                        size,
                         egress: EgressRequest::default(),
                         ssh_public_key: None,
-                    })
-                    .unwrap(),
-                )
-                .unwrap();
-                let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
-                    .arg("--config")
-                    .arg(&config)
-                    .arg("--runtime-directory")
-                    .arg(dir.path().join("run"))
-                    .args(["launch", "rust", "provider-a"])
-                    .arg(request)
-                    .output()
-                    .await
-                    .unwrap();
-                let text = String::from_utf8(output.stderr).unwrap();
-                assert!(!output.status.success());
-                for expected in [
-                    "internal",
-                    "provider-a",
-                    "provision",
-                    "400",
-                    if reference { "vendor validation" } else { "Cannot specify Sandbox resources" },
-                ] {
-                    assert!(text.contains(expected), "{text}");
+                    };
+                    let env = api.provision(provider, &request).await.unwrap();
+                    if let Some(previous) = model.insert((p, label), env.clone()) {
+                        assert_eq!(previous, env);
+                    }
                 }
-                assert!(!text.contains("test-secret-value"), "{text}");
+                1 => {
+                    let id = model.remove(&(p, label)).map(|e| e.id).unwrap_or_else(|| "absent".into());
+                    api.destroy(provider, &id).await.unwrap();
+                    api.destroy(provider, &id).await.unwrap();
+                }
+                _ => {
+                    if let Some(env) = model.get(&(p, label)) {
+                        assert_eq!(&api.inspect(provider, &env.id).await.unwrap(), env);
+                    } else {
+                        assert!(api.inspect(provider, "absent").await.is_err());
+                    }
+                }
             }
-            if upstream == 403 {
-                assert_eq!(client.hello().await.unwrap().providers[0].readiness, Readiness::Ready);
+            for (p, provider) in ["demo", "other"].into_iter().enumerate() {
+                let mut actual = api.list(provider).await.unwrap();
+                actual.sort_by(|a, b| a.id.cmp(&b.id));
+                let mut expected: Vec<_> = model.iter().filter(|((owner, _), _)| *owner == p).map(|(_, e)| e.clone()).collect();
+                expected.sort_by(|a, b| a.id.cmp(&b.id));
+                assert_eq!(actual, expected);
             }
-            server.abort();
         }
-    }
+        drop(daemon);
+        task.abort();
+    });
 }
 
-// Substitute only the vendor network port; use the real Daytona module.
-struct CliDaytonaModule(std::sync::Arc<dyn drydock_host::module::HttpClient>);
-#[async_trait::async_trait]
-impl drydock_host::module::Module for CliDaytonaModule {
-    fn version(&self) -> &str {
-        "test"
+// Provider diagnostics survive the extra daemon hop and CLI formatting, while
+// credential values echoed by a module stay masked. No vendor API is involved.
+#[tokio::test]
+async fn cli_preserves_masked_provider_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, task) = reference(dir.path()).await;
+    let token = dir.path().join("token");
+    std::fs::write(&token, "test-secret-value").unwrap();
+    let text = format!(
+        r#"[provider.broken]
+module="reference"
+credential={{file={:?}}}
+settings={{fault={{kind="internal",reason="HTTP 400 vendor validation",provider_error="test-secret-value rejected"}}}}
+"#,
+        token.to_str().unwrap()
+    );
+    let run = dir.path().join("run");
+    let daemon = Daemon::start(
+        Config::parse(&text).unwrap(),
+        &run,
+        run.join("keys"),
+        vec![HostOption { name: "rust".into(), connection: HostConnection::ExternalUnix { path: host } }],
+    )
+    .await
+    .unwrap();
+    let socket = run.join("api.sock");
+    let path = socket.clone();
+    let server = tokio::spawn(async move {
+        daemon.serve(&path, std::future::pending()).await.unwrap();
+    });
+    let client = Client::unix(&socket).unwrap();
+    for _ in 0..200 {
+        if client.hello().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    async fn configure(
-        &self,
-        config: &ProviderConfiguration,
-        _: std::sync::Arc<dyn drydock_host::module::HttpClient>,
-    ) -> drydock_host::module::Result<std::sync::Arc<dyn drydock_host::module::Provider>> {
-        drydock_host::daytona::DaytonaModule.configure(config, self.0.clone()).await
+    let output = cli(&dir.path().join("unused.toml"), &socket, std::path::Path::new("/not-needed"), &["list", "broken"]).await;
+    assert!(!output.status.success());
+    let text = String::from_utf8(output.stderr).unwrap();
+    for expected in ["internal", "broken", "list", "400", "vendor validation", "<REDACTED>"] {
+        assert!(text.contains(expected), "{text}");
     }
+    assert!(!text.contains("test-secret-value"));
+    server.abort();
+    task.abort();
 }

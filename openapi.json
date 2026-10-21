@@ -1732,6 +1732,13 @@
           "host_version": {
             "type": "string"
           },
+          "loadable_modules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoadableModule"
+            },
+            "description": "Modules the host can configure, including those not yet loaded."
+          },
           "modules": {
             "type": "array",
             "items": {
@@ -1773,6 +1780,26 @@
             "items": {
               "$ref": "#/components/schemas/ProviderConfiguration"
             }
+          }
+        }
+      },
+      "LoadableModule": {
+        "type": "object",
+        "required": [
+          "name",
+          "version",
+          "smallest_size"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "smallest_size": {
+            "$ref": "#/components/schemas/Size",
+            "description": "Smallest supported resource request, used when the caller has no default."
+          },
+          "version": {
+            "type": "string"
           }
         }
       },

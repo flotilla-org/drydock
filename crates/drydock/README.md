@@ -41,57 +41,35 @@ The proxy must already exist; the CLI does not create one. Proxy environment
 values must not contain secrets: they are passed through `env` as command
 arguments. Direct secrets are sent only over the authenticated connection.
 
-## CLI
+## Daemon and CLI
 
-Build the binaries with `cargo build -p drydock -p drydock-host`. Configuration is
-a JSON array of `HostSpec`s. For the reference module:
+See the [standalone guide](../../README.md#standalone-daemon-and-cli) for the
+provider-only TOML format, XDG paths, commands and the interim baked-agent setup.
+`drydock` connects to or starts `drydockd`; it does not own host lifetimes.
+`drydockd` is a thin binary around `Daemon`, which embeds the existing
+`Supervisor`, resolves credentials, discovers modules, assigns providers and
+serves their API through rigging's Unix server with peer-UID admission.
 
-```json
-[
-  {
-    "name": "rust",
-    "connection": {
-      "kind": "managed",
-      "command": ["/absolute/path/to/drydock-host"],
-      "runtime": null
-    },
-    "configuration": {
-      "modules": [{"name": "memory", "entrypoint": "reference"}],
-      "providers": [{
-        "name": "demo",
-        "module": "memory",
-        "settings": {},
-        "credential": {"mode": "direct", "credential_reference": "demo-token"}
-      }]
-    },
-    "credentials": {
-      "demo-token": {"kind": "env", "name": "DEMO_TOKEN"}
-    }
-  }
-]
-```
+`ProviderApi` is the object-safe provider seam implemented by the embedded
+`Daemon` and the socket `Client`. It exposes typed buffered calls and the relay
+and exec byte streams. `Daemon::router()` can be mounted by an embedding daemon;
+`Daemon::serve()` installs local peer authentication. Authentication must be
+installed by the embedder when mounting the router itself.
 
-```sh
-export DEMO_TOKEN=reference-only
-# Choose a private directory with an existing parent.
-drydock --config hosts.json --runtime-directory /tmp/my-drydock hosts
-drydock --config hosts.json --runtime-directory /tmp/my-drydock instances
-drydock --config hosts.json --runtime-directory /tmp/my-drydock list rust demo
-drydock --config hosts.json --runtime-directory /tmp/my-drydock launch rust demo request.json
-drydock --config hosts.json --runtime-directory /tmp/my-drydock destroy rust demo PROVIDER_ID
-```
+The daemon retains status caches across calls and discards stale cache values
+after mutations or a supervised host generation change. Host pollers remain the
+owners of observations; the daemon's `/v1/events` merges their NDJSON records
+with a vector cursor. A snapshot from one host explicitly omits the other
+providers, preserving the protocol's no-false-deletion rule.
 
-`launch` reads a protocol `ProvisionRequest`, including a prepared image from the
-client's separate `prepare` call. Output is JSON, one host/instance per line for
-inventory commands. Each invocation owns any managed hosts it starts; use an
-external host for process state that must survive CLI invocations. Real vendor
-modules use the provider's tags as their record, so they need no local store.
+`HostOption` chooses the available processes; it is daemon/embedder input, never
+provider config. CLI discovery uses installed companions; the explicit daemon
+`--external-host` option instead uses externally managed Unix hosts. Embedders
+can also supply existing `HostConnection::External` connections. Their tokens
+remain private regular files owned by the current user; TCP is loopback-only.
 
-An external Unix host uses `{"kind":"external_unix","path":"/path/host.sock"}`.
-External TCP uses `{"kind":"external","url":"http://127.0.0.1:PORT/",
-"token_file":"/path/token"}`. Tokens must be nonempty regular files with mode
-0400 or 0600 and owned by the current user. Symlinks, special files, tokens over
-64 KiB, and whitespace inside the token are refused; a final CR/LF is removed.
-The open descriptor is checked before reading it. TCP URLs must use a literal loopback IP; redirects, ambient proxies and
-HTTP retries are disabled. External hosts receive the same configuration and
-credential refresh calls, but drydock never starts or terminates them.
+Launch metadata and per-vessel SSH keys live under the private socket directory's
+`keys/UUID` directory. This evidence records the immutable prepared image and
+tools selection; it is not desired state and is never reconciled. Keep these
+keys while their environments need SSH. Config edits take effect on daemon
+restart, and distinct configs should use distinct socket overrides.

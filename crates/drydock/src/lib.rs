@@ -1,7 +1,13 @@
 //! Managed host lifecycle, injected runtime detection, and credential refresh.
 //! Dropping a HostHandle cancels supervision and terminates its managed child.
+pub mod api;
+pub mod config;
 pub mod conformance;
 pub mod credentials;
+pub mod daemon;
+pub mod launch;
+pub mod local;
+pub mod shell;
 use client::Client;
 use credentials::*;
 pub use drydock_client as client;

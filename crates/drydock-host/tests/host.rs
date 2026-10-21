@@ -1627,3 +1627,55 @@ async fn rejected_credential_context_is_not_nested() {
     let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
     assert_eq!(error.to_string().matches("provider a operation list").count(), 1);
 }
+
+// Provider-only TOML must reach readiness using the bundled managed binary's
+// loadable-module handshake, without declaring a host/module registry in config.
+#[tokio::test]
+async fn managed_daemon_discovers_reference_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    let config = drydock::config::Config::parse(
+        r#"
+[provider.demo]
+module = "reference"
+credential = {env="PATH"}
+image = "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+settings = {
+    poll_interval_ms = 10,
+}
+"#,
+    )
+    .unwrap();
+    let daemon = drydock::daemon::Daemon::start(
+        config,
+        &run,
+        run.join("keys"),
+        vec![drydock::daemon::HostOption {
+            name: "rust".into(),
+            connection: drydock::HostConnection::Managed {
+                command: vec![env!("CARGO_BIN_EXE_drydock-host").into()],
+                runtime: None,
+                proxy_environment: Default::default(),
+            },
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
+    let environment = daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    assert_eq!(environment.provider, "demo");
+    assert_eq!(drydock::daemon::ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), vec![environment]);
+    drop(daemon);
+    // Supervisor cancellation releases the managed child and its socket lease.
+    let lock = drydock::local::lock(&run.join("hosts/rust.lock")).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if lock.try_lock().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
