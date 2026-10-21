@@ -98,7 +98,11 @@ bytes. Numeric destinations stay numeric. It carries no other UDP or ICMP.
 
 The fake DNS allocator uses 198.18.0.0/15 and 30-second leases/TTLs, normalizes
 names, renews repeated queries, and reuses expired addresses when the bounded
-pool wraps. Unknown/expired fake destinations fail. A/AAAA queries never yield
+pool wraps. Unknown/expired fake destinations fail. A client that caches an A
+answer past its advertised TTL must resolve again before reconnecting; connection
+pools, pinned `/etc/hosts` entries and resolvers ignoring TTLs can otherwise fail.
+An address can be assigned to another name after expiry and pool wrap, so callers
+must not pin fake addresses. A/AAAA queries never yield
 real DNS answers: A gets a fake IPv4 address, AAAA and other types get NODATA.
 DNS-over-TCP is also captured. Existing TCP sessions survive lease expiry.
 
@@ -134,12 +138,25 @@ The guest/provider must supply:
 
 The agent only replaces its `inet drydock_egress` table, in one nft transaction.
 Agent-marked sockets, the local explicit proxy, and configured loopback forward
-listeners are exempt to avoid recursion. Other guest TCP is captured regardless
-of environment. Refused configuration cleans up prepared listeners; unchanged
+listeners are exempt to avoid recursion. All other TCP is captured, including
+loopback, RFC1918 destinations and guest-local services such as PostgreSQL.
+A local service needing direct access must be arranged as a configured loopback
+forward; there is no blanket loopback/private-network exemption. Direct access
+to capture/DNS service ports is also captured; use port 53 for fake DNS.
+Other guest TCP is captured regardless of environment. Refused configuration cleans up prepared listeners; unchanged
 egress listeners, DNS leases and active streams survive configuration pushes.
 Disabling capture removes redirects before stopping listeners. An agent crash
 leaves redirects installed (connections fail until configuration is restored).
 Agent re-exec loses DNS leases; callers must resolve names again.
+
+Capture, explicit-proxy and DNS-TCP connections share a 128-stream budget.
+Overflow connections are accepted and immediately closed, preserving descriptor
+headroom for the control path. Closing a connection releases its slot. DNS TCP
+uses a 30-second per-query timeout, renewed after each completed exchange, rather
+than a total connection deadline. CONNECT upstreams must send a final 2xx reply
+directly; interim 1xx replies are rejected. Fake DNS names must consist of ASCII
+letters/digits, hyphens, underscores and dots (including punycode names); URL
+delimiters and DNS label escapes cannot become CONNECT authorities.
 
 `cargo test -p drydock-agent` covers DNS allocation/expiry and wire replies,
 real UDP/TCP DNS listeners, CONNECT forwarding through a vessel-scoped transport,

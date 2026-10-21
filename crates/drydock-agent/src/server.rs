@@ -230,7 +230,7 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     }
     if let Some(egress) = &config.egress {
         check_id(&egress.upstream).map_err(api)?;
-        if config.forwards.iter().filter_map(|f| f.tcp).any(|a| [1053, 15001, 15002].contains(&a.port())) {
+        if config.forwards.iter().filter_map(|f| f.tcp).any(|a| crate::egress::RESERVED_PORTS.contains(&a.port())) {
             return Err(api("forward conflicts with an egress listener"));
         }
     }
@@ -285,6 +285,9 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
             if let Some(ca) = ca
                 && let Err(error) = ca.persist(CA_PATH)
             {
+                // persist failed before replacing the old bundle. Reinstall
+                // the previous nft transaction before reporting refusal; if
+                // rollback itself fails, report that separately to the caller.
                 crate::egress::install(&settings.config).await.map_err(at("egress.rollback", "nftables"))?;
                 return Err(at("egress.ca", CA_PATH)(error.error));
             }

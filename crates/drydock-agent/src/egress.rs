@@ -27,6 +27,8 @@ pub(crate) const SOCKET_MARK: u32 = 0x647279;
 const TTL: u32 = 30;
 const FIRST: u32 = u32::from_be_bytes([198, 18, 0, 0]);
 const CAPACITY: u32 = 1 << 17;
+pub(crate) const RESERVED_PORTS: [u16; 3] = [DNS_PORT, CAPTURE_PORT, PROXY_PORT];
+const MAX_CONNECTIONS: usize = 128;
 const NFT: &str = "/opt/drydock/bin/nft";
 
 /// One vessel-scoped host forward. No destination policy lives in this table.
@@ -49,6 +51,16 @@ struct FakeDns {
 impl FakeDns {
     fn allocate(&mut self, name: &str, now: Instant) -> io::Result<Ipv4Addr> {
         let name = name.trim_end_matches('.').to_ascii_lowercase();
+        // DNS permits arbitrary label octets; CONNECT authorities do not. Keep
+        // common private/service names, but reject URL delimiters and escapes.
+        if name.is_empty()
+            || name.len() > 253
+            || name.split('.').any(|label| {
+                label.is_empty() || label.len() > 63 || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+        {
+            return Err(invalid("DNS name is not a CONNECT hostname"));
+        }
         if let Some(&address) = self.names.get(&name) {
             self.leases.get_mut(&address).unwrap().1 = now + Duration::from_secs(TTL.into());
             return Ok(address);
@@ -120,6 +132,8 @@ async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<By
 
 // Read exactly the CONNECT response head, leaving any coalesced tunnel bytes
 // in the stream. Never send application bytes until the upstream accepts.
+// A CONNECT upstream must send its final 2xx response directly; interim 1xx
+// replies are deliberately rejected rather than treated as tunnel acceptance.
 async fn connect(remote: &mut ByteStream, authority: &str) -> io::Result<()> {
     if authority.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()) {
         return Err(invalid("invalid CONNECT authority"));
@@ -155,6 +169,118 @@ async fn bridge(mut stream: ByteStream, mut remote: ByteStream, authority: Optio
     Ok(())
 }
 
+#[derive(Clone)]
+struct CaptureState {
+    opener: Arc<AsyncMutex<Opener>>,
+    id: Arc<Mutex<String>>,
+    map: Arc<Mutex<FakeDns>>,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+async fn serve_connection(stream: TcpStream, passthrough: bool, state: CaptureState) -> io::Result<()> {
+    let authority =
+        if passthrough { None } else { Some(state.map.lock().unwrap().authority(original_destination(&stream)?, Instant::now())?) };
+    let id = state.id.lock().unwrap().clone();
+    let remote = upstream(&state.opener, id).await?;
+    bridge(Box::new(stream), remote, authority.as_deref()).await
+}
+
+async fn serve_capture(listener: TcpListener, passthrough: bool, state: CaptureState) {
+    let mut streams = JoinSet::new();
+    loop {
+        let accepted = tokio::select! {
+            Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "egress accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // Accept and immediately close overflow rather than retaining more
+        // sockets or blocking the listener on a permit. All TCP listeners share
+        // this budget, leaving descriptor headroom for the control path.
+        let Ok(permit) = state.slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let state = state.clone();
+        streams.spawn(async move {
+            let _permit = permit;
+            if let Err(error) = serve_connection(stream, passthrough, state).await {
+                tracing::warn!(%error, "egress stream failed");
+            }
+        });
+    }
+}
+
+async fn dns_exchange(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin), map: &Mutex<FakeDns>) -> io::Result<()> {
+    let length = stream.read_u16().await?;
+    let mut bytes = vec![0; length.into()];
+    stream.read_exact(&mut bytes).await?;
+    let answer = map.lock().unwrap().answer(&bytes, Instant::now())?;
+    stream.write_u16(answer.len() as u16).await?;
+    stream.write_all(&answer).await
+}
+
+async fn dns_connection(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    map: Arc<Mutex<FakeDns>>,
+    idle: Duration,
+) -> io::Result<()> {
+    loop {
+        tokio::time::timeout(idle, dns_exchange(&mut stream, &map))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS TCP query timed out"))??;
+    }
+}
+
+async fn serve_dns_tcp(listener: TcpListener, state: CaptureState) {
+    let mut streams = JoinSet::new();
+    loop {
+        let accepted = tokio::select! {
+            Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "fake DNS TCP accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = state.slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        let map = state.map.clone();
+        streams.spawn(async move {
+            let _permit = permit;
+            let _ = dns_connection(stream, map, Duration::from_secs(30)).await;
+        });
+    }
+}
+
+async fn serve_dns_udp(socket: UdpSocket, map: Arc<Mutex<FakeDns>>) {
+    let mut buffer = [0; 4096];
+    loop {
+        match socket.recv_from(&mut buffer).await {
+            Ok((n, peer)) => {
+                let answer = map.lock().unwrap().answer(&buffer[..n], Instant::now());
+                if let Ok(answer) = answer {
+                    let _ = socket.send_to(&answer, peer).await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "fake DNS receive failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 pub(crate) struct Capture {
     tasks: JoinSet<()>,
     id: Arc<Mutex<String>>,
@@ -162,6 +288,10 @@ pub(crate) struct Capture {
     dns_address: SocketAddr,
     #[cfg(test)]
     proxy_address: SocketAddr,
+    #[cfg(test)]
+    capture_address: SocketAddr,
+    #[cfg(test)]
+    slots: Arc<tokio::sync::Semaphore>,
 }
 impl Capture {
     /// Bind all listeners before changing global guest state. Dropping a refused
@@ -176,9 +306,12 @@ impl Capture {
         proxy_port: u16,
         dns_port: u16,
     ) -> io::Result<Self> {
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"));
+        if !cfg!(target_os = "linux") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"));
+        }
         let tcp = dual_listener(capture_port)?;
+        #[cfg(test)]
+        let capture_address = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp.local_addr()?.port()));
         let explicit = TcpListener::bind((Ipv4Addr::LOCALHOST, proxy_port)).await?;
         let dns_tcp = dual_listener(dns_port)?;
         let dns_port = dns_tcp.local_addr()?.port();
@@ -191,75 +324,13 @@ impl Capture {
         let dns_udp = UdpSocket::from_std(udp.into())?;
         let map = Arc::new(Mutex::new(FakeDns::default()));
         let id = Arc::new(Mutex::new(id));
+        let state =
+            CaptureState { opener, id: id.clone(), map: map.clone(), slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)) };
         let mut tasks = JoinSet::new();
-        for (listener, passthrough) in [(tcp, false), (explicit, true)] {
-            let (opener, id, map) = (opener.clone(), id.clone(), map.clone());
-            tasks.spawn(async move {
-                let mut streams = JoinSet::new();
-                loop {
-                    tokio::select! {
-                        Some(_) = streams.join_next(), if !streams.is_empty() => {},
-                        accepted = listener.accept() => {
-                            let (stream, _) = match accepted { Ok(s) => s, Err(e) => { tracing::warn!(%e, "egress accept failed"); tokio::time::sleep(Duration::from_millis(100)).await; continue; } };
-                            let (opener, id, map) = (opener.clone(), id.lock().unwrap().clone(), map.clone());
-                            streams.spawn(async move {
-                                let result = async {
-                                    let authority = if passthrough { None } else {
-                                        Some(map.lock().unwrap().authority(original_destination(&stream)?, Instant::now())?)
-                                    };
-                                    let remote = upstream(&opener, id).await?;
-                                    bridge(Box::new(stream), remote, authority.as_deref()).await
-                                }.await;
-                                if let Err(error) = result { tracing::warn!(%error, "egress stream failed"); }
-                            });
-                        }
-                    }
-                }
-            });
-        }
-        let udp_map = map.clone();
-        tasks.spawn(async move {
-            let mut buffer = [0; 4096];
-            loop {
-                match dns_udp.recv_from(&mut buffer).await {
-                    Ok((n, peer)) => {
-                        let answer = udp_map.lock().unwrap().answer(&buffer[..n], Instant::now());
-                        if let Ok(answer) = answer {
-                            let _ = dns_udp.send_to(&answer, peer).await;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "fake DNS receive failed");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-        tasks.spawn(async move {
-            let mut streams = JoinSet::new();
-            loop {
-                tokio::select! {
-                    Some(_) = streams.join_next(), if !streams.is_empty() => {},
-                    accepted = dns_tcp.accept() => {
-                        let Ok((mut stream, _)) = accepted else { tokio::time::sleep(Duration::from_millis(100)).await; continue; };
-                        let map = map.clone();
-                        streams.spawn(async move {
-                            let _ = tokio::time::timeout(Duration::from_secs(30), async {
-                                loop {
-                                    let length = stream.read_u16().await?;
-                                    let mut bytes = vec![0; length.into()];
-                                    stream.read_exact(&mut bytes).await?;
-                                    let answer = map.lock().unwrap().answer(&bytes, Instant::now())?;
-                                    stream.write_u16(answer.len() as u16).await?;
-                                    stream.write_all(&answer).await?;
-                                }
-                                #[allow(unreachable_code)] Ok::<(), io::Error>(())
-                            }).await;
-                        });
-                    }
-                }
-            }
-        });
+        tasks.spawn(serve_capture(tcp, false, state.clone()));
+        tasks.spawn(serve_capture(explicit, true, state.clone()));
+        tasks.spawn(serve_dns_tcp(dns_tcp, state.clone()));
+        tasks.spawn(serve_dns_udp(dns_udp, map));
         Ok(Self {
             tasks,
             id,
@@ -267,6 +338,10 @@ impl Capture {
             dns_address: (Ipv4Addr::LOCALHOST, dns_port).into(),
             #[cfg(test)]
             proxy_address,
+            #[cfg(test)]
+            capture_address,
+            #[cfg(test)]
+            slots: state.slots,
         })
     }
     pub(crate) async fn stop(mut self) {
@@ -655,6 +730,118 @@ mod tests {
         agent.abort();
     }
 
+    // Short fake leases require a fresh DNS lookup before a reconnect once the
+    // advertised TTL expires, including if a client kept the old A answer.
+    #[test]
+    fn dns_answer_to_connect_requires_live_lease() {
+        let now = Instant::now();
+        let mut dns = FakeDns::default();
+        let mut query = Message::new();
+        query.add_query(Query::query(Name::from_ascii("cached.example.").unwrap(), RecordType::A));
+        let answer = Message::from_vec(&dns.answer(&query.to_vec().unwrap(), now).unwrap()).unwrap();
+        let RData::A(A(address)) = answer.answers()[0].data() else {
+            panic!("expected A");
+        };
+        let destination = (*address, 443).into();
+        assert_eq!(dns.authority(destination, now + Duration::from_secs(29)).unwrap(), "cached.example:443");
+        assert!(dns.authority(destination, now + Duration::from_secs(30)).is_err());
+        dns.answer(&query.to_vec().unwrap(), now + Duration::from_secs(30)).unwrap();
+        assert_eq!(dns.authority(destination, now + Duration::from_secs(30)).unwrap(), "cached.example:443");
+    }
+
+    // URL delimiters and DNS label escapes may not alter a CONNECT authority.
+    #[hegel::test]
+    fn dns_names_must_be_connect_hostnames(tc: hegel::TestCase) {
+        let mut dns = FakeDns::default();
+        // Span controls, ASCII URL delimiters, allowed label punctuation, and
+        // non-ASCII bytes; also straddle the label and whole-name size limits.
+        let byte = tc.draw(gs::integers::<u8>());
+        let name = format!("a{}b.example", char::from(byte));
+        assert_eq!(dns.allocate(&name, Instant::now()).is_ok(), byte.is_ascii_alphanumeric() || b"-_.".contains(&byte));
+        let label_len = tc.draw(gs::integers::<usize>().min_value(0).max_value(65));
+        assert_eq!(dns.allocate(&format!("{}.example", "a".repeat(label_len)), Instant::now()).is_ok(), (1..=63).contains(&label_len));
+        let final_len = tc.draw(gs::integers::<usize>().min_value(60).max_value(63));
+        let name = format!("{}{}", format!("{}.", "a".repeat(63)).repeat(3), "b".repeat(final_len));
+        assert_eq!(dns.allocate(&name, Instant::now()).is_ok(), name.len() <= 253);
+        for name in ["a@b.example", "a/b.example", "a,b.example", "a:b.example", "a\\032b.example", "a..example", ""] {
+            assert!(dns.allocate(name, Instant::now()).is_err(), "accepted {name}");
+        }
+        for name in ["localhost", "_service.example", "a-b.example", "xn--bcher-kva.example"] {
+            let address = dns.allocate(name, Instant::now()).unwrap();
+            assert_eq!(dns.reverse(address, Instant::now()), Some(name));
+        }
+    }
+
+    // DNS TCP timeout applies to each exchange, allowing repeated queries over
+    // a connection whose total lifetime exceeds the 30-second idle deadline.
+    #[tokio::test(start_paused = true)]
+    async fn dns_tcp_timeout_resets_after_each_query() {
+        let (server, mut client) = tokio::io::duplex(4096);
+        let task = tokio::spawn(dns_connection(server, Arc::new(Mutex::new(FakeDns::default())), Duration::from_secs(30)));
+        let mut query = Message::new();
+        query.add_query(Query::query(Name::from_ascii("idle.example.").unwrap(), RecordType::A));
+        let bytes = query.to_vec().unwrap();
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(20)).await;
+            client.write_u16(bytes.len() as u16).await.unwrap();
+            client.write_all(&bytes).await.unwrap();
+            let length = client.read_u16().await.unwrap();
+            let mut answer = vec![0; length.into()];
+            client.read_exact(&mut answer).await.unwrap();
+            assert_eq!(Message::from_vec(&answer).unwrap().answers().len(), 1);
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(task.await.unwrap().unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    // All three TCP listeners share the same bounded connection budget; holding
+    // DNS sockets cannot grow an unbounded set of proxy or capture streams.
+    #[tokio::test]
+    async fn capture_connection_budget_is_shared_and_released() {
+        use drydock_transport::{Limits, Transport};
+        let (a, b) = tokio::io::duplex(4096);
+        let (host, guest) =
+            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+        let (_host, guest) = (host.unwrap(), guest.unwrap());
+        let capture = Capture::prepare_at(Arc::new(AsyncMutex::new(guest.opener.clone())), "proxy".into(), 0, 0, 0).await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(capture.dns_address).await.unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while capture.slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for address in [capture.dns_address, capture.proxy_address, capture.capture_address] {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await.unwrap().unwrap(), 0);
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while capture.slots.available_permits() != MAX_CONNECTIONS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Released slots admit a new DNS exchange through the same listener.
+        let mut stream = TcpStream::connect(capture.dns_address).await.unwrap();
+        let mut query = Message::new();
+        query.add_query(Query::query(Name::from_ascii("released.example.").unwrap(), RecordType::A));
+        let bytes = query.to_vec().unwrap();
+        stream.write_u16(bytes.len() as u16).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        let length = stream.read_u16().await.unwrap();
+        let mut answer = vec![0; length.into()];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(Message::from_vec(&answer).unwrap().answers().len(), 1);
+        capture.stop().await;
+    }
+
     // The HTTP boundary may reject, truncate, or oversize its CONNECT reply;
     // none of these responses may let application bytes enter the upstream.
     #[tokio::test]
@@ -680,7 +867,15 @@ mod tests {
     // own listener, and only agent-marked sockets/local forwards bypass capture.
     #[test]
     fn nft_rules_cover_both_families_without_uid_exemption() {
-        let config = Configuration { egress: Some(Egress { upstream: "proxy".into() }), ..Configuration::default() };
+        let config = Configuration {
+            egress: Some(Egress { upstream: "proxy".into() }),
+            forwards: vec![crate::GuestForward {
+                id: "local".into(),
+                unix: "/tmp/local".into(),
+                tcp: Some("127.0.0.1:9000".parse().unwrap()),
+            }],
+            ..Configuration::default()
+        };
         let text = rules(&config);
         assert!(text.contains("table inet drydock_egress"));
         assert!(text.contains(&format!("meta mark {SOCKET_MARK} return")));
@@ -688,6 +883,20 @@ mod tests {
         assert!(text.contains("udp dport 53 redirect to :1053"));
         assert!(text.contains("tcp dport 53 redirect to :1053"));
         assert!(text.contains("meta l4proto tcp redirect to :15001"));
-        assert!(!rules(&Configuration::default()).contains("redirect"));
+        let positions: Vec<_> = [
+            "meta mark",
+            "ip daddr 127.0.0.1 tcp dport 15002 return",
+            "ip daddr 127.0.0.1 tcp dport 9000 return",
+            "udp dport 53 redirect",
+            "tcp dport 53 redirect",
+            "meta l4proto tcp redirect",
+        ]
+        .iter()
+        .map(|rule| text.find(rule).unwrap())
+        .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let disabled = rules(&Configuration::default());
+        assert_eq!(disabled, "add table inet drydock_egress\nflush table inet drydock_egress\n");
+        assert!(!disabled.contains("redirect"));
     }
 }
