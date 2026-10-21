@@ -10,7 +10,7 @@ Transport.accept()      -> (purpose, AsyncRead + AsyncWrite)
   Dial / Relay: yamux over the supplied byte stream
 ```
 
-The host knows the vessel identity from its reach recipe. There is no vessel ID, authentication token, or per-vessel agent configuration on this wire. Native listeners must be isolated to the owning vessel by the provider. Dial/Relay callers authenticate their outer connection before handing it to this crate. A port-forward header names a requested destination; the receiver still enforces policy before opening it.
+The host knows the vessel identity from its reach recipe. There is no vessel ID, authentication token, or per-vessel agent configuration on this wire. Native listeners must be isolated to the owning vessel by the provider. Dial/Relay callers authenticate their outer connection before handing it to this crate. The agent uses an opaque forward ID resolved by the receiving host’s per-vessel registry; destination policy belongs to the receiver.
 
 ## API and lifetime
 
@@ -28,7 +28,7 @@ Queues and unfinished handshakes are bounded by `Limits`. Each native handshake 
 
 ## Links
 
-`Purpose::Control` and `Purpose::Router` each carry one long-lived HTTP/2 connection. `http2::connect` returns a clonable hyper sender and its driver task. `http2::serve` runs an axum router for the accepted link's lifetime. `http2::connect_with_body` also accepts streaming hyper body types; the buffered `connect` helper remains convenient for small calls. Both ends send HTTP/2 keepalive pings every 15 seconds with a 30-second acknowledgement deadline (including idle client links). The caller owns these tasks, chooses the router, and applies request deadlines. Multiple calls share the same link; raw traffic uses separate streams, outside HTTP framing. Raw-stream idle/liveness deadlines belong to the consuming protocol; HTTP/2 keepalive covers both agent links.
+`Purpose::Control` carries one long-lived HTTP/2 connection. `http2::connect` returns a clonable hyper sender and its driver task. `http2::serve` runs an axum router for the accepted link's lifetime. `http2::connect_with_body` also accepts streaming hyper body types; the buffered `connect` helper remains convenient for small calls. Both ends send HTTP/2 keepalive pings every 15 seconds with a 30-second acknowledgement deadline (including idle client links). The caller owns these tasks, chooses the router, and applies request deadlines. Multiple calls share the same link; raw traffic uses separate streams, outside HTTP framing. Raw-stream idle/liveness deadlines belong to the consuming protocol; HTTP/2 keepalive covers control links.
 
 ## Wire format (version 1)
 
@@ -46,16 +46,16 @@ Purpose headers:
 | Tag | Purpose | Following fields |
 | --- | --- | --- |
 | 0 | Host-to-agent control link | none |
-| 1 | Agent-to-host router link | none |
-| 2 | Cleat attach | u16 byte length, UTF-8 session name |
-| 3 | Port forward | u16 byte length, UTF-8 host, u16 port |
+| 4 | Generic byte forward | u16 byte length, UTF-8 forward ID |
 
-Targets are 1–1024 UTF-8 bytes without control characters. Host fields are requested destination strings, not parsed socket addresses: the receiver must validate DNS/IP syntax, resolve the name under its policy, and authorize the destination before connecting. Port zero is rejected. Unknown versions, modes, purposes, malformed UTF-8, oversized targets, and truncated headers are errors. Headers describe purpose, not authorization; the caller decides which purposes to serve on each side.
+The drydock agent accepts tag 4 for both forward directions; it never receives a host destination from the guest. See [the agent guide](../drydock-agent/README.md). Tags 1, 2 and 3 are rejected. CLI, hook, MCP and cleat traffic use ordinary forwards.
+
+Forward IDs are 1–1024 UTF-8 bytes without control characters. Only the host configures destinations. Unknown versions, modes, purposes, malformed UTF-8, oversized targets, and truncated headers are errors. Headers describe purpose, not authorization; the caller decides which purposes to serve on each side.
 
 ## Validation
 
 On Linux install `openssh-client` and `openssh-server`, then run `./ci/check.sh` at the repository root. Tests run their own loopback-only sshd with disposable keys as the current user; they do not use the machine's SSH configuration or authorized keys. Set `DRYDOCK_TEST_SSHD` to an absolute executable path if sshd is elsewhere. Root test environments may need `/run/sshd` created for OpenSSH privilege separation.
 
-The same routing, half-close, concurrent-open, and slow-stream HTTP/2 scenarios run over Unix sockets, an OpenSSH test server, and yamux over an in-memory duplex. Generated operation sequences assert routing and byte conservation after each operation across all three transports. Wire properties span all purposes, UTF-8, empty and oversized names, and the u16 port range. Named cases cover malformed and partial headers, fallback in both directions, cancelled accepts, rejected host/identity keys, and SSH process cleanup.
+The same routing, half-close, concurrent-open, and slow-stream HTTP/2 scenarios run over Unix sockets, an OpenSSH test server, and yamux over an in-memory duplex. Generated operation sequences assert routing and byte conservation after each operation across all three transports. Wire properties span all purposes, UTF-8, empty and oversized names,. Named cases cover malformed and partial headers, fallback in both directions, cancelled accepts, rejected host/identity keys, and SSH process cleanup.
 
 Vsock compiles on Linux but requires a VM/vsock device for a live test; the default suite does not claim hardware coverage. Live vsock contract coverage is tracked in [drydock#16](https://github.com/flotilla-org/drydock/issues/16). Hosted CI runs the workspace formatting, Clippy, test, and OpenAPI validation gates. `ci/check.sh` is the reproducible local Rust gate; OpenAPI validation is documented in the repository README.

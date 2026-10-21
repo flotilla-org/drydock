@@ -1,4 +1,4 @@
-//! One long-lived HTTP/2 connection per Control/Router stream. Request bodies
+//! One long-lived HTTP/2 connection per Control stream. Request bodies
 //! and routing remain axum/hyper types; raw streams never enter HTTP framing.
 use crate::{ByteStream, Incoming, Opener, Purpose};
 use axum::Router;
@@ -56,7 +56,7 @@ async fn serve_stream(stream: ByteStream, router: Router) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 fn require_link(purpose: &Purpose) -> io::Result<()> {
-    if !matches!(purpose, Purpose::Control | Purpose::Router) {
+    if !matches!(purpose, Purpose::Control) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "HTTP/2 requires a link purpose"));
     }
     Ok(())
