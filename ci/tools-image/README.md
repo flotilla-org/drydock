@@ -33,6 +33,14 @@ uses Buildx's push-by-digest output, then creates a `rev-<commit>-<index-sha256>
 for that same index. Including the index hash also retains earlier images if a
 revision is rebuilt against an updated builder image. Never prune these revision tags or their manifests while
 any drydock release references them. No mutable tag is used for tools selection.
+If tagging fails after the digest push, rerunning the same command is safe:
+metadata is emitted only after the retention tag succeeds. With unchanged builder
+inputs it reuses the same content-addressed index and tag. If the builder changed,
+a new index gets its own retention tag; prior release pins remain retained. An
+untagged index from a failed attempt has no emitted release metadata and can be
+cleaned up. Retrying does not guarantee byte-identical builds from a mutable
+builder image tag.
+
 `tools-image.txt` contains the canonical registry/name@sha256 index reference;
 `revision.txt` records the source. Archive these beside the resulting drydock
 binaries. The operator must configure registry visibility to public. CI must

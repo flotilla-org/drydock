@@ -17,6 +17,8 @@ DEFAULT_REGISTRY = "ghcr.io/flotilla-org"
 
 
 def image_name(registry):
+    # ':' in the registry component permits host:port. Buildx validates the
+    # actual hostname/port syntax (this lexical check also accepts e.g. a:b).
     if not re.fullmatch(r"[a-z0-9][a-z0-9.:-]*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*", registry):
         raise ValueError("registry must be a lowercase registry[/namespace], without scheme or tag")
     return f"{registry}/drydock-tools"
