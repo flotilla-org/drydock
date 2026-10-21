@@ -111,6 +111,9 @@ impl StandIn {
                 };
                 validate_analytics_fixture(&body, schema);
             }
+            if (200..300).contains(&status) && request.url().path().starts_with("/api/snapshots") {
+                assert!(snapshot_schema_valid(&body, "SnapshotDto", false), "invalid snapshot fixture: {body}");
+            }
             // Schema-valid vendor fixtures, independent of the module request.
             if let Some(rows) = body.get_mut("items").and_then(Value::as_array_mut) {
                 for row in rows {
@@ -199,12 +202,15 @@ impl StandIn {
                 response(200, s.snapshots.values().next().cloned().unwrap_or(Value::Null))
             }
             ("POST", "/api/snapshots") => {
-                let Some(name) = body["name"].as_str() else { reject!("missing snapshot name"); };
+                if !snapshot_schema_valid(&body, "CreateSnapshot", true) {
+                    reject!("invalid CreateSnapshot body");
+                }
+                let name = body["name"].as_str().unwrap();
                 s.snapshot_requests.push(body.clone());
                 if s.snapshots.contains_key(name) {
                     return response(409, json!({"statusCode":409}));
                 }
-                let snapshot = json!({"id":format!("snap-{}",s.snapshots.len()+1),"name":name,"state":"active","cpu":body["cpu"],"mem":body["memory"],"disk":body["disk"]});
+                let snapshot = json!({"id":format!("snap-{}",s.snapshots.len()+1),"name":name,"state":"active","cpu":body.get("cpu").unwrap_or(&json!(1)),"mem":body.get("memory").unwrap_or(&json!(1)),"disk":body.get("disk").unwrap_or(&json!(3)),"gpu":0,"general":false,"size":null,"entrypoint":null,"errorReason":null,"createdAt":"2026-10-21T00:00:00Z","updatedAt":"2026-10-21T00:00:00Z","lastUsedAt":null,"sourceSandboxId":null});
                 s.snapshots.insert(name.into(), snapshot.clone());
                 response(201, snapshot)
             }
@@ -1334,6 +1340,93 @@ async fn standin_origin_and_contract_errors_are_observable() {
     }
     let request = client.get("https://app.daytona.io/api/sandbox").bearer_auth("key-a").build().unwrap();
     assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
+}
+
+// Snapshot wire bodies follow the pinned OpenAPI, including referenced enums,
+// required-but-nullable response fields, and integer request resources.
+fn snapshot_schema_valid(value: &Value, name: &str, request: bool) -> bool {
+    let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
+    fn valid(v: &Value, schema: &Value, spec: &Value, strict: bool) -> bool {
+        if v.is_null() && schema["nullable"] == true {
+            return true;
+        }
+        if let Some(reference) = schema["$ref"].as_str() {
+            return valid(v, &spec["schemas"][reference.rsplit('/').next().unwrap()], spec, strict);
+        }
+        if let Some(parts) = schema["allOf"].as_array()
+            && !parts.iter().all(|s| valid(v, s, spec, strict))
+        {
+            return false;
+        }
+        if let Some(choices) = schema["enum"].as_array()
+            && !choices.contains(v)
+        {
+            return false;
+        }
+        match schema["type"].as_str() {
+            Some("object") => {
+                let Some(object) = v.as_object() else {
+                    return false;
+                };
+                if schema["required"].as_array().is_some_and(|keys| keys.iter().any(|k| !object.contains_key(k.as_str().unwrap()))) {
+                    return false;
+                }
+                object.iter().all(|(k, v)| match schema["properties"].get(k) {
+                    Some(s) => valid(v, s, spec, strict),
+                    None => !strict,
+                })
+            }
+            Some("array") => v.as_array().is_some_and(|items| items.iter().all(|v| valid(v, &schema["items"], spec, strict))),
+            Some("integer") => v.is_i64() || v.is_u64(),
+            Some("number") => v.is_number(),
+            Some("boolean") => v.is_boolean(),
+            Some("string") => {
+                v.as_str().is_some_and(|s| schema["format"] != "date-time" || chrono::DateTime::parse_from_rfc3339(s).is_ok())
+            }
+            None => true,
+            kind => panic!("unsupported snapshot schema type {kind:?}"),
+        }
+    }
+    // Unknown request members are rejected deliberately: OpenAPI permits them by
+    // default, but accepting a renamed resource would hide caller/schema drift.
+    valid(value, &spec["schemas"][name], &spec, request)
+}
+
+// Exercise absent, unknown, and every mistyped resource field at the HTTP boundary.
+// Concurrent/duplicate lifecycle behaviour is covered by the prepare properties.
+#[tokio::test]
+async fn standin_validates_snapshot_create_schema() {
+    let http = StandIn::default();
+    let client = reqwest::Client::new();
+    let base =
+        json!({"name":"fixture","imageName":"image@sha256:abc","regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
+    let mut invalid = vec![json!({}), json!(null)];
+    let mut unknown = base.clone();
+    unknown["mem"] = json!(4);
+    invalid.push(unknown);
+    for key in ["cpu", "memory", "disk"] {
+        for value in [json!("4"), json!(1.5), json!(null), json!(true)] {
+            let mut body = base.clone();
+            body[key] = value;
+            invalid.push(body);
+        }
+    }
+    for body in invalid {
+        let req = client.post("https://app.daytona.io/api/snapshots").bearer_auth("key-a").json(&body).build().unwrap();
+        assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 400, "{body}");
+        assert_eq!(http.0.lock().unwrap().violations.len(), 1);
+        http.0.lock().unwrap().violations.clear();
+    }
+    let req = client.post("https://app.daytona.io/api/snapshots").bearer_auth("key-a").json(&base).build().unwrap();
+    let response = http.execute(req, &ChannelLabel::Default).await.unwrap();
+    assert_eq!(response.status(), 201);
+    let row: Value = serde_json::from_slice(response.body()).unwrap();
+    assert!(snapshot_schema_valid(&row, "SnapshotDto", false));
+    for key in ["gpu", "general", "size", "entrypoint", "createdAt"] {
+        let mut missing = row.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(!snapshot_schema_valid(&missing, "SnapshotDto", false), "missing {key}");
+    }
 }
 
 // The pinned analytics schemas contain objects with optional primitive fields.
