@@ -80,6 +80,7 @@ keys while their environments need SSH. Config edits take effect on daemon
 restart, and distinct configs should use distinct socket overrides. Stop the
 foreground daemon or send SIGTERM to its owning process, then the next CLI call
 starts it with the new configuration. Startup rotates `drydock.log` to
-`drydock.log.1` rather than appending across runs. Keys/evidence currently remain
+`drydock.log.1` rather than appending across runs;
+[#62](https://github.com/flotilla-org/drydock/issues/62) tracks within-run log caps. Keys/evidence currently remain
 after errors and destruction; [#61](https://github.com/flotilla-org/drydock/issues/61)
 tracks safe retention and garbage collection.

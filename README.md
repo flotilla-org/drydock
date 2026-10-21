@@ -78,6 +78,8 @@ to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
 daemon, so use distinct sockets for distinct configurations. Startup is serialized
 across concurrent clients. Diagnostics go to `run/drydock.log`; each daemon
 start rotates the previous run to `drydock.log.1`, replacing the older backup.
+[Within-run size caps #62](https://github.com/flotilla-org/drydock/issues/62) track
+bounding a single long-running daemon's log.
 
 Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
 `egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
