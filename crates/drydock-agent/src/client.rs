@@ -161,6 +161,12 @@ impl Client {
         self.require_compatible()?;
         {
             let targets = self.targets.lock().unwrap();
+            if let Some(egress) = &config.egress {
+                check_id(&egress.upstream)?;
+                if !targets.contains_key(&egress.upstream) {
+                    return Err(invalid("egress upstream host endpoint was never registered"));
+                }
+            }
             for forward in &config.forwards {
                 check_id(&forward.id).map_err(|error| crate::error::context("configure", &forward.id, error))?;
                 if !targets.contains_key(&forward.id) {

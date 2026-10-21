@@ -1,7 +1,9 @@
 //! Drydock's vessel control API and host client. The transport is the trust boundary:
 //! only its host-facing side may serve control; guest forwards carry opaque IDs.
 mod client;
+mod egress;
 mod error;
+pub use egress::{CA_PATH, Egress, PROXY_PORT};
 mod exec;
 mod forward;
 pub use error::{AgentError, ErrorKind};
@@ -14,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configure", "exec", "files", "forwards", "upgrade"];
+pub const FEATURES: &[&str] = &["configure", "exec", "files", "forwards", "egress", "upgrade"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -36,11 +38,11 @@ pub struct Hello {
     pub fingerprint: String,
     pub features: Vec<String>,
 }
-/// Desired state replaces the previous configuration. Egress is stored for the
-/// capture component (#52); this crate does not install redirects or enforce it.
+/// Desired state replaces the previous configuration. Capture forwards traffic;
+/// the kind and the upstream own enforcement.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Configuration {
-    pub egress: serde_json::Value,
+    pub egress: Option<Egress>,
     pub ca: String,
     pub features: Vec<String>,
     pub environment: BTreeMap<String, String>,
@@ -59,10 +61,19 @@ pub enum Endpoint {
     Tcp(SocketAddr),
 }
 impl Endpoint {
-    pub(crate) async fn connect(&self) -> io::Result<ByteStream> {
+    pub(crate) async fn connect_marked(&self, marked: bool) -> io::Result<ByteStream> {
         match self {
             Self::Unix(path) => Ok(Box::new(tokio::net::UnixStream::connect(path).await?)),
-            Self::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+            Self::Tcp(addr) => {
+                if marked {
+                    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+                    #[cfg(target_os = "linux")]
+                    egress::set_option(&socket, libc::SOL_SOCKET, libc::SO_MARK, egress::SOCKET_MARK)?;
+                    Ok(Box::new(socket.connect(*addr).await?))
+                } else {
+                    Ok(Box::new(tokio::net::TcpStream::connect(addr).await?))
+                }
+            }
         }
     }
 }

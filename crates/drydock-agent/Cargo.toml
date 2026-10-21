@@ -9,11 +9,13 @@ drydock-transport = { path = "../drydock-transport" }
 axum = { version = "0.8", default-features = false, features = ["http2", "tokio", "json"] }
 bytes = "1"
 http = "1"
+hickory-proto = { version = "0.25", default-features = false }
 http-body-util = "0.1"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+socket2 = "0.6"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "fs", "time"] }
 tokio-stream = "0.1"

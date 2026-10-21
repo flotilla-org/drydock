@@ -98,6 +98,7 @@ struct Settings {
     config: Configuration,
     listeners: HashMap<String, Listener>,
     targets: HashMap<String, Target>,
+    capture: Option<crate::egress::Capture>,
 }
 struct Shared {
     hello: Hello,
@@ -195,12 +196,13 @@ impl Agent {
                         }
                         Purpose::Forward { id } => {
                             let mut settings = self.shared.settings.lock().await;
+                            let marked = settings.config.egress.is_some();
                             if let Some(target) = settings.targets.get_mut(&id) {
                                 // Reap completed bridges without retaining an unbounded history.
                                 while target.streams.try_join_next().is_some() {}
                                 let endpoint = target.endpoint.clone();
                                 target.streams.spawn(async move {
-                                    if let Err(error) = crate::forward::serve(incoming.stream, &id, Some(&endpoint)).await {
+                                    if let Err(error) = crate::forward::serve_marked(incoming.stream, &id, Some(&endpoint), marked).await {
                                         tracing::warn!(%error, forward = %id, "host-to-guest forward failed");
                                     }
                                 });
@@ -226,7 +228,26 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     if config.environment.iter().any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(api("invalid process environment"));
     }
+    if let Some(egress) = &config.egress {
+        check_id(&egress.upstream).map_err(api)?;
+        if config.forwards.iter().filter_map(|f| f.tcp).any(|a| [1053, 15001, 15002].contains(&a.port())) {
+            return Err(api("forward conflicts with an egress listener"));
+        }
+    }
     let mut settings = s.settings.lock().await;
+    let mut prepared_capture = if settings.capture.is_none() {
+        if let Some(egress) = &config.egress {
+            Some(
+                crate::egress::Capture::prepare(s.opener.clone(), egress.upstream.clone())
+                    .await
+                    .map_err(at("egress.prepare", "listeners"))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut prepared = HashMap::new();
     let preparation: Result<(), ApiError> = async {
         for forward in &config.forwards {
@@ -247,6 +268,27 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
             };
             prepared.insert(forward.id.clone(), listener);
         }
+        if config.egress.is_some() || settings.capture.is_some() {
+            // Stage the CA under the tools prefix before publishing capture.
+            // Configuration.ca is the complete combined trust bundle supplied
+            // by the controller; the agent does not fetch host trust material.
+            let ca = if config.egress.is_some() {
+                let file = tempfile::NamedTempFile::new_in("/opt/drydock").map_err(at("egress.ca", CA_PATH))?;
+                std::fs::write(file.path(), config.ca.as_bytes()).map_err(at("egress.ca", CA_PATH))?;
+                file.as_file().set_permissions(std::fs::Permissions::from_mode(0o644)).map_err(at("egress.ca", CA_PATH))?;
+                file.as_file().sync_all().map_err(at("egress.ca", CA_PATH))?;
+                Some(file)
+            } else {
+                None
+            };
+            crate::egress::install(&config).await.map_err(at("egress.redirect", "nftables"))?;
+            if let Some(ca) = ca
+                && let Err(error) = ca.persist(CA_PATH)
+            {
+                crate::egress::install(&settings.config).await.map_err(at("egress.rollback", "nftables"))?;
+                return Err(at("egress.ca", CA_PATH)(error.error));
+            }
+        }
         Ok(())
     }
     .await;
@@ -255,6 +297,9 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
         // response, so the caller can retry immediately without a bind race.
         for listener in prepared.into_values().flatten() {
             listener.stop().await;
+        }
+        if let Some(capture) = prepared_capture.take() {
+            capture.stop().await;
         }
         return Err(error);
     }
@@ -267,6 +312,14 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     let old = std::mem::replace(&mut settings.listeners, listeners);
     for (_, listener) in old {
         listener.stop().await;
+    }
+    if let Some(egress) = &config.egress {
+        if let Some(capture) = prepared_capture.take() {
+            settings.capture = Some(capture);
+        }
+        settings.capture.as_ref().unwrap().set_upstream(egress.upstream.clone());
+    } else if let Some(capture) = settings.capture.take() {
+        capture.stop().await;
     }
     settings.config = config;
     Ok(StatusCode::NO_CONTENT)
@@ -362,6 +415,9 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
 async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForward>) -> Result<StatusCode, ApiError> {
     check_id(&forward.id).map_err(api)?;
     let mut settings = s.settings.lock().await;
+    if settings.capture.is_some() && forward.tcp.is_some() {
+        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
+    }
     if settings.listeners.contains_key(&forward.id) {
         return Err(api("forward ID already exists"));
     }
@@ -372,6 +428,9 @@ async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForwar
 }
 async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
     let mut settings = s.settings.lock().await;
+    if settings.capture.is_some() && settings.config.forwards.iter().any(|f| f.id == id && f.tcp.is_some()) {
+        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
+    }
     let listener = settings
         .listeners
         .remove(&id)

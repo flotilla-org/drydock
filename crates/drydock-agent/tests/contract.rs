@@ -65,7 +65,7 @@ async fn control_contract_on_both_transports() {
         assert!(h.client.hello().features.contains(&"forwards".into()));
         for value in ["one", "two", ""] {
             let config = Configuration {
-                egress: serde_json::json!({"upstream": value}),
+                egress: None,
                 ca: format!("CA:{value}"),
                 features: vec![value.into()],
                 environment: [
@@ -661,4 +661,16 @@ fn assert_refused(result: std::io::Result<()>) {
     let error = result.unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     assert!(error.to_string().contains("host endpoint already serves a vessel"), "{error}");
+}
+
+// The egress forward belongs to this vessel's client registry, just like other
+// guest-to-host forwards. Unknown IDs must be rejected before any guest changes.
+#[tokio::test]
+async fn egress_requires_registered_vessel_upstream() {
+    let h = harness(false, "test-build").await;
+    for id in ["", "unregistered-proxy"] {
+        let config = Configuration { egress: Some(drydock_agent::Egress { upstream: id.into() }), ..Configuration::default() };
+        assert_eq!(h.client.configure(config).await.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
+    }
 }
