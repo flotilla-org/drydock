@@ -97,7 +97,7 @@ impl Client {
                                     let mut stream = incoming.stream;
                                     if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut endpoint).await { tracing::warn!(%error, forward = %id, "host endpoint stream failed"); }
                                 } else { tracing::warn!(forward = %id, "host endpoint connection failed"); }
-                            }); }
+                            }); } else { tracing::warn!(forward = %id, "unknown guest-to-host forward ID"); }
                         }
                     }
                 }
@@ -133,7 +133,7 @@ impl Client {
         let request = http::Request::builder()
             .method(method)
             .uri(route)
-            .header("content-type", "application/json")
+            .header("content-type", if method == "PUT" && route == "/upgrade" { "application/octet-stream" } else { "application/json" })
             .body(Full::new(Bytes::from(bytes)))
             .map_err(invalid)?;
         let response = self.sender.clone().send_request(request).await.map_err(io::Error::other)?;
@@ -164,6 +164,7 @@ impl Client {
         Ok(ExecOutput {
             body: self.request("POST", "/exec", serde_json::to_vec(&request).map_err(invalid)?).await?,
             pending: BytesMut::new(),
+            seen_exit: false,
         })
     }
     pub async fn write(&self, path: PathBuf, bytes: Vec<u8>, executable: bool) -> io::Result<()> {
@@ -236,13 +237,19 @@ impl Client {
 pub struct ExecOutput {
     body: axum::body::Body,
     pending: BytesMut,
+    seen_exit: bool,
 }
 impl ExecOutput {
     pub async fn next(&mut self) -> io::Result<Option<ExecEvent>> {
+        if self.seen_exit {
+            return Ok(None);
+        }
         loop {
             if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
                 let line = self.pending.split_to(end + 1);
-                return serde_json::from_slice(&line).map(Some).map_err(invalid);
+                let event = serde_json::from_slice(&line).map_err(invalid)?;
+                self.seen_exit = matches!(event, ExecEvent::Exit { .. });
+                return Ok(Some(event));
             }
             match self.body.frame().await {
                 Some(Ok(frame)) => {
@@ -251,12 +258,52 @@ impl ExecOutput {
                     }
                 }
                 Some(Err(error)) => return Err(io::Error::other(error)),
-                None if self.pending.is_empty() => return Ok(None),
+                None if self.pending.is_empty() => {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "exec stream ended without Exit"));
+                }
                 None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated exec event")),
             }
             if self.pending.len() > 1024 * 1024 {
                 return Err(invalid("oversized exec event"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // HTTP-body boundary fake: truncate a valid stream at every drawn byte.
+    // Only a stream containing a complete Exit event may end successfully.
+    #[hegel::test]
+    fn exec_requires_exit_at_truncation_boundaries(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let events = [ExecEvent::Stdout(vec![0, 128, 255]), ExecEvent::Stderr(b"err".to_vec()), ExecEvent::Exit { code: Some(0) }];
+        let bytes: Vec<u8> = events
+            .iter()
+            .flat_map(|event| {
+                let mut bytes = serde_json::to_vec(event).unwrap();
+                bytes.push(b'\n');
+                bytes
+            })
+            .collect();
+        let cut = tc.draw(gs::integers::<usize>().min_value(0).max_value(bytes.len()));
+        let expected_events = bytes[..cut].iter().filter(|byte| **byte == b'\n').count();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut output = ExecOutput { body: axum::body::Body::from(bytes[..cut].to_vec()), pending: BytesMut::new(), seen_exit: false };
+            let mut received = Vec::new();
+            let failed = loop {
+                match output.next().await {
+                    Ok(Some(event)) => received.push(event),
+                    Ok(None) => break false,
+                    Err(error) => {
+                        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+                        break true;
+                    }
+                }
+            };
+            assert_eq!(received, events[..expected_events]);
+            assert_eq!(failed, cut < bytes.len(), "EOF before Exit must be an error");
+        });
     }
 }

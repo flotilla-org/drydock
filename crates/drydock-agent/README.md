@@ -72,6 +72,8 @@ back off; finished listener tasks are rebuilt on the next configuration push.
 An address held by a different forward ID is not transferred in one push.
 Port swaps/transfers require removing the old owners first, then adding the new
 configuration; a refused swap preserves the previous configuration and listeners.
+Refused preparations await cleanup of newly created listeners before returning,
+so retrying immediately cannot race deferred socket removal.
 In this slice the feature list and egress/CA values are stored configuration for consumers, not
 switches that claim to activate capture. The host pushes CA files via the files
 API and names their paths through the process environment.
@@ -81,6 +83,7 @@ Exec uses null stdin, no tty, a detached session, and fixed pipeline defaults
 inherits the pushed environment, including proxy, CA variables and placeholder
 tokens. Output is streamed incrementally and ordered independently per stdout
 and stderr; `Exit` follows their drained output, with `None` for a signal exit.
+EOF without a complete `Exit` is an `UnexpectedEof` error in the host client.
 Output spools into unlinked temporary files so agent exit/re-exec cannot deliver
 SIGPIPE to the child. Idle polling backs off, reuses a buffer, and stops tailing
 when the client disconnects (the child is still reaped). The provider may set
@@ -101,6 +104,9 @@ without uploading again. The activation acknowledgement is advisory: a lost
 response requires reconnecting and checking hello. A short acknowledgement grace period precedes shutdown;
 the binary path remains stable across repeated upgrades. The previous executable
 is retained as `.prev` and restored if direct `execv` rejects the replacement.
+Once exec succeeds, startup failures or later crashes belong to provider
+supervision (#54); automatic probation/rollback is not implemented. An operator
+or provider can restore the retained `.prev` image when needed.
 Re-exec drops control and forward streams, removes owned guest sockets, and resets configuration.
 Stale socket inodes from a crash are reclaimed only when they refuse a connection;
 live listeners and ordinary files are preserved.
@@ -115,13 +121,21 @@ header rewriting, token checking, terminal handling or destination policy.
 Legacy transport purpose tags remain decodable but the agent does not serve
 them. Cleat attach is an ordinary host-to-guest forward to a Unix socket.
 
+Guest forwards grant vessel-level reach, not per-UID authorization. Unix socket
+access follows the agent's umask and parent-directory permissions; the optional
+loopback TCP listener is reachable by every guest UID. Providers that need guest
+UID separation must protect the Unix socket directory/mode and omit loopback TCP.
+Host endpoints apply their own policy (for example per-terminal hook tokens);
+the agent inspects no forwarded bytes and holds no token.
+
 * Guest to host: `add_guest_forward` reserves a host endpoint in this client's
   registry, then creates a guest Unix listener and optional loopback TCP listener.
   `register_host_endpoint` reserves endpoints for forwards installed through a
   configuration push. The guest receives only IDs; it never receives a host
   target. An arriving ID resolves only in the client for that vessel.
 * Host to guest: `add_host_forward` configures a guest Unix/TCP target;
-  `forward(id)` opens a raw stream. `remove_*_forward` removes a route at runtime.
+  `forward(id)` opens a raw stream. TCP port zero is rejected. Unix endpoints
+  connect lazily, allowing the host to register services before their sockets exist. `remove_*_forward` removes a route at runtime.
   Removal closes guest listeners and their streams; unrelated forwards continue.
 * Host Unix endpoints are claimed by stable path and device/inode, including symlink/hardlink
   aliases. Host TCP endpoints require dedicated loopback ports; claims reserve

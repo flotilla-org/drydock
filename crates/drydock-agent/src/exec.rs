@@ -68,7 +68,11 @@ pub(crate) fn launch(request: Exec, environment: BTreeMap<String, String>) -> io
                 match child.try_wait() {
                     Ok(Some(exit)) => status = Some(exit.code()),
                     Ok(None) => {}
-                    Err(_) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "exec child status failed");
+                        let _ = child.wait().await;
+                        break;
+                    }
                 }
             }
             if !emitted {

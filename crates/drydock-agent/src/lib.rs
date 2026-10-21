@@ -13,7 +13,18 @@ pub const FEATURES: &[&str] = &["configure", "exec", "files", "forwards", "upgra
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
-    Ok(format!("{:x}", Sha256::digest(std::fs::read(std::env::current_exe()?)?)))
+    use std::io::Read;
+    let mut executable = std::fs::File::open(std::env::current_exe()?)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = executable.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hello {

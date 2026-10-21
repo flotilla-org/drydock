@@ -489,3 +489,24 @@ async fn occupied_port_swap_refuses_without_changing_configuration() {
         task.abort();
     }
 }
+
+// Port zero is malformed input. Unix targets are deliberately resolved lazily
+// so a host can register a service before it has created its guest socket.
+#[tokio::test]
+async fn forward_targets_reject_zero_ports_and_allow_late_socket_creation() {
+    let h = harness(false, "test-build").await;
+    assert!(
+        h.client
+            .add_host_forward("zero".into(), Endpoint::Tcp("127.0.0.1:0".parse().unwrap()))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("400")
+    );
+    let target = h.dir.path().join("later");
+    h.client.add_host_forward("later".into(), Endpoint::Unix(target.clone())).await.unwrap();
+    let task = tokio::spawn(echo(UnixListener::bind(target).unwrap()));
+    let mut stream = h.client.forward("later").await.unwrap();
+    exchange(&mut stream, b"late service").await;
+    task.abort();
+}

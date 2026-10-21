@@ -166,8 +166,10 @@ impl Agent {
                         Purpose::Forward { id } => {
                             let target = self.shared.settings.lock().await.targets.get(&id).cloned();
                             tasks.spawn(async move {
-                                if let Some(target) = target
-                                    && let Err(error) = bridge(incoming.stream, target).await { tracing::warn!(%error, forward = %id, "host-to-guest forward failed"); }
+                                match target {
+                                    Some(target) => if let Err(error) = bridge(incoming.stream, target).await { tracing::warn!(%error, forward = %id, "host-to-guest forward failed"); },
+                                    None => tracing::warn!(forward = %id, "unknown host-to-guest forward ID"),
+                                }
                             });
                         }
                         _ => {},
@@ -194,16 +196,31 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     }
     let mut settings = s.settings.lock().await;
     let mut prepared = HashMap::new();
-    for forward in &config.forwards {
-        check_id(&forward.id).map_err(api)?;
-        if prepared.contains_key(&forward.id) {
-            return Err(api("duplicate forward ID"));
+    let preparation: Result<(), ApiError> = async {
+        for forward in &config.forwards {
+            check_id(&forward.id).map_err(api)?;
+            if prepared.contains_key(&forward.id) {
+                return Err(api("duplicate forward ID"));
+            }
+            let unchanged = settings.config.forwards.iter().any(|old| old == forward)
+                && settings.listeners.get(&forward.id).is_some_and(|listener| !listener.task.is_finished());
+            let listener = if unchanged {
+                None
+            } else {
+                Some(listen(forward, s.opener.clone(), settings.listeners.get(&forward.id)).await.map_err(api)?)
+            };
+            prepared.insert(forward.id.clone(), listener);
         }
-        let unchanged = settings.config.forwards.iter().any(|old| old == forward)
-            && settings.listeners.get(&forward.id).is_some_and(|listener| !listener.task.is_finished());
-        let listener =
-            if unchanged { None } else { Some(listen(forward, s.opener.clone(), settings.listeners.get(&forward.id)).await.map_err(api)?) };
-        prepared.insert(forward.id.clone(), listener);
+        Ok(())
+    }
+    .await;
+    if let Err(error) = preparation {
+        // A rejected transaction must release staged socket paths before its
+        // response, so the caller can retry immediately without a bind race.
+        for listener in prepared.into_values().flatten() {
+            listener.stop().await;
+        }
+        return Err(error);
     }
     let mut listeners = HashMap::new();
     for (id, listener) in prepared {
@@ -321,6 +338,9 @@ async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> S
 }
 async fn add_target(State(s): State<Arc<Shared>>, Json(target): Json<GuestTarget>) -> Result<StatusCode, ApiError> {
     check_id(&target.id).map_err(api)?;
+    if matches!(&target.endpoint, Endpoint::Tcp(address) if address.port() == 0) {
+        return Err(api("guest target TCP port must be nonzero"));
+    }
     s.settings.lock().await.targets.insert(target.id, target.endpoint);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -503,5 +523,29 @@ mod tests {
         let errno = errors[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
         assert_eq!(ownership_result(Err(io::Error::from_raw_os_error(errno)), uid).is_ok(), uid != 0 && errno == libc::EPERM);
         assert!(ownership_result(Ok(()), uid).is_ok());
+    }
+    // A failed preparation must synchronously clean its newly bound sockets.
+    // Retry the same valid forward without yielding to task-drop scheduling.
+    #[tokio::test]
+    async fn rejected_configuration_awaits_prepared_listener_cleanup() {
+        let (a, b) = tokio::io::duplex(4096);
+        let (host, guest) = tokio::join!(
+            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
+            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
+        );
+        let _host = host.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = Agent::new(guest.unwrap(), "build".into(), dir.path().join("agent"));
+        let good = GuestForward { id: "good".into(), unix: dir.path().join("good"), tcp: None };
+        let occupied = dir.path().join("occupied");
+        std::fs::write(&occupied, b"keep").unwrap();
+        let bad = GuestForward { id: "bad".into(), unix: occupied.clone(), tcp: None };
+        let rejected = Configuration { forwards: vec![good.clone(), bad], ..Configuration::default() };
+        assert!(configure(State(agent.shared.clone()), Json(rejected)).await.is_err());
+        assert!(!good.unix.exists(), "prepared socket must be gone before returning refusal");
+        assert_eq!(std::fs::read(occupied).unwrap(), b"keep");
+        let retry = Configuration { forwards: vec![good.clone()], ..Configuration::default() };
+        configure(State(agent.shared.clone()), Json(retry)).await.unwrap();
+        assert!(good.unix.exists());
     }
 }
