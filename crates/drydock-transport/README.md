@@ -10,7 +10,7 @@ Transport.accept()      -> (purpose, AsyncRead + AsyncWrite)
   Dial / Relay: yamux over the supplied byte stream
 ```
 
-The host knows the vessel identity from its reach recipe. There is no vessel ID, authentication token, or per-vessel agent configuration on this wire. Native listeners must be isolated to the owning vessel by the provider. Dial/Relay callers authenticate their outer connection before handing it to this crate. A port-forward header names a requested destination; the receiver still enforces policy before opening it.
+The host knows the vessel identity from its reach recipe. There is no vessel ID, authentication token, or per-vessel agent configuration on this wire. Native listeners must be isolated to the owning vessel by the provider. Dial/Relay callers authenticate their outer connection before handing it to this crate. The agent uses an opaque forward ID resolved by the receiving host’s per-vessel registry; destination policy belongs to the receiver. Legacy purpose tags may still name a destination for older transport consumers.
 
 ## API and lifetime
 
@@ -47,10 +47,13 @@ Purpose headers:
 | --- | --- | --- |
 | 0 | Host-to-agent control link | none |
 | 1 | Agent-to-host router link | none |
-| 2 | Cleat attach | u16 byte length, UTF-8 session name |
-| 3 | Port forward | u16 byte length, UTF-8 host, u16 port |
+| 2 | Legacy cleat attach | u16 byte length, UTF-8 session name |
+| 3 | Legacy port forward | u16 byte length, UTF-8 host, u16 port |
+| 4 | Generic byte forward | u16 byte length, UTF-8 forward ID |
 
-Targets are 1–1024 UTF-8 bytes without control characters. Host fields are requested destination strings, not parsed socket addresses: the receiver must validate DNS/IP syntax, resolve the name under its policy, and authorize the destination before connecting. Port zero is rejected. Unknown versions, modes, purposes, malformed UTF-8, oversized targets, and truncated headers are errors. Headers describe purpose, not authorization; the caller decides which purposes to serve on each side.
+The drydock agent accepts tag 4 for both forward directions; it never receives a host destination from the guest. See [the agent guide](../drydock-agent/README.md). Legacy tags 2 and 3 remain decodable for existing transport consumers.
+
+Targets and IDs are 1–1024 UTF-8 bytes without control characters. Host fields are requested destination strings, not parsed socket addresses: the receiver must validate DNS/IP syntax, resolve the name under its policy, and authorize the destination before connecting. Port zero is rejected. Unknown versions, modes, purposes, malformed UTF-8, oversized targets, and truncated headers are errors. Headers describe purpose, not authorization; the caller decides which purposes to serve on each side.
 
 ## Validation
 

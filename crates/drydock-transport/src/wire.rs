@@ -8,10 +8,11 @@ pub enum ConnectionKind {
 }
 
 /// Link streams carry exactly one long-lived HTTP/2 connection. Raw streams
-/// identify a cleat session or requested TCP destination. The receiver validates
-/// host syntax and authorizes the destination before opening it.
+/// identify an opaque forward ID. Legacy cleat/TCP purposes remain decodable
+/// for transport consumers; drydock-agent accepts only generic Forward IDs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Purpose {
+    Forward { id: String },
     Control,
     Router,
     CleatAttach { session: String },
@@ -21,6 +22,7 @@ impl Purpose {
     pub(crate) fn validate(&self) -> io::Result<()> {
         match self {
             Self::Control | Self::Router => Ok(()),
+            Self::Forward { id } => validate_text(id),
             Self::CleatAttach { session } => validate_text(session),
             Self::PortForward { host, port } => {
                 validate_text(host)?;
@@ -66,6 +68,7 @@ pub async fn read_connection_kind<R: AsyncRead + Unpin>(s: &mut R) -> io::Result
 pub(crate) async fn write_purpose<W: AsyncWrite + Unpin>(s: &mut W, purpose: &Purpose) -> io::Result<()> {
     purpose.validate()?;
     let (tag, text) = match purpose {
+        Purpose::Forward { id } => (4, id.as_str()),
         Purpose::Control => (0, ""),
         Purpose::Router => (1, ""),
         Purpose::CleatAttach { session } => (2, session.as_str()),
@@ -86,7 +89,7 @@ pub(crate) async fn read_purpose<R: AsyncRead + Unpin>(s: &mut R) -> io::Result<
     let purpose = match tag {
         0 => Purpose::Control,
         1 => Purpose::Router,
-        2 | 3 => {
+        2..=4 => {
             let len = s.read_u16().await? as usize;
             if len == 0 || len > 1024 {
                 return Err(invalid("stream target length out of bounds"));
@@ -94,7 +97,13 @@ pub(crate) async fn read_purpose<R: AsyncRead + Unpin>(s: &mut R) -> io::Result<
             let mut text = vec![0; len];
             s.read_exact(&mut text).await?;
             let text = String::from_utf8(text).map_err(|_| invalid("stream target is not UTF-8"))?;
-            if tag == 2 { Purpose::CleatAttach { session: text } } else { Purpose::PortForward { host: text, port: s.read_u16().await? } }
+            if tag == 4 {
+                Purpose::Forward { id: text }
+            } else if tag == 2 {
+                Purpose::CleatAttach { session: text }
+            } else {
+                Purpose::PortForward { host: text, port: s.read_u16().await? }
+            }
         }
         _ => return Err(invalid("unknown stream purpose")),
     };
@@ -112,6 +121,7 @@ mod tests {
     #[tokio::test]
     async fn wire_layout_and_payload_boundary() {
         for (purpose, expected) in [
+            (Purpose::Forward { id: "x".into() }, vec![4, 0, 1, b'x']),
             (Purpose::Control, vec![0]),
             (Purpose::Router, vec![1]),
             (Purpose::CleatAttach { session: "x".into() }, vec![2, 0, 1, b'x']),
@@ -138,7 +148,7 @@ mod tests {
     // multibyte UTF-8, all purpose variants and the full u16 port boundary.
     #[hegel::test]
     fn purposes_round_trip_or_refuse(tc: hegel::TestCase) {
-        let tag = tc.draw(gs::integers::<u8>().min_value(0).max_value(3));
+        let tag = tc.draw(gs::integers::<u8>().min_value(0).max_value(4));
         let len = tc.draw(gs::integers::<usize>().min_value(0).max_value(1025));
         let alphabet = ["a", "β", "\0", "界"];
         let letter = alphabet[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
@@ -150,7 +160,8 @@ mod tests {
             0 => Purpose::Control,
             1 => Purpose::Router,
             2 => Purpose::CleatAttach { session: text },
-            _ => Purpose::PortForward { host: text, port },
+            3 => Purpose::PortForward { host: text, port },
+            _ => Purpose::Forward { id: text },
         };
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let mut bytes = Vec::new();
@@ -172,7 +183,7 @@ mod tests {
             assert!(read_connection_kind(&mut &bytes[..]).await.is_err());
         }
         for bytes in
-            [vec![4], vec![2, 0, 0], vec![2, 4, 1], vec![2, 0, 1, 255], vec![2, 0, 2, b'x'], vec![3, 0, 1, b'h', 0, 0], vec![2, 0, 1, 0]]
+            [vec![5], vec![2, 0, 0], vec![2, 4, 1], vec![2, 0, 1, 255], vec![2, 0, 2, b'x'], vec![3, 0, 1, b'h', 0, 0], vec![2, 0, 1, 0]]
         {
             assert!(read_purpose(&mut bytes.as_slice()).await.is_err());
         }
