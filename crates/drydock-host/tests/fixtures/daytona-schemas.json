@@ -884,6 +884,382 @@
         }
       },
       "type": "object"
+    },
+    "SnapshotDto": {
+      "example": {
+        "imageName": "imageName",
+        "buildInfo": "",
+        "cpu": 6.027456183070403,
+        "regionIds": [
+          "regionIds",
+          "regionIds"
+        ],
+        "gpu": 1.4658129805029452,
+        "organizationId": "organizationId",
+        "general": true,
+        "createdAt": "2000-01-23T04:56:07.000Z",
+        "disk": 5.637376656633329,
+        "ref": "daytonaio/sandbox:latest",
+        "size": 0.8008281904610115,
+        "mem": 5.962133916683182,
+        "lastUsedAt": "2000-01-23T04:56:07.000Z",
+        "entrypoint": [
+          "entrypoint",
+          "entrypoint"
+        ],
+        "errorReason": "errorReason",
+        "sourceSandboxId": "sandbox123",
+        "name": "name",
+        "id": "id",
+        "state": "",
+        "initialRunnerId": "runner123",
+        "gpuType": "H100",
+        "updatedAt": "2000-01-23T04:56:07.000Z",
+        "sandboxClass": "linux-vm"
+      },
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "organizationId": {
+          "type": "string"
+        },
+        "general": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "imageName": {
+          "type": "string"
+        },
+        "state": {
+          "allOf": [
+            {
+              "$ref": "#/components/schemas/SnapshotState"
+            }
+          ]
+        },
+        "size": {
+          "nullable": true,
+          "type": "number"
+        },
+        "entrypoint": {
+          "items": {
+            "type": "string"
+          },
+          "nullable": true,
+          "type": "array"
+        },
+        "cpu": {
+          "type": "number"
+        },
+        "gpu": {
+          "type": "number"
+        },
+        "gpuType": {
+          "allOf": [
+            {
+              "$ref": "#/components/schemas/GpuType"
+            }
+          ],
+          "description": "The GPU type assigned to the snapshot",
+          "example": "H100"
+        },
+        "mem": {
+          "type": "number"
+        },
+        "disk": {
+          "type": "number"
+        },
+        "errorReason": {
+          "nullable": true,
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "lastUsedAt": {
+          "format": "date-time",
+          "nullable": true,
+          "type": "string"
+        },
+        "buildInfo": {
+          "allOf": [
+            {
+              "$ref": "#/components/schemas/BuildInfo"
+            }
+          ],
+          "description": "Build information for the snapshot"
+        },
+        "regionIds": {
+          "description": "IDs of regions where the snapshot is available",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialRunnerId": {
+          "description": "The initial runner ID of the snapshot",
+          "example": "runner123",
+          "type": "string"
+        },
+        "ref": {
+          "description": "The snapshot reference",
+          "example": "daytonaio/sandbox:latest",
+          "type": "string"
+        },
+        "sourceSandboxId": {
+          "description": "The ID of the sandbox the snapshot was created from",
+          "example": "sandbox123",
+          "nullable": true,
+          "type": "string"
+        },
+        "sandboxClass": {
+          "description": "The sandbox class of the snapshot",
+          "enum": [
+            "linux-vm",
+            "container",
+            "windows"
+          ],
+          "example": "linux-vm",
+          "type": "string",
+          "x-enum-varnames": [
+            "LINUX_VM",
+            "CONTAINER",
+            "WINDOWS"
+          ]
+        }
+      },
+      "required": [
+        "cpu",
+        "createdAt",
+        "disk",
+        "entrypoint",
+        "errorReason",
+        "general",
+        "gpu",
+        "id",
+        "lastUsedAt",
+        "mem",
+        "name",
+        "size",
+        "sourceSandboxId",
+        "state",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "BuildInfo": {
+      "properties": {
+        "dockerfileContent": {
+          "description": "The Dockerfile content used for the build",
+          "example": "FROM node:14\nWORKDIR /app\nCOPY . .\nRUN npm install\nCMD [\"npm\", \"start\"]",
+          "type": "string"
+        },
+        "contextHashes": {
+          "description": "The context hashes used for the build",
+          "example": [
+            "hash1",
+            "hash2"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "createdAt": {
+          "description": "The creation timestamp",
+          "format": "date-time",
+          "type": "string"
+        },
+        "updatedAt": {
+          "description": "The last update timestamp",
+          "format": "date-time",
+          "type": "string"
+        },
+        "snapshotRef": {
+          "description": "The snapshot reference",
+          "example": "daytonaio/sandbox:latest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "createdAt",
+        "snapshotRef",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "GpuType": {
+      "enum": [
+        "H100",
+        "H200",
+        "B300",
+        "RTX-PRO-6000",
+        "RTX-4090",
+        "RTX-5090",
+        "MI355X"
+      ],
+      "type": "string",
+      "x-enum-varnames": [
+        "H100",
+        "H200",
+        "B300",
+        "RTX_PRO_6000",
+        "RTX_4090",
+        "RTX_5090",
+        "MI355X"
+      ]
+    },
+    "SnapshotState": {
+      "enum": [
+        "building",
+        "pending",
+        "pulling",
+        "snapshotting",
+        "active",
+        "inactive",
+        "error",
+        "build_failed",
+        "removing"
+      ],
+      "type": "string"
+    },
+    "CreateSnapshot": {
+      "example": {
+        "disk": 3,
+        "imageName": "ubuntu:22.04",
+        "memory": 1,
+        "buildInfo": "",
+        "regionId": "regionId",
+        "entrypoint": "sleep infinity",
+        "name": "ubuntu-4vcpu-8ram-100gb",
+        "cpu": 1,
+        "gpu": 0,
+        "gpuType": [
+          "H100"
+        ],
+        "sandboxClass": "linux-vm"
+      },
+      "properties": {
+        "name": {
+          "description": "The name of the snapshot",
+          "example": "ubuntu-4vcpu-8ram-100gb",
+          "type": "string"
+        },
+        "imageName": {
+          "description": "The image name of the snapshot",
+          "example": "ubuntu:22.04",
+          "type": "string"
+        },
+        "entrypoint": {
+          "description": "The entrypoint command for the snapshot",
+          "example": "sleep infinity",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cpu": {
+          "description": "CPU cores allocated to the resulting sandbox",
+          "example": 1,
+          "type": "integer"
+        },
+        "gpu": {
+          "description": "GPU units allocated to the resulting sandbox",
+          "example": 0,
+          "type": "integer"
+        },
+        "gpuType": {
+          "description": "Preferred GPU type for the resulting sandbox.",
+          "example": [
+            "H100"
+          ],
+          "items": {
+            "$ref": "#/components/schemas/GpuType"
+          },
+          "type": "array"
+        },
+        "memory": {
+          "description": "Memory allocated to the resulting sandbox in GB",
+          "example": 1,
+          "type": "integer"
+        },
+        "disk": {
+          "description": "Disk space allocated to the sandbox in GB",
+          "example": 3,
+          "type": "integer"
+        },
+        "buildInfo": {
+          "allOf": [
+            {
+              "$ref": "#/components/schemas/CreateBuildInfo"
+            }
+          ],
+          "description": "Build information for the snapshot"
+        },
+        "regionId": {
+          "description": "ID of the region where the snapshot will be available. Defaults to organization default region if not specified.",
+          "type": "string"
+        },
+        "sandboxClass": {
+          "allOf": [
+            {
+              "$ref": "#/components/schemas/SandboxClass"
+            }
+          ],
+          "description": "Target sandbox class. Determines which runners can host sandboxes created from this snapshot.",
+          "example": "linux-vm"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "SandboxClass": {
+      "enum": [
+        "linux-vm",
+        "container",
+        "windows"
+      ],
+      "type": "string",
+      "x-enum-varnames": [
+        "LINUX_VM",
+        "CONTAINER",
+        "WINDOWS"
+      ]
+    },
+    "CreateBuildInfo": {
+      "properties": {
+        "dockerfileContent": {
+          "description": "The Dockerfile content used for the build",
+          "example": "FROM node:14\nWORKDIR /app\nCOPY . .\nRUN npm install\nCMD [\"npm\", \"start\"]",
+          "type": "string"
+        },
+        "contextHashes": {
+          "description": "The context hashes used for the build",
+          "example": [
+            "hash1",
+            "hash2"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "dockerfileContent"
+      ],
+      "type": "object"
     }
-  }
+  },
+  "snapshotSchemasRetrieved": "2026-10-21"
 }

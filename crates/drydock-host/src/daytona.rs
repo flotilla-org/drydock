@@ -531,6 +531,11 @@ impl Provider for Daytona {
             return Err(refused("Daytona requires an image reference pinned by sha256 digest"));
         }
         validate_size(&r.size)?;
+        // CreateSnapshot labels memory/disk "GB", but the resource guide and
+        // default snapshot table specify GiB for the resulting sandbox:
+        // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
+        // Keep binary units consistent with sandbox readback; decimal conversion
+        // would also produce fractions rejected by CreateSnapshot's integer fields.
         let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &r.size);
         let url = self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?;
         let snapshot = match self.call(Method::GET, url, None, c).await {
