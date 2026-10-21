@@ -16,7 +16,7 @@ use tokio::{
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-type ApiError = (StatusCode, String);
+type ApiError = (StatusCode, Json<AgentError>);
 enum Failure {
     Message(String),
     Io(io::Error),
@@ -32,18 +32,40 @@ impl From<io::Error> for Failure {
     }
 }
 fn api(error: impl Into<Failure>) -> ApiError {
-    match error.into() {
-        Failure::Message(message) => (StatusCode::BAD_REQUEST, message),
-        Failure::Io(error) => {
-            let status = match error.kind() {
-                io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-                io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-                io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => StatusCode::BAD_REQUEST,
-                io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, error.to_string())
-        }
+    let error = match error.into() {
+        Failure::Message(message) => AgentError::new("control", "request", invalid(message)),
+        Failure::Io(error) => error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<AgentError>())
+            .cloned()
+            .unwrap_or_else(|| AgentError::new("control", "request", error)),
+    };
+    let status = match io::ErrorKind::from(error.kind) {
+        io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => StatusCode::BAD_REQUEST,
+        io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(error))
+}
+fn at(operation: &'static str, subject: impl std::fmt::Display) -> impl FnOnce(io::Error) -> ApiError {
+    let subject = subject.to_string();
+    move |error| api(crate::error::context(operation, subject, error))
+}
+fn absolute(operation: &'static str, path: &Path) -> Result<(), ApiError> {
+    if !path.is_absolute() {
+        return Err(at(operation, path.display())(invalid("file path must be absolute")));
+    }
+    Ok(())
+}
+struct Target {
+    endpoint: Endpoint,
+    streams: JoinSet<()>,
+}
+impl Target {
+    async fn stop(mut self) {
+        self.streams.shutdown().await;
     }
 }
 struct GuestSocket {
@@ -75,7 +97,7 @@ impl Drop for Listener {
 struct Settings {
     config: Configuration,
     listeners: HashMap<String, Listener>,
-    targets: HashMap<String, Endpoint>,
+    targets: HashMap<String, Target>,
 }
 struct Shared {
     hello: Hello,
@@ -108,7 +130,7 @@ impl Agent {
     pub fn add_transport(&mut self, transport: Transport) {
         self.transports.push(transport);
     }
-    /// Returns the installed executable on upgrade. The composition root re-execs
+    /// Returns the probation candidate on upgrade. The composition root re-execs
     /// with its original fixed flags; dropping this future drops all agent streams.
     pub async fn run(mut self) -> io::Result<PathBuf> {
         let router = Router::new()
@@ -123,6 +145,7 @@ impl Agent {
             .route("/forwards/host", put(add_target).delete(remove_target))
             .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
             .with_state(self.shared.clone());
+        let mut controller_bound = false;
         let mut tasks = JoinSet::new();
         let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
         for mut transport in self.transports.drain(..) {
@@ -162,30 +185,39 @@ impl Agent {
                 incoming = incoming_rx.recv() => {
                     let Some((incoming, opener)) = incoming else { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "host transport closed")); };
                     match incoming.purpose {
-                        Purpose::Control => { *self.shared.opener.lock().await = opener; let router = router.clone(); tasks.spawn(async move { let _ = http2::serve(incoming, router).await; }); }
-                        Purpose::Forward { id } => {
-                            let target = self.shared.settings.lock().await.targets.get(&id).cloned();
-                            tasks.spawn(async move {
-                                match target {
-                                    Some(target) => if let Err(error) = bridge(incoming.stream, target).await { tracing::warn!(%error, forward = %id, "host-to-guest forward failed"); },
-                                    None => tracing::warn!(forward = %id, "unknown host-to-guest forward ID"),
-                                }
-                            });
+                        Purpose::Control => {
+                            if !controller_bound {
+                                *self.shared.opener.lock().await = opener;
+                                controller_bound = true;
+                            }
+                            let router = router.clone();
+                            tasks.spawn(async move { let _ = http2::serve(incoming, router).await; });
                         }
-                        _ => {},
+                        Purpose::Forward { id } => {
+                            let mut settings = self.shared.settings.lock().await;
+                            if let Some(target) = settings.targets.get_mut(&id) {
+                                // Reap completed bridges without retaining an unbounded history.
+                                while target.streams.try_join_next().is_some() {}
+                                let endpoint = target.endpoint.clone();
+                                target.streams.spawn(async move {
+                                    if let Err(error) = crate::forward::serve(incoming.stream, &id, Some(&endpoint)).await {
+                                        tracing::warn!(%error, forward = %id, "host-to-guest forward failed");
+                                    }
+                                });
+                            } else {
+                                tasks.spawn(async move { let _ = crate::forward::serve(incoming.stream, &id, None).await; });
+                            }
+                        }
                     }
                 }
             }
         }
     }
 }
-async fn bridge(mut stream: ByteStream, endpoint: Endpoint) -> io::Result<()> {
-    let mut destination = endpoint.connect().await?;
-    tokio::io::copy_bidirectional(&mut stream, &mut destination).await?;
-    Ok(())
-}
-async fn hello(State(s): State<Arc<Shared>>) -> Json<Hello> {
-    Json(s.hello.clone())
+async fn hello(State(s): State<Arc<Shared>>) -> Result<Json<Hello>, ApiError> {
+    let _guard = s.staged.lock().await;
+    crate::upgrade::confirm(&s.executable).await.map_err(at("upgrade.confirm", s.executable.display()))?;
+    Ok(Json(s.hello.clone()))
 }
 async fn configuration(State(s): State<Arc<Shared>>) -> Json<Configuration> {
     Json(s.settings.lock().await.config.clone())
@@ -207,7 +239,11 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
             let listener = if unchanged {
                 None
             } else {
-                Some(listen(forward, s.opener.clone(), settings.listeners.get(&forward.id)).await.map_err(api)?)
+                Some(
+                    listen(forward, s.opener.clone(), settings.listeners.get(&forward.id))
+                        .await
+                        .map_err(at("forward.listen", forward.unix.display()))?,
+                )
             };
             prepared.insert(forward.id.clone(), listener);
         }
@@ -254,6 +290,7 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
     let unix = if let Some(old) = old.filter(|old| old.unix.path == forward.unix) {
         old.unix.clone()
     } else {
+        crate::socket::private_directory(forward.unix.parent().ok_or_else(|| invalid("socket requires a run directory"))?)?;
         let unix = match UnixListener::bind(&forward.unix) {
             Ok(listener) => listener,
             Err(error) => {
@@ -268,6 +305,7 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
                 UnixListener::bind(&forward.unix)?
             }
         };
+        crate::socket::protect(&forward.unix)?;
         Arc::new(GuestSocket { listener: unix, path: forward.unix.clone() })
     };
     let owned_unix = unix.clone();
@@ -306,6 +344,10 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
             streams.spawn(async move {
                 match opener.open(Purpose::Forward { id: id.clone() }).await {
                     Ok(mut remote) => {
+                        if let Err(error) = crate::forward::opened(&mut remote).await {
+                            tracing::warn!(%error, forward = %id, "guest-to-host forward rejected");
+                            return;
+                        }
                         if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut remote).await {
                             tracing::warn!(%error, forward = %id, "guest-to-host stream failed");
                         }
@@ -323,34 +365,50 @@ async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForwar
     if settings.listeners.contains_key(&forward.id) {
         return Err(api("forward ID already exists"));
     }
-    let listener = listen(&forward, s.opener.clone(), None).await.map_err(api)?;
+    let listener = listen(&forward, s.opener.clone(), None).await.map_err(at("forward.listen", forward.unix.display()))?;
     settings.listeners.insert(forward.id.clone(), listener);
     settings.config.forwards.push(forward);
     Ok(StatusCode::NO_CONTENT)
 }
-async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> StatusCode {
+async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
     let mut settings = s.settings.lock().await;
-    if let Some(listener) = settings.listeners.remove(&id) {
-        listener.stop().await;
-    }
+    let listener = settings
+        .listeners
+        .remove(&id)
+        .ok_or_else(|| at("forward.remove", &id)(io::Error::new(io::ErrorKind::NotFound, "unknown guest forward ID")))?;
+    listener.stop().await;
     settings.config.forwards.retain(|f| f.id != id);
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn add_target(State(s): State<Arc<Shared>>, Json(target): Json<GuestTarget>) -> Result<StatusCode, ApiError> {
     check_id(&target.id).map_err(api)?;
     if matches!(&target.endpoint, Endpoint::Tcp(address) if address.port() == 0) {
         return Err(api("guest target TCP port must be nonzero"));
     }
-    s.settings.lock().await.targets.insert(target.id, target.endpoint);
+    let mut settings = s.settings.lock().await;
+    if let Some(old) = settings.targets.remove(&target.id) {
+        old.stop().await;
+    }
+    settings.targets.insert(target.id, Target { endpoint: target.endpoint, streams: JoinSet::new() });
     Ok(StatusCode::NO_CONTENT)
 }
-async fn remove_target(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> StatusCode {
-    s.settings.lock().await.targets.remove(&id);
-    StatusCode::NO_CONTENT
+async fn remove_target(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
+    let target = s
+        .settings
+        .lock()
+        .await
+        .targets
+        .remove(&id)
+        .ok_or_else(|| at("forward.remove", &id)(io::Error::new(io::ErrorKind::NotFound, "unknown host forward ID")))?;
+    target.stop().await;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Result<Body, ApiError> {
     let environment = s.settings.lock().await.config.environment.clone();
-    let rx = crate::exec::launch(request, environment).map_err(api)?;
+    let program = request.program.clone();
+    let rx = crate::exec::launch(request, environment).map_err(|error| {
+        if error.get_ref().is_some_and(|source| source.is::<AgentError>()) { api(error) } else { at("exec.launch", &program)(error) }
+    })?;
     let stream = ReceiverStream::new(rx).map(|event| {
         let mut bytes = serde_json::to_vec(&event).expect("exec event serialization");
         bytes.push(b'\n');
@@ -365,6 +423,7 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) ->
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut file = tokio::fs::File::from_std(temporary.reopen()?);
     file.write_all(bytes).await?;
+    file.flush().await?;
     let existing = std::fs::symlink_metadata(path).ok().filter(|m| !m.file_type().is_symlink());
     if let Some(metadata) = &existing {
         use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
@@ -397,25 +456,39 @@ fn ownership_result(result: io::Result<()>, uid: u32) -> io::Result<()> {
     }
 }
 async fn write_file(Json(file): Json<FileWrite>) -> Result<StatusCode, ApiError> {
-    atomic_write(&file.path, &file.bytes, file.executable).await.map_err(api)?;
+    absolute("file.write", &file.path)?;
+    atomic_write(&file.path, &file.bytes, file.executable).await.map_err(at("file.write", file.path.display()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn read_file(Json(file): Json<FilePath>) -> Result<Vec<u8>, ApiError> {
     use tokio::io::AsyncReadExt;
     const LIMIT: u64 = 128 * 1024 * 1024;
-    let input = tokio::fs::File::open(file.path).await.map_err(api)?;
-    if input.metadata().await.map_err(api)?.len() > LIMIT {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "read exceeds 128 MiB".into()));
+    absolute("file.read", &file.path)?;
+    let input = tokio::fs::File::open(&file.path).await.map_err(at("file.read", file.path.display()))?;
+    if input.metadata().await.map_err(at("file.read", file.path.display()))?.len() > LIMIT {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(AgentError::new("file.read", file.path.display(), invalid("read exceeds 128 MiB"))),
+        ));
     }
     let mut bytes = Vec::new();
-    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(api)?;
+    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(at("file.read", file.path.display()))?;
     if bytes.len() as u64 > LIMIT {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "read exceeds 128 MiB".into()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(AgentError::new("file.read", file.path.display(), invalid("read exceeds 128 MiB"))),
+        ));
     }
     Ok(bytes)
 }
 async fn flush_file(Json(file): Json<FilePath>) -> Result<StatusCode, ApiError> {
-    tokio::fs::File::open(file.path).await.map_err(api)?.sync_all().await.map_err(api)?;
+    absolute("file.flush", &file.path)?;
+    tokio::fs::File::open(&file.path)
+        .await
+        .map_err(at("file.flush", file.path.display()))?
+        .sync_all()
+        .await
+        .map_err(at("file.flush", file.path.display()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Result<StatusCode, ApiError> {
@@ -423,8 +496,8 @@ async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Result<Sta
         return Err(api("empty agent executable"));
     }
     let mut staged = s.staged.lock().await;
-    let path = s.executable.with_extension("upgrade");
-    atomic_write(&path, &bytes, true).await.map_err(api)?;
+    let path = crate::upgrade::sidecar(&s.executable, "upgrade");
+    atomic_write(&path, &bytes, true).await.map_err(at("upgrade.stage", path.display()))?;
     *staged = Some(path);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -432,18 +505,22 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, Ap
     let mut staged = s.staged.lock().await;
     let path = staged.as_ref().cloned().ok_or_else(|| api("no staged agent"))?;
     // Keep the installed path stable over successive upgrades.
-    let previous = s.executable.with_extension("prev");
+    let previous = crate::upgrade::sidecar(&s.executable, "prev");
     let parent = s.executable.parent().unwrap_or(Path::new("."));
-    let backup_dir = tempfile::tempdir_in(parent).map_err(api)?;
+    let backup_dir = tempfile::tempdir_in(parent).map_err(at("upgrade.backup", parent.display()))?;
     let backup = backup_dir.path().join("previous");
-    tokio::fs::hard_link(&s.executable, &backup).await.map_err(api)?;
-    tokio::fs::rename(&backup, &previous).await.map_err(api)?;
-    tokio::fs::rename(&path, &s.executable).await.map_err(api)?;
+    tokio::fs::hard_link(&s.executable, &backup).await.map_err(at("upgrade.backup", s.executable.display()))?;
+    tokio::fs::rename(&backup, &previous).await.map_err(at("upgrade.backup", previous.display()))?;
+    crate::upgrade::prepare(&s.executable, &path).await.map_err(at("upgrade.prepare", s.executable.display()))?;
     *staged = None;
     if let Some(parent) = s.executable.parent() {
-        tokio::fs::File::open(parent).await.map_err(api)?.sync_all().await.map_err(api)?;
+        tokio::fs::File::open(parent)
+            .await
+            .map_err(at("upgrade.flush", parent.display()))?
+            .sync_all()
+            .await
+            .map_err(at("upgrade.flush", parent.display()))?;
     }
-    let path = s.executable.clone();
     let tx = s.restart.clone();
     tokio::spawn(async move {
         // Activation acknowledgement is advisory: clients reconnect and verify hello.
@@ -508,7 +585,8 @@ mod tests {
         std::fs::write(&executable, b"current image").unwrap();
         activate_upgrade(State(agent.shared.clone())).await.unwrap();
         assert!(agent.shared.staged.lock().await.is_none());
-        assert_eq!(std::fs::read(&executable).unwrap(), b"new image");
+        assert_eq!(std::fs::read(&executable).unwrap(), b"current image");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new image");
         assert_eq!(std::fs::read(previous).unwrap(), b"current image");
     }
 

@@ -32,21 +32,38 @@ async fn main() -> io::Result<()> {
             _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT]")),
         }
     }
+    drydock_agent::socket::private_directory(
+        socket
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("socket {} requires a run directory", socket.display())))?,
+    )?;
     if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
         use std::os::unix::fs::FileTypeExt;
         if !metadata.file_type().is_socket() {
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, "agent socket path is occupied"));
+            return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("agent socket {} is occupied", socket.display())));
         }
         match tokio::time::timeout(std::time::Duration::from_millis(100), tokio::net::UnixStream::connect(&socket)).await {
-            Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(&socket)?,
-            _ => return Err(io::Error::new(io::ErrorKind::AddrInUse, "agent socket already in use or inaccessible")),
+            Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(&socket)
+                .map_err(|e| io::Error::new(e.kind(), format!("remove stale socket {}: {e}", socket.display())))?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("agent socket {} already in use or inaccessible", socket.display()),
+                ));
+            }
         }
     }
-    let listener = UnixListener::bind(&socket)?;
+    let listener =
+        UnixListener::bind(&socket).map_err(|e| io::Error::new(e.kind(), format!("bind agent socket {}: {e}", socket.display())))?;
+    drydock_agent::socket::protect(&socket)?;
     let transport = Transport::native(Arc::new(UnixConnections::new(listener, HOST_SOCKET)), Limits::default())?;
-    let executable = std::env::current_exe()?;
+    let current = std::env::current_exe()?;
     let fingerprint = drydock_agent::fingerprint()?;
-    let mut agent = Agent::new(transport, fingerprint, executable);
+    let executable = drydock_agent::upgrade::startup(&current)
+        .map_err(|e| io::Error::new(e.kind(), format!("recover agent {}: {e}", current.display())))?;
+    let agent = Agent::new(transport, fingerprint, executable.clone());
+    #[cfg(target_os = "linux")]
+    let mut agent = agent;
     #[cfg(target_os = "linux")]
     if let Some(port) = vsock {
         let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port))?;
@@ -61,10 +78,8 @@ async fn main() -> io::Result<()> {
     let path = agent.run().await?;
     let _ = std::fs::remove_file(socket);
     let error = replace_image(&path, &args);
-    let previous = path.with_extension("prev");
-    if previous.exists() {
-        std::fs::rename(previous, &path)?;
-        return Err(replace_image(&path, &args));
+    if drydock_agent::upgrade::rollback(&executable)? {
+        return Err(replace_image(&executable, &args));
     }
     Err(error)
 }

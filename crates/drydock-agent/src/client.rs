@@ -92,12 +92,12 @@ impl Client {
                         // No path, host, or port supplied by the guest is dialed.
                         if let Purpose::Forward { id } = incoming.purpose {
                             let target = map.lock().unwrap().get(&id).cloned();
-                            if let Some(target) = target { streams.spawn(async move {
-                                if let Ok(mut endpoint) = target.0.connect().await {
-                                    let mut stream = incoming.stream;
-                                    if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut endpoint).await { tracing::warn!(%error, forward = %id, "host endpoint stream failed"); }
-                                } else { tracing::warn!(forward = %id, "host endpoint connection failed"); }
-                            }); } else { tracing::warn!(forward = %id, "unknown guest-to-host forward ID"); }
+                            streams.spawn(async move {
+                                let endpoint = target.as_ref().map(|claim| &claim.0);
+                                if let Err(error) = crate::forward::serve(incoming.stream, &id, endpoint).await {
+                                    tracing::warn!(%error, forward = %id, "guest-to-host forward failed");
+                                }
+                            });
                         }
                     }
                 }
@@ -141,7 +141,10 @@ impl Client {
         let body = axum::body::Body::new(response.into_body());
         if !status.is_success() {
             let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(io::Error::other)?;
-            return Err(io::Error::other(format!("{status}: {}", String::from_utf8_lossy(&bytes))));
+            return Err(match serde_json::from_slice::<AgentError>(&bytes) {
+                Ok(error) => error.into_io(),
+                Err(_) => io::Error::other(format!("{status}: {}", String::from_utf8_lossy(&bytes))),
+            });
         }
         Ok(body)
     }
@@ -155,6 +158,20 @@ impl Client {
         Ok(())
     }
     pub async fn configure(&self, config: Configuration) -> io::Result<()> {
+        self.require_compatible()?;
+        {
+            let targets = self.targets.lock().unwrap();
+            for forward in &config.forwards {
+                check_id(&forward.id).map_err(|error| crate::error::context("configure", &forward.id, error))?;
+                if !targets.contains_key(&forward.id) {
+                    return Err(crate::error::context(
+                        "configure",
+                        &forward.id,
+                        io::Error::new(io::ErrorKind::NotFound, "host endpoint was never registered"),
+                    ));
+                }
+            }
+        }
         self.empty("PUT", "/configure", &config).await
     }
     pub async fn configuration(&self) -> io::Result<Configuration> {
@@ -230,7 +247,9 @@ impl Client {
     }
     pub async fn forward(&self, id: &str) -> io::Result<ByteStream> {
         self.require_compatible()?;
-        self.opener.open(Purpose::Forward { id: id.into() }).await
+        let mut stream = self.opener.open(Purpose::Forward { id: id.into() }).await?;
+        crate::forward::opened(&mut stream).await?;
+        Ok(stream)
     }
 }
 /// Incremental NDJSON. Each output channel preserves its own byte order.

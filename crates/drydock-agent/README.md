@@ -9,8 +9,10 @@ redirects or enforcing policy.
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
 [--vsock-port PORT]` alongside the image's own processes. It must not be PID 1.
-The provider supplies a protected, host-facing socket directory, and protects
-vsock access where used. There is no token or per-vessel startup configuration.
+The agent creates its dedicated run directory with mode 0700 and protects its
+Unix sockets with mode 0600, correcting existing owned directory permissions.
+Symlink, foreign-owned and sticky run directories are refused. The provider
+protects vsock access where used. There is no token or per-vessel startup configuration.
 The Unix listener accepts native connections or a host-initiated yamux session;
 the latter also carries reverse streams without a second guest socket. vsock is
 Linux-only. Both listeners share one control state. Native Unix reverse connections use
@@ -43,7 +45,10 @@ The host-facing `Purpose::Control` stream carries HTTP/2 through
 | PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
 | POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
 
-I/O failures distinguish missing paths (404), permissions (403), conflicts (409), malformed input (400) and internal errors (500).
+I/O failures return JSON `AgentError { operation, subject, kind, message }`,
+with missing paths (404), permissions (403), conflicts (409), malformed input
+(400) and internal errors (500). The client preserves the error kind and retains
+the structured body as its `io::Error` source.
 
 JSON byte fields are deliberately arrays of integers for this push-focused API;
 exec events use the same representation, with roughly 2–4 encoded bytes per
@@ -60,14 +65,14 @@ replacements preserve the existing mode and preserve ownership when permitted.
 The optional executable flag sets mode 755. An unprivileged agent tolerates ownership EPERM when directory
 permissions allow replacement; root and other I/O failures remain strict.
 A destination symlink is replaced rather than followed.
-`flush` can also sync a parent directory. Routes use paths directly within the
-vessel, which is already controlled by the trusted caller.
+`flush` can also sync a parent directory. File routes require absolute paths within the vessel.
 
 Configuration replaces egress, CA, enabled features, process environment and
 guest forwards together. Invalid configuration leaves the previous state intact;
-unchanged listeners and their streams survive replacement. Listeners consult the
-current control opener for each connection, so host reconnection does not leave
-a stale session. TCP-only changes reuse the Unix binding. Transient accept errors
+unchanged listeners and their streams survive replacement. The first Control
+connection binds the reverse opener; later Control connections cannot replace
+it. The transport may reconnect its own native carrier. Every configured guest
+forward must have a host endpoint registered in that client. TCP-only changes reuse the Unix binding. Transient accept errors
 back off; finished listener tasks are rebuilt on the next configuration push.
 An address held by a different forward ID is not transferred in one push.
 Port swaps/transfers require removing the old owners first, then adding the new
@@ -103,10 +108,13 @@ backup is ready. `stage_upgrade` and `activate_upgrade` allow activation retries
 without uploading again. The activation acknowledgement is advisory: a lost
 response requires reconnecting and checking hello. A short acknowledgement grace period precedes shutdown;
 the binary path remains stable across repeated upgrades. The previous executable
-is retained as `.prev` and restored if direct `execv` rejects the replacement.
-Once exec succeeds, startup failures or later crashes belong to provider
-supervision (#54); automatic probation/rollback is not implemented. An operator
-or provider can restore the retained `.prev` image when needed.
+is retained as `.prev`. A durable `.probation` marker records the candidate
+image, which runs from `.upgrade` while the installed entry point remains
+runnable. The candidate promotes itself to that entry point on its first hello,
+then clears the marker. If exec fails immediately, rollback happens in-process.
+If the candidate dies before hello (including a loader failure after successful
+exec), the next ordinary provider start restores `.prev` and clears probation.
+Crashes after hello belong to provider supervision (#54).
 Re-exec drops control and forward streams, removes owned guest sockets, and resets configuration.
 Stale socket inodes from a crash are reclaimed only when they refuse a connection;
 live listeners and ordinary files are preserved.
@@ -116,15 +124,17 @@ without agent re-exec.
 
 ## Byte forwards and endpoint ownership
 
-`Purpose::Forward { id }` carries raw bytes. The agent performs no HTTP parsing,
+`Purpose::Forward { id }` begins with an opening result: a big-endian u32
+JSON length and `Result<(), AgentError>`. The client waits for success before
+returning the stream; unknown IDs and dead targets retain their kind and reason.
+After that acknowledgement it carries raw bytes. The agent performs no HTTP parsing,
 header rewriting, token checking, terminal handling or destination policy.
-Legacy transport purpose tags remain decodable but the agent does not serve
-them. Cleat attach is an ordinary host-to-guest forward to a Unix socket.
+Cleat attach is an ordinary host-to-guest forward to a Unix socket.
 
-Guest forwards grant vessel-level reach, not per-UID authorization. Unix socket
-access follows the agent's umask and parent-directory permissions; the optional
+Guest forwards grant vessel-level reach, not per-UID authorization. Unix sockets
+use mode 0600 within an agent-owned 0700 directory; the optional
 loopback TCP listener is reachable by every guest UID. Providers that need guest
-UID separation must protect the Unix socket directory/mode and omit loopback TCP.
+UID separation must omit loopback TCP.
 Host endpoints apply their own policy (for example per-terminal hook tokens);
 the agent inspects no forwarded bytes and holds no token.
 
@@ -136,7 +146,8 @@ the agent inspects no forwarded bytes and holds no token.
 * Host to guest: `add_host_forward` configures a guest Unix/TCP target;
   `forward(id)` opens a raw stream. TCP port zero is rejected. Unix endpoints
   connect lazily, allowing the host to register services before their sockets exist. `remove_*_forward` removes a route at runtime.
-  Removal closes guest listeners and their streams; unrelated forwards continue.
+  Removal closes the route’s live streams in both directions and guest listeners;
+  unknown IDs return NotFound. Unrelated forwards continue.
 * Host Unix endpoints are claimed by stable path and device/inode, including symlink/hardlink
   aliases. Host TCP endpoints require dedicated loopback ports; claims reserve
   the port across loopback addresses, preventing wildcard-listener aliasing.
@@ -157,8 +168,8 @@ A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello
 forward socket cleanup, fingerprint gating and survival/reaping of a child.
 No cloud provider or cleat installation is required.
 
-The most recent host-facing Control link supplies the reverse opener (last
-Control connection wins); this assumes the current single trusted controller.
+The first host-facing Control link supplies the reverse opener for the agent
+lifetime. Later connections cannot retarget it.
 Forward and transport failures emit `tracing` warnings, without logging process
 environment or request bodies. Embedders supply their subscriber. The standalone
 binary logs warnings to stderr by default and honors standard `RUST_LOG`.

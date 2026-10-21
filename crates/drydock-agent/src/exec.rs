@@ -22,14 +22,22 @@ pub(crate) fn launch(request: Exec, environment: BTreeMap<String, String>) -> io
         ("GIT_PAGER", "cat"),
         ("DEBIAN_FRONTEND", "noninteractive"),
     ]);
-    if let Some(cwd) = request.cwd {
+    if let Some(cwd) = &request.cwd {
+        let metadata = std::fs::metadata(cwd).map_err(|e| crate::error::context("exec.cwd", cwd.display(), e))?;
+        if !metadata.is_dir() {
+            return Err(crate::error::context(
+                "exec.cwd",
+                cwd.display(),
+                io::Error::new(io::ErrorKind::NotADirectory, "working directory is not a directory"),
+            ));
+        }
         command.current_dir(cwd);
     }
     // SAFETY: setsid is async-signal-safe; no allocation or locking after fork.
     unsafe {
         command.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
     }
-    let mut child = command.kill_on_drop(false).spawn()?;
+    let mut child = command.kill_on_drop(false).spawn().map_err(|e| crate::error::context("exec.spawn", &request.program, e))?;
     drop((out, err));
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {

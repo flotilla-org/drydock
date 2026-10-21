@@ -125,12 +125,7 @@ async fn ssh_server(dir: &std::path::Path, guest: &str, reverse: &str) -> (ssh::
     )
 }
 fn purposes() -> Vec<Purpose> {
-    vec![
-        Purpose::Control,
-        Purpose::Router,
-        Purpose::CleatAttach { session: "crew/α".into() },
-        Purpose::PortForward { host: "::1".into(), port: 65535 },
-    ]
+    vec![Purpose::Control, Purpose::Forward { id: "crew/α".into() }, Purpose::Forward { id: "service".into() }]
 }
 async fn transfer(from: &Transport, to: &mut Transport, purpose: Purpose, payload: &[u8]) {
     let mut outgoing = from.open(purpose.clone()).await.unwrap();
@@ -164,7 +159,7 @@ async fn routing_contract(kind: Kind) {
 async fn isolation_contract(kind: Kind) {
     for reverse in [false, true] {
         let mut p = pair(kind).await;
-        let purpose = Purpose::CleatAttach { session: "slow".into() };
+        let purpose = Purpose::Forward { id: "slow".into() };
         let mut raw = if reverse { p.guest.open(purpose).await.unwrap() } else { p.host.open(purpose).await.unwrap() };
         let _unread = if reverse { p.host.accept().await.unwrap().unwrap() } else { p.guest.accept().await.unwrap().unwrap() };
         let writer = tokio::spawn(async move { raw.write_all(&vec![7; 16 * 1024 * 1024]).await });
@@ -172,7 +167,7 @@ async fn isolation_contract(kind: Kind) {
         assert!(!writer.is_finished(), "fixture must actually backpressure the raw stream");
         let host_opener = p.host.opener.clone();
         let guest_opener = p.guest.opener.clone();
-        for (from, to, purpose) in [(host_opener, &mut p.guest, Purpose::Control), (guest_opener, &mut p.host, Purpose::Router)] {
+        for (from, to, purpose) in [(host_opener, &mut p.guest, Purpose::Control), (guest_opener, &mut p.host, Purpose::Control)] {
             let (client, driver) = http2::connect(&from, purpose).await.unwrap();
             let incoming = to.accept().await.unwrap().unwrap();
             let server = tokio::spawn(http2::serve(incoming, Router::new().route("/hello", get(|| async { "hello" }))));
@@ -223,7 +218,7 @@ fn generated_bidirectional_routes(tc: hegel::TestCase) {
         .map(|_| {
             (
                 tc.draw(gs::booleans()),
-                tc.draw(gs::integers::<usize>().min_value(0).max_value(3)),
+                tc.draw(gs::integers::<usize>().min_value(0).max_value(purposes().len() - 1)),
                 tc.draw(gs::integers::<usize>().min_value(0).max_value(4096)),
             )
         })
@@ -261,7 +256,7 @@ async fn native_partial_header_and_cancelled_accept() {
     let error = p.guest.accept().await.err().unwrap();
     assert_eq!(error.scope, drydock_transport::ErrorScope::Connection);
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    transfer(&p.host, &mut p.guest, Purpose::Router, b"still healthy").await;
+    transfer(&p.host, &mut p.guest, Purpose::Control, b"still healthy").await;
 }
 
 // Every native kind can carry the yamux fallback, using the same connection
@@ -287,7 +282,7 @@ async fn concurrent_contract(kind: Kind) {
             for i in 0..16u8 {
                 let opener = opener.clone();
                 writers.spawn(async move {
-                    let mut stream = opener.open(Purpose::PortForward { host: "localhost".into(), port: 1000 + i as u16 }).await.unwrap();
+                    let mut stream = opener.open(Purpose::Forward { id: format!("service-{i}") }).await.unwrap();
                     stream.write_all(&[i]).await.unwrap();
                     stream.shutdown().await.unwrap();
                 });
@@ -304,7 +299,7 @@ async fn concurrent_contract(kind: Kind) {
             let mut bytes = Vec::new();
             incoming.stream.read_to_end(&mut bytes).await.unwrap();
             assert_eq!(bytes.len(), 1);
-            assert_eq!(incoming.purpose, Purpose::PortForward { host: "localhost".into(), port: 1000 + bytes[0] as u16 });
+            assert_eq!(incoming.purpose, Purpose::Forward { id: format!("service-{}", bytes[0]) });
             seen.push(bytes[0]);
         }
         seen.sort();
@@ -463,8 +458,8 @@ async fn established_yamux_sessions_release_header_slots() {
             sessions.push(mux);
         }
         let mut raw = UnixStream::connect(&path).await.unwrap();
-        raw.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
+        raw.write_all(b"DDT\x01\x00\x00").await.unwrap();
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
     })
     .await
     .expect("live mux sessions must not consume unfinished-header slots");
@@ -564,8 +559,8 @@ async fn fallback_session_limit_preserves_native_accepts() {
         let _excess = Transport::yamux(Box::new(UnixStream::connect(&path).await.unwrap()), true, Limits::default()).await.unwrap();
         assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Connection);
         let mut raw = UnixStream::connect(&path).await.unwrap();
-        raw.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
+        raw.write_all(b"DDT\x01\x00\x00").await.unwrap();
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
         let _stream = first.open(Purpose::Control).await.unwrap();
         assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
     })
@@ -611,8 +606,8 @@ async fn full_queue_does_not_block_transient_accept_recovery() {
         assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
         let (mut next, accepted) = tokio::io::duplex(32);
         send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream)).await.ok().unwrap();
-        next.write_all(b"DDT\x01\x00\x01").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Router);
+        next.write_all(b"DDT\x01\x00\x00").await.unwrap();
+        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
     })
     .await
     .expect("a dropped transient notice must not stall a full incoming queue");

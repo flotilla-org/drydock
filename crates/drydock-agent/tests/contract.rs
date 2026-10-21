@@ -113,8 +113,13 @@ async fn control_contract_on_both_transports() {
         }
         running.store(false, std::sync::atomic::Ordering::Relaxed);
         reader.await.unwrap();
-        assert!(h.client.read(h.dir.path().join("absent")).await.is_err());
-        assert!(h.client.exec(Exec { program: "/no/such/program".into(), args: vec![], cwd: None }).await.is_err());
+        assert_error(h.client.read(h.dir.path().join("absent")).await.unwrap_err(), std::io::ErrorKind::NotFound, "file.read", "absent");
+        assert_error(
+            h.client.exec(Exec { program: "/no/such/program".into(), args: vec![], cwd: None }).await.err().unwrap(),
+            std::io::ErrorKind::NotFound,
+            "exec.spawn",
+            "/no/such/program",
+        );
     }
 }
 async fn echo(listener: UnixListener) {
@@ -158,12 +163,17 @@ async fn forwards_are_transparent_and_dynamic() {
         let task2 = tokio::spawn(echo(UnixListener::bind(&endpoint2).unwrap()));
         let guest = forward(&h, "reverse");
         h.client.add_guest_forward(guest.clone(), Endpoint::Unix(endpoint2)).await.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&guest.unix).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(h.dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
         let mut reverse: ByteStream = Box::new(UnixStream::connect(&guest.unix).await.unwrap());
         for (index, bytes) in messages.iter().enumerate() {
             exchange(&mut active, bytes).await;
             exchange(&mut reverse, bytes).await;
             if index == 1 {
                 h.client.add_host_forward("transient".into(), Endpoint::Unix(path.clone())).await.unwrap();
+                let mut added = h.client.forward("transient").await.unwrap();
+                exchange(&mut added, b"added during live traffic").await;
             }
             if index == 2 {
                 h.client.remove_host_forward("transient").await.unwrap();
@@ -172,9 +182,8 @@ async fn forwards_are_transparent_and_dynamic() {
         h.client.remove_guest_forward("reverse").await.unwrap();
         assert!(!guest.unix.exists());
         h.client.remove_host_forward("active").await.unwrap();
-        let mut removed = h.client.forward("active").await.unwrap();
-        let mut byte = [0];
-        assert_eq!(tokio::time::timeout(Duration::from_secs(2), removed.read(&mut byte)).await.unwrap().unwrap(), 0);
+        let error = h.client.forward("active").await.err().unwrap();
+        assert_error(error, std::io::ErrorKind::NotFound, "forward.open", "active");
         task.abort();
         task2.abort();
     }
@@ -189,17 +198,22 @@ async fn isolation_and_endpoint_ownership() {
     let endpoint = a.dir.path().join("endpoint");
     let listener = UnixListener::bind(&endpoint).unwrap();
     a.client.add_guest_forward(forward(&a, "private"), Endpoint::Unix(endpoint.clone())).await.unwrap();
-    assert!(b.client.add_guest_forward(forward(&b, "private"), Endpoint::Unix(endpoint.clone())).await.is_err());
+    assert_refused(b.client.add_guest_forward(forward(&b, "private"), Endpoint::Unix(endpoint.clone())).await);
     let alias = b.dir.path().join("alias");
     std::os::unix::fs::symlink(&endpoint, &alias).unwrap();
-    assert!(b.client.register_host_endpoint("alias".into(), Endpoint::Unix(alias)).is_err());
+    assert_refused(b.client.register_host_endpoint("alias".into(), Endpoint::Unix(alias)));
     let hardlink = b.dir.path().join("hardlink");
     std::fs::hard_link(&endpoint, &hardlink).unwrap();
-    assert!(b.client.register_host_endpoint("hardlink".into(), Endpoint::Unix(hardlink)).is_err());
+    assert_refused(b.client.register_host_endpoint("hardlink".into(), Endpoint::Unix(hardlink)));
     for id in ["private".to_owned(), endpoint.display().to_string()] {
         let mut attack = b.guest_opener.open(Purpose::Forward { id }).await.unwrap();
-        let mut byte = [0];
-        assert_eq!(tokio::time::timeout(Duration::from_secs(2), attack.read(&mut byte)).await.unwrap().unwrap(), 0);
+        let length = attack.read_u32().await.unwrap();
+        let mut bytes = vec![0; length as usize];
+        attack.read_exact(&mut bytes).await.unwrap();
+        let result: Result<(), drydock_agent::AgentError> = serde_json::from_slice(&bytes).unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, drydock_agent::ErrorKind::NotFound);
+        assert_eq!(error.operation, "forward.open");
     }
     assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
     let mut legitimate = UnixStream::connect(a.dir.path().join("private")).await.unwrap();
@@ -212,7 +226,7 @@ async fn isolation_and_endpoint_ownership() {
     // claim it under the new socket inode while the first route still exists.
     std::fs::remove_file(&endpoint).unwrap();
     let _replacement = UnixListener::bind(&endpoint).unwrap();
-    assert!(b.client.register_host_endpoint("rebound".into(), Endpoint::Unix(endpoint.clone())).is_err());
+    assert_refused(b.client.register_host_endpoint("rebound".into(), Endpoint::Unix(endpoint.clone())));
 }
 // Generated configuration sequences cover empty/duplicate/invalid and boundary
 // IDs. Each accepted state replaces the old one; refusals preserve it atomically.
@@ -223,6 +237,12 @@ fn configuration_sequences(tc: hegel::TestCase) {
     let ops: Vec<u8> = (0..steps).map(|_| tc.draw(gs::integers::<u8>().min_value(0).max_value(7))).collect();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let h = harness(false, "test-build").await;
+        let mut endpoints = vec![];
+        for (index, id) in ["x".into(), "x".repeat(1024), "duplicate".into(), "invalid-tcp".into()].into_iter().enumerate() {
+            let path = h.dir.path().join(format!("registered-{index}"));
+            endpoints.push(UnixListener::bind(&path).unwrap());
+            h.client.register_host_endpoint(id, Endpoint::Unix(path)).unwrap();
+        }
         let mut previous = Configuration::default();
         for op in ops {
             let mut config = Configuration { ca: op.to_string(), ..Configuration::default() };
@@ -284,7 +304,7 @@ async fn configured_forwards_and_tcp_endpoints() {
         h.client.register_host_endpoint("configured".into(), Endpoint::Tcp(endpoint)).unwrap();
         let other = harness(unix, "test-build").await;
         let alias = std::net::SocketAddr::from(([127, 0, 0, 2], endpoint.port()));
-        assert!(other.client.register_host_endpoint("alias".into(), Endpoint::Tcp(alias)).is_err());
+        assert_refused(other.client.register_host_endpoint("alias".into(), Endpoint::Tcp(alias)));
         let port_reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = port_reservation.local_addr().unwrap();
         drop(port_reservation);
@@ -306,7 +326,10 @@ async fn configured_forwards_and_tcp_endpoints() {
             forwards: vec![f.clone(), GuestForward { id: "bad".into(), unix: occupied.clone(), tcp: None }],
             ..Configuration::default()
         };
-        assert!(h.client.configure(bad).await.is_err());
+        let bad_endpoint = h.dir.path().join("bad-endpoint");
+        let _bad_listener = UnixListener::bind(&bad_endpoint).unwrap();
+        h.client.register_host_endpoint("bad".into(), Endpoint::Unix(bad_endpoint)).unwrap();
+        assert_error(h.client.configure(bad).await.unwrap_err(), std::io::ErrorKind::AddrInUse, "forward.listen", "occupied");
         assert_eq!(h.client.configuration().await.unwrap(), config);
         assert_eq!(std::fs::read(occupied).unwrap(), b"do not replace");
         exchange(&mut socket, b"survived failed config").await;
@@ -325,10 +348,10 @@ async fn configured_forwards_and_tcp_endpoints() {
     }
 }
 
-// A new host control session must redirect an unchanged guest listener to the
-// new per-vessel registry, rather than retaining the disconnected session.
+// A later control connection cannot take over the first controller's reverse
+// opener, even when it registers the same ID and repeats the configuration.
 #[tokio::test]
-async fn unchanged_forward_uses_reconnected_host() {
+async fn later_control_cannot_replace_reverse_opener() {
     async fn pair() -> (Transport, Transport) {
         let (a, b) = tokio::io::duplex(4096);
         let (a, b) =
@@ -347,16 +370,15 @@ async fn unchanged_forward_uses_reconnected_host() {
     let f = GuestForward { id: "same".into(), unix: dir.path().join("forward"), tcp: None };
     first.add_guest_forward(f.clone(), Endpoint::Unix(target1)).await.unwrap();
     let config = first.configuration().await.unwrap();
-    drop(first);
-    drop(listener1);
     let second = Client::connect(host2, "test-build").await.unwrap();
     let target2 = dir.path().join("target2");
     let listener2 = UnixListener::bind(&target2).unwrap();
     second.register_host_endpoint("same".into(), Endpoint::Unix(target2)).unwrap();
     second.configure(config).await.unwrap();
-    let echo_task = tokio::spawn(echo(listener2));
+    let echo_task = tokio::spawn(echo(listener1));
     let mut guest: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
-    exchange(&mut guest, b"new host session").await;
+    exchange(&mut guest, b"original host session").await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), listener2.accept()).await.is_err());
     task.abort();
     echo_task.abort();
 }
@@ -378,10 +400,10 @@ async fn file_modes_and_bounded_read_errors() {
     assert_eq!((after.mode() & 0o777, after.uid(), after.gid()), (0o640, before.uid(), before.gid()));
     h.client.write(path.clone(), vec![], true).await.unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
-    assert!(h.client.read(h.dir.path().join("absent")).await.unwrap_err().to_string().contains("404"));
+    assert!(h.client.read(h.dir.path().join("absent")).await.unwrap_err().to_string().contains("NotFound"));
     let large = h.dir.path().join("large");
     std::fs::File::create(&large).unwrap().set_len(128 * 1024 * 1024 + 1).unwrap();
-    assert!(h.client.read(large).await.unwrap_err().to_string().contains("413"));
+    assert!(h.client.read(large).await.unwrap_err().to_string().contains("read exceeds 128 MiB"));
 }
 
 // Changing only TCP preserves the Unix socket binding. Removing and adding the
@@ -479,7 +501,7 @@ async fn occupied_port_swap_refuses_without_changing_configuration() {
     let mut changed = before.clone();
     changed.forwards[0].tcp = forwards[1].tcp;
     changed.forwards[1].tcp = forwards[0].tcp;
-    assert!(h.client.configure(changed).await.is_err());
+    assert_error(h.client.configure(changed).await.unwrap_err(), std::io::ErrorKind::AddrInUse, "forward.listen", "port-a");
     assert_eq!(h.client.configuration().await.unwrap(), before);
     for f in forwards {
         let mut stream: ByteStream = Box::new(tokio::net::TcpStream::connect(f.tcp.unwrap()).await.unwrap());
@@ -501,7 +523,7 @@ async fn forward_targets_reject_zero_ports_and_allow_late_socket_creation() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("400")
+            .contains("InvalidInput")
     );
     let target = h.dir.path().join("later");
     h.client.add_host_forward("later".into(), Endpoint::Unix(target.clone())).await.unwrap();
@@ -509,4 +531,134 @@ async fn forward_targets_reject_zero_ports_and_allow_late_socket_creation() {
     let mut stream = h.client.forward("later").await.unwrap();
     exchange(&mut stream, b"late service").await;
     task.abort();
+}
+
+fn assert_error(error: std::io::Error, kind: std::io::ErrorKind, operation: &str, subject: &str) {
+    assert_eq!(error.kind(), kind, "{error}");
+    let detail = error.get_ref().unwrap().downcast_ref::<drydock_agent::AgentError>().expect("structured agent error");
+    assert_eq!(detail.operation, operation);
+    assert!(detail.subject.contains(subject), "{detail:?}");
+    assert!(!detail.message.is_empty());
+}
+// Errors cross both real control transports with the original kind and enough
+// context to distinguish missing programs, cwd, file operations and forwards.
+#[tokio::test]
+async fn errors_name_the_failed_operation_and_subject() {
+    use std::io::ErrorKind;
+    for unix in [false, true] {
+        let h = harness(unix, "test-build").await;
+        let path = h.dir.path().join("absent");
+        assert_error(h.client.read(path.clone()).await.unwrap_err(), ErrorKind::NotFound, "file.read", "absent");
+        assert_error(h.client.flush(path.clone()).await.unwrap_err(), ErrorKind::NotFound, "file.flush", "absent");
+        assert_error(
+            h.client.exec(Exec { program: "/missing-program".into(), args: vec![], cwd: None }).await.err().unwrap(),
+            ErrorKind::NotFound,
+            "exec.spawn",
+            "/missing-program",
+        );
+        assert_error(
+            h.client.exec(Exec { program: "/bin/true".into(), args: vec![], cwd: Some(path.clone()) }).await.err().unwrap(),
+            ErrorKind::NotFound,
+            "exec.cwd",
+            "absent",
+        );
+        let relative = PathBuf::from("relative");
+        assert_error(
+            h.client.write(relative.clone(), vec![1], false).await.unwrap_err(),
+            ErrorKind::InvalidInput,
+            "file.write",
+            "relative",
+        );
+        assert_error(h.client.read(relative.clone()).await.unwrap_err(), ErrorKind::InvalidInput, "file.read", "relative");
+        assert_error(h.client.flush(relative).await.unwrap_err(), ErrorKind::InvalidInput, "file.flush", "relative");
+        h.client.add_host_forward("dead".into(), Endpoint::Unix(path)).await.unwrap();
+        assert_error(h.client.forward("dead").await.err().unwrap(), ErrorKind::NotFound, "forward.open", "absent");
+        let refused = h.dir.path().join("refused");
+        drop(UnixListener::bind(&refused).unwrap());
+        h.client.add_host_forward("refused".into(), Endpoint::Unix(refused)).await.unwrap();
+        assert_error(h.client.forward("refused").await.err().unwrap(), ErrorKind::ConnectionRefused, "forward.open", "refused");
+        assert_error(h.client.forward("unknown").await.err().unwrap(), ErrorKind::NotFound, "forward.open", "unknown");
+        assert_error(h.client.remove_host_forward("unknown").await.unwrap_err(), ErrorKind::NotFound, "forward.remove", "unknown");
+        assert_error(h.client.remove_guest_forward("unknown").await.unwrap_err(), ErrorKind::NotFound, "forward.remove", "unknown");
+        let config = Configuration { forwards: vec![forward(&h, "unregistered")], ..Configuration::default() };
+        assert_error(h.client.configure(config).await.unwrap_err(), ErrorKind::NotFound, "configure", "unregistered");
+        assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
+        assert!(!h.dir.path().join("unregistered").exists());
+    }
+}
+// Removal closes a live host-to-guest bridge before returning, while another
+// route remains usable. Guest listener removal already has the same contract.
+#[tokio::test]
+async fn removing_host_forward_closes_its_live_streams() {
+    for unix in [false, true] {
+        let h = harness(unix, "test-build").await;
+        let path = h.dir.path().join("target");
+        let task = tokio::spawn(echo(UnixListener::bind(&path).unwrap()));
+        for id in ["remove", "keep"] {
+            h.client.add_host_forward(id.into(), Endpoint::Unix(path.clone())).await.unwrap();
+        }
+        let mut removed = h.client.forward("remove").await.unwrap();
+        let mut kept = h.client.forward("keep").await.unwrap();
+        exchange(&mut removed, b"live").await;
+        h.client.remove_host_forward("remove").await.unwrap();
+        let mut byte = [0];
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), removed.read(&mut byte)).await.unwrap().unwrap(), 0);
+        exchange(&mut kept, b"still live").await;
+        task.abort();
+    }
+}
+// For each forward direction, each endpoint can half-close independently:
+// request EOF leaves replies writable, and reply EOF leaves requests writable.
+#[tokio::test]
+async fn forward_eof_propagates_in_each_direction() {
+    for unix in [false, true] {
+        for reverse in [false, true] {
+            for server_first in [false, true] {
+                let h = harness(unix, "test-build").await;
+                let path = h.dir.path().join("endpoint");
+                let listener = UnixListener::bind(&path).unwrap();
+                if reverse {
+                    h.client.add_guest_forward(forward(&h, "eof"), Endpoint::Unix(path)).await.unwrap();
+                } else {
+                    h.client.add_host_forward("eof".into(), Endpoint::Unix(path)).await.unwrap();
+                }
+                let endpoint = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    if server_first {
+                        stream.write_all(b"reply").await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                    let mut bytes = vec![];
+                    stream.read_to_end(&mut bytes).await.unwrap();
+                    assert_eq!(bytes, b"request");
+                    if !server_first {
+                        stream.write_all(b"reply").await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                });
+                let mut stream: ByteStream = if reverse {
+                    Box::new(UnixStream::connect(h.dir.path().join("eof")).await.unwrap())
+                } else {
+                    h.client.forward("eof").await.unwrap()
+                };
+                let mut bytes = vec![];
+                if server_first {
+                    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes)).await.unwrap().unwrap();
+                }
+                stream.write_all(b"request").await.unwrap();
+                stream.shutdown().await.unwrap();
+                if !server_first {
+                    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes)).await.unwrap().unwrap();
+                }
+                assert_eq!(bytes, b"reply");
+                tokio::time::timeout(Duration::from_secs(2), endpoint).await.unwrap().unwrap();
+            }
+        }
+    }
+}
+
+fn assert_refused(result: std::io::Result<()>) {
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(error.to_string().contains("host endpoint already serves a vessel"), "{error}");
 }

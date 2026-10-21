@@ -1,8 +1,13 @@
 //! Drydock's vessel control API and host client. The transport is the trust boundary:
 //! only its host-facing side may serve control; guest forwards carry opaque IDs.
 mod client;
+mod error;
 mod exec;
+mod forward;
+pub use error::{AgentError, ErrorKind};
 mod server;
+pub mod socket;
+pub mod upgrade;
 pub use client::{Client, ExecOutput};
 use drydock_transport::ByteStream;
 use serde::{Deserialize, Serialize};
