@@ -95,8 +95,10 @@ struct Authentication {
     credentials: Credentials,
     generation: u64,
     rejected: bool,
+    rejection_error: Option<ProtocolError>,
 }
 struct Instance {
+    diagnostic_secrets: Arc<Mutex<Vec<Secret>>>,
     config: ProviderConfiguration,
     provider: Arc<dyn Provider>,
     // Synchronous metadata access only; never hold this guard across await.
@@ -211,9 +213,12 @@ impl Instance {
         let module_ready = matches!(module, Readiness::Ready);
         if auth.rejected {
             match auth.credentials.mode {
-                CredentialMode::Direct { .. } => {
-                    Availability { readiness: Readiness::MissingCredential { reason: "credential rejected".into() }, may_call: false }
-                }
+                CredentialMode::Direct { .. } => Availability {
+                    readiness: Readiness::MissingCredential {
+                        reason: auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into()),
+                    },
+                    may_call: false,
+                },
                 CredentialMode::Proxied { .. } if module_ready => Availability {
                     readiness: Readiness::Unknown { reason: "proxy credential rejected; awaiting successful probe".into() },
                     may_call: true,
@@ -267,7 +272,10 @@ impl Instance {
             // A pending observation reservation can safely survive unready time:
             // no route can resume while polling remains disabled by readiness.
             if !self.availability(&auth).may_call {
-                return Err(ProtocolError::unavailable("provider is not ready; inspect hello", None));
+                return Err(ProtocolError::unavailable(
+                    auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "provider is not ready; inspect hello".into()),
+                    None,
+                ));
             }
             (auth.credentials.clone(), auth.generation)
         };
@@ -275,9 +283,9 @@ impl Instance {
             return Err(refused("operation capability not declared"));
         }
         self.reserve(gate.name(), poll)?;
-        let result = f(self.provider.clone(), credentials).await;
+        let result = f(self.provider.clone(), credentials).await.map_err(|error| self.diagnostic_error(error, gate.name()));
         if let Err(error) = &result {
-            tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), "provider call failed");
+            tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
         }
         let mut auth = self.auth.recover();
         let before = self.readiness(&auth);
@@ -286,10 +294,12 @@ impl Instance {
                 *self.poll_error.recover() = result.as_ref().err().cloned();
             }
             if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
+                auth.rejection_error = result.as_ref().err().cloned();
                 auth.rejected = true;
                 auth.generation += 1; // invalidate every call started before this rejection
             } else if result.is_ok() && auth.rejected && matches!(auth.credentials.mode, CredentialMode::Proxied { .. }) {
                 auth.rejected = false;
+                auth.rejection_error = None;
                 auth.generation += 1; // only a probe started after rejection can repair it
             }
         }
@@ -298,6 +308,14 @@ impl Instance {
             tracing::info!(provider = %self.config.name, route = gate.name(), readiness = readiness_status(&after), "provider readiness changed");
         }
         result
+    }
+    fn diagnostic_error(&self, error: ProtocolError, operation: &str) -> ProtocolError {
+        // Retain previous generations too: an in-flight request or a vendor's
+        // delayed explanation can still echo an earlier credential.
+        let secrets = self.diagnostic_secrets.recover();
+        let mut values: Vec<&str> = secrets.iter().map(Secret::expose).collect();
+        values.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        error.diagnostic_context(&self.config.name, operation, &values)
     }
     fn longest_window(&self, operation: &str) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -365,6 +383,7 @@ struct Configuration {
 }
 #[derive(Clone)]
 pub struct Host {
+    diagnostic_secrets: Arc<Mutex<Vec<Secret>>>,
     registry: Arc<Registry>,
     config: Arc<RwLock<Configuration>>,
     configuring: Arc<AsyncMutex<()>>,
@@ -378,6 +397,7 @@ impl Host {
         let (changed, _) = watch::channel(0);
         Self {
             registry: Arc::new(registry),
+            diagnostic_secrets: Arc::default(),
             config: Arc::new(RwLock::new(Configuration::default())),
             configuring: Arc::new(AsyncMutex::new(())),
             events: EventLog {
@@ -725,6 +745,9 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         if matches!(&p.credential, CredentialMode::Proxied { placeholder_token, .. } if placeholder_token.expose().is_empty()) {
             return Err(refused("empty proxy placeholder token").into());
         }
+        if let CredentialMode::Proxied { placeholder_token, .. } = &p.credential {
+            host.diagnostic_secrets.recover().push(placeholder_token.clone());
+        }
         let credentials = Credentials::new(p.credential.clone());
         let proxy = match &p.credential {
             CredentialMode::Proxied { proxy_url, .. } => Some(proxy_url.as_str()),
@@ -761,8 +784,9 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
             p.name.clone(),
             Arc::new(Instance {
                 config: p.clone(),
+                diagnostic_secrets: host.diagnostic_secrets.clone(),
                 provider,
-                auth: Mutex::new(Authentication { credentials, rejected: false, generation: 0 }),
+                auth: Mutex::new(Authentication { credentials, rejected: false, rejection_error: None, generation: 0 }),
                 capabilities,
                 rate_limits,
                 events: sink,
@@ -816,9 +840,16 @@ async fn credential(
         return Err(refused("proxied provider cannot accept direct credentials").into());
     }
     let before = instance.readiness(&auth);
+    {
+        let mut secrets = host.diagnostic_secrets.recover();
+        if !secrets.contains(&refresh.value) {
+            secrets.push(refresh.value.clone());
+        }
+    }
     auth.credentials.value = Some(refresh.value);
     auth.generation += 1;
     auth.rejected = false;
+    auth.rejection_error = None;
     *instance.poll_error.recover() = None;
     instance.credential_changes.send_replace(auth.credentials.clone());
     let after = instance.readiness(&auth);

@@ -21,3 +21,5 @@ libc = "0.2"
 drydock-host = { path = "../drydock-host" }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "io-util", "test-util"] }
+axum = "0.8"
+rigging-replay-testkit.workspace = true

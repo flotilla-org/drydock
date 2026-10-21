@@ -120,9 +120,13 @@ validate their own resource bounds before vendor calls.
 
 `Secret` redacts Debug output, including nested credential and reach recipes,
 but deliberately serializes the original string for transport. Never log their
-serialized JSON. Raw `Internal.provider_error` and optional
-`Unavailable.provider_error` contain sensitive, untrusted vendor text: do not log
-them at info level or forward them to end users.
+serialized JSON. `Internal.provider_error` and optional
+`Unavailable.provider_error` carry provider explanations to the operator. The host
+masks configured credential values (including proxy placeholders) by content
+before returning errors or logging them at warn level. CLI errors include the
+provider, operation, category, reason, upstream HTTP status and provider message.
+A Daytona 401 rejects the key; a 403 is `Refused` for the named operation and
+leaves the provider ready. No additional permission error variant is needed.
 `provider_state_unknown` means the vendor returned an unrecognized state; it is
 an Unknown observation, not evidence that the environment stopped or disappeared.
 
@@ -233,8 +237,8 @@ independent and accepts 1–86400 seconds. For example, a cold start can use
 Startup includes host configuration/credential readiness; request deadlines cover
 buffered HTTP calls and upgrade setup. Record and transition deadlines bound
 observation waits, while headers and probes have their own deadlines. Failure
-details contain safe categories (`timeout`, `decode`, `transport`, or typed HTTP
-status/class), never vendor reasons or probe output.
+details include error categories, reasons and provider messages after host
+credential masking. Guest probe output and reach recipes remain redacted.
 
 `echo_relay` is only for fixtures whose relay is an echo server. Real agents have
 a protocol: provide `reach_probe: ["/absolute/path/to/round-trip-probe", ...]`.
@@ -319,3 +323,18 @@ SSH pins and corrupt relay bytes fail the exact reach verdict. The fixture
 protocol; production agents provide their own round-trip executable through
 `reach_probe`. Additional transport/probe fault coverage is listed in
 [`boundary-matrix.json`](crates/drydock-host/tests/fixtures/boundary-matrix.json).
+
+Daytona API key permissions for this module (see [Daytona API keys](https://www.daytona.io/docs/api-keys)):
+
+| Operation | Required scope |
+| --- | --- |
+| Prepare (create an image snapshot) | `write:snapshots` |
+| Launch, suspend, resume, export from a sandbox | `write:sandboxes` |
+| Destroy | `delete:sandboxes` |
+| List, inspect, poll, snapshot lookup | Read access is always granted |
+| Exec and bootstrap through toolbox | Valid organization key; no separate runtime scope |
+| Usage | `read:billing` or `write:sandboxes` |
+| Quota | `read:limits` |
+
+Organization membership must also match the key. Permission failures
+report the exact upstream operation and message; they do not invalidate the key.

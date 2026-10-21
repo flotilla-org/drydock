@@ -368,6 +368,7 @@ name = "drydock"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "clap",
  "drydock-client",
@@ -375,6 +376,7 @@ dependencies = [
  "drydock-protocol",
  "libc",
  "rigging-process",
+ "rigging-replay-testkit",
  "serde",
  "serde_json",
  "tempfile",

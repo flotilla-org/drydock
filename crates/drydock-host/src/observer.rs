@@ -38,7 +38,8 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 stopping: stopping.clone(),
             };
             if let Err(error) = instance.provider.run(context).await {
-                tracing::error!(provider = %instance.config.name, route = "observer", error_class = error.class(), "push observer stopped");
+                let error = instance.diagnostic_error(error, "observer");
+                tracing::warn!(provider = %instance.config.name, route = "observer", error_class = error.class(), error = %error, "push observer stopped");
             }
             return;
         };
@@ -58,13 +59,16 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             let Some(instance) = weak.upgrade() else {
                 break;
             };
+            if !instance.availability(&instance.auth.recover()).may_call {
+                continue;
+            }
             let generation = instance.auth.recover().generation;
             let observation_generation = *instance.observation_generation.recover();
             let rows = tokio::select! {
                 result = instance.call_with_budget(Gate::List, true, |p,c| async move { p.list(&c).await }) => match result {
                     Ok(rows) => rows,
                     Err(error) => {
-                        tracing::warn!(provider = %instance.config.name, route = "poll", error_class = error.class(), "poll failed; retaining inventory");
+                        tracing::warn!(provider = %instance.config.name, route = "poll", error_class = error.class(), error = %error, "poll failed; retaining inventory");
                         let auth = instance.auth.recover();
                         if auth.generation == generation && !auth.rejected {
                             *instance.poll_error.recover() = Some(error);

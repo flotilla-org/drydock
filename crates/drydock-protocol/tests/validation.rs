@@ -65,7 +65,7 @@ fn every_route_carries_typed_error_statuses() {
         ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },
         ProtocolError::QuotaExhausted { reason: "r".into() },
         ProtocolError::CredentialRejected { reason: "r".into() },
-        ProtocolError::Internal { reason: "r".into(), provider_error: Secret::new("sensitive") },
+        ProtocolError::Internal { reason: "r".into(), provider_error: "sensitive".into() },
         ProtocolError::CommandFailed { reason: "r".into(), exit_code: 7, output: Secret::new("sensitive") },
     ];
     assert_eq!(errors.iter().map(ProtocolError::status).collect::<Vec<_>>(), [404, 405, 422, 503, 429, 402, 502, 500, 424]);
@@ -105,8 +105,8 @@ fn instants_and_shared_constraints() {
     assert_eq!(schemas["PrepareRequest"]["properties"]["image_digest"]["minLength"], 1);
     assert_eq!(schemas["ExecRequest"]["properties"]["command"]["prefixItems"][0]["minLength"], 1);
     assert_eq!(schemas["ExecRequest"]["properties"]["command"]["minItems"], 1);
-    let error = ProtocolError::Internal { reason: "safe".into(), provider_error: Secret::new("sensitive-value") };
-    assert!(!format!("{error:?}").contains("sensitive-value"));
+    let error = ProtocolError::Internal { reason: "safe".into(), provider_error: "sensitive-value".into() };
+    assert!(format!("{error:?}").contains("sensitive-value"));
     assert_eq!(serde_json::to_value(error).unwrap()["provider_error"], "sensitive-value");
 }
 

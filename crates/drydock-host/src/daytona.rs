@@ -119,6 +119,7 @@ impl Daytona {
         response_format: ResponseFormat,
     ) -> Result<Option<Value>> {
         let token = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "Daytona API key not delivered".into() })?;
+        let operation = format!("{method} {}", url.path());
         let mut request = reqwest::Request::new(method, url);
         let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| refused("invalid Daytona API key header"))?;
@@ -129,7 +130,7 @@ impl Daytona {
             *request.body_mut() = Some(body.to_string().into());
         }
         let response = rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Unavailable {
-            provider_error: Some(Secret::new(bounded(error.as_bytes()))),
+            provider_error: Some(bounded(error.as_bytes())),
             reason: "Daytona transport failed".into(),
             retry_after: None,
         })?;
@@ -140,16 +141,18 @@ impl Daytona {
         }
         let raw = bounded(response.body());
         if !(200..300).contains(&status) {
-            // Reasons remain generic; bounded vendor text travels only inside Secret.
+            // Keep upstream status and explanation for every category.
             // No SDK retry is involved.
+            let reason = format!("Daytona {operation} HTTP {status}: {raw}");
             return Err(match status {
-                401 | 403 => ProtocolError::CredentialRejected { reason: "Daytona rejected the credential or account permission".into() },
-                404 => ProtocolError::NotFound { reason: "Daytona resource not found".into() },
-                402 => ProtocolError::QuotaExhausted { reason: "Daytona quota exhausted".into() },
-                429 => ProtocolError::RateLimited { reason: "Daytona organization rate limit".into(), retry_after },
-                408 => ProtocolError::unavailable("Daytona command or request timed out", None),
-                500..=599 => ProtocolError::unavailable("Daytona API unavailable", retry_after),
-                _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: Secret::new(raw) },
+                401 => ProtocolError::CredentialRejected { reason: reason.clone() },
+                403 => ProtocolError::Refused { reason: format!("permission denied for {operation}; {reason}") },
+                404 => ProtocolError::NotFound { reason: reason.clone() },
+                402 => ProtocolError::QuotaExhausted { reason: reason.clone() },
+                429 => ProtocolError::RateLimited { reason: reason.clone(), retry_after },
+                408 => ProtocolError::unavailable(reason.clone(), None),
+                500..=599 => ProtocolError::unavailable(reason.clone(), retry_after),
+                _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: raw },
             });
         }
         if response.body().is_empty() {
@@ -160,7 +163,7 @@ impl Daytona {
         }
         serde_json::from_slice(response.body())
             .map(Some)
-            .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona response".into(), provider_error: Secret::new(raw) })
+            .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona response".into(), provider_error: raw })
     }
     async fn inventory(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Value>> {
         let mut rows = Vec::new();
@@ -270,7 +273,7 @@ impl Daytona {
             let output = self.execute(&row.environment.id, &command, 20, c).await?;
             let proof: Value = serde_json::from_str(&output).map_err(|_| ProtocolError::Internal {
                 reason: "invalid Daytona egress probe response".into(),
-                provider_error: Secret::new(bounded(output.as_bytes())),
+                provider_error: bounded(output.as_bytes()),
             })?;
             if proof["uid"].as_u64().is_none()
                 || proof["unlisted_canary"].as_bool().is_none()
@@ -279,7 +282,7 @@ impl Daytona {
             {
                 return Err(ProtocolError::Internal {
                     reason: "incomplete Daytona egress proof".into(),
-                    provider_error: Secret::new(bounded(output.as_bytes())),
+                    provider_error: bounded(output.as_bytes()),
                 });
             }
             if proof["uid"] == 0
@@ -373,10 +376,7 @@ impl Daytona {
 }
 const GIB: u64 = 1 << 30;
 fn bad_value(value: &Value) -> ProtocolError {
-    ProtocolError::Internal {
-        reason: "incomplete Daytona response".into(),
-        provider_error: Secret::new(bounded(value.to_string().as_bytes())),
-    }
+    ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: bounded(value.to_string().as_bytes()) }
 }
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
@@ -393,10 +393,7 @@ fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     Ok(url)
 }
 fn bad_response() -> ProtocolError {
-    ProtocolError::Internal {
-        reason: "incomplete Daytona response".into(),
-        provider_error: Secret::new("required field missing or invalid"),
-    }
+    ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: "required field missing or invalid".into() }
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| bad_value(v))
@@ -876,14 +873,14 @@ fn shell_command(command: &[String]) -> String {
 // Keeping raw_value local avoids changing serde's flattened event decoding.
 fn parse_analytics(bytes: &[u8]) -> Result<Value> {
     let fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> = serde_json::from_slice(bytes)
-        .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona analytics".into(), provider_error: Secret::new(bounded(bytes)) })?;
+        .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona analytics".into(), provider_error: bounded(bytes) })?;
     let mut result = serde_json::Map::new();
     for (key, value) in fields {
         let parsed = if key == "totalPrice" {
-            Value::String(decimal_lexeme(value.get()).ok_or_else(|| ProtocolError::Internal {
-                reason: "invalid Daytona price".into(),
-                provider_error: Secret::new(bounded(bytes)),
-            })?)
+            Value::String(
+                decimal_lexeme(value.get())
+                    .ok_or_else(|| ProtocolError::Internal { reason: "invalid Daytona price".into(), provider_error: bounded(bytes) })?,
+            )
         } else {
             serde_json::from_str(value.get()).map_err(|_| bad_response())?
         };

@@ -168,7 +168,7 @@ trait SafeError {
 impl SafeError for Error {
     fn category(self) -> String {
         match self {
-            Error::Protocol(error) => format!("http {} {}", error.status(), error.class()),
+            Error::Protocol(error) => format!("http {} {}", error.status(), error),
             Error::InvalidResponse => "decode".into(),
             Error::Transport => "transport".into(),
             Error::InvalidRequest => "invalid request".into(),
@@ -1193,16 +1193,19 @@ async fn semantic_requests(client: &Client, provider: &str, options: &Options, o
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Operator diagnostics identify failure classes but never include vendor
-    // reasons, raw errors or readiness text, which may contain credentials.
+    // Conformance reports preserve the host-masked provider reasons and details;
+    // low-level decode/IO failures retain their stable categories.
     #[test]
-    fn safe_diagnostic_categories() {
-        let secret = "must-never-appear";
+    fn diagnostic_categories_and_provider_messages() {
+        let secret = "vendor explanation";
         let errors = [
             (Error::InvalidResponse, "decode"),
             (Error::Transport, "transport"),
-            (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused"),
-            (Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: Secret::new(secret) }), "http 500 internal"),
+            (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused: vendor explanation"),
+            (
+                Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: secret.into() }),
+                "http 500 internal: vendor explanation; vendor explanation",
+            ),
             (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready"),
         ];
         for (error, expected) in errors {

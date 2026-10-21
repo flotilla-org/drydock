@@ -633,3 +633,16 @@ async fn reference_preparation_ignores_size() {
     let row = host.client.provision("a", &provision).await.unwrap();
     assert_eq!(row.granted_size, Some(preparation.size));
 }
+
+// Glue: the CLI uses the client's Display; provider diagnostics must survive it.
+#[test]
+fn operator_error_includes_provider_diagnostic() {
+    let error = Error::Protocol(ProtocolError::Internal {
+        reason: "provider daytona operation provision HTTP 400".into(),
+        provider_error: "Cannot specify Sandbox resources when using a snapshot".into(),
+    });
+    let text = error.to_string();
+    for expected in ["internal", "daytona", "provision", "400", "Cannot specify Sandbox resources"] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+}

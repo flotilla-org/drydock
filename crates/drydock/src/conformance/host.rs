@@ -110,7 +110,7 @@ fn error_cases() -> Vec<ProtocolError> {
         ProtocolError::RateLimited { reason: "fixture".into(), retry_after: Some(7) },
         ProtocolError::QuotaExhausted { reason: "fixture".into() },
         ProtocolError::CredentialRejected { reason: "fixture".into() },
-        ProtocolError::Internal { reason: "fixture".into(), provider_error: Secret::new("vendor raw") },
+        ProtocolError::Internal { reason: "fixture".into(), provider_error: "vendor raw".into() },
         ProtocolError::NotFound { reason: "fixture".into() },
         ProtocolError::MethodNotAllowed { reason: "fixture".into() },
     ]
@@ -154,7 +154,12 @@ pub async fn error_contract(client: &Client, base: &HostConfiguration, report: &
                     .map_err(SafeError::category)?;
                 require(response.status == error.status(), "wrong typed error HTTP status")?;
                 let actual: ProtocolError = serde_json::from_value(response.body).map_err(SafeError::category)?;
-                require(actual == error, "typed error fields lost")?;
+                let mut actual_fields = serde_json::to_value(&actual).map_err(SafeError::category)?;
+                let expected_fields = serde_json::to_value(&error).map_err(SafeError::category)?;
+                let reason = actual_fields["reason"].as_str().unwrap_or_default();
+                require(reason.ends_with(expected_fields["reason"].as_str().unwrap_or_default()), "typed error reason lost")?;
+                actual_fields["reason"] = expected_fields["reason"].clone();
+                require(actual_fields == expected_fields, "typed error fields lost")?;
                 if let Some(retry) = error.retry_after() {
                     require(
                         response.headers.get("retry-after").and_then(|value| value.to_str().ok()) == Some(retry.to_string().as_str()),

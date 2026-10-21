@@ -549,9 +549,9 @@ pub enum ProtocolError {
     Unavailable {
         reason: String,
         retry_after: Option<u64>,
-        /// Optional bounded provider/transport detail; never include it in public logs.
+        /// Bounded provider/transport detail, masked for credentials by the host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_error: Option<Secret>,
+        provider_error: Option<String>,
     },
     RateLimited {
         reason: String,
@@ -572,8 +572,8 @@ pub enum ProtocolError {
     },
     Internal {
         reason: String,
-        /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
-        provider_error: Secret,
+        /// Provider explanation, masked for credentials before leaving the host.
+        provider_error: String,
     },
 }
 
@@ -628,5 +628,59 @@ impl ProtocolError {
             Self::Unavailable { retry_after, .. } | Self::RateLimited { retry_after, .. } => *retry_after,
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NotFound { reason }
+            | Self::MethodNotAllowed { reason }
+            | Self::Refused { reason }
+            | Self::Unavailable { reason, .. }
+            | Self::RateLimited { reason, .. }
+            | Self::QuotaExhausted { reason }
+            | Self::CredentialRejected { reason }
+            | Self::CommandFailed { reason, .. }
+            | Self::Internal { reason, .. } => reason,
+        };
+        write!(f, "{}: {}", self.class(), reason)?;
+        match self {
+            Self::Internal { provider_error, .. } => write!(f, "; {provider_error}"),
+            Self::Unavailable { provider_error: Some(detail), .. } => write!(f, "; {detail}"),
+            _ => Ok(()),
+        }
+    }
+}
+impl ProtocolError {
+    /// Mask credential substrings in every diagnostic field and attach call context.
+    /// Secret-bearing command output remains redacted in Display and Debug.
+    pub fn diagnostic_context(mut self, provider: &str, operation: &str, secrets: &[&str]) -> Self {
+        fn mask(text: &str, secrets: &[&str]) -> String {
+            let mut text = text.to_owned();
+            for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                text = text.replace(secret, "<REDACTED>");
+            }
+            text
+        }
+        let reason = match &mut self {
+            Self::NotFound { reason }
+            | Self::MethodNotAllowed { reason }
+            | Self::Refused { reason }
+            | Self::Unavailable { reason, .. }
+            | Self::RateLimited { reason, .. }
+            | Self::QuotaExhausted { reason }
+            | Self::CredentialRejected { reason }
+            | Self::CommandFailed { reason, .. }
+            | Self::Internal { reason, .. } => reason,
+        };
+        *reason = mask(&format!("provider {provider} operation {operation}: {reason}"), secrets);
+        match &mut self {
+            Self::Internal { provider_error, .. } => *provider_error = mask(provider_error, secrets),
+            Self::Unavailable { provider_error: Some(detail), .. } => *detail = mask(detail, secrets),
+            Self::CommandFailed { output, .. } => *output = Secret::new(mask(output.expose(), secrets)),
+            _ => {}
+        }
+        self
     }
 }

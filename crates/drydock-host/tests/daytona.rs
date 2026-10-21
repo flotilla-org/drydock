@@ -518,7 +518,7 @@ async fn vendor_errors() {
         (400, "internal"),
         (401, "credential_rejected"),
         (402, "quota_exhausted"),
-        (403, "credential_rejected"),
+        (403, "refused"),
         (404, "not_found"),
         (409, "internal"),
         (422, "internal"),
@@ -529,7 +529,8 @@ async fn vendor_errors() {
         let before = http.0.lock().unwrap().requests;
         let e = p.list(&c).await.unwrap_err();
         assert_eq!(e.class(), class);
-        assert!(!format!("{e:?}").contains("key-a"));
+        assert!(e.to_string().contains(&format!("HTTP {status}")));
+        assert!(e.to_string().contains("key-a must never be echoed"));
         if status == 429 {
             assert_eq!(e.retry_after(), Some(17));
         }
@@ -1140,17 +1141,17 @@ async fn standin_enforces_vendor_wire_contract() {
     assert!(matches!(p.list(&c).await, Err(ProtocolError::CredentialRejected { .. })));
 }
 
-// Unknown HTTP responses retain bounded sensitive vendor evidence. Debug output
-// must redact it, but the authenticated supervisor can inspect the Secret.
+// Unknown HTTP responses retain bounded vendor evidence. The host masks
+// configured credentials before displaying or returning these diagnostics.
 #[tokio::test]
 async fn internal_retains_vendor_body() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     http.0.lock().unwrap().failure = Some(400);
     let error = p.list(&credentials(false)).await.unwrap_err();
-    assert!(!format!("{error:?}").contains("key-a"));
+    assert!(format!("{error:?}").contains("key-a"));
     let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
-    assert!(provider_error.expose().contains("key-a must never be echoed"));
+    assert!(provider_error.as_str().contains("key-a must never be echoed"));
 }
 
 // The trusted bootstrap preflight has a safe public diagnostic while preserving
@@ -1231,9 +1232,9 @@ async fn transport_outages_are_unavailable() {
     let p = provider(Arc::new(Offline)).await;
     let error = p.list(&credentials(false)).await.unwrap_err();
     assert!(matches!(error, ProtocolError::Unavailable { .. }));
-    assert!(!format!("{error:?}").contains("private transport detail"));
+    assert!(error.to_string().contains("private transport detail"));
     let ProtocolError::Unavailable { provider_error: Some(detail), .. } = error else { panic!("missing protected transport diagnostic") };
-    assert!(detail.expose().contains("private transport detail"));
+    assert!(detail.as_str().contains("private transport detail"));
 }
 
 // Probe command failure and malformed proof leave successful creation/re-adoption

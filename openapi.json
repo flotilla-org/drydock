@@ -2105,15 +2105,11 @@
                 ]
               },
               "provider_error": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/Secret",
-                    "description": "Optional bounded provider/transport detail; never include it in public logs."
-                  }
-                ]
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Bounded provider/transport detail, masked for credentials by the host."
               },
               "reason": {
                 "type": "string"
@@ -2234,8 +2230,8 @@
                 ]
               },
               "provider_error": {
-                "$ref": "#/components/schemas/Secret",
-                "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
+                "type": "string",
+                "description": "Provider explanation, masked for credentials before leaving the host."
               },
               "reason": {
                 "type": "string"
@@ -3065,8 +3061,8 @@
                   ]
                 },
                 "provider_error": {
-                  "$ref": "#/components/schemas/Secret",
-                  "description": "Sensitive, untrusted vendor text: never log at info level or forward to end users."
+                  "type": "string",
+                  "description": "Provider explanation, masked for credentials before leaving the host."
                 },
                 "reason": {
                   "type": "string"
@@ -3128,15 +3124,11 @@
                   ]
                 },
                 "provider_error": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/Secret",
-                      "description": "Optional bounded provider/transport detail; never include it in public logs."
-                    }
-                  ]
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Bounded provider/transport detail, masked for credentials by the host."
                 },
                 "reason": {
                   "type": "string"
