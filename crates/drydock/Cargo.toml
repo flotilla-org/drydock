@@ -5,6 +5,24 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rigging-paths.workspace = true
+rigging-http-serve.workspace = true
+rigging-http-client.workspace = true
+rigging-tls.workspace = true
+rigging-stream.workspace = true
+reqwest = { workspace = true, features = ["json", "stream", "query"] }
+sha2.workspace = true
+http.workspace = true
+bytes = "1"
+percent-encoding = "2"
+axum = "0.8"
+toml = "1.0"
+tempfile = "3"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+async-stream = "0.3"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
 drydock-client = { path = "../drydock-client" }
 drydock-protocol = { path = "../drydock-protocol" }
 rigging-process.workspace = true
@@ -21,5 +39,5 @@ libc = "0.2"
 drydock-host = { path = "../drydock-host" }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "io-util", "test-util"] }
-axum = "0.8"
+hegeltest = "=0.48.1"
 rigging-replay-testkit.workspace = true

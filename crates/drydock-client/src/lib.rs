@@ -465,6 +465,12 @@ impl StatusCache {
         state.values.insert(key, (now, value.clone()));
         serde_json::from_value(value).map_err(|_| Error::InvalidResponse)
     }
+    /// Mutations discard cached observations but retain their spent budget.
+    pub async fn invalidate(&self, provider: &str) {
+        if let Some(state) = self.states.get(provider) {
+            state.lock().await.values.clear();
+        }
+    }
     pub async fn list(&self, provider: &str) -> Result<Vec<Environment>> {
         self.read(provider, None).await
     }

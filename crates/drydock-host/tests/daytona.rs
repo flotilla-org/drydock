@@ -24,6 +24,8 @@ struct State {
     requests: usize,
     failure: Option<u16>,
     failure_message: Option<String>,
+    /// A vendor outage applies to every caller until the test clears it.
+    outage: Option<(u16, String)>,
     ssh_response: Option<Value>,
     exec_response: Option<Value>,
     probe_failure_message: Option<String>,
@@ -136,6 +138,9 @@ impl StandIn {
         };
         if !authorized {
             return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
+        }
+        if let Some((status, message)) = &s.outage {
+            return response(*status, json!({"statusCode":status,"message":message,"error":"Bad Request"}));
         }
         if let Some(status) = s.failure.take() {
             let message = s.failure_message.take().unwrap_or_else(|| "key-a must never be echoed".into());
@@ -1726,33 +1731,35 @@ async fn ongoing_usage_does_not_bill_the_future() {
 }
 
 // Masking at the host boundary sees the complete vendor body before truncation,
-// including a credential that crosses the old 16 KiB byte boundary.
+// including a credential that crosses the old 16 KiB byte boundary. The same
+// vendor outage must survive another caller (including the host's poller).
 #[tokio::test]
 async fn vendor_body_masking_precedes_truncation() {
     let vendor = Arc::new(StandIn::default());
     let host = HostHarness::start(vendor.clone()).await;
     drydock::client::Observer::new(host.client.clone(), None).next().await.unwrap();
-    let message = format!("{}key-a trailing", "x".repeat(16360));
-    {
-        let mut state = vendor.0.lock().unwrap();
-        state.failure = Some(400);
-        state.failure_message = Some(message.clone());
+    // Place the credential across both historical raw truncation and the
+    // current bounded-diagnostic payload cut (which reserves a marker).
+    let prefix = json!({"statusCode":400,"message":"key-a trailing","error":"Bad Request"}).to_string().find("key-a").unwrap();
+    for boundary in [16384, 16384 - "...<truncated>".len()] {
+        let message = format!("{}key-a trailing", "x".repeat(boundary - prefix - 2));
+        vendor.0.lock().unwrap().outage = Some((400, message));
+        // Force a competing vendor call before the foreground host call. This
+        // deterministically covers the poller's one-shot-fault consumption race.
+        let p = provider(vendor.clone()).await;
+        let ProtocolError::Internal { provider_error, .. } = p.list(&credentials(false)).await.unwrap_err() else {
+            panic!("expected body")
+        };
+        assert!(provider_error.len() > 16384);
+        assert_eq!(provider_error.find("key-a"), Some(boundary - 2));
+        assert!(provider_error.contains("key-a trailing"));
+        let error = host.client.list("daytona").await.unwrap_err();
+        let drydock::client::Error::Protocol(ProtocolError::Internal { provider_error, .. }) = error else {
+            panic!("expected provider body")
+        };
+        assert!(provider_error.len() <= 16384);
+        assert!(!provider_error.contains("ke"), "even a two-byte credential prefix must not escape");
     }
-    let error = host.client.list("daytona").await.unwrap_err();
-    let drydock::client::Error::Protocol(ProtocolError::Internal { provider_error, .. }) = error else { panic!("expected provider body") };
-    assert!(provider_error.len() <= 16384);
-    assert!(!provider_error.contains("key-"), "partial credential must not escape");
-    // The module must retain the entire body so the host can apply every
-    // configured provider's credentials before enforcing the diagnostic limit.
-    {
-        let mut state = vendor.0.lock().unwrap();
-        state.failure = Some(400);
-        state.failure_message = Some(message);
-    }
-    let p = provider(vendor.clone()).await;
-    let ProtocolError::Internal { provider_error, .. } = p.list(&credentials(false)).await.unwrap_err() else { panic!("expected body") };
-    assert!(provider_error.len() > 16384);
-    assert!(provider_error.contains("key-a trailing"));
     host.finish().await;
 }
 

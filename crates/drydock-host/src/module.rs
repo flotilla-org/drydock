@@ -18,6 +18,10 @@ pub fn refused(reason: impl Into<String>) -> ProtocolError {
 /// receive a post-commit run hook with credentials and shutdown. No module retries.
 #[async_trait]
 pub trait Module: Send + Sync {
+    /// Modules override this when their minimum differs from one CPU/GiB.
+    fn smallest_size(&self) -> Size {
+        Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 }
+    }
     fn version(&self) -> &str;
     /// Cancelled when the host stops. Dropping the future must release uncommitted
     /// resources; factories must yield while waiting on external work.

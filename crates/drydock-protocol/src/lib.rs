@@ -82,6 +82,9 @@ pub struct Hello {
     pub protocol_version: String,
     pub host_version: String,
     pub modules: Vec<LoadedModule>,
+    /// Modules the host can configure, including those not yet loaded.
+    #[serde(default)]
+    pub loadable_modules: Vec<LoadableModule>,
     pub providers: Vec<ProviderDeclaration>,
 }
 impl Hello {
@@ -92,6 +95,13 @@ impl Hello {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct LoadableModule {
+    pub name: String,
+    pub version: String,
+    /// Smallest supported resource request, used when the caller has no default.
+    pub smallest_size: Size,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct LoadedModule {
     pub name: String,
