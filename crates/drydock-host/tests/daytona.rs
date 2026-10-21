@@ -1677,12 +1677,12 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
         let c = credentials(false);
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().probe_http_failure = Some(502);
-        http.0.lock().unwrap().probe_failure_message = Some("validation key-a".into());
+        http.0.lock().unwrap().probe_failure_message = Some("validation fallback-secret-xyz".into());
         let mut r = request(prep, "fallback-log");
         r.egress = EgressRequest::DenyAll { direct: vec![] };
         p.provision(r, &c).await.unwrap();
     });
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("lifecycle succeeded; egress measurement failed"), "{logs}");
-    assert!(!logs.contains("key-a"), "{logs}");
+    assert!(!logs.contains("fallback-secret-xyz"), "{logs}");
 }

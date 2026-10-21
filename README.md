@@ -133,7 +133,10 @@ limiting diagnostics to 16 KiB per field. Derived patterns are cached when a
 credential is first delivered, rather than rebuilt on every failed call. Base64
 matching covers the complete encoded credential; it does not detect a credential
 embedded within a larger encoded payload (for example `base64(user:key)`) or
-arbitrarily transformed/nested encodings. Display escapes control characters.
+arbitrarily transformed/nested encodings. Masking covers configured credentials,
+not other secret-like values such as provider-minted SSH tokens echoed in vendor
+error bodies. Malformed response diagnostics omit reach recipes and guest output.
+Display escapes control characters.
 Empty credential values are ignored. Every nonempty value is masked, including
 short placeholders; a short or common value can therefore obscure unrelated
 words in a diagnostic. Use distinctive placeholders for readable diagnostics.

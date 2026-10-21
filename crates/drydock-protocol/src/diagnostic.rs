@@ -114,6 +114,10 @@ impl DiagnosticMasker {
         self.patterns.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         self.patterns.dedup();
     }
+    /// Mask and bound diagnostic text without adding operation context.
+    pub fn text(&self, text: &str) -> String {
+        bounded(mask(text, &self.patterns))
+    }
     /// Mask complete diagnostics before bounding text or rendering for operators.
     pub fn context(&self, mut error: ProtocolError, provider: &str, operation: &str) -> ProtocolError {
         let patterns = &self.patterns;

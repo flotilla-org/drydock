@@ -98,7 +98,7 @@ const RECENT_CREDENTIAL_LIMIT: usize = 32;
 struct DiagnosticSecrets {
     current: BTreeMap<String, Secret>,
     recent: VecDeque<Secret>,
-    masker: DiagnosticMasker,
+    masker: Arc<DiagnosticMasker>,
 }
 impl DiagnosticSecrets {
     fn contains(&self, secret: &Secret) -> bool {
@@ -111,18 +111,20 @@ impl DiagnosticSecrets {
         let known = self.contains(&secret);
         if let Some(previous) = self.current.insert(provider.to_owned(), secret.clone()) {
             self.recent.retain(|value| value != &previous);
-            self.recent.push_back(previous);
+            if !self.current.values().any(|value| value == &previous) {
+                self.recent.push_back(previous);
+            }
         }
         self.recent.retain(|value| value != &secret);
         let evicted = self.recent.len() > RECENT_CREDENTIAL_LIMIT;
         if evicted {
             self.recent.pop_front();
-            self.masker = DiagnosticMasker::default();
+            self.masker = Arc::default();
             for value in self.current.values().chain(self.recent.iter()) {
-                self.masker.remember(value.expose());
+                Arc::make_mut(&mut self.masker).remember(value.expose());
             }
         } else if !known {
-            self.masker.remember(secret.expose());
+            Arc::make_mut(&mut self.masker).remember(secret.expose());
         }
         if !known && (1..4).contains(&secret.expose().len()) {
             tracing::debug!(
@@ -363,16 +365,17 @@ impl Instance {
         self.diagnostic_error_for_token(error, operation, None)
     }
     fn diagnostic_error_for_token(&self, error: ProtocolError, operation: &str, token: Option<&Secret>) -> ProtocolError {
-        let secrets = self.diagnostic_secrets.recover();
-        if let Some(token) = token.filter(|token| !secrets.contains(token)) {
+        let (mut masker, missing_token) = {
+            let secrets = self.diagnostic_secrets.recover();
+            (secrets.masker.clone(), token.filter(|token| !secrets.contains(token)))
+        };
+        if let Some(token) = missing_token {
             // A long-running call may outlive the recent-generation window.
-            let mut masker = secrets.masker.clone();
-            masker.remember(token.expose());
-            masker.context(error, &self.config.name, operation)
-        } else {
-            secrets.masker.context(error, &self.config.name, operation)
+            Arc::make_mut(&mut masker).remember(token.expose());
         }
+        masker.context(error, &self.config.name, operation)
     }
+
     fn longest_window(&self, operation: &str) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.rate_limits.iter().filter(|r| r.operation == operation).map(|r| r.period_seconds).max().unwrap_or(0),
@@ -734,6 +737,15 @@ where
         Ok(Self(value))
     }
 }
+fn mask_readiness(readiness: Readiness, masker: &DiagnosticMasker) -> Readiness {
+    match readiness {
+        Readiness::MissingCredential { reason } => Readiness::MissingCredential { reason: masker.text(&reason) },
+        Readiness::MissingTool { reason } => Readiness::MissingTool { reason: masker.text(&reason) },
+        Readiness::VersionMismatch { reason } => Readiness::VersionMismatch { reason: masker.text(&reason) },
+        Readiness::Unknown { reason } => Readiness::Unknown { reason: masker.text(&reason) },
+        Readiness::Ready => Readiness::Ready,
+    }
+}
 async fn hello(State(host): State<Host>) -> Json<Hello> {
     let config = host.config.read().await;
     Json(Hello {
@@ -747,7 +759,11 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
                 provider: name.clone(),
                 module: i.config.module.clone(),
                 capabilities: i.capabilities.clone(),
-                readiness: i.readiness(&i.auth.recover()),
+                readiness: {
+                    let readiness = i.readiness(&i.auth.recover());
+                    let masker = host.diagnostic_secrets.recover().masker.clone();
+                    mask_readiness(readiness, &masker)
+                },
                 rate_limits: i.rate_limits.clone(),
             })
             .collect(),
@@ -817,7 +833,12 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         let provider = tokio::select! {
             biased;
             _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::unavailable("host stopping", None).into()),
-            result = module.configure(p, http) => result?,
+            result = module.configure(p, http) => result.map_err(|error| {
+                let masker = host.diagnostic_secrets.recover().masker.clone();
+                let error = masker.context(error, &p.name, "configure");
+                tracing::warn!(provider = %p.name, route = "configure", error_class = error.class(), error = %error, "provider call failed");
+                error
+            })?,
         };
         let (credential_changes, _) = watch::channel(credentials.clone());
         let capabilities = provider.capabilities();
@@ -1675,6 +1696,84 @@ mod operation_tests {
         }
         host.shutdown(async {}).await;
     }
+    #[test]
+    fn active_shared_values_do_not_consume_history() {
+        let mut secrets = DiagnosticSecrets::default();
+        secrets.remember("a", Secret::new("shared"));
+        secrets.remember("b", Secret::new("shared"));
+        secrets.remember("a", Secret::new("new-a"));
+        assert!(secrets.recent.is_empty());
+        secrets.remember("b", Secret::new("new-b"));
+        assert_eq!(secrets.recent, VecDeque::from([Secret::new("shared")]));
+    }
+
+    #[test]
+    fn readiness_reasons_mask_without_adding_context() {
+        let mut masker = DiagnosticMasker::default();
+        masker.remember("readiness-secret");
+        for readiness in [
+            Readiness::MissingCredential { reason: "missing readiness-secret".into() },
+            Readiness::Unknown { reason: "unknown readiness-secret".into() },
+        ] {
+            let result = mask_readiness(readiness, &masker);
+            let wire = serde_json::to_string(&result).unwrap();
+            assert!(!wire.contains("readiness-secret"));
+            assert!(wire.contains("<REDACTED>"));
+            assert!(!wire.contains("operation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_masks_readiness_reasons_at_wire_boundary() {
+        let host = Host::new(reference::registry());
+        let config = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"reference"}],
+            "providers":[{"name":"a","module":"memory","settings":{},
+                "credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        configure(State(host.clone()), ApiJson(config)).await.map_err(|e| e.0).unwrap();
+        host.diagnostic_secrets.recover().remember("a", Secret::new("readiness-secret"));
+        {
+            let config = host.config.read().await;
+            let mut auth = config.providers["a"].auth.recover();
+            auth.rejected = true;
+            auth.rejection_error = Some(ProtocolError::CredentialRejected { reason: "readiness-secret rejected".into() });
+        }
+        let Json(result) = hello(State(host.clone())).await;
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("readiness-secret"));
+        assert!(wire.contains("<REDACTED>"));
+        host.shutdown(async {}).await;
+    }
+
+    #[tokio::test]
+    async fn configure_errors_mask_placeholder_and_include_context() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl Module for Failing {
+            fn version(&self) -> &str {
+                "test"
+            }
+            async fn configure(&self, _: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+                Err(ProtocolError::Internal { reason: "configure-secret rejected".into(), provider_error: "configure-secret body".into() })
+            }
+        }
+        let host = Host::new(Registry::from([("failing".into(), Arc::new(Failing) as Arc<dyn Module>)]));
+        let config = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"failing"}],
+            "providers":[{"name":"a","module":"memory","settings":{},
+                "credential":{"mode":"proxied","placeholder_token":"configure-secret","proxy_url":"http://127.0.0.1:1"}}]
+        }))
+        .unwrap();
+        let error = configure(State(host.clone()), ApiJson(config)).await.err().unwrap().0;
+        let wire = serde_json::to_string(&error).unwrap();
+        assert!(!wire.contains("configure-secret"));
+        assert!(wire.contains("<REDACTED>"));
+        assert!(wire.contains("provider a operation configure:"));
+        host.shutdown(async {}).await;
+    }
+
     // Glue: a unique short credential emits a debug registration note without
     // its value; delivering that same credential again emits no duplicate note.
     #[test]
