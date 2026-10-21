@@ -36,7 +36,8 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
-Protocol version 5 requires `size` in every prepare request. Modules choose their
+Protocol version 6 exposes masked provider diagnostics and maps permission
+denials to `Refused`. It retains version 5's required `size` in every prepare request. Modules choose their
 prepared key; Daytona includes size because snapshots fix sandbox resources.
 Clients and hosts must upgrade together.
 
@@ -138,9 +139,12 @@ short placeholders; a short or common value can therefore obscure unrelated
 words in a diagnostic. Use distinctive placeholders for readable diagnostics.
 Registering a unique value shorter than four bytes emits a debug-level note with
 its byte length, never its content.
-The host retains unique credential values for its lifetime to cover delayed
-vendor echoes after rotation; it does not prune that history. Provider removal
-requires a host restart.
+The host masks currently configured credentials plus the 32 most recent distinct
+replaced values across providers. Older historical values are evicted and their
+cached patterns removed; they are no longer covered by that recent window.
+An in-flight call also masks the credential it used even if that value has been
+evicted. Provider removal requires a host restart. Successful response bodies,
+reach recipes and guest/probe output are omitted from validation diagnostics.
 
 Rust API compatibility: `provider_error` is now `String` (or `Option<String>`),
 and its Debug output is visible. Modules return complete diagnostics to the host;

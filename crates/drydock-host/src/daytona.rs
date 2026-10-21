@@ -161,9 +161,10 @@ impl Daytona {
         if matches!(response_format, ResponseFormat::Analytics) {
             return parse_analytics(response.body()).map(Some);
         }
-        serde_json::from_slice(response.body())
-            .map(Some)
-            .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona response".into(), provider_error: raw })
+        serde_json::from_slice(response.body()).map(Some).map_err(|_| ProtocolError::Internal {
+            reason: "invalid Daytona response".into(),
+            provider_error: "response was not valid JSON".into(),
+        })
     }
     async fn inventory(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Value>> {
         let mut rows = Vec::new();
@@ -273,7 +274,7 @@ impl Daytona {
             let output = self.execute(&row.environment.id, &command, 20, c).await?;
             let proof: Value = serde_json::from_str(&output).map_err(|_| ProtocolError::Internal {
                 reason: "invalid Daytona egress probe response".into(),
-                provider_error: diagnostic_text(output.as_bytes()),
+                provider_error: "probe output omitted".into(),
             })?;
             if proof["uid"].as_u64().is_none()
                 || proof["unlisted_canary"].as_bool().is_none()
@@ -282,7 +283,7 @@ impl Daytona {
             {
                 return Err(ProtocolError::Internal {
                     reason: "incomplete Daytona egress proof".into(),
-                    provider_error: diagnostic_text(output.as_bytes()),
+                    provider_error: "probe output omitted".into(),
                 });
             }
             if proof["uid"] == 0
@@ -375,8 +376,10 @@ impl Daytona {
     }
 }
 const GIB: u64 = 1 << 30;
-fn bad_value(value: &Value) -> ProtocolError {
-    ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: diagnostic_text(value.to_string().as_bytes()) }
+// Successful responses can contain reach recipes and guest output. Their
+// contents are never diagnostic text, even when validation fails.
+fn bad_value(_value: &Value) -> ProtocolError {
+    bad_response()
 }
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
@@ -654,8 +657,8 @@ impl Provider for Daytona {
         match self.observed(value, c).await {
             Ok(row) => Ok(row),
             Err(error) => {
-                // Typed category reaches host diagnostics; guest/vendor text stays secret.
-                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), error = ?error, "lifecycle succeeded; egress measurement failed");
+                // This fallback bypasses host error masking: log only its category.
+                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), "lifecycle succeeded; egress measurement failed");
                 Ok(fallback)
             }
         }

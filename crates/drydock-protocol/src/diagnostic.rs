@@ -103,7 +103,7 @@ impl std::fmt::Display for LogText<'_> {
 }
 /// Cached credential patterns for repeated host diagnostics. This type deliberately
 /// has no Debug/Display implementation because patterns include credential values.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DiagnosticMasker {
     patterns: Vec<String>,
 }

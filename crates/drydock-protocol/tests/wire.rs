@@ -123,7 +123,7 @@ fn hello_requires_exact_protocol_version() {
     // Version 1 assumes every snapshot is complete and must reject version 2 semantics.
     let old = Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], providers: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5.0.0", "5 "] {
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6.0.0", "6 "] {
         let hello = Hello { protocol_version: version.into(), host_version: "test".into(), modules: vec![], providers: vec![] };
         assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
@@ -157,4 +157,14 @@ fn exact_cost_roundtrips(tc: hegel::TestCase) {
     assert_eq!(serde_json::from_str::<Cost>(&encoded).unwrap(), cost);
     assert!(!ResourceKind::Cpu.accepts_unit("By"));
     assert!(ResourceKind::Memory.accepts_unit("By.s"));
+}
+
+// Protocol 6 changes diagnostic field semantics and the permission-error mapping;
+// protocol-5 peers must not pass the exact handshake after that contract change.
+#[test]
+fn diagnostic_contract_requires_protocol_six() {
+    for (version, compatible) in [("5", false), ("6", true)] {
+        let hello = Hello { protocol_version: version.into(), host_version: "test".into(), modules: vec![], providers: vec![] };
+        assert_eq!(hello.is_compatible(), compatible);
+    }
 }

@@ -174,8 +174,8 @@ impl SafeError for Error {
             Error::InvalidRequest => "invalid request".into(),
             Error::VersionMismatch => "version mismatch".into(),
             Error::RateLimited => "rate limited".into(),
-            Error::NotReady(_) => "not ready".into(),
-            Error::ReadinessTimeout(_) => "startup timeout".into(),
+            Error::NotReady(readiness) => format!("not ready: {readiness:?}"),
+            Error::ReadinessTimeout(readiness) => format!("startup timeout: {readiness:?}"),
         }
     }
 }
@@ -1206,12 +1206,25 @@ mod tests {
                 Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: secret.into() }),
                 "http 500 internal: vendor explanation; vendor explanation",
             ),
-            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready"),
+            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready: Unknown { reason: \"vendor explanation\" }"),
         ];
         for (error, expected) in errors {
             assert_eq!(error.category(), expected);
         }
         assert_eq!(std::io::Error::new(std::io::ErrorKind::TimedOut, secret).category(), "timeout");
+    }
+    // Conformance retains the host's readiness reason for both initial refusal
+    // and readiness timeout, rather than collapsing either to a bare category.
+    #[test]
+    fn readiness_diagnostics_retain_reasons() {
+        for readiness in [
+            Readiness::Unknown { reason: "provider validation".into() },
+            Readiness::MissingCredential { reason: "provider validation".into() },
+            Readiness::MissingTool { reason: "provider validation".into() },
+        ] {
+            assert!(Error::NotReady(readiness.clone()).category().contains("provider validation"));
+            assert!(Error::ReadinessTimeout(readiness).category().contains("provider validation"));
+        }
     }
     // Billing settle accepts zero through one day and refuses typos/overflow
     // before any endpoint calls; it is independent of request/event timeouts.

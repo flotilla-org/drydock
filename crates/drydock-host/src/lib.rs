@@ -91,24 +91,44 @@ impl EventSink {
     }
 }
 type PendingEvent = (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, EventKind);
-// Retain old generations to mask delayed vendor echoes. Derive patterns only
-// when adding a unique value, never on failed calls. Lifetime is this host.
+// Keep active values plus a bounded recent history, shared across providers.
+// Derive patterns at delivery; rebuild only when an old value is evicted.
+const RECENT_CREDENTIAL_LIMIT: usize = 32;
 #[derive(Default)]
 struct DiagnosticSecrets {
-    values: Vec<Secret>,
+    current: BTreeMap<String, Secret>,
+    recent: VecDeque<Secret>,
     masker: DiagnosticMasker,
 }
 impl DiagnosticSecrets {
-    fn remember(&mut self, secret: Secret) {
-        if !self.values.contains(&secret) {
-            if (1..4).contains(&secret.expose().len()) {
-                tracing::debug!(
-                    credential_bytes = secret.expose().len(),
-                    "short credential registered; diagnostic masking may obscure unrelated text"
-                );
+    fn contains(&self, secret: &Secret) -> bool {
+        self.current.values().any(|value| value == secret) || self.recent.contains(secret)
+    }
+    fn remember(&mut self, provider: &str, secret: Secret) {
+        if self.current.get(provider) == Some(&secret) {
+            return;
+        }
+        let known = self.contains(&secret);
+        if let Some(previous) = self.current.insert(provider.to_owned(), secret.clone()) {
+            self.recent.retain(|value| value != &previous);
+            self.recent.push_back(previous);
+        }
+        self.recent.retain(|value| value != &secret);
+        let evicted = self.recent.len() > RECENT_CREDENTIAL_LIMIT;
+        if evicted {
+            self.recent.pop_front();
+            self.masker = DiagnosticMasker::default();
+            for value in self.current.values().chain(self.recent.iter()) {
+                self.masker.remember(value.expose());
             }
+        } else if !known {
             self.masker.remember(secret.expose());
-            self.values.push(secret);
+        }
+        if !known && (1..4).contains(&secret.expose().len()) {
+            tracing::debug!(
+                credential_bytes = secret.expose().len(),
+                "short credential registered; diagnostic masking may obscure unrelated text"
+            );
         }
     }
 }
@@ -294,11 +314,14 @@ impl Instance {
             // no route can resume while polling remains disabled by readiness.
             let availability = self.availability(&auth);
             if !availability.may_call {
-                let reason = if auth.rejected && matches!(auth.credentials.mode, CredentialMode::Direct { .. }) {
-                    auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into())
-                } else {
-                    format!("provider is not ready: {:?}", availability.readiness)
-                };
+                if auth.rejected
+                    && matches!(auth.credentials.mode, CredentialMode::Direct { .. })
+                    && let Some(error) = &auth.rejection_error
+                {
+                    // Already masked and contextualized at the original failure.
+                    return Err(ProtocolError::unavailable(error.to_string(), None));
+                }
+                let reason = format!("provider is not ready: {:?}", availability.readiness);
                 return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()));
             }
             (auth.credentials.clone(), auth.generation)
@@ -307,7 +330,10 @@ impl Instance {
             return Err(refused("operation capability not declared"));
         }
         self.reserve(gate.name(), poll)?;
-        let result = f(self.provider.clone(), credentials).await.map_err(|error| self.diagnostic_error(error, gate.name()));
+        let call_token = credentials.token().cloned();
+        let result = f(self.provider.clone(), credentials)
+            .await
+            .map_err(|error| self.diagnostic_error_for_token(error, gate.name(), call_token.as_ref()));
         if let Err(error) = &result {
             tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
         }
@@ -334,10 +360,18 @@ impl Instance {
         result
     }
     fn diagnostic_error(&self, error: ProtocolError, operation: &str) -> ProtocolError {
-        // Retain previous generations too: an in-flight request or a vendor's
-        // delayed explanation can still echo an earlier credential.
+        self.diagnostic_error_for_token(error, operation, None)
+    }
+    fn diagnostic_error_for_token(&self, error: ProtocolError, operation: &str, token: Option<&Secret>) -> ProtocolError {
         let secrets = self.diagnostic_secrets.recover();
-        secrets.masker.context(error, &self.config.name, operation)
+        if let Some(token) = token.filter(|token| !secrets.contains(token)) {
+            // A long-running call may outlive the recent-generation window.
+            let mut masker = secrets.masker.clone();
+            masker.remember(token.expose());
+            masker.context(error, &self.config.name, operation)
+        } else {
+            secrets.masker.context(error, &self.config.name, operation)
+        }
     }
     fn longest_window(&self, operation: &str) -> std::time::Duration {
         std::time::Duration::from_secs(
@@ -768,7 +802,7 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
             return Err(refused("empty proxy placeholder token").into());
         }
         if let CredentialMode::Proxied { placeholder_token, .. } = &p.credential {
-            host.diagnostic_secrets.recover().remember(placeholder_token.clone());
+            host.diagnostic_secrets.recover().remember(&p.name, placeholder_token.clone());
         }
         let credentials = Credentials::new(p.credential.clone());
         let proxy = match &p.credential {
@@ -862,7 +896,7 @@ async fn credential(
         return Err(refused("proxied provider cannot accept direct credentials").into());
     }
     let before = instance.readiness(&auth);
-    host.diagnostic_secrets.recover().remember(refresh.value.clone());
+    host.diagnostic_secrets.recover().remember(&p, refresh.value.clone());
     auth.credentials.value = Some(refresh.value);
     auth.generation += 1;
     auth.rejected = false;
@@ -1634,7 +1668,11 @@ mod operation_tests {
                 configure(State(host.clone()), ApiJson(config.clone())).await.map_err(|e| e.0).unwrap();
             }
         }
-        assert_eq!(host.diagnostic_secrets.recover().values.len(), 1);
+        {
+            let secrets = host.diagnostic_secrets.recover();
+            assert_eq!(secrets.current.values().map(Secret::expose).collect::<BTreeSet<_>>().len(), 1);
+            assert!(secrets.recent.is_empty());
+        }
         host.shutdown(async {}).await;
     }
     // Glue: a unique short credential emits a debug registration note without
@@ -1661,12 +1699,78 @@ mod operation_tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let mut secrets = DiagnosticSecrets::default();
-            secrets.remember(Secret::new("xyz"));
-            secrets.remember(Secret::new("xyz"));
+            secrets.remember("provider", Secret::new("xyz"));
+            secrets.remember("provider", Secret::new("xyz"));
         });
         let text = String::from_utf8(captured.recover().clone()).unwrap();
         assert_eq!(text.matches("short credential registered").count(), 1);
         assert!(text.contains("credential_bytes=3"));
         assert!(!text.contains("xyz"));
+    }
+    // Credential history is bounded independently of refresh count, while every
+    // active provider and the recent replacement window remain masked.
+    #[test]
+    fn credential_history_is_bounded_and_active_values_remain_masked() {
+        for rotations in [0, 1, RECENT_CREDENTIAL_LIMIT, RECENT_CREDENTIAL_LIMIT + 1, 100] {
+            let mut secrets = DiagnosticSecrets::default();
+            secrets.remember("other", Secret::new("other-active-token"));
+            for generation in 0..=rotations {
+                secrets.remember("rotating", Secret::new(format!("generation-{generation}-token")));
+            }
+            assert_eq!(secrets.recent.len(), rotations.min(RECENT_CREDENTIAL_LIMIT));
+            assert_eq!(secrets.current.len(), 2);
+            let current = format!("generation-{rotations}-token");
+            let previous = format!("generation-{}-token", rotations.saturating_sub(1));
+            let oldest_recent = format!("generation-{}-token", rotations.saturating_sub(RECENT_CREDENTIAL_LIMIT));
+            let error = secrets.masker.context(
+                ProtocolError::Internal {
+                    reason: "validation".into(),
+                    provider_error: format!("other-active-token {current} {previous} {oldest_recent} generation-0-token"),
+                },
+                "p",
+                "list",
+            );
+            let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+            assert!(!provider_error.contains("other-active-token"));
+            assert!(!provider_error.contains(&current));
+            assert!(!provider_error.contains(&previous));
+            assert!(!provider_error.contains(&oldest_recent));
+            if rotations > RECENT_CREDENTIAL_LIMIT {
+                assert!(provider_error.contains("generation-0-token"));
+            }
+        }
+    }
+
+    // A call masks its own credential even if many refreshes evict that value
+    // before its vendor error returns; the retained history still stays bounded.
+    #[tokio::test]
+    async fn in_flight_error_masks_evicted_call_credential() {
+        let instance = instance("list").await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let call = instance.clone();
+        let started = entered.clone();
+        let waiting = release.clone();
+        let pending = tokio::spawn(async move {
+            call.call(Gate::List, move |_, credentials| async move {
+                started.notify_one();
+                waiting.notified().await;
+                Err::<(), _>(ProtocolError::Internal {
+                    reason: "vendor failure".into(),
+                    provider_error: credentials.token().unwrap().expose().into(),
+                })
+            })
+            .await
+        });
+        entered.notified().await;
+        for generation in 0..100 {
+            instance.diagnostic_secrets.recover().remember("a", Secret::new(format!("new-{generation}")));
+        }
+        assert!(!instance.diagnostic_secrets.recover().contains(&Secret::new("token")));
+        release.notify_one();
+        let error = pending.await.unwrap().unwrap_err();
+        let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+        assert_eq!(provider_error, "<REDACTED>");
+        assert!(instance.diagnostic_secrets.recover().recent.len() <= RECENT_CREDENTIAL_LIMIT);
     }
 }

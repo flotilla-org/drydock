@@ -1612,3 +1612,18 @@ async fn proxied_missing_tool_does_not_report_stale_rejection() {
     assert!(error.to_string().contains("test tool absent"));
     assert!(!error.to_string().contains("credential_rejected"));
 }
+
+// An admission error after rejection retains the original context exactly once.
+#[tokio::test]
+async fn rejected_credential_context_is_not_nested() {
+    let h = Harness::start().await;
+    h.configure(vec![provider(
+        "a",
+        json!({"fixture":true,"fixture_push":true,"fault":{"kind":"credential_rejected","reason":"vendor rejected"}}),
+    )])
+    .await;
+    h.credential("a", "fixture-token").await;
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
+    assert_eq!(error.to_string().matches("provider a operation list").count(), 1);
+}

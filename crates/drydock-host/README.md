@@ -1,6 +1,6 @@
 # Rust reference host
 
-`drydock-host` serves protocol version 5 directly from `drydock-protocol`. Its binary
+`drydock-host` serves protocol version 6 directly from `drydock-protocol`. Its binary
 registers the in-memory `reference` module. Embedders register additional compiled
 Rust factories in `module::Registry` and use the same router/listeners. The crate
 requires Unix and is tested on Linux.
