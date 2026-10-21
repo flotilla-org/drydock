@@ -5,6 +5,10 @@ use tokio::net::UnixListener;
 const HOST_SOCKET: &str = "/run/drydock/host.sock";
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .with_writer(std::io::stderr)
+        .init();
     if std::process::id() == 1 {
         return Err(io::Error::other("drydock-agent must not be PID 1"));
     }
@@ -138,5 +142,24 @@ mod tests {
         pids.sort();
         assert_eq!(pids, vec![11, 22, 33]);
         assert!(inherited_children(&dir.path().join("missing")).is_empty());
+    }
+    // Linux keeps an exited, unreaped child in procfs. Exiting before the startup
+    // scan does not hide it; waitpid can still reap the recorded PID afterwards.
+    #[test]
+    fn proc_scan_includes_already_exited_children() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat.rsplit_once(')').unwrap().1.trim_start().starts_with('Z') {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(inherited_children(std::path::Path::new("/proc/self/task")).contains(&(pid as i32)));
+        child.wait().unwrap();
+        assert!(!inherited_children(std::path::Path::new("/proc/self/task")).contains(&(pid as i32)));
     }
 }

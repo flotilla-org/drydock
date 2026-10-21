@@ -1,5 +1,5 @@
 use crate::*;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use drydock_transport::{Opener, Purpose, Transport, http2};
 use http_body_util::{BodyExt, Full};
 use std::{
@@ -95,8 +95,8 @@ impl Client {
                             if let Some(target) = target { streams.spawn(async move {
                                 if let Ok(mut endpoint) = target.0.connect().await {
                                     let mut stream = incoming.stream;
-                                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut endpoint).await;
-                                }
+                                    if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut endpoint).await { tracing::warn!(%error, forward = %id, "host endpoint stream failed"); }
+                                } else { tracing::warn!(forward = %id, "host endpoint connection failed"); }
                             }); }
                         }
                     }
@@ -161,7 +161,10 @@ impl Client {
         self.json("GET", "/configure", &()).await
     }
     pub async fn exec(&self, request: Exec) -> io::Result<ExecOutput> {
-        Ok(ExecOutput { body: self.request("POST", "/exec", serde_json::to_vec(&request).map_err(invalid)?).await?, pending: Vec::new() })
+        Ok(ExecOutput {
+            body: self.request("POST", "/exec", serde_json::to_vec(&request).map_err(invalid)?).await?,
+            pending: BytesMut::new(),
+        })
     }
     pub async fn write(&self, path: PathBuf, bytes: Vec<u8>, executable: bool) -> io::Result<()> {
         self.empty("POST", "/files/write", &FileWrite { path, bytes, executable }).await
@@ -176,7 +179,16 @@ impl Client {
     /// Stage then activate via the stable route. Reconnect afterwards and verify
     /// the new hello fingerprint before using any generation-specific routes.
     pub async fn upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
+        self.stage_upgrade(executable).await?;
+        self.activate_upgrade().await
+    }
+    /// Retain a staged image across activation failures without retransmission.
+    pub async fn stage_upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
         self.request("PUT", "/upgrade", executable).await?.collect().await.map_err(io::Error::other)?;
+        Ok(())
+    }
+    /// Retry activation of an already staged image after a filesystem failure.
+    pub async fn activate_upgrade(&self) -> io::Result<()> {
         self.empty("POST", "/upgrade", &()).await
     }
     pub fn register_host_endpoint(&self, id: String, endpoint: Endpoint) -> io::Result<()> {
@@ -223,13 +235,13 @@ impl Client {
 /// Incremental NDJSON. Each output channel preserves its own byte order.
 pub struct ExecOutput {
     body: axum::body::Body,
-    pending: Vec<u8>,
+    pending: BytesMut,
 }
 impl ExecOutput {
     pub async fn next(&mut self) -> io::Result<Option<ExecEvent>> {
         loop {
             if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-                let line: Vec<_> = self.pending.drain(..=end).collect();
+                let line = self.pending.split_to(end + 1);
                 return serde_json::from_slice(&line).map(Some).map_err(invalid);
             }
             match self.body.frame().await {

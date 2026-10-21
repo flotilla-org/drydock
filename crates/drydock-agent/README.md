@@ -45,13 +45,21 @@ The host-facing `Purpose::Control` stream carries HTTP/2 through
 
 I/O failures distinguish missing paths (404), permissions (403), conflicts (409), malformed input (400) and internal errors (500).
 
-JSON byte fields are arrays of integers. Requests and read-back are limited to
-128 MiB (oversized reads return 413 before buffering);
+JSON byte fields are deliberately arrays of integers for this push-focused API;
+exec events use the same representation, with roughly 2–4 encoded bytes per
+output byte. Streaming general file transfer remains part of #50. Requests and read-back are limited to
+128 MiB (oversized reads return 413 before buffering). For JSON writes this is
+the encoded body limit: three-digit byte arrays fit slightly less than 32 MiB
+of file data, and single-digit arrays fit slightly less than 64 MiB, after path
+and JSON metadata. The near-limit test covers accepted 31 MiB and rejected
+32 MiB worst-case binary writes. Upgrade uploads and read-back use raw bytes;
 large general file operations, archives, directory traversal and diffs belong
 to #50. Empty writes and arbitrary binary read-back are supported. File writes
 replace the entire file atomically; new non-executable files use mode 644,
-replacements preserve the existing mode/owner, and the optional executable flag
-sets mode 755. A destination symlink is replaced rather than followed.
+replacements preserve the existing mode and preserve ownership when permitted.
+The optional executable flag sets mode 755. An unprivileged agent tolerates ownership EPERM when directory
+permissions allow replacement; root and other I/O failures remain strict.
+A destination symlink is replaced rather than followed.
 `flush` can also sync a parent directory. Routes use paths directly within the
 vessel, which is already controlled by the trusted caller.
 
@@ -61,8 +69,10 @@ unchanged listeners and their streams survive replacement. Listeners consult the
 current control opener for each connection, so host reconnection does not leave
 a stale session. TCP-only changes reuse the Unix binding. Transient accept errors
 back off; finished listener tasks are rebuilt on the next configuration push.
-In this slice the
-feature list and egress/CA values are stored configuration for consumers, not
+An address held by a different forward ID is not transferred in one push.
+Port swaps/transfers require removing the old owners first, then adding the new
+configuration; a refused swap preserves the previous configuration and listeners.
+In this slice the feature list and egress/CA values are stored configuration for consumers, not
 switches that claim to activate capture. The host pushes CA files via the files
 API and names their paths through the process environment.
 
@@ -75,20 +85,25 @@ Output spools into unlinked temporary files so agent exit/re-exec cannot deliver
 SIGPIPE to the child. Idle polling backs off, reuses a buffer, and stops tailing
 when the client disconnects (the child is still reaped). The provider may set
 the agent’s standard `TMPDIR` to place spools on disk instead of tmpfs. Disk use
-grows with a command's output until it exits;
-callers should manage long-running service logs. Dropping a stream does not kill
+grows with a command's output until it exits, including after disconnection.
+This unbounded spool is an accepted tradeoff in this slice; callers must manage
+long-running service logs. Dropping a stream does not kill
 the process. On Linux, startup reaps children inherited across re-exec after they
-exit. The provider's init reaps children orphaned by an agent crash.
+exit. Discovery is best effort when procfs child lists are unavailable; exited
+but unreaped children remain in those lists and are included in the startup scan.
+The provider's init reaps children orphaned by an agent crash.
 
 Upgrade uses only `/hello` and `/upgrade`: stage with PUT, activate with POST,
-reconnect with a fresh provider transport, then verify the new fingerprint. The
-activation acknowledgement is advisory: a lost response requires reconnecting
-and checking hello. A short acknowledgement grace period precedes shutdown;
+reconnect with a fresh provider transport, then verify the new fingerprint.
+A failed activation retains its staged image and existing rollback until a new
+backup is ready. `stage_upgrade` and `activate_upgrade` allow activation retries
+without uploading again. The activation acknowledgement is advisory: a lost
+response requires reconnecting and checking hello. A short acknowledgement grace period precedes shutdown;
 the binary path remains stable across repeated upgrades. The previous executable
 is retained as `.prev` and restored if direct `execv` rejects the replacement.
-Re-exec drops control
-and forward streams, removes owned guest sockets, and resets configuration.
-Stale socket inodes from a crash are reclaimed only when they refuse a connection; live listeners and ordinary files are preserved.
+Re-exec drops control and forward streams, removes owned guest sockets, and resets configuration.
+Stale socket inodes from a crash are reclaimed only when they refuse a connection;
+live listeners and ordinary files are preserved.
 The host pushes it again after hello. Children continue running with their
 original environment. Embedders update their own files using `/files/write`
 without agent re-exec.
@@ -127,3 +142,9 @@ chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
 A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,
 forward socket cleanup, fingerprint gating and survival/reaping of a child.
 No cloud provider or cleat installation is required.
+
+The most recent host-facing Control link supplies the reverse opener (last
+Control connection wins); this assumes the current single trusted controller.
+Forward and transport failures emit `tracing` warnings, without logging process
+environment or request bodies. Embedders supply their subscriber. The standalone
+binary logs warnings to stderr by default and honors standard `RUST_LOG`.

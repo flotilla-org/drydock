@@ -128,15 +128,19 @@ impl Agent {
         for mut transport in self.transports.drain(..) {
             let tx = incoming_tx.clone();
             tasks.spawn(async move {
+                let mut backoff = std::time::Duration::from_millis(100);
                 loop {
                     let incoming = match transport.accept().await {
                         Ok(Some(incoming)) => incoming,
                         Ok(None) => break,
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        Err(error) => {
+                            tracing::warn!(%error, "agent transport accept failed");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
                             continue;
                         }
                     };
+                    backoff = std::time::Duration::from_millis(100);
                     if tx.send((incoming, transport.opener.clone())).await.is_err() {
                         break;
                     }
@@ -162,9 +166,8 @@ impl Agent {
                         Purpose::Forward { id } => {
                             let target = self.shared.settings.lock().await.targets.get(&id).cloned();
                             tasks.spawn(async move {
-                                if let Some(target) = target {
-                                    let _ = bridge(incoming.stream, target).await;
-                                }
+                                if let Some(target) = target
+                                    && let Err(error) = bridge(incoming.stream, target).await { tracing::warn!(%error, forward = %id, "host-to-guest forward failed"); }
                             });
                         }
                         _ => {},
@@ -276,13 +279,21 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                Err(_) => break,
+                Err(error) => {
+                    tracing::warn!(%error, forward = %id, "guest listener stopped");
+                    break;
+                }
             };
             let opener = opener.lock().await.clone();
             let id = id.clone();
             streams.spawn(async move {
-                if let Ok(mut remote) = opener.open(Purpose::Forward { id }).await {
-                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut remote).await;
+                match opener.open(Purpose::Forward { id: id.clone() }).await {
+                    Ok(mut remote) => {
+                        if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut remote).await {
+                            tracing::warn!(%error, forward = %id, "guest-to-host stream failed");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, forward = %id, "guest-to-host forward open failed"),
                 }
             });
         }
@@ -339,8 +350,15 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) ->
         use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
         // SAFETY: the temporary file owns this open descriptor. Preserve the
         // destination's owner before chmod (chown may clear permission bits).
-        if unsafe { libc::fchown(temporary.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
-            return Err(io::Error::last_os_error());
+        let temporary_owner = temporary.as_file().metadata()?;
+        if (metadata.uid(), metadata.gid()) != (temporary_owner.uid(), temporary_owner.gid()) {
+            let result = if unsafe { libc::fchown(temporary.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            };
+            // SAFETY: geteuid has no arguments or memory effects.
+            ownership_result(result, unsafe { libc::geteuid() })?;
         }
     }
     let mode = if executable { 0o755 } else { existing.map_or(0o644, |m| m.permissions().mode()) };
@@ -348,6 +366,15 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) ->
     file.sync_all().await?;
     temporary.persist(path).map_err(|error| error.error)?;
     tokio::fs::File::open(parent).await?.sync_all().await
+}
+// Unprivileged replacement may be allowed by directory permissions even when
+// preserving another user's owner is not. Preserve it when permitted; root and
+// non-permission failures remain strict.
+fn ownership_result(result: io::Result<()>, uid: u32) -> io::Result<()> {
+    match result {
+        Err(error) if uid != 0 && error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        other => other,
+    }
 }
 async fn write_file(Json(file): Json<FileWrite>) -> Result<StatusCode, ApiError> {
     atomic_write(&file.path, &file.bytes, file.executable).await.map_err(api)?;
@@ -383,16 +410,16 @@ async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Result<Sta
 }
 async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, ApiError> {
     let mut staged = s.staged.lock().await;
-    let path = staged.take().ok_or_else(|| api("no staged agent"))?;
+    let path = staged.as_ref().cloned().ok_or_else(|| api("no staged agent"))?;
     // Keep the installed path stable over successive upgrades.
     let previous = s.executable.with_extension("prev");
-    match tokio::fs::remove_file(&previous).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(api(error)),
-    }
-    tokio::fs::hard_link(&s.executable, &previous).await.map_err(api)?;
+    let parent = s.executable.parent().unwrap_or(Path::new("."));
+    let backup_dir = tempfile::tempdir_in(parent).map_err(api)?;
+    let backup = backup_dir.path().join("previous");
+    tokio::fs::hard_link(&s.executable, &backup).await.map_err(api)?;
+    tokio::fs::rename(&backup, &previous).await.map_err(api)?;
     tokio::fs::rename(&path, &s.executable).await.map_err(api)?;
+    *staged = None;
     if let Some(parent) = s.executable.parent() {
         tokio::fs::File::open(parent).await.map_err(api)?.sync_all().await.map_err(api)?;
     }
@@ -437,5 +464,44 @@ mod tests {
         let _stream = tokio::net::UnixStream::connect(f.unix).await.unwrap();
         let incoming = tokio::time::timeout(std::time::Duration::from_secs(2), host.accept()).await.unwrap().unwrap().unwrap();
         assert_eq!(incoming.purpose, Purpose::Forward { id: "recover".into() });
+    }
+    // Real filesystem boundary: if backup linking fails, activation must retain
+    // both the staged image and previous rollback, and POST alone must retry.
+    #[tokio::test]
+    async fn partial_activation_failure_retains_stage_and_previous() {
+        let (a, b) = tokio::io::duplex(4096);
+        let (host, guest) = tokio::join!(
+            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
+            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
+        );
+        let _host = host.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agent");
+        let previous = executable.with_extension("prev");
+        std::fs::write(&previous, b"previous rollback").unwrap();
+        let agent = Agent::new(guest.unwrap(), "old".into(), executable.clone());
+        stage_upgrade(State(agent.shared.clone()), Bytes::from_static(b"new image")).await.unwrap();
+        assert!(activate_upgrade(State(agent.shared.clone())).await.is_err());
+        let staged = agent.shared.staged.lock().await.clone().expect("stage must survive failed linking");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"new image");
+        assert_eq!(std::fs::read(&previous).unwrap(), b"previous rollback");
+        std::fs::write(&executable, b"current image").unwrap();
+        activate_upgrade(State(agent.shared.clone())).await.unwrap();
+        assert!(agent.shared.staged.lock().await.is_none());
+        assert_eq!(std::fs::read(&executable).unwrap(), b"new image");
+        assert_eq!(std::fs::read(previous).unwrap(), b"current image");
+    }
+
+    // fchown is a kernel boundary: its result policy must tolerate EPERM only
+    // for unprivileged replacement, never mask root or unrelated I/O failures.
+    // Generate root/non-root identities and permission, I/O, missing-file errors.
+    #[hegel::test]
+    fn ownership_permission_policy(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let uid = if tc.draw(gs::booleans()) { 0 } else { 1000 };
+        let errors = [libc::EPERM, libc::EIO, libc::ENOENT, libc::EROFS];
+        let errno = errors[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+        assert_eq!(ownership_result(Err(io::Error::from_raw_os_error(errno)), uid).is_ok(), uid != 0 && errno == libc::EPERM);
+        assert!(ownership_result(Ok(()), uid).is_ok());
     }
 }

@@ -52,7 +52,12 @@ pub(crate) fn launch(request: Exec, environment: BTreeMap<String, String>) -> io
                         // On disconnect continue reaping; never kill the detached child.
                         let _ = tx.send(event).await;
                     }
-                    Err(_) => return,
+                    Err(error) => {
+                        tracing::warn!(%error, "exec output spool read failed");
+                        drop(tx);
+                        let _ = child.wait().await;
+                        return;
+                    }
                 }
             }
             if status.is_some() && !emitted {

@@ -405,3 +405,87 @@ async fn tcp_only_configuration_changes_reuse_unix_listener() {
     exchange(&mut unix, b"retained Unix").await;
     echo_task.abort();
 }
+
+// JSON writes are bounded by encoded body size. Three-digit binary data near
+// that limit is accepted at 31 MiB and rejected at 32 MiB; rejection is atomic.
+#[tokio::test]
+async fn large_binary_write_obeys_encoded_body_limit() {
+    let h = harness(false, "test-build").await;
+    let path = h.dir.path().join("large-push");
+    h.client.write(path.clone(), vec![255; 31 * 1024 * 1024], false).await.unwrap();
+    let bytes = h.client.read(path.clone()).await.unwrap();
+    assert_eq!(bytes.len(), 31 * 1024 * 1024);
+    assert!(bytes.iter().all(|byte| *byte == 255));
+    drop(bytes);
+    assert!(h.client.write(path.clone(), vec![255; 32 * 1024 * 1024], false).await.unwrap_err().to_string().contains("413"));
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 31 * 1024 * 1024);
+}
+
+// Detached exec output remains writable after its consumer disconnects. The
+// agent still waits for the child, so a completed command cannot leave a zombie.
+#[tokio::test]
+async fn disconnected_exec_drains_to_spool_and_is_reaped() {
+    let h = harness(false, "test-build").await;
+    let gate = h.dir.path().join("release");
+    let done = h.dir.path().join("done");
+    let pidfile = h.dir.path().join("pid");
+    let mut stream = h
+        .client
+        .exec(shell(&format!(
+            "echo $$ > '{}'; printf ready; while test ! -f '{}'; do sleep 0.01; done; head -c 131072 /dev/zero; printf complete > '{}'",
+            pidfile.display(),
+            gate.display(),
+            done.display()
+        )))
+        .await
+        .unwrap();
+    assert_eq!(stream.next().await.unwrap(), Some(ExecEvent::Stdout(b"ready".to_vec())));
+    let pid = std::fs::read_to_string(pidfile).unwrap();
+    drop(stream);
+    std::fs::write(gate, []).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let completed = std::fs::read(&done).ok().as_deref() == Some(b"complete");
+            #[cfg(target_os = "linux")]
+            let reaped = !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists();
+            #[cfg(not(target_os = "linux"))]
+            let reaped = true;
+            if completed && reaped {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// A port owned by another forward is deliberately not stolen during atomic
+// configuration. A rejected port swap leaves both existing routes usable.
+#[tokio::test]
+async fn occupied_port_swap_refuses_without_changing_configuration() {
+    let h = harness(false, "test-build").await;
+    let mut forwards = Vec::new();
+    let mut echo_tasks = Vec::new();
+    for id in ["port-a", "port-b"] {
+        let target = h.dir.path().join(format!("target-{id}"));
+        echo_tasks.push(tokio::spawn(echo(UnixListener::bind(&target).unwrap())));
+        let mut f = forward(&h, id);
+        f.tcp = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+        h.client.add_guest_forward(f.clone(), Endpoint::Unix(target)).await.unwrap();
+        forwards.push(f);
+    }
+    let before = h.client.configuration().await.unwrap();
+    let mut changed = before.clone();
+    changed.forwards[0].tcp = forwards[1].tcp;
+    changed.forwards[1].tcp = forwards[0].tcp;
+    assert!(h.client.configure(changed).await.is_err());
+    assert_eq!(h.client.configuration().await.unwrap(), before);
+    for f in forwards {
+        let mut stream: ByteStream = Box::new(tokio::net::TcpStream::connect(f.tcp.unwrap()).await.unwrap());
+        exchange(&mut stream, f.id.as_bytes()).await;
+    }
+    for task in echo_tasks {
+        task.abort();
+    }
+}

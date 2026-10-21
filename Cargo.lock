@@ -419,6 +419,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
