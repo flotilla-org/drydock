@@ -111,6 +111,8 @@ impl StandIn {
                 };
                 validate_analytics_fixture(&body, schema);
             }
+            // Current snapshot routes all return SnapshotDto on success; list/delete
+            // routes must choose their own response schema when added here.
             if (200..300).contains(&status) && request.url().path().starts_with("/api/snapshots") {
                 assert!(snapshot_schema_valid(&body, "SnapshotDto", false), "invalid snapshot fixture: {body}");
             }
@@ -1421,6 +1423,7 @@ fn snapshot_schema_composition_requires_matching_branches() {
         let any = json!({"anyOf":[{"type":"integer"},{"type":"number"}]});
         let one = json!({"oneOf":[{"type":"integer"},{"type":"number"}]});
         assert_eq!(snapshot_value_valid(&value, &any, &spec, false), value.is_number());
+        // Integers match both branches, so oneOf must reject them.
         assert_eq!(snapshot_value_valid(&value, &one, &spec, false), value.is_number() && !value.is_i64());
     }
 }
