@@ -553,6 +553,8 @@ pub enum ProtocolError {
         retry_after: Option<u64>,
         /// Bounded provider/transport detail, masked for credentials by the host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        // Plain text has no type-level redaction: host boundaries must apply
+        // DiagnosticMasker before serializing or logging provider explanations.
         provider_error: Option<String>,
     },
     RateLimited {
@@ -575,6 +577,8 @@ pub enum ProtocolError {
     Internal {
         reason: String,
         /// Provider explanation, masked for credentials before leaving the host.
+        // Plain text has no type-level redaction: host boundaries must apply
+        // DiagnosticMasker before serializing or logging provider explanations.
         provider_error: String,
     },
 }
