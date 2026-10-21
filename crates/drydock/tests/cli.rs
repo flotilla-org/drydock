@@ -163,11 +163,13 @@ async fn cli_full_provider_errors() {
     };
     let status = Arc::new(AtomicU16::new(200));
     let current = status.clone();
-    let router = axum::Router::new().fallback(move || {
+    let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
         let current = current.clone();
         async move {
             let status = current.load(Ordering::SeqCst);
-            let body = if status == 200 {
+            let body = if status == 200 && uri.path().starts_with("/api/snapshots/") {
+                json!({"id":"fixture-snapshot","name":uri.path().rsplit('/').next().unwrap(),"state":"active","cpu":2,"mem":4,"disk":10})
+            } else if status == 200 {
                 json!({"items":[]})
             } else {
                 json!({"message":"Cannot specify Sandbox resources when using a snapshot; credential test-secret-value"})
@@ -220,6 +222,23 @@ async fn cli_full_provider_errors() {
             // Configure before invoking the CLI so readiness/polling are exercised too.
             client.configure(&configuration).await.unwrap();
             client.credential("provider-a", Secret::new("test-secret-value")).await.unwrap();
+            let prepared_for_launch = if !reference && upstream == 400 {
+                Some(
+                    client
+                        .prepare(
+                            "provider-a",
+                            &PrepareRequest {
+                                image_digest: format!("image@sha256:{}", "a".repeat(64)),
+                                tools_digest: "tools".into(),
+                                size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
             if !reference && upstream != 0 {
                 // Let the immediate successful poll settle before injecting the route error.
                 drydock::client::Observer::new(client.clone(), None).next().await.unwrap();
@@ -267,12 +286,12 @@ async fn cli_full_provider_errors() {
                     &request,
                     serde_json::to_vec(&ProvisionRequest {
                         label: "bad-request".into(),
-                        prepared: Prepared {
+                        prepared: prepared_for_launch.unwrap_or_else(|| Prepared {
                             provider: "provider-a".into(),
                             id: "snapshot".into(),
                             image_digest: "image".into(),
                             tools_digest: "tools".into(),
-                        },
+                        }),
                         size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
                         egress: EgressRequest::default(),
                         ssh_public_key: None,
