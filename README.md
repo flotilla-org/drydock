@@ -136,6 +136,8 @@ arbitrarily transformed/nested encodings. Display escapes control characters.
 Empty credential values are ignored. Every nonempty value is masked, including
 short placeholders; a short or common value can therefore obscure unrelated
 words in a diagnostic. Use distinctive placeholders for readable diagnostics.
+Registering a unique value shorter than four bytes emits a debug-level note with
+its byte length, never its content.
 The host retains unique credential values for its lifetime to cover delayed
 vendor echoes after rotation; it does not prune that history. Provider removal
 requires a host restart.

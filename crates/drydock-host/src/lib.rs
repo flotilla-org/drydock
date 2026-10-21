@@ -101,6 +101,12 @@ struct DiagnosticSecrets {
 impl DiagnosticSecrets {
     fn remember(&mut self, secret: Secret) {
         if !self.values.contains(&secret) {
+            if (1..4).contains(&secret.expose().len()) {
+                tracing::debug!(
+                    credential_bytes = secret.expose().len(),
+                    "short credential registered; diagnostic masking may obscure unrelated text"
+                );
+            }
             self.masker.remember(secret.expose());
             self.values.push(secret);
         }
@@ -1630,5 +1636,37 @@ mod operation_tests {
         }
         assert_eq!(host.diagnostic_secrets.recover().values.len(), 1);
         host.shutdown(async {}).await;
+    }
+    // Glue: a unique short credential emits a debug registration note without
+    // its value; delivering that same credential again emits no duplicate note.
+    #[test]
+    fn short_credential_note_contains_length_without_value() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.recover().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Capture(output.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut secrets = DiagnosticSecrets::default();
+            secrets.remember(Secret::new("xyz"));
+            secrets.remember(Secret::new("xyz"));
+        });
+        let text = String::from_utf8(captured.recover().clone()).unwrap();
+        assert_eq!(text.matches("short credential registered").count(), 1);
+        assert!(text.contains("credential_bytes=3"));
+        assert!(!text.contains("xyz"));
     }
 }
