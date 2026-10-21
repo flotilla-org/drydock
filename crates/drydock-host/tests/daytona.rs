@@ -23,6 +23,10 @@ struct State {
     mints: usize,
     requests: usize,
     failure: Option<u16>,
+    failure_message: Option<String>,
+    ssh_response: Option<Value>,
+    exec_response: Option<Value>,
+    probe_failure_message: Option<String>,
     executed: Vec<String>,
     probe: Option<Value>,
     violations: Vec<String>,
@@ -129,7 +133,8 @@ impl StandIn {
             return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
         }
         if let Some(status) = s.failure.take() {
-            return response(status, json!({"statusCode":status,"message":"key-a must never be echoed","error":"Too Many Requests"}));
+            let message = s.failure_message.take().unwrap_or_else(|| "key-a must never be echoed".into());
+            return response(status, json!({"statusCode":status,"message":message,"error":"Too Many Requests"}));
         }
         let method = request.method().as_str();
         let path = request.url().path();
@@ -298,7 +303,7 @@ impl StandIn {
             ("POST", p) if p.ends_with("/ssh-access") => {
                 s.ssh_expiries.push(request.url().query_pairs().find(|(k,_)|k=="expiresInMinutes").map(|(_,v)|v.into_owned()));
                 s.mints += 1;
-                response(200, json!({"token":format!("ephemeral-{}",s.mints),"expiresAt":"2026-10-19T12:05:00Z"}))
+                response(200, s.ssh_response.clone().unwrap_or_else(|| json!({"token":format!("ephemeral-{}",s.mints),"expiresAt":"2026-10-19T12:05:00Z"})))
             }
             ("POST", p) if p.ends_with("/stop") || p.ends_with("/start") => {
                 s.lifecycle_posts.push(p.into());
@@ -312,8 +317,9 @@ impl StandIn {
                 let Some(timeout) = body["timeout"].as_u64() else { reject!("missing timeout"); };
                 s.exec_timeouts.push(timeout);
                 if command.starts_with("test \"$(id -u)\"") && let Some(status) = s.probe_http_failure {
-                    return response(status, json!({"statusCode":status,"message":"Bad Gateway","error":"Bad Gateway"}));
+                    return response(status, json!({"statusCode":status,"message":s.probe_failure_message.as_deref().unwrap_or("Bad Gateway"),"error":"Bad Gateway"}));
                 }
+                if let Some(value) = &s.exec_response { return response(200, value.clone()); }
                 if s.require_bootstrap_budget && command.contains("nohup") && timeout < 20 {
                     return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
                 }
@@ -518,7 +524,7 @@ async fn vendor_errors() {
         (400, "internal"),
         (401, "credential_rejected"),
         (402, "quota_exhausted"),
-        (403, "credential_rejected"),
+        (403, "refused"),
         (404, "not_found"),
         (409, "internal"),
         (422, "internal"),
@@ -529,7 +535,8 @@ async fn vendor_errors() {
         let before = http.0.lock().unwrap().requests;
         let e = p.list(&c).await.unwrap_err();
         assert_eq!(e.class(), class);
-        assert!(!format!("{e:?}").contains("key-a"));
+        assert!(e.to_string().contains(&format!("HTTP {status}")));
+        assert!(e.to_string().contains("key-a must never be echoed"));
         if status == 429 {
             assert_eq!(e.retry_after(), Some(17));
         }
@@ -1140,17 +1147,17 @@ async fn standin_enforces_vendor_wire_contract() {
     assert!(matches!(p.list(&c).await, Err(ProtocolError::CredentialRejected { .. })));
 }
 
-// Unknown HTTP responses retain bounded sensitive vendor evidence. Debug output
-// must redact it, but the authenticated supervisor can inspect the Secret.
+// Unknown HTTP responses retain bounded vendor evidence. The host masks
+// configured credentials before displaying or returning these diagnostics.
 #[tokio::test]
 async fn internal_retains_vendor_body() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     http.0.lock().unwrap().failure = Some(400);
     let error = p.list(&credentials(false)).await.unwrap_err();
-    assert!(!format!("{error:?}").contains("key-a"));
+    assert!(format!("{error:?}").contains("key-a"));
     let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
-    assert!(provider_error.expose().contains("key-a must never be echoed"));
+    assert!(provider_error.as_str().contains("key-a must never be echoed"));
 }
 
 // The trusted bootstrap preflight has a safe public diagnostic while preserving
@@ -1231,9 +1238,9 @@ async fn transport_outages_are_unavailable() {
     let p = provider(Arc::new(Offline)).await;
     let error = p.list(&credentials(false)).await.unwrap_err();
     assert!(matches!(error, ProtocolError::Unavailable { .. }));
-    assert!(!format!("{error:?}").contains("private transport detail"));
+    assert!(error.to_string().contains("private transport detail"));
     let ProtocolError::Unavailable { provider_error: Some(detail), .. } = error else { panic!("missing protected transport diagnostic") };
-    assert!(detail.expose().contains("private transport detail"));
+    assert!(detail.as_str().contains("private transport detail"));
 }
 
 // Probe command failure and malformed proof leave successful creation/re-adoption
@@ -1580,4 +1587,103 @@ async fn ongoing_usage_does_not_bill_the_future() {
     let usage = p.operations().usage.unwrap().usage(period, &credentials(false)).await.unwrap();
     let elapsed_hours = (chrono::Utc::now() - start).num_milliseconds() as f64 / 3_600_000.0;
     assert!((1.0..=elapsed_hours).contains(&usage.environment_hours[0].hours));
+}
+
+// Masking at the host boundary sees the complete vendor body before truncation,
+// including a credential that crosses the old 16 KiB byte boundary.
+#[tokio::test]
+async fn vendor_body_masking_precedes_truncation() {
+    let vendor = Arc::new(StandIn::default());
+    let host = HostHarness::start(vendor.clone()).await;
+    drydock::client::Observer::new(host.client.clone(), None).next().await.unwrap();
+    let message = format!("{}key-a trailing", "x".repeat(16360));
+    {
+        let mut state = vendor.0.lock().unwrap();
+        state.failure = Some(400);
+        state.failure_message = Some(message.clone());
+    }
+    let error = host.client.list("daytona").await.unwrap_err();
+    let drydock::client::Error::Protocol(ProtocolError::Internal { provider_error, .. }) = error else { panic!("expected provider body") };
+    assert!(provider_error.len() <= 16384);
+    assert!(!provider_error.contains("key-"), "partial credential must not escape");
+    // The module must retain the entire body so the host can apply every
+    // configured provider's credentials before enforcing the diagnostic limit.
+    {
+        let mut state = vendor.0.lock().unwrap();
+        state.failure = Some(400);
+        state.failure_message = Some(message);
+    }
+    let p = provider(vendor.clone()).await;
+    let ProtocolError::Internal { provider_error, .. } = p.list(&credentials(false)).await.unwrap_err() else { panic!("expected body") };
+    assert!(provider_error.len() > 16384);
+    assert!(provider_error.contains("key-a trailing"));
+    host.finish().await;
+}
+
+// Malformed successful responses must not turn minted SSH recipes or guest
+// command/probe output into ordinary diagnostics in any operator-facing view.
+#[tokio::test]
+async fn malformed_sensitive_responses_do_not_disclose_values() {
+    let http = Arc::new(StandIn::default());
+    let p = provider_with_probe(http.clone(), true).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let env = row(p.provision(request(prep, "malformed-sensitive"), &c).await.unwrap());
+    http.0.lock().unwrap().ssh_response = Some(json!({"token":null,"sshCommand":"ssh minted-private-token@gateway"}));
+    let error = p.reach(&env.id, &c).await.err().unwrap();
+    for view in [error.to_string(), format!("{error:?}"), serde_json::to_string(&error).unwrap()] {
+        assert!(!view.contains("minted-private-token"), "{view}");
+        assert!(!view.contains("sshCommand"), "{view}");
+    }
+    for response in [json!({"result":"guest-private-output"}), json!({"exitCode":"invalid","result":"guest-private-output"})] {
+        http.0.lock().unwrap().exec_response = Some(response);
+        let error = p.operations().exec.unwrap().exec(&env.id, ExecRequest { command: vec!["run".into()] }, &c).await.err().unwrap();
+        for view in [error.to_string(), format!("{error:?}"), serde_json::to_string(&error).unwrap()] {
+            assert!(!view.contains("guest-private-output"), "{view}");
+        }
+    }
+    http.0.lock().unwrap().exec_response = None;
+    http.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["networkBlockAll"] = json!(true);
+    http.0.lock().unwrap().probe = Some(json!({"private_output":"guest-private-output"}));
+    let error = p.inspect(&env.id, &c).await.unwrap_err();
+    for view in [error.to_string(), format!("{error:?}"), serde_json::to_string(&error).unwrap()] {
+        assert!(!view.contains("guest-private-output"), "{view}");
+    }
+}
+
+// Lifecycle fallback succeeds, so its module-level log must contain only the
+// category: the host never receives this error to apply credential masking.
+#[test]
+fn lifecycle_fallback_log_does_not_disclose_provider_body() {
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let output = logs.clone();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || Capture(output.clone())).finish();
+    // This must remain the only global-subscriber installer in this integration
+    // binary; another installer would fail. Use the process dispatcher
+    // so HTTP/provider tasks and parallel callsite registration are captured too.
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let http = Arc::new(StandIn::default());
+        let p = provider_with_probe(http.clone(), true).await;
+        let c = credentials(false);
+        let prep = prepared(p.as_ref(), &c).await;
+        http.0.lock().unwrap().probe_http_failure = Some(502);
+        http.0.lock().unwrap().probe_failure_message = Some("validation fallback-secret-xyz".into());
+        let mut r = request(prep, "fallback-log");
+        r.egress = EgressRequest::DenyAll { direct: vec![] };
+        p.provision(r, &c).await.unwrap();
+    });
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("lifecycle succeeded; egress measurement failed"), "{logs}");
+    assert!(!logs.contains("fallback-secret-xyz"), "{logs}");
 }

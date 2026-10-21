@@ -36,7 +36,8 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
-Protocol version 5 requires `size` in every prepare request. Modules choose their
+Protocol version 6 exposes masked provider diagnostics and maps permission
+denials to `Refused`. It retains version 5's required `size` in every prepare request. Modules choose their
 prepared key; Daytona includes size because snapshots fix sandbox resources.
 Clients and hosts must upgrade together.
 
@@ -120,9 +121,38 @@ validate their own resource bounds before vendor calls.
 
 `Secret` redacts Debug output, including nested credential and reach recipes,
 but deliberately serializes the original string for transport. Never log their
-serialized JSON. Raw `Internal.provider_error` and optional
-`Unavailable.provider_error` contain sensitive, untrusted vendor text: do not log
-them at info level or forward them to end users.
+serialized JSON. `Internal.provider_error` and optional
+`Unavailable.provider_error` carry provider explanations to the operator. The host
+masks configured credential values (including proxy placeholders) by content
+before returning errors or logging them at warn level. CLI errors include the
+provider, operation, category, reason, upstream HTTP status and provider message.
+A Daytona 401 rejects the key; a 403 is `Refused` for the named operation and
+leaves the provider ready. No additional permission error variant is needed.
+Masking covers literal, JSON-escaped, percent-encoded and base64 echoes, before
+limiting diagnostics to 16 KiB per field. Derived patterns are cached when a
+credential is first delivered, rather than rebuilt on every failed call. Base64
+matching covers the complete encoded credential; it does not detect a credential
+embedded within a larger encoded payload (for example `base64(user:key)`) or
+arbitrarily transformed/nested encodings. Masking covers configured credentials,
+not other secret-like values such as provider-minted SSH tokens echoed in vendor
+error bodies. Malformed response diagnostics omit reach recipes and guest output.
+Display escapes control characters.
+Empty credential values are ignored. Every nonempty value is masked, including
+short placeholders; a short or common value can therefore obscure unrelated
+words in a diagnostic. Use distinctive placeholders for readable diagnostics.
+Registering a unique value shorter than four bytes emits a debug-level note with
+its byte length, never its content.
+The host masks currently configured credentials plus the 32 most recent distinct
+replaced values across providers. Older historical values are evicted and their
+cached patterns removed; they are no longer covered by that recent window.
+An in-flight call also masks the credential it used even if that value has been
+evicted. Provider removal requires a host restart. Successful response bodies,
+reach recipes and guest/probe output are omitted from validation diagnostics.
+
+Rust API compatibility: `provider_error` is now `String` (or `Option<String>`),
+and its Debug output is visible. Modules return complete diagnostics to the host;
+they should not log raw errors themselves. The host performs credential masking
+before returning or logging them. Credential and recipe Debug output stays redacted.
 `provider_state_unknown` means the vendor returned an unrecognized state; it is
 an Unknown observation, not evidence that the environment stopped or disappeared.
 
@@ -233,8 +263,8 @@ independent and accepts 1–86400 seconds. For example, a cold start can use
 Startup includes host configuration/credential readiness; request deadlines cover
 buffered HTTP calls and upgrade setup. Record and transition deadlines bound
 observation waits, while headers and probes have their own deadlines. Failure
-details contain safe categories (`timeout`, `decode`, `transport`, or typed HTTP
-status/class), never vendor reasons or probe output.
+details include error categories, reasons and provider messages after host
+credential masking. Guest probe output and reach recipes remain redacted.
 
 `echo_relay` is only for fixtures whose relay is an echo server. Real agents have
 a protocol: provide `reach_probe: ["/absolute/path/to/round-trip-probe", ...]`.
@@ -319,3 +349,18 @@ SSH pins and corrupt relay bytes fail the exact reach verdict. The fixture
 protocol; production agents provide their own round-trip executable through
 `reach_probe`. Additional transport/probe fault coverage is listed in
 [`boundary-matrix.json`](crates/drydock-host/tests/fixtures/boundary-matrix.json).
+
+Daytona API key permissions for this module (see [Daytona API keys](https://www.daytona.io/docs/api-keys)):
+
+| Operation | Required scope |
+| --- | --- |
+| Prepare (create an image snapshot) | `write:snapshots` |
+| Launch, suspend, resume, export from a sandbox | `write:sandboxes` |
+| Destroy | `delete:sandboxes` |
+| List, inspect, poll, snapshot lookup | Read access is always granted |
+| Exec and bootstrap through toolbox | Valid organization key; no separate runtime scope |
+| Usage | `read:billing` or `write:sandboxes` |
+| Quota | `read:limits` |
+
+Organization membership must also match the key. Permission failures
+report the exact upstream operation and message; they do not invalidate the key.

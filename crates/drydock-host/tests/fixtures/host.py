@@ -125,7 +125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "5", "host_version": "fixture", "modules": modules,
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "6", "host_version": "fixture", "modules": modules,
                 "providers": [{"provider": name, "module": config["module"], "readiness": {"status": readiness.get(name, "ready"), **({"reason": "missing"} if readiness.get(name) == "missing_credential" else {})},
                                "capabilities": capabilities, "rate_limits": []} for name, config in providers.items()]})
         if parsed.path == "/v1/config":
@@ -183,6 +183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         error = providers[provider]["settings"].get("fault")
         if error and parts[-1] == "environments":
             error = copy.deepcopy(error)
+            error["reason"] = f"provider {provider} operation list: {error['reason']}"
             if error["kind"] == "credential_rejected":
                 readiness[provider] = "missing_credential"
             status = {"refused":422,"unavailable":503,"rate_limited":429,"quota_exhausted":402,"credential_rejected":502,"internal":500,"not_found":404,"method_not_allowed":405}[error["kind"]]

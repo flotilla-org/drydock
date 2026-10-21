@@ -25,7 +25,7 @@ async fn cli_lifecycle_against_reference_host() {
         async move {
             let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
                 .arg("--config")
-                .arg(config)
+                .arg(&config)
                 .arg("--runtime-directory")
                 .arg(runtime)
                 .args(&args)
@@ -150,4 +150,198 @@ async fn cli_lifecycle_against_reference_host() {
     run(vec!["destroy".into(), "rust".into(), "a".into(), environment.id]).await;
     assert!(client.list("a").await.unwrap().is_empty());
     server.abort();
+}
+
+// The CLI traverses real host and vendor sockets. This HTTP stand-in supplies
+// validation/permission errors at the vendor boundary; no provider logic is faked.
+#[tokio::test]
+async fn cli_full_provider_errors() {
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    };
+    let status = Arc::new(AtomicU16::new(200));
+    let current = status.clone();
+    let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let current = current.clone();
+        async move {
+            let status = current.load(Ordering::SeqCst);
+            let body = if status == 200 && uri.path().starts_with("/api/snapshots/") {
+                json!({"id":"fixture-snapshot","name":uri.path().rsplit('/').next().unwrap(),"state":"active","cpu":2,"mem":4,"disk":10})
+            } else if status == 200 {
+                json!({"items":[]})
+            } else {
+                json!({"message":"Cannot specify Sandbox resources when using a snapshot; credential test-secret-value"})
+            };
+            (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(body))
+        }
+    });
+
+    for reference in [true, false] {
+        for (upstream, class) in [(400, "internal"), (401, "credential_rejected"), (403, "refused"), (0, "unavailable")] {
+            status.store(200, Ordering::SeqCst);
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = dir.path().join("host.sock");
+            let path = socket.clone();
+            let vendor = rigging_replay_testkit::http_contract::StandIn::start("https://app.daytona.io", router.clone()).await;
+            let host = drydock_host::Host::new(BTreeMap::from([
+                ("reference".into(), Arc::new(drydock_host::reference::ReferenceModule) as Arc<dyn drydock_host::module::Module>),
+                ("daytona".into(), Arc::new(CliDaytonaModule(vendor.http.clone())) as Arc<dyn drydock_host::module::Module>),
+            ]));
+            let server =
+                tokio::spawn(async move { host.serve_unix(path, unsafe { libc::geteuid() }, std::future::pending()).await.unwrap() });
+            let client = drydock::client::Client::unix(&socket).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while client.hello().await.is_err() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let credential = dir.path().join("credential");
+            std::fs::write(&credential, "test-secret-value").unwrap();
+            let kind = if reference { "reference" } else { "daytona" };
+            let mut settings = json!({
+                "organization_id":"org", "ssh_host_key":"ssh-ed25519 AAAA", "agent_command":"agent",
+                "rate_limits":[]
+            });
+            if reference {
+                settings = json!({"fixture":true,"fixture_push":true,"poll_interval_ms":3600000,"fault":{
+                    "kind":class, "reason":format!("HTTP {upstream}: vendor validation test-secret-value"),
+                    "provider_error":"vendor explanation test-secret-value", "retry_after":null
+                }});
+            }
+            let configuration: HostConfiguration = serde_json::from_value(json!({
+                "modules":[{"name":"module","entrypoint":kind}],
+                "providers":[{"name":"provider-a","module":"module","settings":settings,
+                    "credential":{"mode":"direct","credential_reference":"test"}}]
+            }))
+            .unwrap();
+            // Configure before invoking the CLI so readiness/polling are exercised too.
+            client.configure(&configuration).await.unwrap();
+            client.credential("provider-a", Secret::new("test-secret-value")).await.unwrap();
+            let prepared_for_launch = if !reference && upstream == 400 {
+                Some(
+                    client
+                        .prepare(
+                            "provider-a",
+                            &PrepareRequest {
+                                image_digest: format!("image@sha256:{}", "a".repeat(64)),
+                                tools_digest: "tools".into(),
+                                size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if !reference && upstream != 0 {
+                // Let the immediate successful poll settle before injecting the route error.
+                drydock::client::Observer::new(client.clone(), None).next().await.unwrap();
+                status.store(upstream, Ordering::SeqCst);
+            }
+            if upstream == 0 {
+                drop(vendor);
+            }
+            let spec = HostSpec {
+                name: "rust".into(),
+                connection: HostConnection::ExternalUnix { path: socket },
+                configuration,
+                credentials: BTreeMap::from([(
+                    "test".into(),
+                    drydock::credentials::CredentialReference::File { path: credential, json_field: None },
+                )]),
+            };
+            let config = dir.path().join("hosts.json");
+            std::fs::write(&config, serde_json::to_vec(&vec![spec]).unwrap()).unwrap();
+            let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+                .arg("--config")
+                .arg(&config)
+                .arg("--runtime-directory")
+                .arg(dir.path().join("run"))
+                .args(["list", "rust", "provider-a"])
+                .output()
+                .await
+                .unwrap();
+            assert!(!output.status.success());
+            let text = String::from_utf8(output.stderr).unwrap();
+            for expected in [class, "provider-a", "list"] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(!text.contains("test-secret-value"), "{text}");
+            if upstream != 0 {
+                assert!(text.contains(&upstream.to_string()), "{text}");
+                assert!(text.contains(if reference { "vendor validation" } else { "Cannot specify Sandbox resources" }), "{text}");
+                assert!(text.contains("<REDACTED>"), "{text}");
+            } else {
+                assert!(text.contains(if reference { "vendor validation" } else { "transport failed" }), "{text}");
+            }
+            if upstream == 400 {
+                let request = dir.path().join("launch.json");
+                std::fs::write(
+                    &request,
+                    serde_json::to_vec(&ProvisionRequest {
+                        label: "bad-request".into(),
+                        prepared: prepared_for_launch.unwrap_or_else(|| Prepared {
+                            provider: "provider-a".into(),
+                            id: "snapshot".into(),
+                            image_digest: "image".into(),
+                            tools_digest: "tools".into(),
+                        }),
+                        size: Size { cpus: 2., memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                        egress: EgressRequest::default(),
+                        ssh_public_key: None,
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
+                    .arg("--config")
+                    .arg(&config)
+                    .arg("--runtime-directory")
+                    .arg(dir.path().join("run"))
+                    .args(["launch", "rust", "provider-a"])
+                    .arg(request)
+                    .output()
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(output.stderr).unwrap();
+                assert!(!output.status.success());
+                for expected in [
+                    "internal",
+                    "provider-a",
+                    "provision",
+                    "400",
+                    if reference { "vendor validation" } else { "Cannot specify Sandbox resources" },
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+                assert!(!text.contains("test-secret-value"), "{text}");
+            }
+            if upstream == 403 {
+                assert_eq!(client.hello().await.unwrap().providers[0].readiness, Readiness::Ready);
+            }
+            server.abort();
+        }
+    }
+}
+
+// Substitute only the vendor network port; use the real Daytona module.
+struct CliDaytonaModule(std::sync::Arc<dyn drydock_host::module::HttpClient>);
+#[async_trait::async_trait]
+impl drydock_host::module::Module for CliDaytonaModule {
+    fn version(&self) -> &str {
+        "test"
+    }
+    async fn configure(
+        &self,
+        config: &ProviderConfiguration,
+        _: std::sync::Arc<dyn drydock_host::module::HttpClient>,
+    ) -> drydock_host::module::Result<std::sync::Arc<dyn drydock_host::module::Provider>> {
+        drydock_host::daytona::DaytonaModule.configure(config, self.0.clone()).await
+    }
 }

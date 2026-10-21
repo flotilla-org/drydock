@@ -22,7 +22,7 @@ pub enum Error {
     InvalidResponse,
     #[error("invalid host endpoint or request")]
     InvalidRequest,
-    #[error("host protocol error: {}", .0.class())]
+    #[error("host protocol error: {0}")]
     Protocol(ProtocolError),
     #[error("host protocol version mismatch")]
     VersionMismatch,

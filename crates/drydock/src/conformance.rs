@@ -168,14 +168,14 @@ trait SafeError {
 impl SafeError for Error {
     fn category(self) -> String {
         match self {
-            Error::Protocol(error) => format!("http {} {}", error.status(), error.class()),
+            Error::Protocol(error) => format!("http {} {}", error.status(), error),
             Error::InvalidResponse => "decode".into(),
             Error::Transport => "transport".into(),
             Error::InvalidRequest => "invalid request".into(),
             Error::VersionMismatch => "version mismatch".into(),
             Error::RateLimited => "rate limited".into(),
-            Error::NotReady(_) => "not ready".into(),
-            Error::ReadinessTimeout(_) => "startup timeout".into(),
+            Error::NotReady(readiness) => format!("not ready: {readiness:?}"),
+            Error::ReadinessTimeout(readiness) => format!("startup timeout: {readiness:?}"),
         }
     }
 }
@@ -1193,22 +1193,38 @@ async fn semantic_requests(client: &Client, provider: &str, options: &Options, o
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Operator diagnostics identify failure classes but never include vendor
-    // reasons, raw errors or readiness text, which may contain credentials.
+    // Conformance reports preserve the host-masked provider reasons and details;
+    // low-level decode/IO failures retain their stable categories.
     #[test]
-    fn safe_diagnostic_categories() {
-        let secret = "must-never-appear";
+    fn diagnostic_categories_and_provider_messages() {
+        let secret = "vendor explanation";
         let errors = [
             (Error::InvalidResponse, "decode"),
             (Error::Transport, "transport"),
-            (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused"),
-            (Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: Secret::new(secret) }), "http 500 internal"),
-            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready"),
+            (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused: vendor explanation"),
+            (
+                Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: secret.into() }),
+                "http 500 internal: vendor explanation; vendor explanation",
+            ),
+            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready: Unknown { reason: \"vendor explanation\" }"),
         ];
         for (error, expected) in errors {
             assert_eq!(error.category(), expected);
         }
         assert_eq!(std::io::Error::new(std::io::ErrorKind::TimedOut, secret).category(), "timeout");
+    }
+    // Conformance retains the host's readiness reason for both initial refusal
+    // and readiness timeout, rather than collapsing either to a bare category.
+    #[test]
+    fn readiness_diagnostics_retain_reasons() {
+        for readiness in [
+            Readiness::Unknown { reason: "provider validation".into() },
+            Readiness::MissingCredential { reason: "provider validation".into() },
+            Readiness::MissingTool { reason: "provider validation".into() },
+        ] {
+            assert!(Error::NotReady(readiness.clone()).category().contains("provider validation"));
+            assert!(Error::ReadinessTimeout(readiness).category().contains("provider validation"));
+        }
     }
     // Billing settle accepts zero through one day and refuses typos/overflow
     // before any endpoint calls; it is independent of request/event timeouts.

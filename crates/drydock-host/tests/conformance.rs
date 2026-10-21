@@ -228,7 +228,7 @@ async fn configurable_transition_deadlines() {
 #[tokio::test]
 async fn running_state_failure_preserves_replay_checks() {
     let report = python_report("inspect").await;
-    assert!(report.checks.iter().any(|c| c.name == "running_state" && !c.passed && c.detail == "http 503 unavailable"));
+    assert!(report.checks.iter().any(|c| c.name == "running_state" && !c.passed && c.detail.starts_with("http 503 unavailable")));
     for name in ["running_event", "cursor_resume", "resume_stream", "stopped_event", "cleanup"] {
         assert!(report.checks.iter().any(|c| c.name == name && c.passed), "{name}: {report:?}");
     }

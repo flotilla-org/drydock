@@ -836,8 +836,10 @@ async fn binary_sigterm_drains_and_removes_socket() {
     wait_hello(&client).await;
     let mut records = client.get("http://localhost/v1/events").send().await.unwrap().bytes_stream();
     assert!(records.next().await.unwrap().is_ok());
-    let config = json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("fault",json!({"fault":{"kind":"unavailable","reason":"sensitive-vendor-reason","retry_after":null}}))]});
+    let config = json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("fault",json!({"fault":{"kind":"unavailable","reason":"sensitive-vendor-reason","provider_error":"provider explanation sensitive-credential-value","retry_after":null}}))]});
     assert_eq!(client.put("http://localhost/v1/config").json(&config).send().await.unwrap().status(), 204);
+    let before: Hello = client.get("http://localhost/v1/hello").send().await.unwrap().json().await.unwrap();
+    assert!(matches!(before.providers[0].readiness, Readiness::MissingCredential { .. }));
     assert_eq!(
         client
             .put("http://localhost/v1/providers/fault/credential")
@@ -867,7 +869,9 @@ async fn binary_sigterm_drains_and_removes_socket() {
     assert!(logs.contains("route=\"/v1/config\""));
     assert!(logs.contains("error_class=\"refused\""));
     assert!(!logs.contains("sensitive-value-never-log"));
-    assert!(!logs.contains("sensitive-vendor-reason"));
+    assert!(logs.contains("sensitive-vendor-reason"));
+    assert!(logs.contains("provider explanation <REDACTED>"));
+    assert!(!logs.contains("provider is not ready"));
     assert!(!logs.contains("sensitive-credential-value"));
     assert!(logs.contains("route=\"poll\""));
     assert!(logs.contains("error_class=\"unavailable\""));
@@ -1467,7 +1471,7 @@ async fn disappearing_operation_port_is_a_typed_refusal() {
         .unwrap();
     assert_eq!(response.status(), 422);
     assert!(
-        matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { reason } if reason == "operation port unavailable")
+        matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { reason } if reason.ends_with("operation port unavailable"))
     );
     assert!(h.hello().await.providers[0].capabilities.fallback_runner);
 }
@@ -1566,4 +1570,60 @@ async fn cheap_inventory_carries_measured_egress() {
     control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
     let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
     assert_eq!(rows[0].egress, Enforcement::Advisory);
+}
+
+// Diagnostics are masked against every configured credential, including another
+// provider's old generation and proxied placeholder, before wire/Debug/Display.
+#[tokio::test]
+async fn diagnostics_mask_all_configured_credentials() {
+    let h = Harness::start().await;
+    let fault = json!({"fault":{"kind":"internal","reason":"vendor direct-token old-token placeholder-token",
+        "provider_error":"validation direct-token old-token placeholder-token"}});
+    let mut proxy = provider("proxy", json!({}));
+    proxy["credential"] = json!({"mode":"proxied","placeholder_token":"placeholder-token","proxy_url":"http://127.0.0.1:12345"});
+    h.configure(vec![provider("a", fault), provider("b", json!({})), proxy]).await;
+    h.credential("a", "direct-token").await;
+    h.credential("b", "old-token").await;
+    h.credential("b", "new-token").await;
+    let response = h.ok(Method::GET, "/providers/a/environments", Value::Null, 500).await;
+    let body = response.text().await.unwrap();
+    let error: ProtocolError = serde_json::from_str(&body).unwrap();
+    for view in [body, error.to_string(), format!("{error:?}")] {
+        for secret in ["direct-token", "old-token", "placeholder-token"] {
+            assert!(!view.contains(secret), "{view}");
+        }
+        assert!(view.contains("validation <REDACTED> <REDACTED> <REDACTED>"), "{view}");
+    }
+}
+
+// An unrelated module prerequisite must take precedence over a stale proxied
+// rejection when the proxy remains eligible for credential repair probes.
+#[tokio::test]
+async fn proxied_missing_tool_does_not_report_stale_rejection() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    let mut proxy = provider("a", json!({}));
+    proxy["credential"] = json!({"mode":"proxied", "placeholder_token":"placeholder", "proxy_url":"http://127.0.0.1:1"});
+    h.configure(vec![proxy]).await;
+    control.reject_list.store(true, SeqCst);
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    control.missing_tool.store(true, SeqCst);
+    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
+    assert!(error.to_string().contains("test tool absent"));
+    assert!(!error.to_string().contains("credential_rejected"));
+}
+
+// An admission error after rejection retains the original context exactly once.
+#[tokio::test]
+async fn rejected_credential_context_is_not_nested() {
+    let h = Harness::start().await;
+    h.configure(vec![provider(
+        "a",
+        json!({"fixture":true,"fixture_push":true,"fault":{"kind":"credential_rejected","reason":"vendor rejected"}}),
+    )])
+    .await;
+    h.credential("a", "fixture-token").await;
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
+    assert_eq!(error.to_string().matches("provider a operation list").count(), 1);
 }

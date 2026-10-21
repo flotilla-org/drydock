@@ -1,5 +1,7 @@
 //! JSON wire contract for ADR 0070 language hosts. No provider or HTTP runtime lives here.
 //! Provider IDs are opaque; labels identify a client's environment for idempotent creation.
+mod diagnostic;
+pub use diagnostic::DiagnosticMasker;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -9,7 +11,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "5";
+pub const PROTOCOL_VERSION: &str = "6";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -549,9 +551,11 @@ pub enum ProtocolError {
     Unavailable {
         reason: String,
         retry_after: Option<u64>,
-        /// Optional bounded provider/transport detail; never include it in public logs.
+        /// Bounded provider/transport detail, masked for credentials by the host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_error: Option<Secret>,
+        // Plain text has no type-level redaction: host boundaries must apply
+        // DiagnosticMasker before serializing or logging provider explanations.
+        provider_error: Option<String>,
     },
     RateLimited {
         reason: String,
@@ -572,8 +576,10 @@ pub enum ProtocolError {
     },
     Internal {
         reason: String,
-        /// Sensitive, untrusted vendor text: never log at info level or forward to end users.
-        provider_error: Secret,
+        /// Provider explanation, masked for credentials before leaving the host.
+        // Plain text has no type-level redaction: host boundaries must apply
+        // DiagnosticMasker before serializing or logging provider explanations.
+        provider_error: String,
     },
 }
 
@@ -627,6 +633,28 @@ impl ProtocolError {
         match self {
             Self::Unavailable { retry_after, .. } | Self::RateLimited { retry_after, .. } => *retry_after,
             _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NotFound { reason }
+            | Self::MethodNotAllowed { reason }
+            | Self::Refused { reason }
+            | Self::Unavailable { reason, .. }
+            | Self::RateLimited { reason, .. }
+            | Self::QuotaExhausted { reason }
+            | Self::CredentialRejected { reason }
+            | Self::CommandFailed { reason, .. }
+            | Self::Internal { reason, .. } => reason,
+        };
+        write!(f, "{}: {}", self.class(), diagnostic::LogText(reason))?;
+        match self {
+            Self::Internal { provider_error, .. } => write!(f, "; {}", diagnostic::LogText(provider_error)),
+            Self::Unavailable { provider_error: Some(detail), .. } => write!(f, "; {}", diagnostic::LogText(detail)),
+            _ => Ok(()),
         }
     }
 }

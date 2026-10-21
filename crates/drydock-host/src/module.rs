@@ -6,8 +6,8 @@ pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// Errors are serialized to authenticated host clients, including snapshot readers.
-/// Modules must exclude credentials from reasons. Raw diagnostics may contain
-/// sensitive vendor text and must use the protocol Secret fields.
+/// The host masks configured credential values in reasons and provider diagnostics.
+/// Credentials, tokens and reach recipes still use Secret fields.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }

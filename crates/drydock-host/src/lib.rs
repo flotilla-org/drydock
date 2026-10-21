@@ -91,12 +91,57 @@ impl EventSink {
     }
 }
 type PendingEvent = (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, EventKind);
+// Keep active values plus a bounded recent history, shared across providers.
+// Derive patterns at delivery; rebuild only when an old value is evicted.
+const RECENT_CREDENTIAL_LIMIT: usize = 32;
+#[derive(Default)]
+struct DiagnosticSecrets {
+    current: BTreeMap<String, Secret>,
+    recent: VecDeque<Secret>,
+    masker: Arc<DiagnosticMasker>,
+}
+impl DiagnosticSecrets {
+    fn contains(&self, secret: &Secret) -> bool {
+        self.current.values().any(|value| value == secret) || self.recent.contains(secret)
+    }
+    fn remember(&mut self, provider: &str, secret: Secret) {
+        if self.current.get(provider) == Some(&secret) {
+            return;
+        }
+        let known = self.contains(&secret);
+        if let Some(previous) = self.current.insert(provider.to_owned(), secret.clone()) {
+            self.recent.retain(|value| value != &previous);
+            if !self.current.values().any(|value| value == &previous) {
+                self.recent.push_back(previous);
+            }
+        }
+        self.recent.retain(|value| value != &secret);
+        let evicted = self.recent.len() > RECENT_CREDENTIAL_LIMIT;
+        if evicted {
+            self.recent.pop_front();
+            self.masker = Arc::default();
+            for value in self.current.values().chain(self.recent.iter()) {
+                Arc::make_mut(&mut self.masker).remember(value.expose());
+            }
+        } else if !known {
+            Arc::make_mut(&mut self.masker).remember(secret.expose());
+        }
+        if !known && (1..4).contains(&secret.expose().len()) {
+            tracing::debug!(
+                credential_bytes = secret.expose().len(),
+                "short credential registered; diagnostic masking may obscure unrelated text"
+            );
+        }
+    }
+}
 struct Authentication {
     credentials: Credentials,
     generation: u64,
     rejected: bool,
+    rejection_error: Option<ProtocolError>,
 }
 struct Instance {
+    diagnostic_secrets: Arc<Mutex<DiagnosticSecrets>>,
     config: ProviderConfiguration,
     provider: Arc<dyn Provider>,
     // Synchronous metadata access only; never hold this guard across await.
@@ -211,9 +256,12 @@ impl Instance {
         let module_ready = matches!(module, Readiness::Ready);
         if auth.rejected {
             match auth.credentials.mode {
-                CredentialMode::Direct { .. } => {
-                    Availability { readiness: Readiness::MissingCredential { reason: "credential rejected".into() }, may_call: false }
-                }
+                CredentialMode::Direct { .. } => Availability {
+                    readiness: Readiness::MissingCredential {
+                        reason: auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into()),
+                    },
+                    may_call: false,
+                },
                 CredentialMode::Proxied { .. } if module_ready => Availability {
                     readiness: Readiness::Unknown { reason: "proxy credential rejected; awaiting successful probe".into() },
                     may_call: true,
@@ -266,8 +314,17 @@ impl Instance {
             // rejection blocks both; proxied rejection permits both to probe.
             // A pending observation reservation can safely survive unready time:
             // no route can resume while polling remains disabled by readiness.
-            if !self.availability(&auth).may_call {
-                return Err(ProtocolError::unavailable("provider is not ready; inspect hello", None));
+            let availability = self.availability(&auth);
+            if !availability.may_call {
+                if auth.rejected
+                    && matches!(auth.credentials.mode, CredentialMode::Direct { .. })
+                    && let Some(error) = &auth.rejection_error
+                {
+                    // Already masked and contextualized at the original failure.
+                    return Err(ProtocolError::unavailable(error.to_string(), None));
+                }
+                let reason = format!("provider is not ready: {:?}", availability.readiness);
+                return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()));
             }
             (auth.credentials.clone(), auth.generation)
         };
@@ -275,9 +332,12 @@ impl Instance {
             return Err(refused("operation capability not declared"));
         }
         self.reserve(gate.name(), poll)?;
-        let result = f(self.provider.clone(), credentials).await;
+        let call_token = credentials.token().cloned();
+        let result = f(self.provider.clone(), credentials)
+            .await
+            .map_err(|error| self.diagnostic_error_for_token(error, gate.name(), call_token.as_ref()));
         if let Err(error) = &result {
-            tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), "provider call failed");
+            tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
         }
         let mut auth = self.auth.recover();
         let before = self.readiness(&auth);
@@ -286,10 +346,12 @@ impl Instance {
                 *self.poll_error.recover() = result.as_ref().err().cloned();
             }
             if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
+                auth.rejection_error = result.as_ref().err().cloned();
                 auth.rejected = true;
                 auth.generation += 1; // invalidate every call started before this rejection
             } else if result.is_ok() && auth.rejected && matches!(auth.credentials.mode, CredentialMode::Proxied { .. }) {
                 auth.rejected = false;
+                auth.rejection_error = None;
                 auth.generation += 1; // only a probe started after rejection can repair it
             }
         }
@@ -299,6 +361,21 @@ impl Instance {
         }
         result
     }
+    fn diagnostic_error(&self, error: ProtocolError, operation: &str) -> ProtocolError {
+        self.diagnostic_error_for_token(error, operation, None)
+    }
+    fn diagnostic_error_for_token(&self, error: ProtocolError, operation: &str, token: Option<&Secret>) -> ProtocolError {
+        let (mut masker, missing_token) = {
+            let secrets = self.diagnostic_secrets.recover();
+            (secrets.masker.clone(), token.filter(|token| !secrets.contains(token)))
+        };
+        if let Some(token) = missing_token {
+            // A long-running call may outlive the recent-generation window.
+            Arc::make_mut(&mut masker).remember(token.expose());
+        }
+        masker.context(error, &self.config.name, operation)
+    }
+
     fn longest_window(&self, operation: &str) -> std::time::Duration {
         std::time::Duration::from_secs(
             self.rate_limits.iter().filter(|r| r.operation == operation).map(|r| r.period_seconds).max().unwrap_or(0),
@@ -365,6 +442,7 @@ struct Configuration {
 }
 #[derive(Clone)]
 pub struct Host {
+    diagnostic_secrets: Arc<Mutex<DiagnosticSecrets>>,
     registry: Arc<Registry>,
     config: Arc<RwLock<Configuration>>,
     configuring: Arc<AsyncMutex<()>>,
@@ -378,6 +456,7 @@ impl Host {
         let (changed, _) = watch::channel(0);
         Self {
             registry: Arc::new(registry),
+            diagnostic_secrets: Arc::default(),
             config: Arc::new(RwLock::new(Configuration::default())),
             configuring: Arc::new(AsyncMutex::new(())),
             events: EventLog {
@@ -658,6 +737,15 @@ where
         Ok(Self(value))
     }
 }
+fn mask_readiness(readiness: Readiness, masker: &DiagnosticMasker) -> Readiness {
+    match readiness {
+        Readiness::MissingCredential { reason } => Readiness::MissingCredential { reason: masker.text(&reason) },
+        Readiness::MissingTool { reason } => Readiness::MissingTool { reason: masker.text(&reason) },
+        Readiness::VersionMismatch { reason } => Readiness::VersionMismatch { reason: masker.text(&reason) },
+        Readiness::Unknown { reason } => Readiness::Unknown { reason: masker.text(&reason) },
+        Readiness::Ready => Readiness::Ready,
+    }
+}
 async fn hello(State(host): State<Host>) -> Json<Hello> {
     let config = host.config.read().await;
     Json(Hello {
@@ -671,7 +759,11 @@ async fn hello(State(host): State<Host>) -> Json<Hello> {
                 provider: name.clone(),
                 module: i.config.module.clone(),
                 capabilities: i.capabilities.clone(),
-                readiness: i.readiness(&i.auth.recover()),
+                readiness: {
+                    let readiness = i.readiness(&i.auth.recover());
+                    let masker = host.diagnostic_secrets.recover().masker.clone();
+                    mask_readiness(readiness, &masker)
+                },
                 rate_limits: i.rate_limits.clone(),
             })
             .collect(),
@@ -725,6 +817,9 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         if matches!(&p.credential, CredentialMode::Proxied { placeholder_token, .. } if placeholder_token.expose().is_empty()) {
             return Err(refused("empty proxy placeholder token").into());
         }
+        if let CredentialMode::Proxied { placeholder_token, .. } = &p.credential {
+            host.diagnostic_secrets.recover().remember(&p.name, placeholder_token.clone());
+        }
         let credentials = Credentials::new(p.credential.clone());
         let proxy = match &p.credential {
             CredentialMode::Proxied { proxy_url, .. } => Some(proxy_url.as_str()),
@@ -738,7 +833,12 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
         let provider = tokio::select! {
             biased;
             _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::unavailable("host stopping", None).into()),
-            result = module.configure(p, http) => result?,
+            result = module.configure(p, http) => result.map_err(|error| {
+                let masker = host.diagnostic_secrets.recover().masker.clone();
+                let error = masker.context(error, &p.name, "configure");
+                tracing::warn!(provider = %p.name, route = "configure", error_class = error.class(), error = %error, "provider call failed");
+                error
+            })?,
         };
         let (credential_changes, _) = watch::channel(credentials.clone());
         let capabilities = provider.capabilities();
@@ -761,8 +861,9 @@ async fn configure(State(host): State<Host>, ApiJson(request): ApiJson<HostConfi
             p.name.clone(),
             Arc::new(Instance {
                 config: p.clone(),
+                diagnostic_secrets: host.diagnostic_secrets.clone(),
                 provider,
-                auth: Mutex::new(Authentication { credentials, rejected: false, generation: 0 }),
+                auth: Mutex::new(Authentication { credentials, rejected: false, rejection_error: None, generation: 0 }),
                 capabilities,
                 rate_limits,
                 events: sink,
@@ -816,9 +917,11 @@ async fn credential(
         return Err(refused("proxied provider cannot accept direct credentials").into());
     }
     let before = instance.readiness(&auth);
+    host.diagnostic_secrets.recover().remember(&p, refresh.value.clone());
     auth.credentials.value = Some(refresh.value);
     auth.generation += 1;
     auth.rejected = false;
+    auth.rejection_error = None;
     *instance.poll_error.recover() = None;
     instance.credential_changes.send_replace(auth.credentials.clone());
     let after = instance.readiness(&auth);
@@ -1144,6 +1247,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
     .await
 }
 
+// Readiness transitions log only a static status label, never the reason.
+// They are not serialized as events; hello masks reasons at its wire boundary.
 fn readiness_status(value: &Readiness) -> &'static str {
     match value {
         Readiness::Ready => "ready",
@@ -1531,5 +1636,242 @@ mod operation_tests {
         cheap.egress_policy = None;
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
         assert_eq!(cheap.environment.egress, Enforcement::Advisory);
+    }
+    // Credential delivery wakes a host poll immediately. Advancing a paused
+    // clock while unready must not attempt a call or record a spurious error.
+    #[tokio::test(start_paused = true)]
+    async fn poll_waits_for_credential_without_spurious_failure() {
+        let host = Host::new(reference::registry());
+        let config = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"reference"}],
+            "providers":[{"name":"a","module":"memory","settings":{"poll_interval_ms":3600000},
+                "credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        configure(State(host.clone()), ApiJson(config)).await.map_err(|e| e.0).unwrap();
+        let instance = host.instance("a").await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(7200)).await;
+        tokio::task::yield_now().await;
+        assert!(instance.poll_error.recover().is_none());
+        assert!(!host.events.log.recover().inventories.contains_key("a"));
+        let mut changes = host.events.changed.subscribe();
+        credential(State(host.clone()), ApiPath("a".into()), ApiJson(CredentialRefresh { value: Secret::new("token") }))
+            .await
+            .map_err(|e| e.0)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !host.events.log.recover().inventories.contains_key("a") {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(instance.poll_error.recover().is_none());
+        host.shutdown(async {}).await;
+    }
+
+    // Repeated configuration and several providers sharing a placeholder must
+    // retain one diagnostic secret for delayed vendor echoes.
+    #[tokio::test]
+    async fn repeated_proxy_configuration_deduplicates_diagnostic_secret() {
+        let host = Host::new(reference::registry());
+        let config: HostConfiguration = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"reference"}],
+            "providers":[{"name":"a","module":"memory","settings":{},
+                "credential":{"mode":"proxied","placeholder_token":"placeholder","proxy_url":"http://127.0.0.1:1"}}]
+        }))
+        .unwrap();
+        let mut config = config;
+        for count in 1..=3 {
+            let mut provider = config.providers[0].clone();
+            provider.name = format!("provider-{count}");
+            config.providers.push(provider);
+            for _ in 0..2 {
+                configure(State(host.clone()), ApiJson(config.clone())).await.map_err(|e| e.0).unwrap();
+            }
+        }
+        {
+            let secrets = host.diagnostic_secrets.recover();
+            assert_eq!(secrets.current.values().map(Secret::expose).collect::<BTreeSet<_>>().len(), 1);
+            assert!(secrets.recent.is_empty());
+        }
+        host.shutdown(async {}).await;
+    }
+    #[test]
+    fn active_shared_values_do_not_consume_history() {
+        let mut secrets = DiagnosticSecrets::default();
+        secrets.remember("a", Secret::new("shared"));
+        secrets.remember("b", Secret::new("shared"));
+        secrets.remember("a", Secret::new("new-a"));
+        assert!(secrets.recent.is_empty());
+        secrets.remember("b", Secret::new("new-b"));
+        assert_eq!(secrets.recent, VecDeque::from([Secret::new("shared")]));
+    }
+
+    #[test]
+    fn readiness_reasons_mask_without_adding_context() {
+        let mut masker = DiagnosticMasker::default();
+        masker.remember("readiness-secret");
+        for readiness in [
+            Readiness::MissingCredential { reason: "missing readiness-secret".into() },
+            Readiness::Unknown { reason: "unknown readiness-secret".into() },
+        ] {
+            let result = mask_readiness(readiness, &masker);
+            let wire = serde_json::to_string(&result).unwrap();
+            assert!(!wire.contains("readiness-secret"));
+            assert!(wire.contains("<REDACTED>"));
+            assert!(!wire.contains("operation"));
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_masks_readiness_reasons_at_wire_boundary() {
+        let host = Host::new(reference::registry());
+        let config = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"reference"}],
+            "providers":[{"name":"a","module":"memory","settings":{},
+                "credential":{"mode":"direct","credential_reference":"test"}}]
+        }))
+        .unwrap();
+        configure(State(host.clone()), ApiJson(config)).await.map_err(|e| e.0).unwrap();
+        host.diagnostic_secrets.recover().remember("a", Secret::new("readiness-secret"));
+        {
+            let config = host.config.read().await;
+            let mut auth = config.providers["a"].auth.recover();
+            auth.rejected = true;
+            auth.rejection_error = Some(ProtocolError::CredentialRejected { reason: "readiness-secret rejected".into() });
+        }
+        let Json(result) = hello(State(host.clone())).await;
+        let wire = serde_json::to_string(&result).unwrap();
+        assert!(!wire.contains("readiness-secret"));
+        assert!(wire.contains("<REDACTED>"));
+        host.shutdown(async {}).await;
+    }
+
+    #[tokio::test]
+    async fn configure_errors_mask_placeholder_and_include_context() {
+        struct Failing;
+        #[async_trait::async_trait]
+        impl Module for Failing {
+            fn version(&self) -> &str {
+                "test"
+            }
+            async fn configure(&self, _: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+                Err(ProtocolError::Internal { reason: "configure-secret rejected".into(), provider_error: "configure-secret body".into() })
+            }
+        }
+        let host = Host::new(Registry::from([("failing".into(), Arc::new(Failing) as Arc<dyn Module>)]));
+        let config = serde_json::from_value(serde_json::json!({
+            "modules":[{"name":"memory","entrypoint":"failing"}],
+            "providers":[{"name":"a","module":"memory","settings":{},
+                "credential":{"mode":"proxied","placeholder_token":"configure-secret","proxy_url":"http://127.0.0.1:1"}}]
+        }))
+        .unwrap();
+        let error = configure(State(host.clone()), ApiJson(config)).await.err().unwrap().0;
+        let wire = serde_json::to_string(&error).unwrap();
+        assert!(!wire.contains("configure-secret"));
+        assert!(wire.contains("<REDACTED>"));
+        assert!(wire.contains("provider a operation configure:"));
+        host.shutdown(async {}).await;
+    }
+
+    // Glue: a unique short credential emits a debug registration note without
+    // its value; delivering that same credential again emits no duplicate note.
+    #[test]
+    fn short_credential_note_contains_length_without_value() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.recover().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Capture(output.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut secrets = DiagnosticSecrets::default();
+            secrets.remember("provider", Secret::new("xyz"));
+            secrets.remember("provider", Secret::new("xyz"));
+        });
+        let text = String::from_utf8(captured.recover().clone()).unwrap();
+        assert_eq!(text.matches("short credential registered").count(), 1);
+        assert!(text.contains("credential_bytes=3"));
+        assert!(!text.contains("xyz"));
+    }
+    // Credential history is bounded independently of refresh count, while every
+    // active provider and the recent replacement window remain masked.
+    #[test]
+    fn credential_history_is_bounded_and_active_values_remain_masked() {
+        for rotations in [0, 1, RECENT_CREDENTIAL_LIMIT, RECENT_CREDENTIAL_LIMIT + 1, 100] {
+            let mut secrets = DiagnosticSecrets::default();
+            secrets.remember("other", Secret::new("other-active-token"));
+            for generation in 0..=rotations {
+                secrets.remember("rotating", Secret::new(format!("generation-{generation}-token")));
+            }
+            assert_eq!(secrets.recent.len(), rotations.min(RECENT_CREDENTIAL_LIMIT));
+            assert_eq!(secrets.current.len(), 2);
+            let current = format!("generation-{rotations}-token");
+            let previous = format!("generation-{}-token", rotations.saturating_sub(1));
+            let oldest_recent = format!("generation-{}-token", rotations.saturating_sub(RECENT_CREDENTIAL_LIMIT));
+            let error = secrets.masker.context(
+                ProtocolError::Internal {
+                    reason: "validation".into(),
+                    provider_error: format!("other-active-token {current} {previous} {oldest_recent} generation-0-token"),
+                },
+                "p",
+                "list",
+            );
+            let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+            assert!(!provider_error.contains("other-active-token"));
+            assert!(!provider_error.contains(&current));
+            assert!(!provider_error.contains(&previous));
+            assert!(!provider_error.contains(&oldest_recent));
+            if rotations > RECENT_CREDENTIAL_LIMIT {
+                assert!(provider_error.contains("generation-0-token"));
+            }
+        }
+    }
+
+    // A call masks its own credential even if many refreshes evict that value
+    // before its vendor error returns; the retained history still stays bounded.
+    #[tokio::test]
+    async fn in_flight_error_masks_evicted_call_credential() {
+        let instance = instance("list").await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let call = instance.clone();
+        let started = entered.clone();
+        let waiting = release.clone();
+        let pending = tokio::spawn(async move {
+            call.call(Gate::List, move |_, credentials| async move {
+                started.notify_one();
+                waiting.notified().await;
+                Err::<(), _>(ProtocolError::Internal {
+                    reason: "vendor failure".into(),
+                    provider_error: credentials.token().unwrap().expose().into(),
+                })
+            })
+            .await
+        });
+        entered.notified().await;
+        for generation in 0..100 {
+            instance.diagnostic_secrets.recover().remember("a", Secret::new(format!("new-{generation}")));
+        }
+        assert!(!instance.diagnostic_secrets.recover().contains(&Secret::new("token")));
+        release.notify_one();
+        let error = pending.await.unwrap().unwrap_err();
+        let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+        assert_eq!(provider_error, "<REDACTED>");
+        assert!(instance.diagnostic_secrets.recover().recent.len() <= RECENT_CREDENTIAL_LIMIT);
     }
 }
