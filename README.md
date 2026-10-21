@@ -36,6 +36,10 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
+Protocol version 5 requires `size` in every prepare request. Modules choose their
+prepared key; Daytona includes size because snapshots fix sandbox resources.
+Clients and hosts must upgrade together.
+
 Protocol version 4 adds transitional observations and scoped resource measurements
 with UCUM units, exact decimal money plus currency, and structured quota keys.
 The host retains the last stable billing state across known progress samples;
@@ -66,8 +70,8 @@ Wire conventions chosen for this first protocol version:
 - Configuration contains non-secret settings and credential references or proxy
   placeholders. Direct credential values are sent separately through the
   authenticated credential refresh route, including initial delivery.
-- Prepare is look-up-or-build by image/tools digest pair; a prepared form belongs
-  to its named provider. Hosts must refuse cross-provider use. Baking and upload
+- Prepare is look-up-or-build by a module-defined key (Daytona: image/tools
+  digests and size); a prepared form belongs to its named provider. Hosts must refuse cross-provider use. Baking and upload
   start the agent with fixed flags, without per-vessel configuration.
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
   unsupported destinations are refused, never widened. The result records
@@ -209,7 +213,7 @@ figures can include concurrent workloads and delayed vendor accounting; they are
 not a monetary estimate. The runner prepares the selected image/tools digests twice and checks
 look-up-or-build identity before provisioning; the input prepared ID is replaced.
 Operators can also obtain a complete prepared form with
-`drydock --config hosts.json prepare HOST NAME IMAGE_DIGEST TOOLS_DIGEST`.
+`drydock --config hosts.json prepare HOST NAME IMAGE_DIGEST TOOLS_DIGEST CPUS MEMORY_BYTES DISK_BYTES`.
 Preparation can incur provider charges. Live Daytona and then Namespace validation
 are operator runs once their modules and test credentials exist.
 

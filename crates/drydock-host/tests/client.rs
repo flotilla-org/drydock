@@ -23,7 +23,17 @@ fn spec() -> HostSpec {
     }
 }
 async fn prepare(client: &Client) -> Prepared {
-    client.prepare("a", &PrepareRequest { image_digest: "sha256:image".into(), tools_digest: "sha256:tools".into() }).await.unwrap()
+    client
+        .prepare(
+            "a",
+            &PrepareRequest {
+                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                image_digest: "sha256:image".into(),
+                tools_digest: "sha256:tools".into(),
+            },
+        )
+        .await
+        .unwrap()
 }
 fn request(prepared: Prepared) -> ProvisionRequest {
     ProvisionRequest {
@@ -599,4 +609,26 @@ async fn typed_observer_preserves_partial_snapshot_markers() {
         }
         other => panic!("expected marked gap snapshot, got {other:?}"),
     }
+}
+
+// Reference preparation keys only on digests: accepting another size leaves the
+// prepared identity unchanged, and provision uses its own requested size.
+#[tokio::test]
+async fn reference_preparation_ignores_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut host = supervisor(dir.path()).start(spec()).await.unwrap();
+    host.ready(Duration::from_secs(5)).await.unwrap();
+    let mut preparation = PrepareRequest {
+        image_digest: "image".into(),
+        tools_digest: "tools".into(),
+        size: Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 },
+    };
+    let first = host.client.prepare("a", &preparation).await.unwrap();
+    preparation.size = Size { cpus: 4., memory_bytes: u64::MAX, disk_bytes: u64::MAX };
+    let second = host.client.prepare("a", &preparation).await.unwrap();
+    assert_eq!(first, second);
+    let mut provision = request(first);
+    provision.size = preparation.size.clone();
+    let row = host.client.provision("a", &provision).await.unwrap();
+    assert_eq!(row.granted_size, Some(preparation.size));
 }

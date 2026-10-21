@@ -31,6 +31,9 @@ enum Command {
         provider: String,
         image_digest: String,
         tools_digest: String,
+        cpus: f64,
+        memory_bytes: u64,
+        disk_bytes: u64,
     },
     Hosts,
     Instances,
@@ -132,7 +135,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("provider failed conformance".into());
                 }
             }
-            Command::Prepare { provider, image_digest, tools_digest, .. } => {
+            Command::Prepare { provider, image_digest, tools_digest, cpus, memory_bytes, disk_bytes, .. } => {
                 status?;
                 instance_ready(&handle, provider)?;
                 println!(
@@ -140,7 +143,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     serde_json::to_string(
                         &handle
                             .client
-                            .prepare(provider, &PrepareRequest { image_digest: image_digest.clone(), tools_digest: tools_digest.clone() })
+                            .prepare(
+                                provider,
+                                &PrepareRequest {
+                                    size: drydock_protocol::Size { cpus: *cpus, memory_bytes: *memory_bytes, disk_bytes: *disk_bytes },
+                                    image_digest: image_digest.clone(),
+                                    tools_digest: tools_digest.clone()
+                                }
+                            )
                             .await?
                     )?
                 );

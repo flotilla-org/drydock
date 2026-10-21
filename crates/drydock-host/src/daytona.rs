@@ -532,7 +532,8 @@ impl Provider for Daytona {
         {
             return Err(refused("Daytona requires an image reference pinned by sha256 digest"));
         }
-        let snapshot_name = name("snapshot", &format!("{}\0{}", r.image_digest, r.tools_digest));
+        validate_size(&r.size)?;
+        let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &r.size);
         let url = self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?;
         let snapshot = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
@@ -540,7 +541,7 @@ impl Provider for Daytona {
                 match self
                     .create(
                         self.path(&self.settings.api_url, &["snapshots"])?,
-                        json!({"name":snapshot_name,"imageName":r.image_digest,"regionId":self.settings.region,"sandboxClass":"container"}),
+                        json!({"name":snapshot_name,"imageName":r.image_digest,"regionId":self.settings.region,"sandboxClass":"container","cpu":r.size.cpus as u64,"memory":r.size.memory_bytes/GIB,"disk":r.size.disk_bytes/GIB}),
                         c,
                     )
                     .await?
@@ -584,17 +585,9 @@ impl Provider for Daytona {
         }
         let policy = allowlist(r.egress)?;
         let size = &r.size;
-        if !size.cpus.is_finite()
-            || size.cpus.fract() != 0.0
-            || !(1.0..=4.0).contains(&size.cpus)
-            || size.memory_bytes == 0
-            || size.memory_bytes > 8 * GIB
-            || !size.memory_bytes.is_multiple_of(GIB)
-            || size.disk_bytes == 0
-            || size.disk_bytes > 10 * GIB
-            || !size.disk_bytes.is_multiple_of(GIB)
-        {
-            return Err(refused("Daytona container size requires 1..4 whole vCPU, 1..8 GiB RAM, 1..10 GiB disk"));
+        validate_size(size)?;
+        if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.tools_digest, size) {
+            return Err(refused("Daytona size does not match the prepared snapshot"));
         }
         if let Some(v) = self
             .inventory(Some(&r.label), c)
@@ -614,7 +607,7 @@ impl Provider for Daytona {
         }
         let mut body = json!({
             "name":name("environment", &r.label), "snapshot":r.prepared.id, "labels":{"flotilla.label":r.label.clone()},
-            "target":self.settings.region, "cpu":size.cpus as u64, "memory":size.memory_bytes/GIB, "disk":size.disk_bytes/GIB,
+            "target":self.settings.region,
             "autoStopInterval":0, "autoPauseInterval":0, "autoDeleteInterval":-1, "public":false
         });
         body.as_object_mut().unwrap().extend(policy.as_object().unwrap().clone());
@@ -937,6 +930,26 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
                 .max()
         })
 }
+// The provider records the prepared form under this deterministic resource key.
+fn snapshot_name(image: &str, tools: &str, size: &Size) -> String {
+    name("snapshot", &format!("{image}\0{tools}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+}
+fn validate_size(size: &Size) -> Result<()> {
+    if !size.cpus.is_finite()
+        || size.cpus.fract() != 0.0
+        || !(1.0..=4.0).contains(&size.cpus)
+        || size.memory_bytes == 0
+        || size.memory_bytes > 8 * GIB
+        || !size.memory_bytes.is_multiple_of(GIB)
+        || size.disk_bytes == 0
+        || size.disk_bytes > 10 * GIB
+        || !size.disk_bytes.is_multiple_of(GIB)
+    {
+        return Err(refused("Daytona container size requires 1..4 whole vCPU, 1..8 GiB RAM, 1..10 GiB disk"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

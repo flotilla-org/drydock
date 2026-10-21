@@ -9,7 +9,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "4";
+pub const PROTOCOL_VERSION: &str = "5";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -203,9 +203,11 @@ pub enum Destination {
         cidr: Cidr,
     },
 }
-/// Preparation is look-up-or-build at the provider, keyed by both digests.
+/// Preparation is look-up-or-build at the provider. Modules choose their key;
+/// providers that fix resources at prepare include size alongside both digests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
+    pub size: Size,
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub image_digest: String,

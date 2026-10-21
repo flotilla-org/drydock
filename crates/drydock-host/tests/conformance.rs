@@ -12,7 +12,18 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 async fn reference_binary_passes_conformance() {
     let configuration = fixture_configuration();
     let (_dir, mut binary, host) = start_binary(configuration.clone()).await;
-    let prepared = host.client.prepare("a", &PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }).await.unwrap();
+    let prepared = host
+        .client
+        .prepare(
+            "a",
+            &PrepareRequest {
+                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+            },
+        )
+        .await
+        .unwrap();
     let options = Options {
         request: ProvisionRequest {
             label: "conformance".into(),

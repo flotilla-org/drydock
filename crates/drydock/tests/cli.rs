@@ -43,9 +43,20 @@ async fn cli_lifecycle_against_reference_host() {
     assert!(run(vec!["hosts".into()]).await.contains("ready"));
     assert!(run(vec!["instances".into()]).await.contains("\"instance\":\"a\""));
     let client = drydock::client::Client::unix(socket).unwrap();
-    let prepared: Prepared =
-        serde_json::from_str(&run(vec!["prepare".into(), "rust".into(), "a".into(), "sha256:image".into(), "sha256:tools".into()]).await)
-            .unwrap();
+    let prepared: Prepared = serde_json::from_str(
+        &run(vec![
+            "prepare".into(),
+            "rust".into(),
+            "a".into(),
+            "sha256:image".into(),
+            "sha256:tools".into(),
+            "1".into(),
+            "1024".into(),
+            "0".into(),
+        ])
+        .await,
+    )
+    .unwrap();
     let request = dir.path().join("launch.json");
     std::fs::write(
         &request,
@@ -66,7 +77,17 @@ async fn cli_lifecycle_against_reference_host() {
     let options = drydock::conformance::Options {
         request: ProvisionRequest {
             label: "cli-conformance".into(),
-            prepared: client.prepare("a", &PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }).await.unwrap(),
+            prepared: client
+                .prepare(
+                    "a",
+                    &PrepareRequest {
+                        size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                        image_digest: "image".into(),
+                        tools_digest: "tools".into(),
+                    },
+                )
+                .await
+                .unwrap(),
             size: Size { cpus: 2., memory_bytes: 1024, disk_bytes: 0 },
             egress: EgressRequest::default(),
             ssh_public_key: None,

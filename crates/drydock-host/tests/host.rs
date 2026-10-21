@@ -62,11 +62,16 @@ impl Harness {
         self.credential("b", "two").await;
     }
     async fn prepared(&self, p: &str) -> Prepared {
-        self.ok(Method::POST, &format!("/providers/{p}/prepare"), json!({"image_digest":"sha256:image","tools_digest":"sha256:tools"}), 200)
-            .await
-            .json()
-            .await
-            .unwrap()
+        self.ok(
+            Method::POST,
+            &format!("/providers/{p}/prepare"),
+            json!({"image_digest":"sha256:image","tools_digest":"sha256:tools","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}),
+            200,
+        )
+        .await
+        .json()
+        .await
+        .unwrap()
     }
     async fn provision(&self, p: &str, label: &str, prepared: &Prepared, status: u16) -> Environment {
         self.ok(Method::POST, &format!("/providers/{p}/environments"), request(label, prepared), status).await.json().await.unwrap()
@@ -333,7 +338,14 @@ async fn proxied_credentials_use_supervisor_proxy() {
     let mut config = provider("proxied", json!({}));
     config["credential"] = serde_json::to_value(mode).unwrap();
     h.configure(vec![config]).await;
-    let error = h.ok(Method::POST, "/providers/proxied/prepare", json!({"image_digest":"i","tools_digest":"t"}), 502).await;
+    let error = h
+        .ok(
+            Method::POST,
+            "/providers/proxied/prepare",
+            json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}),
+            502,
+        )
+        .await;
     assert!(matches!(error.json::<ProtocolError>().await.unwrap(), ProtocolError::CredentialRejected { .. }));
     // Proxy-side repair needs no Direct refresh or host reconfiguration.
     h.prepared("proxied").await;
@@ -619,7 +631,7 @@ async fn independent_providers_and_inflight_credential_refresh() {
     let pending = tokio::spawn(async move {
         client
             .post("http://localhost/v1/providers/a/prepare")
-            .json(&json!({"image_digest":"image","tools_digest":"tools"}))
+            .json(&json!({"image_digest":"image","tools_digest":"tools","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}))
             .send()
             .await
             .unwrap()
@@ -1000,8 +1012,17 @@ interactions:
     let provider = module.configure(&config, http).await.unwrap();
     let mut credentials = Credentials::new(config.credential);
     credentials.value = Some(Secret::new("placeholder"));
-    let prepared =
-        provider.prepare(PrepareRequest { image_digest: "image".into(), tools_digest: "tools".into() }, &credentials).await.unwrap();
+    let prepared = provider
+        .prepare(
+            PrepareRequest {
+                size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+            },
+            &credentials,
+        )
+        .await
+        .unwrap();
     assert_eq!(prepared.provider, "a");
     session.assert_complete();
 }
@@ -1159,7 +1180,12 @@ async fn poll_rejection_survives_stale_success_until_refresh() {
     control.hold_success.store(true, SeqCst);
     let client = h.client.clone();
     let pending = tokio::spawn(async move {
-        client.post("http://localhost/v1/providers/a/prepare").json(&json!({"image_digest":"i","tools_digest":"t"})).send().await.unwrap()
+        client
+            .post("http://localhost/v1/providers/a/prepare")
+            .json(&json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}))
+            .send()
+            .await
+            .unwrap()
     });
     control.success_entered.notified().await;
     control.reject_list.store(true, SeqCst);
