@@ -96,15 +96,21 @@ ordinary `CONNECT hostname:port` requests on the registered upstream forward.
 The agent waits for a successful CONNECT response before relaying application
 bytes. Numeric destinations stay numeric. It carries no other UDP or ICMP.
 
-The fake DNS allocator uses 198.18.0.0/15 and 30-second leases/TTLs, normalizes
-names, renews repeated queries, and reuses expired addresses when the bounded
-pool wraps. Unknown/expired fake destinations fail. A client that caches an A
-answer past its advertised TTL must resolve again before reconnecting; connection
-pools, pinned `/etc/hosts` entries and resolvers ignoring TTLs can otherwise fail.
-An address can be assigned to another name after expiry and pool wrap, so callers
-must not pin fake addresses. A/AAAA queries never yield
-real DNS answers: A gets a fake IPv4 address, AAAA and other types get NODATA.
-DNS-over-TCP is also captured. Existing TCP sessions survive lease expiry.
+The fake DNS allocator uses 198.18.0.0/15 and advertises a 30-second TTL.
+Mappings live for 60 seconds after the last lookup, adding a setup grace period
+for connections that start near DNS TTL expiry. Names are normalized and renewed
+on repeated queries; an ordered expiry index reuses expired addresses without
+scanning the pool under the shared DNS mutex. Allocation, renewal and exhaustion
+use the O(log pool size) ordered index. The index holds one
+entry per mapping, including after repeated renewals.
+
+Unknown/expired fake destinations fail. A client caching an answer beyond the
+lease must resolve again before reconnecting; connection pools, pinned
+`/etc/hosts` entries and resolvers ignoring TTLs can otherwise fail. An address
+can be reassigned after its lease expires, so callers must not pin fake addresses.
+A/AAAA queries never yield real DNS answers: A gets a fake IPv4 address, AAAA and
+other types get NODATA. DNS-over-TCP is also captured. Existing TCP sessions
+survive lease expiry.
 
 On an enabled configuration, the controller-supplied `ca` is atomically written
 as `/opt/drydock/ca.pem` (`CA_PATH`), readable by guest processes. Supply the
@@ -125,7 +131,10 @@ The guest/provider must supply:
 - `CAP_NET_ADMIN` for the agent to install its vessel-local nft table and mark
   its own outbound TCP sockets. This is not a UID exemption: launched processes
   with the same UID are still redirected. Native host-facing transports use
-  Unix/vsock; TCP sockets dialed by agent host-to-guest forwards use `SO_MARK`.
+  Unix/vsock; yamux multiplexes these existing streams. All TCP sockets dialed by
+  agent host-to-guest forwards use `SO_MARK` while capture is enabled. The shipped
+  binary has no TCP host-link connector. A future agent-side TCP carrier must
+  apply the same marking before connect to avoid capture recursion.
 - A writable `/opt/drydock` for the pushed trust bundle, and a resolver entry in
   `/etc/resolv.conf`. UDP/TCP port 53 goes to fake DNS regardless of the named
   resolver. DNS libraries must have a nameserver to contact in the first place.
@@ -138,7 +147,9 @@ The guest/provider must supply:
 
 The agent only replaces its `inet drydock_egress` table, in one nft transaction.
 Agent-marked sockets, the local explicit proxy, and configured loopback forward
-listeners are exempt to avoid recursion. All other TCP is captured, including
+listeners are exempt to avoid recursion. Forward TCP bind addresses must be
+concrete loopback addresses; unspecified (`0.0.0.0`/`::`) and non-loopback binds
+are rejected before their configuration is published. All other TCP is captured, including
 loopback, RFC1918 destinations and guest-local services such as PostgreSQL.
 A local service needing direct access must be arranged as a configured loopback
 forward; there is no blanket loopback/private-network exemption. Direct access

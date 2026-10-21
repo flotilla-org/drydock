@@ -52,6 +52,7 @@ pub struct Configuration {
 pub struct GuestForward {
     pub id: String,
     pub unix: PathBuf,
+    /// Concrete loopback bind address; wildcard and non-loopback binds are refused.
     pub tcp: Option<SocketAddr>,
 }
 /// TCP addresses are numeric, so host ownership cannot change through DNS.

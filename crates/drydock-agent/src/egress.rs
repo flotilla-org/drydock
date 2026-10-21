@@ -6,7 +6,7 @@ use hickory_proto::{
     rr::{RData, Record, RecordType, rdata::A},
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
@@ -25,6 +25,7 @@ const CAPTURE_PORT: u16 = 15001;
 const DNS_PORT: u16 = 1053;
 pub(crate) const SOCKET_MARK: u32 = 0x647279;
 const TTL: u32 = 30;
+const LEASE_SECONDS: u64 = 60;
 const FIRST: u32 = u32::from_be_bytes([198, 18, 0, 0]);
 const CAPACITY: u32 = 1 << 17;
 pub(crate) const RESERVED_PORTS: [u16; 3] = [DNS_PORT, CAPTURE_PORT, PROXY_PORT];
@@ -47,6 +48,7 @@ struct FakeDns {
     names: HashMap<String, Ipv4Addr>,
     leases: HashMap<Ipv4Addr, (String, Instant)>,
     next: u32,
+    expiries: BTreeSet<(Instant, Ipv4Addr)>,
 }
 impl FakeDns {
     fn allocate(&mut self, name: &str, now: Instant) -> io::Result<Ipv4Addr> {
@@ -61,24 +63,34 @@ impl FakeDns {
         {
             return Err(invalid("DNS name is not a CONNECT hostname"));
         }
+        let expires = now + Duration::from_secs(LEASE_SECONDS);
         if let Some(&address) = self.names.get(&name) {
-            self.leases.get_mut(&address).unwrap().1 = now + Duration::from_secs(TTL.into());
+            let lease = self.leases.get_mut(&address).unwrap();
+            self.expiries.remove(&(lease.1, address));
+            lease.1 = expires;
+            self.expiries.insert((expires, address));
             return Ok(address);
         }
-        for _ in 0..CAPACITY {
+        // The index contains one entry per lease, even after renewals. Looking
+        // at its first entry avoids scanning the entire pool while holding the
+        // shared DNS mutex. Allocation, renewal and exhaustion inspect/update
+        // the ordered index in O(log pool size), rather than walking all leases.
+        let address = if let Some(&(expiry, address)) = self.expiries.first().filter(|(expiry, _)| *expiry <= now) {
+            self.expiries.remove(&(expiry, address));
+            let (old, _) = self.leases.remove(&address).unwrap();
+            self.names.remove(&old);
+            address
+        } else if self.leases.len() < CAPACITY as usize {
             let address = Ipv4Addr::from(FIRST + self.next);
             self.next = (self.next + 1) % CAPACITY;
-            if let Some((old, expiry)) = self.leases.get(&address) {
-                if *expiry > now {
-                    continue;
-                }
-                self.names.remove(old);
-            }
-            self.names.insert(name.clone(), address);
-            self.leases.insert(address, (name, now + Duration::from_secs(TTL.into())));
-            return Ok(address);
-        }
-        Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "fake DNS pool exhausted"))
+            address
+        } else {
+            return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "fake DNS pool exhausted"));
+        };
+        self.names.insert(name.clone(), address);
+        self.leases.insert(address, (name, expires));
+        self.expiries.insert((expires, address));
+        Ok(address)
     }
     fn reverse(&self, address: Ipv4Addr, now: Instant) -> Option<&str> {
         self.leases.get(&address).filter(|(_, expiry)| *expiry > now).map(|(name, _)| name.as_str())
@@ -445,17 +457,28 @@ fn rules(config: &Configuration) -> String {
     rules
 }
 
-pub(crate) async fn install(config: &Configuration) -> io::Result<()> {
-    use std::process::Stdio;
-    let mut command = tokio::process::Command::new(NFT);
-    command.args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-    let mut child = command.kill_on_drop(true).spawn()?;
-    child.stdin.take().unwrap().write_all(rules(config).as_bytes()).await?;
-    let result = child.wait_with_output().await?;
-    if result.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("install guest egress redirect: {}", String::from_utf8_lossy(&result.stderr))))
+pub(crate) struct System {
+    pub(crate) nft: std::path::PathBuf,
+    pub(crate) ca: std::path::PathBuf,
+}
+impl Default for System {
+    fn default() -> Self {
+        Self { nft: NFT.into(), ca: CA_PATH.into() }
+    }
+}
+impl System {
+    pub(crate) async fn install(&self, config: &Configuration) -> io::Result<()> {
+        use std::process::Stdio;
+        let mut command = tokio::process::Command::new(&self.nft);
+        command.args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        let mut child = command.kill_on_drop(true).spawn()?;
+        child.stdin.take().unwrap().write_all(rules(config).as_bytes()).await?;
+        let result = child.wait_with_output().await?;
+        if result.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!("install guest egress redirect: {}", String::from_utf8_lossy(&result.stderr))))
+        }
     }
 }
 
@@ -472,7 +495,7 @@ mod tests {
         // Span both /16 halves and both pool boundaries. The clock samples the
         // instant before expiry, exact expiry, and instants after expiry.
         let slot = tc.draw(gs::integers::<u32>().min_value(0).max_value(CAPACITY - 1));
-        let advance = tc.draw(gs::integers::<u64>().min_value(29).max_value(31));
+        let advance = tc.draw(gs::integers::<u64>().min_value(LEASE_SECONDS - 1).max_value(LEASE_SECONDS + 1));
         let now = Instant::now();
         let mut dns = FakeDns { next: slot, ..FakeDns::default() };
         let a = dns.allocate("One.Example.", now).unwrap();
@@ -482,13 +505,32 @@ mod tests {
         let b = dns.allocate("two.example", now).unwrap();
         assert_ne!(a, b);
         let later = now + Duration::from_secs(advance);
-        assert_eq!(dns.reverse(a, later).is_some(), advance < TTL.into());
-        // Drawn wrap position models the allocator returning to an old slot.
-        dns.next = slot;
-        let c = dns.allocate("three.example", later).unwrap();
-        assert_eq!(c == a, advance >= TTL.into());
-        assert_eq!(dns.reverse(c, later), Some("three.example"));
+        assert_eq!(dns.reverse(a, later).is_some(), advance < LEASE_SECONDS);
         assert_eq!(dns.reverse(b, now), Some("two.example"));
+        let c = dns.allocate("three.example", later).unwrap();
+        assert_eq!([a, b].contains(&c), advance >= LEASE_SECONDS);
+        assert_eq!(dns.reverse(c, later), Some("three.example"));
+        assert_eq!(dns.expiries.len(), dns.leases.len(), "renewals must not grow the expiry index");
+    }
+
+    // Renewed leases cannot be recycled using stale expiry-index entries, and
+    // repeated lookups must not grow the bounded index independently of leases.
+    #[hegel::test]
+    fn renewed_leases_remain_reserved(tc: hegel::TestCase) {
+        let mut dns = FakeDns::default();
+        let mut now = Instant::now();
+        let address = dns.allocate("retained.example", now).unwrap();
+        // Draw time advances below the lease duration, crossing old expiries
+        // over the generated sequence while continually renewing one name.
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+        for index in 0..steps {
+            now += Duration::from_secs(tc.draw(gs::integers::<u64>().min_value(0).max_value(LEASE_SECONDS - 1)));
+            assert_eq!(dns.allocate("retained.example", now).unwrap(), address);
+            let other = dns.allocate(&format!("other{index}.example"), now).unwrap();
+            assert_ne!(other, address);
+            assert_eq!(dns.reverse(address, now), Some("retained.example"));
+            assert_eq!(dns.expiries.len(), dns.leases.len());
+        }
     }
 
     // ADR 0069: DNS wire replies preserve the question/ID and give fake A
@@ -524,8 +566,8 @@ mod tests {
         }
         assert_eq!(dns.allocate("overflow.example", now).unwrap_err().kind(), io::ErrorKind::AddrNotAvailable);
         assert_eq!(dns.reverse(Ipv4Addr::new(198, 19, 255, 255), now), Some(format!("host{}.example", CAPACITY - 1).as_str()));
-        assert_eq!(dns.allocate("reused.example", now + Duration::from_secs(30)).unwrap(), Ipv4Addr::new(198, 18, 0, 0));
-        assert_eq!(dns.reverse(Ipv4Addr::new(198, 18, 0, 0), now + Duration::from_secs(30)), Some("reused.example"));
+        assert_eq!(dns.allocate("reused.example", now + Duration::from_secs(LEASE_SECONDS)).unwrap(), Ipv4Addr::new(198, 18, 0, 0));
+        assert_eq!(dns.reverse(Ipv4Addr::new(198, 18, 0, 0), now + Duration::from_secs(LEASE_SECONDS)), Some("reused.example"));
     }
 
     // Only mapped fake destinations may become hostnames; numeric destinations
@@ -538,7 +580,7 @@ mod tests {
         assert!(dns.authority("198.19.255.255:443".parse().unwrap(), now).is_err());
         let ip = dns.allocate("example.org", now).unwrap();
         assert_eq!(dns.authority((ip, 8443).into(), now).unwrap(), "example.org:8443");
-        assert!(dns.authority((ip, 8443).into(), now + Duration::from_secs(30)).is_err());
+        assert!(dns.authority((ip, 8443).into(), now + Duration::from_secs(LEASE_SECONDS)).is_err());
         assert_eq!(dns.authority("198.20.0.0:80".parse().unwrap(), now).unwrap(), "198.20.0.0:80");
         assert_eq!(dns.authority("[2001:db8::1]:443".parse().unwrap(), now).unwrap(), "[2001:db8::1]:443");
     }
@@ -739,23 +781,26 @@ mod tests {
         agent.abort();
     }
 
-    // Short fake leases require a fresh DNS lookup before a reconnect once the
-    // advertised TTL expires, including if a client kept the old A answer.
+    // Advertise a short DNS TTL but retain mappings through a setup grace
+    // period, so using an answer near TTL expiry still recovers its hostname.
     #[test]
-    fn dns_answer_to_connect_requires_live_lease() {
+    fn dns_answer_to_connect_has_grace_then_requires_renewal() {
         let now = Instant::now();
         let mut dns = FakeDns::default();
         let mut query = Message::new();
         query.add_query(Query::query(Name::from_ascii("cached.example.").unwrap(), RecordType::A));
         let answer = Message::from_vec(&dns.answer(&query.to_vec().unwrap(), now).unwrap()).unwrap();
+        assert_eq!(answer.answers()[0].ttl(), TTL);
         let RData::A(A(address)) = answer.answers()[0].data() else {
             panic!("expected A");
         };
         let destination = (*address, 443).into();
-        assert_eq!(dns.authority(destination, now + Duration::from_secs(29)).unwrap(), "cached.example:443");
-        assert!(dns.authority(destination, now + Duration::from_secs(30)).is_err());
-        dns.answer(&query.to_vec().unwrap(), now + Duration::from_secs(30)).unwrap();
-        assert_eq!(dns.authority(destination, now + Duration::from_secs(30)).unwrap(), "cached.example:443");
+        for elapsed in [u64::from(TTL) - 1, TTL.into(), u64::from(TTL) + 1, LEASE_SECONDS - 1] {
+            assert_eq!(dns.authority(destination, now + Duration::from_secs(elapsed)).unwrap(), "cached.example:443");
+        }
+        assert!(dns.authority(destination, now + Duration::from_secs(LEASE_SECONDS)).is_err());
+        dns.answer(&query.to_vec().unwrap(), now + Duration::from_secs(LEASE_SECONDS)).unwrap();
+        assert_eq!(dns.authority(destination, now + Duration::from_secs(LEASE_SECONDS)).unwrap(), "cached.example:443");
     }
 
     // URL delimiters and DNS label escapes may not alter a CONNECT authority.

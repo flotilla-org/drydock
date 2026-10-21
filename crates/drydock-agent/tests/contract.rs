@@ -674,3 +674,23 @@ async fn egress_requires_registered_vessel_upstream() {
         assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
     }
 }
+
+// Guest TCP listeners require a concrete loopback address. Wildcard and public
+// binds must fail before publishing any listener or exemption configuration.
+#[tokio::test]
+async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
+    let h = harness(false, "test-build").await;
+    let endpoint = h.dir.path().join("host-endpoint");
+    let _listener = UnixListener::bind(&endpoint).unwrap();
+    h.client.register_host_endpoint("concrete".into(), Endpoint::Unix(endpoint)).unwrap();
+    for address in ["0.0.0.0:9000", "[::]:9000", "192.0.2.1:9000", "[2001:db8::1]:9000"] {
+        let unix = h.dir.path().join("guest-listener");
+        let config = Configuration {
+            forwards: vec![GuestForward { id: "concrete".into(), unix: unix.clone(), tcp: Some(address.parse().unwrap()) }],
+            ..Configuration::default()
+        };
+        assert_eq!(h.client.configure(config).await.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
+        assert!(!unix.exists());
+    }
+}
