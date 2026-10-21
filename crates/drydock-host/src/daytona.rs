@@ -315,9 +315,9 @@ impl Daytona {
         base.path_segments_mut().map_err(|_| bad_response())?.pop_if_empty().extend([id, "process", "execute"]);
         let url = base;
         let v = self.call(Method::POST, url, Some(json!({"command": command, "timeout": timeout})), c).await?;
-        let exit_code = v.get("exitCode").and_then(Value::as_i64).and_then(|v| i32::try_from(v).ok()).ok_or_else(|| bad_value(&v))?;
+        let exit_code = v.get("exitCode").and_then(Value::as_i64).and_then(|v| i32::try_from(v).ok()).ok_or_else(bad_response)?;
         // Empty output is valid for a successful command (or a failing command).
-        let output = v.get("result").and_then(Value::as_str).ok_or_else(|| bad_value(&v))?;
+        let output = v.get("result").and_then(Value::as_str).ok_or_else(bad_response)?;
         if exit_code != 0 {
             return Err(ProtocolError::CommandFailed {
                 reason: "Daytona guest command failed".into(),
@@ -376,11 +376,6 @@ impl Daytona {
     }
 }
 const GIB: u64 = 1 << 30;
-// Successful responses can contain reach recipes and guest output. Their
-// contents are never diagnostic text, even when validation fails.
-fn bad_value(_value: &Value) -> ProtocolError {
-    bad_response()
-}
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
     if url.scheme() != "https"
@@ -395,11 +390,13 @@ fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     }
     Ok(url)
 }
+// Successful responses can contain reach recipes and guest output. Their
+// contents are never diagnostic text, even when validation fails.
 fn bad_response() -> ProtocolError {
     ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: "required field missing or invalid".into() }
 }
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
-    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| bad_value(v))
+    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(bad_response)
 }
 fn name(prefix: &str, input: &str) -> String {
     // Keep vendor names below 63 bytes, with 160 bits of digest identity.
@@ -770,7 +767,7 @@ impl QuotaOperation for Daytona {
     }
 }
 fn number(v: &Value, key: &str) -> Result<f64> {
-    v.get(key).and_then(Value::as_f64).filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| bad_value(v))
+    v.get(key).and_then(Value::as_f64).filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(bad_response)
 }
 #[async_trait]
 impl UsageOperation for Daytona {
@@ -811,7 +808,7 @@ impl UsageOperation for Daytona {
         sandboxes.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
         let totals = self.call(Method::GET, sandboxes, None, c).await?;
         let mut seen = BTreeSet::new();
-        for sandbox in totals.as_array().ok_or_else(|| bad_value(&totals))? {
+        for sandbox in totals.as_array().ok_or_else(bad_response)? {
             let id = text(sandbox, "sandboxId")?;
             if !seen.insert(id) {
                 continue;
@@ -820,24 +817,24 @@ impl UsageOperation for Daytona {
                 self.path(&self.settings.analytics_url, &["organization", &self.settings.organization_id, "sandbox", id, "usage"])?;
             url.query_pairs_mut().append_pair("from", &from_text).append_pair("to", &to_text);
             let periods = self.call(Method::GET, url, None, c).await?;
-            for row in periods.as_array().ok_or_else(|| bad_value(&periods))? {
+            for row in periods.as_array().ok_or_else(bad_response)? {
                 let cpus = number(row, "cpu")?;
                 // Zero-CPU records contribute no size-hours, even if other
                 // optional fields are absent or malformed.
                 if cpus == 0.0 {
                     continue;
                 }
-                let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_value(row))?;
+                let start = text(row, "startAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response())?;
                 let end = match row.get("endAt") {
                     None => ongoing_end,
                     Some(value) => {
                         let end = value
                             .as_str()
-                            .ok_or_else(|| bad_value(row))?
+                            .ok_or_else(bad_response)?
                             .parse::<chrono::DateTime<chrono::Utc>>()
-                            .map_err(|_| bad_value(row))?;
+                            .map_err(|_| bad_response())?;
                         if end < start {
-                            return Err(bad_value(row));
+                            return Err(bad_response());
                         }
                         end
                     }
@@ -848,9 +845,8 @@ impl UsageOperation for Daytona {
                     continue;
                 }
                 let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
-                let bytes = |key| -> Result<u64> {
-                    row.get(key).and_then(Value::as_u64).and_then(|v| v.checked_mul(GIB)).ok_or_else(|| bad_value(row))
-                };
+                let bytes =
+                    |key| -> Result<u64> { row.get(key).and_then(Value::as_u64).and_then(|v| v.checked_mul(GIB)).ok_or_else(bad_response) };
                 environment_hours.push(SizeUsage {
                     size: Size { cpus, memory_bytes: bytes("ramGB")?, disk_bytes: bytes("diskGB")? },
                     hours: seconds / 3600.0,

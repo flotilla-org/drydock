@@ -1247,6 +1247,8 @@ async fn trace_request(request: Request, next: Next) -> Response {
     .await
 }
 
+// Readiness transitions log only a static status label, never the reason.
+// They are not serialized as events; hello masks reasons at its wire boundary.
 fn readiness_status(value: &Readiness) -> &'static str {
     match value {
         Readiness::Ready => "ready",

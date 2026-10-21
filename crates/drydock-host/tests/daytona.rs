@@ -1668,7 +1668,8 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
     let logs = Arc::new(Mutex::new(Vec::new()));
     let output = logs.clone();
     let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || Capture(output.clone())).finish();
-    // This integration binary owns its subscriber. Use the process dispatcher
+    // This must remain the only global-subscriber installer in this integration
+    // binary; another installer would fail. Use the process dispatcher
     // so HTTP/provider tasks and parallel callsite registration are captured too.
     tracing::subscriber::set_global_default(subscriber).unwrap();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
