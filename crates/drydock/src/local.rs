@@ -19,6 +19,12 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+/// Append lock suffixes: replacing an extension aliases distinct socket overrides.
+pub fn socket_lock_path(socket: &Path, suffix: &str) -> PathBuf {
+    let mut path = socket.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
 pub fn lock(path: &Path) -> Result<std::fs::File, String> {
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -44,7 +50,7 @@ pub async fn connect(config: &Path, socket: &Path) -> Result<Client, String> {
     }
     let parent = socket.parent().ok_or("socket needs a parent")?;
     private_dir(parent)?;
-    let startup = lock(&socket.with_extension("startup.lock"))?;
+    let startup = lock(&socket_lock_path(socket, ".startup.lock"))?;
     // Nonblocking lock attempts keep other Tokio tasks and concurrent clients live.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -98,5 +104,22 @@ pub async fn connect(config: &Path, socket: &Path) -> Result<Client, String> {
             return Err("daemon startup timed out; see drydock.log".into());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Distinct socket overrides must be independently ownable, even when only
+    // their extensions differ. Check real OS lock admission, not a path string.
+    #[test]
+    fn socket_overrides_do_not_alias_lifecycle_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock(&socket_lock_path(&dir.path().join("daemon.sock"), ".lock")).unwrap();
+        first.try_lock().unwrap();
+        for name in ["daemon.other", "daemon.lock"] {
+            let other = lock(&socket_lock_path(&dir.path().join(name), ".lock")).unwrap();
+            assert!(other.try_lock().is_ok(), "socket {name} aliases another daemon's lock");
+        }
     }
 }
