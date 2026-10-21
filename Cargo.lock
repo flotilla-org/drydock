@@ -440,9 +440,11 @@ dependencies = [
 name = "drydock-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "hegeltest",
  "ipnet",
+ "percent-encoding",
  "regex",
  "serde",
  "serde_json",

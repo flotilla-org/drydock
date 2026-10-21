@@ -193,7 +193,7 @@ async fn cli_full_provider_errors() {
             let client = drydock::client::Client::unix(&socket).unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while client.hello().await.is_err() {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
             })
             .await

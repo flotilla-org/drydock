@@ -127,6 +127,19 @@ before returning errors or logging them at warn level. CLI errors include the
 provider, operation, category, reason, upstream HTTP status and provider message.
 A Daytona 401 rejects the key; a 403 is `Refused` for the named operation and
 leaves the provider ready. No additional permission error variant is needed.
+Masking covers literal, JSON-escaped, percent-encoded and base64 echoes, before
+limiting diagnostics to 16 KiB per field. Display escapes control characters.
+Empty credential values are ignored. Every nonempty value is masked, including
+short placeholders; a short or common value can therefore obscure unrelated
+words in a diagnostic. Use distinctive placeholders for readable diagnostics.
+The host retains unique credential values for its lifetime to cover delayed
+vendor echoes after rotation; it does not prune that history. Provider removal
+requires a host restart.
+
+Rust API compatibility: `provider_error` is now `String` (or `Option<String>`),
+and its Debug output is visible. Modules return complete diagnostics to the host;
+they should not log raw errors themselves. The host performs credential masking
+before returning or logging them. Credential and recipe Debug output stays redacted.
 `provider_state_unknown` means the vendor returned an unrecognized state; it is
 an Unknown observation, not evidence that the environment stopped or disappeared.
 

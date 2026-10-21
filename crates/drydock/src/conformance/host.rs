@@ -157,7 +157,10 @@ pub async fn error_contract(client: &Client, base: &HostConfiguration, report: &
                 let mut actual_fields = serde_json::to_value(&actual).map_err(SafeError::category)?;
                 let expected_fields = serde_json::to_value(&error).map_err(SafeError::category)?;
                 let reason = actual_fields["reason"].as_str().unwrap_or_default();
-                require(reason.ends_with(expected_fields["reason"].as_str().unwrap_or_default()), "typed error reason lost")?;
+                require(
+                    reason == format!("provider {provider} operation list: {}", expected_fields["reason"].as_str().unwrap_or_default()),
+                    "typed error reason or call context lost",
+                )?;
                 actual_fields["reason"] = expected_fields["reason"].clone();
                 require(actual_fields == expected_fields, "typed error fields lost")?;
                 if let Some(retry) = error.retry_after() {

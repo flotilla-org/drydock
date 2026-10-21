@@ -183,6 +183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         error = providers[provider]["settings"].get("fault")
         if error and parts[-1] == "environments":
             error = copy.deepcopy(error)
+            error["reason"] = f"provider {provider} operation list: {error['reason']}"
             if error["kind"] == "credential_rejected":
                 readiness[provider] = "missing_credential"
             status = {"refused":422,"unavailable":503,"rate_limited":429,"quota_exhausted":402,"credential_rejected":502,"internal":500,"not_found":404,"method_not_allowed":405}[error["kind"]]

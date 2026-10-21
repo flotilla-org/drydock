@@ -838,7 +838,8 @@ async fn binary_sigterm_drains_and_removes_socket() {
     assert!(records.next().await.unwrap().is_ok());
     let config = json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("fault",json!({"fault":{"kind":"unavailable","reason":"sensitive-vendor-reason","provider_error":"provider explanation sensitive-credential-value","retry_after":null}}))]});
     assert_eq!(client.put("http://localhost/v1/config").json(&config).send().await.unwrap().status(), 204);
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    let before: Hello = client.get("http://localhost/v1/hello").send().await.unwrap().json().await.unwrap();
+    assert!(matches!(before.providers[0].readiness, Readiness::MissingCredential { .. }));
     assert_eq!(
         client
             .put("http://localhost/v1/providers/fault/credential")
@@ -1593,4 +1594,21 @@ async fn diagnostics_mask_all_configured_credentials() {
         }
         assert!(view.contains("validation <REDACTED> <REDACTED> <REDACTED>"), "{view}");
     }
+}
+
+// An unrelated module prerequisite must take precedence over a stale proxied
+// rejection when the proxy remains eligible for credential repair probes.
+#[tokio::test]
+async fn proxied_missing_tool_does_not_report_stale_rejection() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    let mut proxy = provider("a", json!({}));
+    proxy["credential"] = json!({"mode":"proxied", "placeholder_token":"placeholder", "proxy_url":"http://127.0.0.1:1"});
+    h.configure(vec![proxy]).await;
+    control.reject_list.store(true, SeqCst);
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    control.missing_tool.store(true, SeqCst);
+    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
+    assert!(error.to_string().contains("test tool absent"));
+    assert!(!error.to_string().contains("credential_rejected"));
 }

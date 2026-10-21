@@ -23,6 +23,7 @@ struct State {
     mints: usize,
     requests: usize,
     failure: Option<u16>,
+    failure_message: Option<String>,
     executed: Vec<String>,
     probe: Option<Value>,
     violations: Vec<String>,
@@ -129,7 +130,8 @@ impl StandIn {
             return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
         }
         if let Some(status) = s.failure.take() {
-            return response(status, json!({"statusCode":status,"message":"key-a must never be echoed","error":"Too Many Requests"}));
+            let message = s.failure_message.take().unwrap_or_else(|| "key-a must never be echoed".into());
+            return response(status, json!({"statusCode":status,"message":message,"error":"Too Many Requests"}));
         }
         let method = request.method().as_str();
         let path = request.url().path();
@@ -1581,4 +1583,35 @@ async fn ongoing_usage_does_not_bill_the_future() {
     let usage = p.operations().usage.unwrap().usage(period, &credentials(false)).await.unwrap();
     let elapsed_hours = (chrono::Utc::now() - start).num_milliseconds() as f64 / 3_600_000.0;
     assert!((1.0..=elapsed_hours).contains(&usage.environment_hours[0].hours));
+}
+
+// Masking at the host boundary sees the complete vendor body before truncation,
+// including a credential that crosses the old 16 KiB byte boundary.
+#[tokio::test]
+async fn vendor_body_masking_precedes_truncation() {
+    let vendor = Arc::new(StandIn::default());
+    let host = HostHarness::start(vendor.clone()).await;
+    drydock::client::Observer::new(host.client.clone(), None).next().await.unwrap();
+    let message = format!("{}key-a trailing", "x".repeat(16360));
+    {
+        let mut state = vendor.0.lock().unwrap();
+        state.failure = Some(400);
+        state.failure_message = Some(message.clone());
+    }
+    let error = host.client.list("daytona").await.unwrap_err();
+    let drydock::client::Error::Protocol(ProtocolError::Internal { provider_error, .. }) = error else { panic!("expected provider body") };
+    assert!(provider_error.len() <= 16384);
+    assert!(!provider_error.contains("key-"), "partial credential must not escape");
+    // The module must retain the entire body so the host can apply every
+    // configured provider's credentials before enforcing the diagnostic limit.
+    {
+        let mut state = vendor.0.lock().unwrap();
+        state.failure = Some(400);
+        state.failure_message = Some(message);
+    }
+    let p = provider(vendor.clone()).await;
+    let ProtocolError::Internal { provider_error, .. } = p.list(&credentials(false)).await.unwrap_err() else { panic!("expected body") };
+    assert!(provider_error.len() > 16384);
+    assert!(provider_error.contains("key-a trailing"));
+    host.finish().await;
 }

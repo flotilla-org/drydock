@@ -39,7 +39,7 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             };
             if let Err(error) = instance.provider.run(context).await {
                 let error = instance.diagnostic_error(error, "observer");
-                tracing::warn!(provider = %instance.config.name, route = "observer", error_class = error.class(), error = %error, "push observer stopped");
+                tracing::error!(provider = %instance.config.name, route = "observer", error_class = error.class(), error = %error, "push observer stopped");
             }
             return;
         };

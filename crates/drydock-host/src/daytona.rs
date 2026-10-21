@@ -130,8 +130,8 @@ impl Daytona {
             *request.body_mut() = Some(body.to_string().into());
         }
         let response = rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Unavailable {
-            provider_error: Some(bounded(error.as_bytes())),
-            reason: "Daytona transport failed".into(),
+            provider_error: Some(diagnostic_text(error.as_bytes())),
+            reason: format!("Daytona {operation} transport failed"),
             retry_after: None,
         })?;
         let retry_after = retry_delay(response.headers());
@@ -139,20 +139,20 @@ impl Daytona {
         if status == 409 && accept_conflict {
             return Ok(None);
         }
-        let raw = bounded(response.body());
+        let raw = diagnostic_text(response.body());
         if !(200..300).contains(&status) {
             // Keep upstream status and explanation for every category.
             // No SDK retry is involved.
             let reason = format!("Daytona {operation} HTTP {status}: {raw}");
             return Err(match status {
                 401 => ProtocolError::CredentialRejected { reason: reason.clone() },
-                403 => ProtocolError::Refused { reason: format!("permission denied for {operation}; {reason}") },
+                403 => ProtocolError::Refused { reason: format!("permission denied; {reason}") },
                 404 => ProtocolError::NotFound { reason: reason.clone() },
                 402 => ProtocolError::QuotaExhausted { reason: reason.clone() },
                 429 => ProtocolError::RateLimited { reason: reason.clone(), retry_after },
                 408 => ProtocolError::unavailable(reason.clone(), None),
                 500..=599 => ProtocolError::unavailable(reason.clone(), retry_after),
-                _ => ProtocolError::Internal { reason: format!("unexpected Daytona HTTP {status}"), provider_error: raw },
+                _ => ProtocolError::Internal { reason: format!("unexpected Daytona {operation} HTTP {status}"), provider_error: raw },
             });
         }
         if response.body().is_empty() {
@@ -273,7 +273,7 @@ impl Daytona {
             let output = self.execute(&row.environment.id, &command, 20, c).await?;
             let proof: Value = serde_json::from_str(&output).map_err(|_| ProtocolError::Internal {
                 reason: "invalid Daytona egress probe response".into(),
-                provider_error: bounded(output.as_bytes()),
+                provider_error: diagnostic_text(output.as_bytes()),
             })?;
             if proof["uid"].as_u64().is_none()
                 || proof["unlisted_canary"].as_bool().is_none()
@@ -282,7 +282,7 @@ impl Daytona {
             {
                 return Err(ProtocolError::Internal {
                     reason: "incomplete Daytona egress proof".into(),
-                    provider_error: bounded(output.as_bytes()),
+                    provider_error: diagnostic_text(output.as_bytes()),
                 });
             }
             if proof["uid"] == 0
@@ -376,7 +376,7 @@ impl Daytona {
 }
 const GIB: u64 = 1 << 30;
 fn bad_value(value: &Value) -> ProtocolError {
-    ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: bounded(value.to_string().as_bytes()) }
+    ProtocolError::Internal { reason: "incomplete Daytona response".into(), provider_error: diagnostic_text(value.to_string().as_bytes()) }
 }
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
@@ -402,8 +402,9 @@ fn name(prefix: &str, input: &str) -> String {
     // Keep vendor names below 63 bytes, with 160 bits of digest identity.
     format!("drydock-{prefix}-{}", &format!("{:x}", Sha256::digest(input.as_bytes()))[..40])
 }
-fn bounded(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)]).into_owned()
+fn diagnostic_text(bytes: &[u8]) -> String {
+    // The host must mask complete credential echoes before limiting diagnostics.
+    String::from_utf8_lossy(bytes).into_owned()
 }
 fn policy_matches(row: &Value, policy: &Value) -> bool {
     // Compare stable requested destinations, never a DNS resolution at retry.
@@ -873,14 +874,14 @@ fn shell_command(command: &[String]) -> String {
 // Keeping raw_value local avoids changing serde's flattened event decoding.
 fn parse_analytics(bytes: &[u8]) -> Result<Value> {
     let fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> = serde_json::from_slice(bytes)
-        .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona analytics".into(), provider_error: bounded(bytes) })?;
+        .map_err(|_| ProtocolError::Internal { reason: "invalid Daytona analytics".into(), provider_error: diagnostic_text(bytes) })?;
     let mut result = serde_json::Map::new();
     for (key, value) in fields {
         let parsed = if key == "totalPrice" {
-            Value::String(
-                decimal_lexeme(value.get())
-                    .ok_or_else(|| ProtocolError::Internal { reason: "invalid Daytona price".into(), provider_error: bounded(bytes) })?,
-            )
+            Value::String(decimal_lexeme(value.get()).ok_or_else(|| ProtocolError::Internal {
+                reason: "invalid Daytona price".into(),
+                provider_error: diagnostic_text(bytes),
+            })?)
         } else {
             serde_json::from_str(value.get()).map_err(|_| bad_response())?
         };
@@ -960,10 +961,10 @@ mod tests {
     use super::*;
     // Vendor decimal lexemes retain all digits, beyond binary64's exact range.
     #[test]
-    fn exact_vendor_money_and_bounded_errors() {
+    fn exact_vendor_money_and_complete_errors() {
         let v = parse_analytics(br#"{"totalPrice":9007199254740993.00000001,"sandboxCount":1}"#).unwrap();
         assert_eq!(v["totalPrice"], "9007199254740993.00000001");
-        assert_eq!(bounded(&vec![b'x'; 20000]).len(), 16384);
+        assert_eq!(diagnostic_text(&vec![b'x'; 20000]).len(), 20000);
         assert_eq!(decimal_lexeme("1.23e-7").as_deref(), Some("0.000000123"));
         assert_eq!(decimal_lexeme("1.23e+5").as_deref(), Some("123000"));
         assert_eq!(decimal_lexeme("0.5e1").as_deref(), Some("5"));

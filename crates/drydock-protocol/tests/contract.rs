@@ -76,3 +76,52 @@ fn diagnostic_masking_preserves_error_contract() {
         }
     }
 }
+
+// Vendor JSON may escape credential bytes. Masking must happen before the
+// diagnostic limit, and Display must not emit vendor-controlled log lines.
+#[test]
+fn escaped_and_long_diagnostics_are_safe() {
+    let secret = "quoted\"token\\秘密";
+    let encoded = serde_json::to_string(secret).unwrap();
+    let detail = format!("validation {encoded}");
+    let error = ProtocolError::Internal { reason: "vendor\nFORGED\u{1b}[31m".into(), provider_error: detail }.diagnostic_context(
+        "p",
+        "list",
+        &[secret],
+    );
+    assert!(!error.to_string().contains(&encoded));
+    assert!(!error.to_string().contains('\n'));
+    assert!(!error.to_string().contains('\u{1b}'));
+    let detail = format!("{}key-abcdef trailing", "x".repeat(16381));
+    let error =
+        ProtocolError::Internal { reason: "validation".into(), provider_error: detail }.diagnostic_context("p", "list", &["key-abcdef"]);
+    let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+    assert!(provider_error.len() <= 16384);
+    assert!(!provider_error.contains("key-"));
+}
+
+// Credential echoes can be literal, JSON escaped (including UTF-16), percent
+// encoded, or standard/URL-safe base64 with or without padding. Short values and
+// overlapping patterns must not re-mask inserted markers.
+#[test]
+fn encoded_credential_echoes_and_short_values_are_masked() {
+    for echo in [
+        "quoted\\\"token\\\\\\u79d8\\u5bc6",
+        "quoted%22token%5C%E7%A7%98%E5%AF%86",
+        "quoted%22token%5c%e7%a7%98%e5%af%86",
+        "cXVvdGVkInRva2VuXOenmOWvhg==",
+        "cXVvdGVkInRva2VuXOenmOWvhg",
+    ] {
+        let error = ProtocolError::Internal { reason: "validation".into(), provider_error: echo.into() }.diagnostic_context(
+            "p",
+            "list",
+            &["quoted\"token\\秘密"],
+        );
+        let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+        assert_eq!(provider_error, "<REDACTED>", "{echo}");
+    }
+    let error =
+        ProtocolError::Internal { reason: "AAA".into(), provider_error: "AAA".into() }.diagnostic_context("p", "list", &["", "A", "AA"]);
+    let ProtocolError::Internal { provider_error, .. } = error else { unreachable!() };
+    assert_eq!(provider_error, "<REDACTED><REDACTED>");
+}
