@@ -12,10 +12,15 @@ use std::{
     time::Duration,
 };
 
-/// Build-owned selection point. Issue #53 replaces this interim identifier with
-/// the tools image matching the agent build. Today's modules use operator-baked tools.
-pub fn build_tools_digest() -> &'static str {
-    "operator-baked-agent-v1"
+/// Checked-in tools index, optionally overridden when compiling this build.
+/// The pin may be older than this build: the host upgrades after agent hello.
+pub fn build_tools_digest() -> Result<&'static str, Error> {
+    match env!("DRYDOCK_TOOLS_IMAGE") {
+        "unpublished" => Err(refused(
+            "the tools image has not been published yet; run the operator tools-image publish workflow and merge its pin PR, or rebuild with DRYDOCK_TOOLS_IMAGE set to a published registry/name@sha256 reference",
+        )),
+        reference => Ok(reference),
+    }
 }
 #[derive(Clone, Default, Deserialize, Serialize, clap::Args)]
 #[serde(deny_unknown_fields)]
@@ -187,6 +192,7 @@ pub async fn prepare(
     options: &LaunchOptions,
     resolver: &dyn ImageResolver,
 ) -> Result<(Prepared, Size), Error> {
+    let tools_digest = build_tools_digest()?;
     let size = options.size(provider, minimum).map_err(refused)?;
     let image =
         options.image.as_deref().or(provider.image.as_deref()).ok_or_else(|| refused("provider needs a default image or --image"))?;
@@ -194,7 +200,7 @@ pub async fn prepare(
     let prepared = client
         .clone()
         .with_request_timeout(Duration::from_secs(600))
-        .prepare(name, &PrepareRequest { size: size.clone(), image_digest, tools_digest: build_tools_digest().into() })
+        .prepare(name, &PrepareRequest { size: size.clone(), image_digest, tools_digest: tools_digest.into() })
         .await?;
     Ok((prepared, size))
 }

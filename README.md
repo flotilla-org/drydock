@@ -38,15 +38,19 @@ egress = "open"
 settings = {
   organization_id = "YOUR_ORGANIZATION_ID",
   ssh_host_key = "ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
-  agent_command = "/usr/local/bin/vessel-agent --socket /run/drydock/agent.sock",
+  agent_command = "/opt/drydock/drydock-agent",
 }
 ```
 
-The image must carry today's operator-baked agent and its fixed `agent_command`.
-[Tools image #53](https://github.com/flotilla-org/drydock/issues/53) replaces
-this interim setup; [bare-image launch #54](https://github.com/flotilla-org/drydock/issues/54)
-adds checks for images such as `ubuntu:24.04` after that image exists. Nobody types
-a tools digest: `build_tools_digest()` selects the interim `operator-baked-agent-v1`.
+Every drydock build uses the checked-in [tools image pin](crates/drydock/tools-image.txt),
+including `cargo install` and Git dependencies. `DRYDOCK_TOOLS_IMAGE` can override
+it at build time. The pin can lag the host build: after hello, the host pushes
+and re-execs its current agent when fingerprints differ. Before the first image
+is published the pin reads `unpublished`; publish through the operator workflow
+and merge its generated pin PR before using `launch` or `prepare` (or compile
+with a published image override). See the [tools image and module guide](ci/tools-image/README.md).
+Daytona's provider integration and removal of `agent_command` remain in
+[#54](https://github.com/flotilla-org/drydock/issues/54).
 
 ```sh
 drydock providers

@@ -1301,3 +1301,6 @@ mod tests {
 mod host;
 pub use host::{configuration_contract, error_contract, lifecycle_sequence, optional_contract, poll_contract, stream_contract};
 use host::{fixture, host_fixtures};
+
+mod tools;
+pub use tools::{ToolsEvidence, vessel_tools};

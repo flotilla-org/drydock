@@ -44,7 +44,9 @@ arguments. Direct secrets are sent only over the authenticated connection.
 ## Daemon and CLI
 
 See the [standalone guide](../../README.md#standalone-daemon-and-cli) for the
-provider-only TOML format, XDG paths, commands and the interim baked-agent setup.
+provider-only TOML format, XDG paths, commands and the checked-in tools pin.
+The [tools pin guide](../../ci/tools-image/README.md#checked-in-pin-and-first-publication)
+explains the unpublished sentinel, build-time override and post-hello agent upgrade.
 `drydock` connects to or starts `drydockd`; it does not own host lifetimes.
 `drydockd` is a thin binary around `Daemon`, which embeds the existing
 `Supervisor`, resolves credentials, discovers modules, assigns providers and

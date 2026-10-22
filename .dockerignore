@@ -1,0 +1,5 @@
+.git
+.github
+.flotilla
+target
+**/__pycache__

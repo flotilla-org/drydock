@@ -31,7 +31,11 @@ impl Drop for ReleaseOnDrop {
 #[tokio::test]
 async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let dir = tempfile::tempdir().unwrap();
-    let executable = dir.path().join("drydock-agent");
+    // Match the tools layer's installation layout, leaving room beside the
+    // executable for .prev, .upgrade and .probation during upgrade/rollback.
+    let install = dir.path().join("opt/drydock");
+    std::fs::create_dir_all(&install).unwrap();
+    let executable = install.join("drydock-agent");
     let binary = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
     let old = format!("{:x}", Sha256::digest(&binary));
     std::fs::write(&executable, &binary).unwrap();
@@ -118,6 +122,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     assert_eq!(child.id(), Some(pid));
     assert!(child.try_wait().unwrap().is_none());
     assert_eq!(upgraded.hello().fingerprint, new);
+    assert_eq!(std::fs::read(executable.with_extension("prev")).unwrap(), binary);
     assert!(!guest_socket.exists(), "old forward paths must be removed before re-exec");
     assert_eq!(upgraded.configuration().await.unwrap(), Configuration::default());
     std::fs::write(gate, []).unwrap();
@@ -274,4 +279,122 @@ fn assert_mismatch<T>(result: std::io::Result<T>) {
     };
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("agent fingerprint mismatch"), "{error}");
+}
+
+// A checked-in tools pin can predate the host. The normal handshake must push
+// the current binary on mismatched hello, re-exec in place, and return a usable
+// client only after the new hello. A matching pin must not rewrite rollback.
+#[tokio::test]
+async fn older_tools_pin_is_upgraded_during_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("opt/drydock");
+    std::fs::create_dir_all(&install).unwrap();
+    let executable = install.join("drydock-agent");
+    let current = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let mut older = current.clone();
+    older.extend_from_slice(b"older tools pin");
+    std::fs::write(&executable, &older).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    let desired = format!("{:x}", Sha256::digest(&current));
+    let initial = connect(&socket, &desired).await;
+    assert!(!initial.is_compatible());
+    drop(initial);
+    let pid = child.id();
+    for _ in 0..2 {
+        let client = Client::connect_current(
+            || async {
+                let stream = UnixStream::connect(&socket).await?;
+                Transport::yamux(Box::new(stream), true, Limits::default()).await
+            },
+            &current,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(client.is_compatible());
+        assert_eq!(client.hello().fingerprint, desired);
+        client.configure(Configuration::default()).await.unwrap();
+        assert_eq!(child.id(), pid);
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read(&executable).unwrap(), current);
+        assert_eq!(std::fs::read(executable.with_extension("prev")).unwrap(), older);
+    }
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+// If the candidate is rejected and the old binary rolls back, the bounded
+// handshake must explain which fingerprint kept answering hello, not merely
+// report that the deadline expired. This uses the real loader/rollback process.
+#[tokio::test]
+async fn upgrade_timeout_reports_the_last_hello_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("drydock-agent");
+    let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let fingerprint = format!("{:x}", Sha256::digest(&old));
+    std::fs::write(&executable, &old).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    drop(connect(&socket, &fingerprint).await);
+    let error = Client::connect_current(
+        || async {
+            let stream = UnixStream::connect(&socket).await?;
+            Transport::yamux(Box::new(stream), true, Limits::default()).await
+        },
+        b"not an executable",
+        Duration::from_secs(3),
+    )
+    .await
+    .err()
+    .expect("a rejected candidate cannot become the current agent");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains(&format!("last hello fingerprint {fingerprint}")), "{error}");
+    assert_eq!(std::fs::read(&executable).unwrap(), old);
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+// Provider transport failures during reconnect must survive in the timeout
+// diagnostic. Only the provider connection boundary is unavailable here; the
+// real guest upgrades successfully and is independently reachable afterwards.
+#[tokio::test]
+async fn upgrade_timeout_reports_the_last_transport_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("drydock-agent");
+    let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let old_fingerprint = format!("{:x}", Sha256::digest(&old));
+    std::fs::write(&executable, &old).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    drop(connect(&socket, &old_fingerprint).await);
+    let mut desired = old;
+    desired.extend_from_slice(b"transport failure test");
+    let calls = AtomicUsize::new(0);
+    let error = Client::connect_current(
+        || async {
+            if calls.fetch_add(1, Ordering::Relaxed) > 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "provider reconnect unavailable"));
+            }
+            let stream = UnixStream::connect(&socket).await?;
+            Transport::yamux(Box::new(stream), true, Limits::default()).await
+        },
+        &desired,
+        Duration::from_secs(3),
+    )
+    .await
+    .err()
+    .expect("an unavailable provider reconnect must time out");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("last transport error: provider reconnect unavailable"), "{error}");
+    assert!(calls.load(Ordering::Relaxed) > 1);
+    let current = connect(&socket, &format!("{:x}", Sha256::digest(&desired))).await;
+    assert!(current.is_compatible());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
 }

@@ -104,6 +104,11 @@ pub trait Provider: Send + Sync {
     fn rate_limits(&self) -> Vec<RateLimit> {
         vec![]
     }
+    /// Append this build's tools image under /opt/drydock, preserving the base's
+    /// entrypoint, command and init. Record the provider's prepared form using
+    /// the module's key (both digests plus provider prepare-time constraints).
+    /// Upload bootstrap installs the same files at the same paths instead.
+    /// See ci/tools-image/README.md for the full prepare/start outcome contract.
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
     /// Running observations must include granted_size to emit a billing Running

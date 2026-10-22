@@ -24,6 +24,33 @@ async fn reference_binary_passes_conformance() {
         )
         .await
         .unwrap();
+    // The reference module has no guest: exercise the reusable startup checks
+    // with its explicit process model, through the real authenticated endpoint.
+    let tools_environment = host
+        .client
+        .provision(
+            "a",
+            &ProvisionRequest {
+                label: "tools-model".into(),
+                prepared: prepared.clone(),
+                size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                egress: EgressRequest::Open,
+                ssh_public_key: None,
+            },
+        )
+        .await
+        .unwrap();
+    conformance::vessel_tools(
+        &host.client,
+        "a",
+        &tools_environment.id,
+        &ExecRequest { command: vec!["drydock-fixture".into(), "tools".into()] },
+        "reference-model",
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    host.client.destroy("a", &tools_environment.id).await.unwrap();
     // Tiny sizes exercise the reference module; these are not Daytona resource requests.
     let options = Options {
         request: ProvisionRequest {

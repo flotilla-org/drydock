@@ -19,12 +19,23 @@ the fixed host socket `/run/drydock/host.sock` (`HOST_SOCKET` in the binary);
 host-initiated yamux requires no reverse socket. Live provider isolation and
 startup/supervision are verified in the provider integration work (#54).
 
-The host constructs `Client::connect(transport, expected_fingerprint)`. The
-client fetches `/hello` before returning: its build fingerprint and features
-constitute readiness. The expected fingerprint is the SHA-256 of the delivered
-agent executable, independent of the embedder's version. Until fingerprints
-match, the client refuses every operation except hello and upgrade. Routes
-other than those two have no cross-generation compatibility promise.
+The host normally calls `Client::connect_current(open_transport, executable,
+timeout)`. The tools image pin is a bootstrap reference and may contain an older
+agent. This handshake hashes the host's desired executable, reads hello, and
+pushes the binary plus re-execs when fingerprints differ. It reconnects through
+the supplied provider transport factory and returns only after verifying the
+current fingerprint. A matching hello avoids an unnecessary upgrade. Supply the
+binary for the vessel's architecture; push configuration after this handshake.
+The first transport/hello failure returns immediately: provider startup readiness
+is the caller's responsibility. Only reconnects after an accepted upgrade are
+retried until the deadline. A timeout includes the last observed fingerprint or
+transport/hello error to distinguish rollback from reconnect failures.
+
+Low-level `Client::connect(transport, expected_fingerprint)` remains available
+for explicit hello/upgrade tooling. Until fingerprints match, its client refuses
+every operation except hello and upgrade: generation-specific routes have no
+cross-generation compatibility promise. A mismatch is an upgrade trigger for the
+normal handshake, not a reason to refuse an older tools pin.
 
 ## Control contract
 

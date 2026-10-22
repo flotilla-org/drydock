@@ -97,6 +97,61 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// Connect to a vessel started from any published tools pin. A mismatched
+    /// hello triggers push + re-exec, then a fresh transport and verified hello.
+    /// The factory must open a new provider transport on every invocation.
+    /// Returns only a compatible client; callers push configuration afterwards.
+    /// Initial transport/hello errors return immediately; only post-upgrade
+    /// reconnects retry. The caller must arrange initial provider readiness.
+    pub async fn connect_current<F, Fut>(mut open: F, executable: &[u8], timeout: std::time::Duration) -> io::Result<Self>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Transport>>,
+    {
+        use sha2::{Digest, Sha256};
+        if executable.is_empty() {
+            return Err(invalid("current agent executable is empty"));
+        }
+        let expected = format!("{:x}", Sha256::digest(executable));
+        let mut observation = "no hello received".to_owned();
+        let result = tokio::time::timeout(timeout, async {
+            let client = Self::connect(open().await?, &expected).await?;
+            observation = format!("last hello fingerprint {}", client.hello.fingerprint);
+            if client.is_compatible() {
+                return Ok(client);
+            }
+            client.stage_upgrade(executable.to_vec()).await?;
+            // Activation acknowledgement is advisory: re-exec can close the
+            // stream before the response arrives. Only the next hello decides.
+            let _ = client.activate_upgrade().await;
+            drop(client);
+            loop {
+                match open().await {
+                    Ok(transport) => match Self::connect(transport, &expected).await {
+                        Ok(client) => {
+                            if client.is_compatible() {
+                                return Ok(client);
+                            }
+                            observation = format!("last hello fingerprint {}", client.hello.fingerprint);
+                        }
+                        Err(error) => observation = format!("last hello error: {error}"),
+                    },
+                    Err(error) => observation = format!("last transport error: {error}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        result.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("agent did not report the current fingerprint after hello/upgrade; {observation}"),
+            )
+        })?
+    }
+
+    /// Low-level connection for explicit hello/upgrade tooling. Normal hosts
+    /// should use connect_current so an older tools pin upgrades automatically.
     pub async fn connect(mut transport: Transport, expected: impl Into<String>) -> io::Result<Self> {
         let (sender, driver) = http2::connect(&transport.opener, Purpose::Control).await?;
         let targets: Targets = Arc::default();
