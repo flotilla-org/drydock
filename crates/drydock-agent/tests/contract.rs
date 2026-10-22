@@ -65,7 +65,7 @@ async fn control_contract_on_both_transports() {
         assert!(h.client.hello().features.contains(&"forwards".into()));
         for value in ["one", "two", ""] {
             let config = Configuration {
-                egress: serde_json::json!({"upstream": value}),
+                egress: None,
                 ca: format!("CA:{value}"),
                 features: vec![value.into()],
                 environment: [
@@ -661,4 +661,36 @@ fn assert_refused(result: std::io::Result<()>) {
     let error = result.unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     assert!(error.to_string().contains("host endpoint already serves a vessel"), "{error}");
+}
+
+// The egress forward belongs to this vessel's client registry, just like other
+// guest-to-host forwards. Unknown IDs must be rejected before any guest changes.
+#[tokio::test]
+async fn egress_requires_registered_vessel_upstream() {
+    let h = harness(false, "test-build").await;
+    for id in ["", "unregistered-proxy"] {
+        let config = Configuration { egress: Some(drydock_agent::Egress { upstream: id.into() }), ..Configuration::default() };
+        assert_eq!(h.client.configure(config).await.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
+    }
+}
+
+// Guest TCP listeners require a concrete loopback address. Wildcard and public
+// binds must fail before publishing any listener or exemption configuration.
+#[tokio::test]
+async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
+    let h = harness(false, "test-build").await;
+    let endpoint = h.dir.path().join("host-endpoint");
+    let _listener = UnixListener::bind(&endpoint).unwrap();
+    h.client.register_host_endpoint("concrete".into(), Endpoint::Unix(endpoint)).unwrap();
+    for address in ["0.0.0.0:9000", "[::]:9000", "192.0.2.1:9000", "[2001:db8::1]:9000"] {
+        let unix = h.dir.path().join("guest-listener");
+        let config = Configuration {
+            forwards: vec![GuestForward { id: "concrete".into(), unix: unix.clone(), tcp: Some(address.parse().unwrap()) }],
+            ..Configuration::default()
+        };
+        assert_eq!(h.client.configure(config).await.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
+        assert!(!unix.exists());
+    }
 }

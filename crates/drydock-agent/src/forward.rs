@@ -18,9 +18,14 @@ pub(crate) async fn opened(stream: &mut ByteStream) -> io::Result<()> {
     let result: Result<(), AgentError> = serde_json::from_slice(&bytes).map_err(invalid)?;
     result.map_err(AgentError::into_io)
 }
-pub(crate) async fn serve(mut stream: ByteStream, id: &str, endpoint: Option<&Endpoint>) -> io::Result<()> {
+pub(crate) async fn serve(stream: ByteStream, id: &str, endpoint: Option<&Endpoint>) -> io::Result<()> {
+    serve_marked(stream, id, endpoint, false).await
+}
+pub(crate) async fn serve_marked(mut stream: ByteStream, id: &str, endpoint: Option<&Endpoint>, marked: bool) -> io::Result<()> {
     let connected = match endpoint {
-        Some(endpoint) => endpoint.connect().await.map_err(|e| AgentError::new("forward.open", format!("{id}: {endpoint:?}"), e)),
+        Some(endpoint) => {
+            endpoint.connect_marked(marked).await.map_err(|e| AgentError::new("forward.open", format!("{id}: {endpoint:?}"), e))
+        }
         None => Err(AgentError::new("forward.open", id, io::Error::new(io::ErrorKind::NotFound, "unknown forward ID"))),
     };
     match connected {

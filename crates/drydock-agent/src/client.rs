@@ -17,11 +17,17 @@ fn claims() -> &'static Mutex<HashSet<EndpointKey>> {
     static CLAIMS: OnceLock<Mutex<HashSet<EndpointKey>>> = OnceLock::new();
     CLAIMS.get_or_init(Mutex::default)
 }
-struct Claim(Endpoint, Vec<EndpointKey>);
+struct Claim {
+    endpoint: Endpoint,
+    keys: Vec<EndpointKey>,
+    // Keep an unlinked socket inode alive until the last stream claim closes.
+    #[cfg(target_os = "linux")]
+    _inode: Option<std::fs::File>,
+}
 impl Drop for Claim {
     fn drop(&mut self) {
         let mut claims = claims().lock().unwrap();
-        for key in &self.1 {
+        for key in &self.keys {
             claims.remove(key);
         }
     }
@@ -31,9 +37,19 @@ fn claim(endpoint: Endpoint) -> io::Result<Claim> {
         Endpoint::Unix(path) => Endpoint::Unix(std::fs::canonicalize(path)?),
         other => other,
     };
+    #[cfg(target_os = "linux")]
+    let inode = if let Endpoint::Unix(path) = &endpoint {
+        use std::os::unix::fs::OpenOptionsExt;
+        Some(std::fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW).open(path)?)
+    } else {
+        None
+    };
     let keys = match &endpoint {
         Endpoint::Unix(path) => {
             use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            #[cfg(target_os = "linux")]
+            let metadata = inode.as_ref().unwrap().metadata()?;
+            #[cfg(not(target_os = "linux"))]
             let metadata = std::fs::metadata(path)?;
             if !metadata.file_type().is_socket() {
                 return Err(invalid("host endpoint must be a Unix socket"));
@@ -54,7 +70,12 @@ fn claim(endpoint: Endpoint) -> io::Result<Claim> {
         return Err(io::Error::new(io::ErrorKind::AddrInUse, "host endpoint already serves a vessel"));
     }
     claims.extend(keys.iter().cloned());
-    Ok(Claim(endpoint, keys))
+    Ok(Claim {
+        endpoint,
+        keys,
+        #[cfg(target_os = "linux")]
+        _inode: inode,
+    })
 }
 type Targets = Arc<Mutex<HashMap<String, Arc<Claim>>>>;
 /// One vessel per client. A host endpoint stays exclusively claimed until all
@@ -93,7 +114,7 @@ impl Client {
                         if let Purpose::Forward { id } = incoming.purpose {
                             let target = map.lock().unwrap().get(&id).cloned();
                             streams.spawn(async move {
-                                let endpoint = target.as_ref().map(|claim| &claim.0);
+                                let endpoint = target.as_ref().map(|claim| &claim.endpoint);
                                 if let Err(error) = crate::forward::serve(incoming.stream, &id, endpoint).await {
                                     tracing::warn!(%error, forward = %id, "guest-to-host forward failed");
                                 }
@@ -161,6 +182,12 @@ impl Client {
         self.require_compatible()?;
         {
             let targets = self.targets.lock().unwrap();
+            if let Some(egress) = &config.egress {
+                check_id(&egress.upstream)?;
+                if !targets.contains_key(&egress.upstream) {
+                    return Err(invalid("egress upstream host endpoint was never registered"));
+                }
+            }
             for forward in &config.forwards {
                 check_id(&forward.id).map_err(|error| crate::error::context("configure", &forward.id, error))?;
                 if !targets.contains_key(&forward.id) {
@@ -324,5 +351,25 @@ mod tests {
             assert_eq!(received, events[..expected_events]);
             assert_eq!(failed, cut < bytes.len(), "EOF before Exit must be an error");
         });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod claim_tests {
+    use super::*;
+    // A removed Unix pathname no longer names a listening endpoint. Retaining
+    // its claim must not make a different, newly created socket look shared
+    // when the filesystem recycles an inode while old stream claims still live.
+    #[test]
+    fn removed_unix_sockets_do_not_claim_recycled_inodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut retained = Vec::new();
+        for index in 0..256 {
+            let path = dir.path().join(format!("endpoint-{index}"));
+            let socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            retained.push(claim(Endpoint::Unix(path.clone())).unwrap());
+            drop(socket);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }

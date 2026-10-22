@@ -98,9 +98,11 @@ struct Settings {
     config: Configuration,
     listeners: HashMap<String, Listener>,
     targets: HashMap<String, Target>,
+    capture: Option<crate::egress::Capture>,
 }
 struct Shared {
     hello: Hello,
+    egress_system: crate::egress::System,
     opener: Arc<Mutex<Opener>>,
     settings: Mutex<Settings>,
     executable: PathBuf,
@@ -118,6 +120,7 @@ impl Agent {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             hello: Hello { fingerprint, features: FEATURES.iter().map(|s| (*s).into()).collect() },
+            egress_system: crate::egress::System::default(),
             opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),
             executable,
@@ -195,12 +198,17 @@ impl Agent {
                         }
                         Purpose::Forward { id } => {
                             let mut settings = self.shared.settings.lock().await;
+                            // Choose the dial policy from the configuration at
+                            // forward acceptance, under configure's lock. Marks
+                            // belong to sockets; toggles do not rewrite existing
+                            // streams or retroactively change this choice.
+                            let marked = settings.config.egress.is_some();
                             if let Some(target) = settings.targets.get_mut(&id) {
                                 // Reap completed bridges without retaining an unbounded history.
                                 while target.streams.try_join_next().is_some() {}
                                 let endpoint = target.endpoint.clone();
                                 target.streams.spawn(async move {
-                                    if let Err(error) = crate::forward::serve(incoming.stream, &id, Some(&endpoint)).await {
+                                    if let Err(error) = crate::forward::serve_marked(incoming.stream, &id, Some(&endpoint), marked).await {
                                         tracing::warn!(%error, forward = %id, "host-to-guest forward failed");
                                     }
                                 });
@@ -226,7 +234,26 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     if config.environment.iter().any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
         return Err(api("invalid process environment"));
     }
+    if let Some(egress) = &config.egress {
+        check_id(&egress.upstream).map_err(api)?;
+        if config.forwards.iter().filter_map(|f| f.tcp).any(|a| crate::egress::RESERVED_PORTS.contains(&a.port())) {
+            return Err(api("forward conflicts with an egress listener"));
+        }
+    }
     let mut settings = s.settings.lock().await;
+    let mut prepared_capture = if settings.capture.is_none() {
+        if let Some(egress) = &config.egress {
+            Some(
+                crate::egress::Capture::prepare(s.opener.clone(), egress.upstream.clone())
+                    .await
+                    .map_err(at("egress.prepare", "listeners"))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut prepared = HashMap::new();
     let preparation: Result<(), ApiError> = async {
         for forward in &config.forwards {
@@ -247,6 +274,33 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
             };
             prepared.insert(forward.id.clone(), listener);
         }
+        if config.egress.is_some() || settings.capture.is_some() {
+            // Stage the CA under the tools prefix before publishing capture.
+            // Configuration.ca is the complete combined trust bundle supplied
+            // by the controller; the agent does not fetch host trust material.
+            let ca = if config.egress.is_some() {
+                let file = tempfile::NamedTempFile::new_in(s.egress_system.ca.parent().unwrap())
+                    .map_err(at("egress.ca", s.egress_system.ca.display()))?;
+                std::fs::write(file.path(), config.ca.as_bytes()).map_err(at("egress.ca", s.egress_system.ca.display()))?;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644))
+                    .map_err(at("egress.ca", s.egress_system.ca.display()))?;
+                file.as_file().sync_all().map_err(at("egress.ca", s.egress_system.ca.display()))?;
+                Some(file)
+            } else {
+                None
+            };
+            s.egress_system.install(&config).await.map_err(at("egress.redirect", "nftables"))?;
+            if let Some(ca) = ca
+                && let Err(error) = ca.persist(&s.egress_system.ca)
+            {
+                // persist failed before replacing the old bundle. Reinstall
+                // the previous nft transaction before reporting refusal; if
+                // rollback itself fails, report that separately to the caller.
+                s.egress_system.install(&settings.config).await.map_err(at("egress.rollback", "nftables"))?;
+                return Err(at("egress.ca", s.egress_system.ca.display())(error.error));
+            }
+        }
         Ok(())
     }
     .await;
@@ -255,6 +309,9 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
         // response, so the caller can retry immediately without a bind race.
         for listener in prepared.into_values().flatten() {
             listener.stop().await;
+        }
+        if let Some(capture) = prepared_capture.take() {
+            capture.stop().await;
         }
         return Err(error);
     }
@@ -267,6 +324,14 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     let old = std::mem::replace(&mut settings.listeners, listeners);
     for (_, listener) in old {
         listener.stop().await;
+    }
+    if let Some(egress) = &config.egress {
+        if let Some(capture) = prepared_capture.take() {
+            settings.capture = Some(capture);
+        }
+        settings.capture.as_ref().unwrap().set_upstream(egress.upstream.clone());
+    } else if let Some(capture) = settings.capture.take() {
+        capture.stop().await;
     }
     settings.config = config;
     Ok(StatusCode::NO_CONTENT)
@@ -362,6 +427,9 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
 async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForward>) -> Result<StatusCode, ApiError> {
     check_id(&forward.id).map_err(api)?;
     let mut settings = s.settings.lock().await;
+    if settings.capture.is_some() && forward.tcp.is_some() {
+        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
+    }
     if settings.listeners.contains_key(&forward.id) {
         return Err(api("forward ID already exists"));
     }
@@ -372,6 +440,9 @@ async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForwar
 }
 async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
     let mut settings = s.settings.lock().await;
+    if settings.capture.is_some() && settings.config.forwards.iter().any(|f| f.id == id && f.tcp.is_some()) {
+        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
+    }
     let listener = settings
         .listeners
         .remove(&id)
@@ -588,6 +659,78 @@ mod tests {
         assert_eq!(std::fs::read(&executable).unwrap(), b"current image");
         assert_eq!(std::fs::read(&staged).unwrap(), b"new image");
         assert_eq!(std::fs::read(previous).unwrap(), b"current image");
+    }
+
+    // A process-boundary nft stand-in records the last committed transaction.
+    // Fail once after real capture preparation and once after nft installation;
+    // both refusals must free every port and preserve configuration/nft state.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn egress_configuration_failures_release_ports_and_restore_nft() {
+        for fail_persist in [false, true] {
+            let (a, b) = tokio::io::duplex(4096);
+            let (host, guest) = tokio::join!(
+                Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
+                Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
+            );
+            let _host = host.unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let nft = dir.path().join("nft");
+            std::fs::write(
+                &nft,
+                r#"#!/bin/sh
+set -eu
+cat > "$0.state"
+cat "$0.state" >> "$0.log"
+printf '\n--transaction--\n' >> "$0.log"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let initial_rules = "add table inet drydock_egress\nflush table inet drydock_egress\n";
+            let state_path = dir.path().join("nft.state");
+            let log_path = dir.path().join("nft.log");
+            std::fs::write(&state_path, initial_rules).unwrap();
+            std::fs::write(&log_path, "").unwrap();
+            let ca = dir.path().join("ca.pem");
+            if fail_persist {
+                std::fs::create_dir(&ca).unwrap();
+            }
+            let mut agent = Agent::new(guest.unwrap(), "build".into(), dir.path().join("agent"));
+            Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft, ca };
+            let previous = Configuration { environment: [("OLD".into(), "kept".into())].into(), ..Configuration::default() };
+            configure(State(agent.shared.clone()), Json(previous.clone())).await.unwrap();
+            let forward = GuestForward { id: "duplicate".into(), unix: dir.path().join("forward"), tcp: None };
+            let rejected = Configuration {
+                egress: Some(crate::Egress { upstream: "proxy".into() }),
+                ca: "new bundle".into(),
+                forwards: if fail_persist { vec![] } else { vec![forward.clone(), forward.clone()] },
+                ..Configuration::default()
+            };
+            let error = configure(State(agent.shared.clone()), Json(rejected)).await.unwrap_err();
+            if fail_persist {
+                assert_eq!(error.1.0.operation, "egress.ca");
+            }
+            let settings = agent.shared.settings.lock().await;
+            assert_eq!(settings.config, previous);
+            assert!(settings.capture.is_none());
+            assert!(settings.listeners.is_empty());
+            assert!(!forward.unix.exists());
+            assert_eq!(std::fs::read_to_string(&state_path).unwrap(), initial_rules);
+            let log = std::fs::read_to_string(&log_path).unwrap();
+            if fail_persist {
+                assert_eq!(log.matches("--transaction--").count(), 2);
+                assert!(log.contains("meta l4proto tcp redirect"));
+                assert!(log.ends_with(&format!("{initial_rules}\n--transaction--\n")));
+            } else {
+                assert!(log.is_empty(), "preparation refusal must not touch nft");
+            }
+            // Rebind synchronously, before a caller retries configuration.
+            let _dns = std::net::TcpListener::bind("[::]:1053").unwrap();
+            let _capture = std::net::TcpListener::bind("[::]:15001").unwrap();
+            let _proxy = std::net::TcpListener::bind("127.0.0.1:15002").unwrap();
+            let _udp = std::net::UdpSocket::bind("[::]:1053").unwrap();
+        }
     }
 
     // fchown is a kernel boundary: its result policy must tolerate EPERM only
