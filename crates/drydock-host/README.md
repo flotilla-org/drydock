@@ -265,8 +265,7 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
     "settings": {
       "organization_id":"YOUR_ORGANIZATION_ID",
       "region":"eu", "tier":1,
-      "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
-      "agent_command":"/opt/drydock/drydock-agent"
+      "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY"
     },
     "credential":{"mode":"direct", "credential_reference":"daytona-key"}
   }]
@@ -280,34 +279,31 @@ The key needs sandbox creation/modification/deletion, snapshot creation and bill
 read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
 
-Drydock's agent is supplied by the tools OCI image described above; its build
-selects its checked-in bootstrap tools digest (which may predate the host). Daytona still accepts the fixed `agent_command`
-setting. Its tools-image layering/start integration and removal of that setting
-are tracked in #54; this image-build change does not implement those provider
-operations. The current Daytona bootstrap also needs `flock` and Python 3 for
-listener liveness checks.
+Prepare builds a Daytona snapshot with `buildInfo.dockerfileContent`: the pinned
+base plus `COPY --from` the pinned tools image's `/opt/drydock/`. It never sets
+entrypoint, command or init. The build selects the tools reference through
+`crates/drydock/tools-image.txt` (or `DRYDOCK_TOOLS_IMAGE` at build time); the
+`unpublished` pin refuses preparation until the first publish. Both references
+must be immutable SHA-256 image references.
 
-A deterministic provider snapshot name tags
-the digest pair and size; subsequent prepare calls look it up and wait for `active`. The module sets the container
-class and snapshot resources explicitly. Provision inherits those resources and
-refuses a size that differs from the prepared key. No tools are uploaded. Prepare
-observes a build for up to four minutes; callers may call prepare again to continue observation of that same
-snapshot. Size requests must use whole vCPU and GiB within the default 4 vCPU,
-8 GiB RAM and 10 GiB disk cap; incompatible requests are refused rather than rounded.
+The snapshot name includes the digest pair and size. Prepare reuses it and waits
+for `active`, for up to four minutes per call. Provision inherits the snapshot's
+resources and refuses a size that differs from the prepared key. Requests must
+use whole vCPU and GiB within the default 4 vCPU, 8 GiB RAM and 10 GiB disk cap.
 
 Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
-disables auto-stop/auto-pause and auto-delete, waits for started, then launches
-the fixed command through toolbox exec. A guest `flock` serialises bootstrap;
-bootstrap succeeds only when a connection to `/run/drydock/agent.sock` succeeds.
-A stale socket with no listener is removed and the fixed agent command is restarted.
-`agent_command` is a trusted operator shell fragment interpreted by `sh`; unlike
-`ExecRequest.command` and the probe argv, it is not quoted as one executable.
+disables auto-stop/auto-pause and auto-delete, waits for started, then executes
+`/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`.
+The baked binary detaches a supervisor, uses an OS file lock to make concurrent
+bootstraps converge, and restarts the fixed agent after a crash. It requires
+neither Python nor util-linux `flock`. PID 1 remains Daytona's daemon.
 
-The toolbox budget is 25 seconds, covering the eight-second flock wait, five-second
-readiness loop and bounded one-second liveness connects; ordinary exec/probes get
-20 seconds (the current protocol `ExecRequest` has no timeout field). The agent should
-replace that socket when it starts. Drydock subsequently pushes egress, CA and
-features over its control connection. A failed bootstrap leaves a labelled
+Toolbox bootstrap has a 25-second execution budget; ordinary exec/probes get
+20 seconds. Bootstrap starts supervision; it does not claim agent readiness.
+`drydockd` waits up to 60 seconds for the agent's `Client::connect_current`
+handshake over the SSH gateway before returning launch success. It uses the
+installed sibling `drydock-agent` (override `DRYDOCK_AGENT_BIN`) to upgrade an
+older tools agent and verifies its current hello. A failed bootstrap leaves a labelled
 resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
 resource; size or egress mismatches (including missing policy evidence) are refused
 with guidance to use a new label. They never change the existing resource's policy.
@@ -317,9 +313,8 @@ hold a provider-wide creation mutex.
 Suspend is stop, resume is start plus bootstrap. The whole filesystem persists;
 memory and resident processes do not. `suspend_preserves_memory: false` declares
 this explicitly. There is no pause operation on the container class. Resume
-removes the old stopped process's socket before bootstrapping; repeated resume of
-an already running sandbox checks the listener and restarts a dead agent without
-disturbing a live socket.
+starts supervision again; the agent removes its stale socket. Repeated resume of
+an already running sandbox keeps the existing singleton supervisor.
 The deterministic resume token is an id-bound continuation marker, not an access
 credential; every call still requires the organisation API key. It uses `Secret`
 because that is the protocol's resume-token representation.

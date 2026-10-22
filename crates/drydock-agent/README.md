@@ -8,6 +8,10 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
 [--vsock-port PORT]` alongside the image's own processes. It must not be PID 1.
+Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`.
+This detaches a singleton supervisor alongside the provider's init; the supervisor
+holds an OS file lock and restarts the agent after a crash, without guest Python
+or util-linux. Providers must invoke this bootstrap again after stop/start.
 The agent creates its dedicated run directory with mode 0700 and protects its
 Unix sockets with mode 0600, correcting existing owned directory permissions.
 Symlink, foreign-owned and sticky run directories are refused. The provider

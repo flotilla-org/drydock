@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drydock-agent = { path = "../drydock-agent" }
+drydock-transport = { path = "../drydock-transport" }
 rigging-paths.workspace = true
 rigging-http-serve.workspace = true
 rigging-http-client.workspace = true

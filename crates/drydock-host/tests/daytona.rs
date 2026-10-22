@@ -339,10 +339,10 @@ impl StandIn {
                     return response(status, json!({"statusCode":status,"message":s.probe_failure_message.as_deref().unwrap_or("Bad Gateway"),"error":"Bad Gateway"}));
                 }
                 if let Some(value) = &s.exec_response { return response(200, value.clone()); }
-                if s.require_bootstrap_budget && command.contains("nohup") && timeout < 20 {
+                if s.require_bootstrap_budget && command.contains("--supervise") && timeout < 20 {
                     return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
                 }
-                if command.contains("nohup") {
+                if command.contains("--supervise") {
                     s.bootstraps += 1;
                     if !command.contains("--socket /run/drydock/agent.sock") { reject!("bootstrap missing socket flag"); }
                 }
@@ -382,12 +382,19 @@ impl Drop for StandIn {
             let state = self.0.lock().unwrap();
             assert!(state.violations.is_empty(), "vendor contract violations: {:?}", state.violations);
             for body in &state.snapshot_requests {
-                assert!(body["imageName"].as_str().is_some_and(|v| v.contains("@sha256:")), "snapshot must pin the image digest");
+                let dockerfile = body["buildInfo"]["dockerfileContent"].as_str().expect("prepare must build the tools layer");
+                let instructions: Vec<_> = dockerfile.lines().collect();
+                assert_eq!(instructions.len(), 3, "only FROM and COPY preserve the base entrypoint and command");
+                assert!(instructions[0].starts_with("FROM registry.invalid/drydock-tools@sha256:"));
+                assert!(instructions[1].starts_with("FROM ") && instructions[1].contains("@sha256:"));
+                assert_eq!(instructions[2], "COPY --from=drydock_tools /opt/drydock/ /opt/drydock/");
+                assert!(body.get("entrypoint").is_none());
+                assert!(body.get("imageName").is_none());
                 assert_eq!(body["sandboxClass"], "container");
                 assert_eq!(body["regionId"], "eu");
             }
             assert!(state.ssh_expiries.iter().all(|v| v.as_deref() == Some("5")), "reach must request a short expiry");
-            assert!(state.executed.iter().filter(|c| c.contains("nohup")).all(|c| c.contains("--socket /run/drydock/agent.sock")));
+            assert!(state.executed.iter().filter(|c| c.contains("--supervise")).all(|c| c.contains("--socket /run/drydock/agent.sock")));
             let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
             for row in &state.fixture_rows {
                 for key in spec["schemas"]["Sandbox"]["required"].as_array().unwrap() {
@@ -425,12 +432,15 @@ async fn provider(http: Arc<dyn HttpClient>) -> Arc<dyn Provider> {
     provider_with_probe(http, false).await
 }
 async fn provider_with_probe(http: Arc<dyn HttpClient>, probe: bool) -> Arc<dyn Provider> {
-    let config:ProviderConfiguration = serde_json::from_value(json!({"name":"daytona","module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA","agent_command":"agent --socket /run/drydock/agent.sock"},"credential":{"mode":"direct","credential_reference":"test"}})).unwrap();
+    let config:ProviderConfiguration = serde_json::from_value(json!({"name":"daytona","module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"},"credential":{"mode":"direct","credential_reference":"test"}})).unwrap();
     let mut config = config;
     if probe {
         config.settings.insert("egress_probe".into(), json!({"command":["/usr/local/bin/check-egress"]}));
     }
     DaytonaModule.configure(&config, http).await.unwrap()
+}
+fn tools_image(digit: char) -> String {
+    format!("registry.invalid/drydock-tools@sha256:{}", digit.to_string().repeat(64))
 }
 fn daytona_size() -> Size {
     Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 }
@@ -439,7 +449,7 @@ async fn prepared(p: &dyn Provider, c: &Credentials) -> Prepared {
     let request = PrepareRequest {
         size: daytona_size(),
         image_digest: format!("docker.io/test/image@sha256:{}", "a".repeat(64)),
-        tools_digest: "sha256:tools".into(),
+        tools_digest: tools_image('a'),
     };
     let first = p.prepare(request.clone(), c).await.unwrap();
     assert_eq!(p.prepare(request, c).await.unwrap(), first);
@@ -751,17 +761,17 @@ async fn preparation_converges_by_digest_pair() {
     let b = provider(http.clone()).await;
     let c = credentials(false);
     let mut r =
-        PrepareRequest { size: daytona_size(), image_digest: format!("image@sha256:{}", "b".repeat(64)), tools_digest: "tools-a".into() };
+        PrepareRequest { size: daytona_size(), image_digest: format!("image@sha256:{}", "b".repeat(64)), tools_digest: tools_image('a') };
     let (x, y) = tokio::join!(a.prepare(r.clone(), &c), b.prepare(r.clone(), &c));
     let x = x.unwrap();
     assert_eq!(x, y.unwrap());
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
-    r.tools_digest = "tools-b".into();
+    r.tools_digest = tools_image('b');
     let other = a.prepare(r, &c).await.unwrap();
     assert_ne!(x.id, other.id);
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 2);
     assert!(
-        a.prepare(PrepareRequest { size: daytona_size(), image_digest: "image:latest".into(), tools_digest: "tools".into() }, &c)
+        a.prepare(PrepareRequest { size: daytona_size(), image_digest: "image:latest".into(), tools_digest: tools_image('a') }, &c)
             .await
             .is_err()
     );
@@ -783,7 +793,7 @@ fn prepared_sizes_route_to_snapshots(tc: hegel::TestCase) {
         let p = provider(http.clone()).await;
         let c = credentials(false);
         let base =
-            PrepareRequest { image_digest: format!("image@sha256:{}", "c".repeat(64)), tools_digest: "tools".into(), size: size.clone() };
+            PrepareRequest { image_digest: format!("image@sha256:{}", "c".repeat(64)), tools_digest: tools_image('a'), size: size.clone() };
         let prep = p.prepare(base.clone(), &c).await.unwrap();
         let other_host = provider(http.clone()).await;
         assert_eq!(other_host.prepare(base.clone(), &c).await.unwrap(), prep);
@@ -897,7 +907,7 @@ async fn inactive_snapshot_activates_once_then_polls() {
     assert!(start.elapsed() >= std::time::Duration::from_secs(2));
 }
 
-// Bootstrap's vendor deadline must contain its flock and readiness budgets.
+// Bootstrap retains a bounded vendor deadline for starting supervision.
 // Guest command failure is not a transient provider outage.
 #[tokio::test]
 async fn bootstrap_budget_and_command_failure() {
@@ -959,38 +969,17 @@ async fn probe_failures_surface_without_erasing_inventory() {
     assert_eq!(p.list(&c).await.unwrap().len(), 1);
 }
 
-// A socket inode without a listener must not count as successful bootstrap.
-// Execute the actual emitted guest script in a disposable local directory.
+// Bootstrap delegates to the baked binary and needs no Python, flock, or shell
+// fragment setting. Lifecycle readiness belongs to the daemon's agent hello.
 #[tokio::test]
-async fn stale_socket_fails_bootstrap_liveness() {
-    if std::process::Command::new("flock").arg("--version").output().is_err() {
-        return;
-    }
+async fn bootstrap_uses_only_baked_tools() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials(false);
     let prep = prepared(p.as_ref(), &c).await;
-    p.provision(request(prep, "stale"), &c).await.unwrap();
-    let script = http.0.lock().unwrap().executed.iter().find(|v| v.contains("nohup")).unwrap().clone();
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("agent.sock");
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    assert!(socket.exists());
-    let status = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(script.replace("agent --socket /run/drydock/agent.sock", "true").replace("/run/drydock", dir.path().to_str().unwrap()))
-        .status()
-        .await
-        .unwrap();
-    assert!(!status.success(), "stale socket was accepted as a live agent");
-    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let status = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(script.replace("agent --socket /run/drydock/agent.sock", "true").replace("/run/drydock", dir.path().to_str().unwrap()))
-        .status()
-        .await
-        .unwrap();
-    assert!(status.success(), "an actual listening agent was not accepted");
+    p.provision(request(prep, "tools-only"), &c).await.unwrap();
+    let state = http.0.lock().unwrap();
+    assert_eq!(state.executed, ["/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock"]);
 }
 
 // This network-boundary wrapper controls response latency without sleeping
@@ -1177,23 +1166,6 @@ async fn internal_retains_vendor_body() {
     assert!(format!("{error:?}").contains("key-a"));
     let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
     assert!(provider_error.as_str().contains("key-a must never be echoed"));
-}
-
-// The trusted bootstrap preflight has a safe public diagnostic while preserving
-// its raw merged output inside the redacting field.
-#[tokio::test]
-async fn missing_python_has_a_public_bootstrap_diagnostic() {
-    let http = Arc::new(StandIn::default());
-    let p = provider(http.clone()).await;
-    let c = credentials(false);
-    let prep = prepared(p.as_ref(), &c).await;
-    http.0.lock().unwrap().command_exit = Some(2);
-    http.0.lock().unwrap().command_output = Some("missing-python3\n".into());
-    let Err(ProtocolError::CommandFailed { reason, exit_code: 2, output }) = p.provision(request(prep, "missing-tool"), &c).await else {
-        panic!("bootstrap must fail")
-    };
-    assert!(reason.contains("missing python3"));
-    assert_eq!(output.expose(), "missing-python3\n");
 }
 
 // Lifecycle state checks must not invoke isolation probes. Even a failing probe
@@ -1443,8 +1415,7 @@ async fn standin_validates_snapshot_create_schema() {
     let req = client.post("https://app.daytona.io/api/snapshots/missing/activate").bearer_auth("key-a").build().unwrap();
     assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 404);
     assert_eq!(http.0.lock().unwrap().activations, 0);
-    let base =
-        json!({"name":"fixture","imageName":"image@sha256:abc","regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
+    let base = json!({"name":"fixture","buildInfo":{"dockerfileContent":format!("FROM {} AS drydock_tools\nFROM image@sha256:{}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n", tools_image('a'), "b".repeat(64))},"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
     let mut invalid = vec![json!({}), json!(null)];
     let mut unknown = base.clone();
     unknown["mem"] = json!(4);
@@ -1552,7 +1523,6 @@ impl HostHarness {
                     "modules":[{"name":"daytona","entrypoint":"daytona"}],
                     "providers":[{"name":"daytona","module":"daytona","settings":{
                         "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA",
-                        "agent_command":"agent --socket /run/drydock/agent.sock",
                         "egress_probe":{"command":["/usr/local/bin/check-egress"]}
                     },"credential":{"mode":"direct","credential_reference":"test"}}]
                 }))
@@ -1829,4 +1799,64 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("lifecycle succeeded; egress measurement failed"), "{logs}");
     assert!(!logs.contains("fallback-secret-xyz"), "{logs}");
+}
+
+// Concurrent provision retries both bootstrap the same started sandbox, without
+// holding a host-local creation lock. The baked supervisor enforces singleton.
+#[tokio::test]
+async fn concurrent_bootstraps_after_start_and_resume() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    let prep = prepared(p.as_ref(), &c).await;
+    let request = request(prep, "concurrent-bootstrap");
+    let (first, second) = tokio::join!(p.provision(request.clone(), &c), p.provision(request, &c));
+    let first = row(first.unwrap());
+    assert_eq!(first.id, row(second.unwrap()).id);
+    assert_eq!(http.0.lock().unwrap().bootstraps, 2);
+    let operations = p.operations();
+    let lifecycle = operations.suspend_resume.unwrap();
+    let token = lifecycle.suspend(&first.id, &c).await.unwrap();
+    let (first_resume, second_resume) =
+        tokio::join!(lifecycle.resume(&first.id, token.clone(), &c), lifecycle.resume(&first.id, token, &c));
+    first_resume.unwrap();
+    second_resume.unwrap();
+    assert_eq!(http.0.lock().unwrap().bootstraps, 4);
+}
+
+// Unpublished, mutable and instruction-injecting tools references must refuse
+// before contacting Daytona, as must instruction-injecting base references.
+#[tokio::test]
+async fn prepare_refuses_unpublished_or_unsafe_tools() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials(false);
+    for tools in [
+        "unpublished".into(),
+        "tools:latest".into(),
+        format!("tools\nRUN bad@sha256:{}", "a".repeat(64)),
+        format!("tools@sha256:{}", "a".repeat(63)),
+    ] {
+        assert!(
+            p.prepare(
+                PrepareRequest { size: daytona_size(), image_digest: format!("ubuntu@sha256:{}", "a".repeat(64)), tools_digest: tools },
+                &c
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        p.prepare(
+            PrepareRequest {
+                size: daytona_size(),
+                image_digest: format!("ubuntu\nRUN bad@sha256:{}", "a".repeat(64)),
+                tools_digest: tools_image('a')
+            },
+            &c
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(http.0.lock().unwrap().requests, 0);
 }
