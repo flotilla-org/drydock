@@ -189,3 +189,56 @@ async fn supervised_tools_upgrade_and_restart_current_agent() {
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     assert_eq!(hello(&socket).await, desired);
 }
+
+// Killing only the supervisor leaves an orphan agent. Bootstrap must preserve
+// that live agent and its socket; once it exits, the new supervisor recovers it.
+#[tokio::test]
+async fn bootstrap_beside_orphan_preserves_live_socket_and_recovers_after_exit() {
+    use std::os::unix::{fs::MetadataExt, process::CommandExt};
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("agent.sock");
+    let mut original = supervisor(&socket);
+    let fingerprint = hello(&socket).await;
+    let orphan = agents(&socket);
+    assert_eq!(orphan.len(), 1);
+    let inode = std::fs::metadata(&socket).unwrap().ino();
+    original.0.kill().unwrap();
+    original.0.wait().unwrap();
+
+    let log_path = directory.path().join("replacement.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let _replacement = ProcessGroup(
+        Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+            .args(["--supervisor", "--socket"])
+            .arg(&socket)
+            .env("PATH", "/nonexistent")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Observe a real duplicate-agent startup refusal and its exit,
+            // rather than passing before the new supervisor attempts startup.
+            if std::fs::read_to_string(&log_path).unwrap().contains("already in use") && agents(&socket) == orphan {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("duplicate agent must refuse the orphan's listening socket");
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+    assert_eq!(hello(&socket).await, fingerprint);
+    assert_eq!(agents(&socket), orphan);
+
+    // SAFETY: this is the orphan belonging to the private test socket.
+    assert_eq!(unsafe { libc::kill(orphan[0], libc::SIGKILL) }, 0);
+    assert_eq!(hello(&socket).await, fingerprint);
+    let recovered = agents(&socket);
+    assert_eq!(recovered.len(), 1);
+    assert_ne!(recovered, orphan);
+}
