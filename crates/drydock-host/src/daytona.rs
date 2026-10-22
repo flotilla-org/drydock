@@ -605,6 +605,8 @@ impl Provider for Daytona {
             // provision does not implicitly resume an existing label.
             let mut row = self.environment(v)?;
             if matches!(row.environment.state, Observation::Running) {
+                // Every Running re-adoption bootstraps; the guest supervisor's
+                // lock makes this idempotent even across concurrent hosts.
                 self.bootstrap(&row.environment.id, c).await?;
                 row = self.inspect_after_lifecycle(&row.environment.id, c).await?;
             }

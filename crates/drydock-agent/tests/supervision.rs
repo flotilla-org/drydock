@@ -73,10 +73,17 @@ async fn singleton_recovers_after_crash_and_start_resume() {
     hello(&socket).await;
     // Either competing supervisor may win; the loser must exit successfully.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while first.0.try_wait().unwrap().is_none() && duplicate.0.try_wait().unwrap().is_none() {
+    let loser = loop {
+        if let Some(status) = first.0.try_wait().unwrap() {
+            break status;
+        }
+        if let Some(status) = duplicate.0.try_wait().unwrap() {
+            break status;
+        }
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    };
+    assert!(loser.success(), "the competing supervisor must exit successfully");
     let before = agents(&socket);
     assert_eq!(before.len(), 1);
     // SAFETY: PID belongs to the agent in this test's private socket directory.
