@@ -15,19 +15,60 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m unittest discover -s ci -p 'test_tools_*.py'
-  image-build:
-    if: github.event_name == 'pull_request'
+  # Each platform builds and is checked on a runner of its own architecture,
+  # so nothing is compiled or tested under emulation.
+  platform:
     needs: script-tests
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DRYDOCK_TOOLS_REGISTRY: ${{ vars.DRYDOCK_TOOLS_REGISTRY || 'ghcr.io/flotilla-org' }}
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
+        with:
+          fetch-depth: 0
       - uses: docker/setup-buildx-action@v3
-      - name: Build both platforms without publishing
-        run: python3 ci/tools_image.py --revision "$GITHUB_SHA"
+      - name: Build linux/${{ matrix.arch }} without publishing
+        if: env.PUBLISH != 'true'
+        run: python3 ci/tools_image.py --revision "$GITHUB_SHA" --platform "linux/${{ matrix.arch }}"
+      - name: Select registry host
+        if: env.PUBLISH == 'true'
+        id: registry
+        run: echo "host=${DRYDOCK_TOOLS_REGISTRY%%/*}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ secrets.DRYDOCK_TOOLS_USERNAME || github.actor }}
+          password: ${{ secrets.DRYDOCK_TOOLS_PASSWORD || secrets.GITHUB_TOKEN }}
+      - name: Publish linux/${{ matrix.arch }} image by digest
+        if: env.PUBLISH == 'true'
+        run: >-
+          python3 ci/tools_image.py --revision "$GITHUB_SHA" --registry "$DRYDOCK_TOOLS_REGISTRY"
+          --publish --platform "linux/${{ matrix.arch }}"
+      - name: Stock Ubuntu runtime acceptance on ${{ matrix.arch }}
+        if: env.PUBLISH == 'true'
+        run: python3 ci/test_tools_runtime.py --arch "${{ matrix.arch }}" "$(cat target/tools-image/platform-${{ matrix.arch }}.txt)"
+      - uses: actions/upload-artifact@v4
+        if: env.PUBLISH == 'true'
+        with:
+          name: tools-platform-${{ matrix.arch }}
+          path: target/tools-image/platform-${{ matrix.arch }}.txt
+          if-no-files-found: error
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: script-tests
+    needs: platform
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -39,8 +80,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tools-platform-*
+          path: target/tools-platform
+          merge-multiple: true
       - name: Select registry host
         id: registry
         run: echo "host=${DRYDOCK_TOOLS_REGISTRY%%/*}" >> "$GITHUB_OUTPUT"
@@ -49,8 +94,10 @@ jobs:
           registry: ${{ steps.registry.outputs.host }}
           username: ${{ secrets.DRYDOCK_TOOLS_USERNAME || github.actor }}
           password: ${{ secrets.DRYDOCK_TOOLS_PASSWORD || secrets.GITHUB_TOKEN }}
-      - name: Publish exact merged revision by digest
-        run: python3 ci/tools_image.py --revision "$GITHUB_SHA" --registry "$DRYDOCK_TOOLS_REGISTRY" --publish
+      - name: Assemble the tools index from both platform images
+        run: >-
+          python3 ci/tools_image.py --revision "$GITHUB_SHA" --registry "$DRYDOCK_TOOLS_REGISTRY" --publish
+          --assemble "$(cat target/tools-platform/platform-amd64.txt)" "$(cat target/tools-platform/platform-arm64.txt)"
       - name: Verify public anonymous pulls on both architectures
         run: |
           anonymous=$(mktemp -d)
@@ -58,8 +105,6 @@ jobs:
           image=$(cat target/tools-image/tools-image.txt)
           docker --config "$anonymous" pull --platform linux/amd64 "$image"
           docker --config "$anonymous" pull --platform linux/arm64 "$image"
-      - name: Stock Ubuntu runtime acceptance on both architectures
-        run: python3 ci/test_tools_runtime.py "$(cat target/tools-image/tools-image.txt)"
       - name: Stamp matching tools into drydock build
         run: echo "DRYDOCK_TOOLS_IMAGE=$(cat target/tools-image/tools-image.txt)" >> "$GITHUB_ENV"
       - name: Test stamped prepare and launch
@@ -74,7 +119,8 @@ jobs:
           path: |
             target/tools-image/tools-image.txt
             target/tools-image/revision.txt
-            target/tools-image/metadata.json
+            target/tools-platform/platform-amd64.txt
+            target/tools-platform/platform-arm64.txt
             target/release/drydock
             target/release/drydockd
             target/release/drydock-host
@@ -92,6 +138,9 @@ jobs:
           body: |
             Published and anonymously verified bootstrap tools image:
             `${{ env.DRYDOCK_TOOLS_IMAGE }}`
+
+            Each platform image was built and checked on stock Ubuntu on a
+            runner of its own architecture.
 
             This pin can lag the host build: a fingerprint mismatch at hello
             triggers push plus re-exec of the host's current agent. Operator

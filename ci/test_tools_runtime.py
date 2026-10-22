@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Operator acceptance: tools index on stock Ubuntu, on both architectures.
+"""Operator acceptance: tools image on stock Ubuntu, per architecture.
 
-Requires Docker Buildx/binfmt and a published image@sha256 reference. Build the
-probe from the same checkout/revision as the tools. Never changes base config.
+Requires Docker Buildx and a published image@sha256 reference: either the tools
+index, or one platform image with a single --arch. CI runs each architecture on a
+runner of that architecture; checking a foreign one needs binfmt emulation. Build
+the probe from the same checkout/revision as the tools. Never changes base config.
 """
 import argparse
 import hashlib
@@ -56,6 +58,14 @@ def check_saved_image(data):
         check_archive(archive.extractfile(image["Layers"][0]).read())
 
 
+def tools_reference(reference, raw, architecture):
+    # A platform image (from a per-architecture CI build) is used as published;
+    # an index is resolved to its manifest for this architecture.
+    if "manifests" not in raw:
+        return reference
+    return platform_reference(reference, raw, architecture)
+
+
 def platform_reference(reference, index, architecture):
     matches = [entry["digest"] for entry in index["manifests"]
                if entry.get("platform", {}).get("os") == "linux"
@@ -66,14 +76,19 @@ def platform_reference(reference, index, architecture):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", help="published tools index reference")
+    parser.add_argument("image", help="published tools index or platform image reference")
+    parser.add_argument("--arch", choices=["amd64", "arm64"], action="append",
+                        help="architecture to check (repeatable); default both")
     args = parser.parse_args()
     if "@sha256:" not in args.image:
         parser.error("acceptance requires an immutable tools reference")
+    arches = args.arch or ["amd64", "arm64"]
     index = json.loads(run("docker", "buildx", "imagetools", "inspect", "--raw", args.image))
+    if "manifests" not in index and len(arches) != 1:
+        parser.error("a platform image is checked for exactly one --arch")
     ubuntu_index = json.loads(run("docker", "buildx", "imagetools", "inspect", "--raw", "ubuntu:24.04"))
-    for arch in ["amd64", "arm64"]:
-        tools = platform_reference(args.image, index, arch)
+    for arch in arches:
+        tools = tools_reference(args.image, index, arch)
         ubuntu = platform_reference("ubuntu:24.04", ubuntu_index, arch)
         platform = f"linux/{arch}"
         tag = f"drydock-tools-acceptance:{uuid.uuid4().hex}"
@@ -82,11 +97,13 @@ def main():
             tmp = Path(tmp)
             try:
                 subprocess.run(["docker", "pull", "--platform", platform, tools], check=True)
-                image_id = json.loads(run("docker", "image", "inspect", tools))[0]["Id"]
+                inspected = json.loads(run("docker", "image", "inspect", tools))[0]
+                assert inspected["Architecture"] == arch, f"tools image is {inspected['Architecture']}, expected {arch}"
+                image_id = inspected["Id"]
                 check_saved_image(subprocess.check_output(["docker", "image", "save", image_id]))
                 subprocess.run(["docker", "pull", "--platform", platform, ubuntu], check=True)
                 base = image_config(ubuntu)
-                (tmp / "Dockerfile").write_text(f"FROM {args.image} AS tools\nFROM {ubuntu}\nCOPY --from=tools /opt/drydock /opt/drydock\n")
+                (tmp / "Dockerfile").write_text(f"FROM {tools} AS tools\nFROM {ubuntu}\nCOPY --from=tools /opt/drydock /opt/drydock\n")
                 subprocess.run(["docker", "buildx", "build", "--platform", platform, "--load", "-t", tag, str(tmp)], check=True)
                 prepared = image_config(tag)
                 for key in ["Entrypoint", "Cmd"]:

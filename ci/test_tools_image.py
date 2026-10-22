@@ -1,5 +1,6 @@
 """Builder boundary tests: no daemon is needed to exercise export/publish policy."""
 from contextlib import redirect_stdout, redirect_stderr
+import hashlib
 import io
 import json
 import subprocess
@@ -42,6 +43,80 @@ class ToolsImage(unittest.TestCase):
             output = cmd[cmd.index("--output") + 1]
             self.assertEqual(output, "type=image,name=host/tools,push=true,push-by-digest=true,name-canonical=true" if publish else "type=oci,dest=out.tar")
             self.assertEqual(cmd[-1], "context")
+
+    # A native per-architecture build names exactly one platform; the default
+    # (local) build still produces both.
+    def test_single_platform_build(self):
+        for platform in image.PLATFORMS:
+            cmd = image.build_command(Path("context"), "host/tools", Path("meta"), Path("out.tar"), True, "1.99.0", [platform])
+            self.assertEqual(cmd[cmd.index("--platform") + 1], platform)
+        self.assertEqual(image.platform_file("linux/arm64"), "platform-arm64.txt")
+
+    # Only immutable images of the tools repository can enter the index.
+    def test_platform_image_validation(self):
+        name = "host/tools"
+        good = name + "@sha256:" + "a" * 64
+        self.assertEqual(image.platform_image(name, good), good)
+        for reference in ["other/tools@sha256:" + "a" * 64, name + ":latest", name + "@sha256:" + "a" * 63, "sha256:" + "a" * 64]:
+            with self.subTest(reference=reference), self.assertRaises(ValueError):
+                image.platform_image(name, reference)
+
+    # Assembly creates the index from both platform images, reads its digest
+    # back from the exact registry bytes, and retains that digest.
+    def test_assemble_index(self):
+        name = "host/tools"
+        amd, arm = name + "@sha256:" + "a" * 64, name + "@sha256:" + "b" * 64
+        raw = json.dumps({"manifests": [{"digest": amd.split("@")[1], "platform": {"os": "linux", "architecture": "amd64"}},
+                                        {"digest": arm.split("@")[1], "platform": {"os": "linux", "architecture": "arm64"}}]}).encode()
+        commands = []
+        with patch.object(image.subprocess, "run", side_effect=lambda c, **k: commands.append(c)), patch.object(image.subprocess, "check_output", return_value=raw):
+            reference = image.assemble(name, "c" * 40, [amd, arm])
+        digest = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(reference, f"{name}@sha256:{digest}")
+        self.assertEqual(commands[0], ["docker", "buildx", "imagetools", "create", "--tag", f"{name}:rev-{'c' * 40}", amd, arm])
+        self.assertEqual(commands[1][-2:], [f"{name}:rev-{'c' * 40}-{digest}", reference])
+        for references in [[amd], [amd, amd], [amd, arm, amd]]:
+            with self.subTest(references=references), self.assertRaises(ValueError):
+                image.assemble(name, "c" * 40, references)
+        missing = json.dumps({"manifests": [{"digest": "x", "platform": {"os": "linux", "architecture": "amd64"}}]}).encode()
+        with patch.object(image.subprocess, "run"), patch.object(image.subprocess, "check_output", return_value=missing), self.assertRaises(ValueError):
+            image.assemble(name, "c" * 40, [amd, arm])
+
+    # A platform build writes only its platform file: it is never a pin and
+    # gets no retention tag of its own.
+    def test_platform_publish_writes_platform_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            archive = MagicMock()
+            archive.stdout = io.BytesIO(b"archive")
+            archive.wait.return_value = 0
+            commands = []
+            def execute(command, **kwargs):
+                commands.append(command)
+                if command[:2] == ["tar", "-x"]:
+                    (Path(command[-1]) / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.99.0"\n')
+                if command[:3] == ["docker", "buildx", "build"]:
+                    Path(command[command.index("--metadata-file") + 1]).write_text(json.dumps({"containerimage.digest": "sha256:" + "d" * 64}))
+            argv = ["tools_image.py", "--revision", "merged", "--output", tmp, "--publish", "--platform", "linux/arm64"]
+            with patch("sys.argv", argv), patch.object(image.subprocess, "check_output", return_value="a" * 40), patch.object(image.subprocess, "Popen", return_value=archive), patch.object(image.subprocess, "run", side_effect=execute):
+                with redirect_stdout(io.StringIO()):
+                    image.main()
+            self.assertEqual((output / "platform-arm64.txt").read_text(), image.DEFAULT_REGISTRY + "/drydock-tools@sha256:" + "d" * 64 + "\n")
+            self.assertFalse((output / "tools-image.txt").exists())
+            self.assertFalse(any(c[:4] == ["docker", "buildx", "imagetools", "create"] for c in commands))
+            build = next(c for c in commands if c[:3] == ["docker", "buildx", "build"])
+            self.assertEqual(build[build.index("--platform") + 1], "linux/arm64")
+
+    def test_assemble_requires_publish(self):
+        with patch("sys.argv", ["tools_image.py", "--revision", "main", "--assemble", "x"]), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            image.main()
+
+    # The runtime check uses a platform image as published and resolves an index.
+    def test_runtime_tools_reference(self):
+        reference = "registry.example/tools@sha256:" + "c" * 64
+        self.assertEqual(runtime.tools_reference(reference, {"config": {}}, "arm64"), reference)
+        index = {"manifests": [{"digest": "sha256:" + "b" * 64, "platform": {"os": "linux", "architecture": "arm64"}}]}
+        self.assertEqual(runtime.tools_reference(reference, index, "arm64"), "registry.example/tools@sha256:" + "b" * 64)
 
     # The Git/Buildx subprocess boundary is replaced here: only an archived
     # revision may reach the builder and a published build must pass ancestry.

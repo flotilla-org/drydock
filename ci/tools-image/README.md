@@ -9,7 +9,8 @@ the Dockerfile. Static builds are deferred.
 
 ## Build and release
 
-With Python 3.11+, Docker Buildx and native workers or QEMU/binfmt installed:
+Locally, with Python 3.11+ and Docker Buildx (building a foreign architecture needs
+native workers or QEMU/binfmt):
 
 ```sh
 python3 ci/tools_image.py --revision HEAD
@@ -18,19 +19,33 @@ python3 ci/tools_image.py --revision HEAD
 
 Production images are produced by CI from a merged revision. The script archives
 that exact revision rather than sending the working tree to the builder. Publish
-refuses revisions not reachable from the fetched origin/main:
+refuses revisions not reachable from the fetched origin/main.
+
+CI builds each platform on a runner of that architecture (`ubuntu-24.04` and
+`ubuntu-24.04-arm`), so nothing is compiled or tested under emulation. Each
+publishes its platform image by digest and runs the stock-Ubuntu check on its own
+CPU; a final job combines the two into the index:
 
 ```sh
-python3 ci/tools_image.py --revision "$GITHUB_SHA" --publish \
+# on each native runner
+python3 ci/tools_image.py --revision "$GITHUB_SHA" --publish --platform linux/arm64 \
   --registry "${DRYDOCK_TOOLS_REGISTRY:-ghcr.io/flotilla-org}"
-python3 ci/test_tools_runtime.py "$(cat target/tools-image/tools-image.txt)"
+python3 ci/test_tools_runtime.py --arch arm64 "$(cat target/tools-image/platform-arm64.txt)"
+# then once, with both platform images
+python3 ci/tools_image.py --revision "$GITHUB_SHA" --publish \
+  --assemble "$AMD64_IMAGE" "$ARM64_IMAGE"
 DRYDOCK_TOOLS_IMAGE="$(cat target/tools-image/tools-image.txt)" \
   cargo build --locked --release -p drydock -p drydock-host
 ```
 
+A platform image (`platform-<arch>.txt`) is only an input to `--assemble`, never
+a tools pin. Assembly checks the index lists exactly both platforms and reads its
+digest from the registry's bytes.
+
 `--registry` is configuration, with default `ghcr.io/flotilla-org`. Publishing
-uses Buildx's push-by-digest output, then creates a `rev-<commit>-<index-sha256>` retention tag
-for that same index. Including the index hash also retains earlier images if a
+uses Buildx's push-by-digest output for each platform image; assembly tags the
+index `rev-<commit>` while reading its digest back, then creates a
+`rev-<commit>-<index-sha256>` retention tag for that same index. Including the index hash also retains earlier images if a
 revision is rebuilt against an updated builder image. Never prune these revision tags or their manifests while
 any drydock release references them. No mutable tag is used for tools selection.
 If tagging fails after the digest push, rerunning the same command is safe:
