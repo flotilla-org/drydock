@@ -2,6 +2,7 @@ use drydock_agent::Agent;
 use drydock_transport::{Limits, Transport, native::UnixConnections};
 use std::{io, path::PathBuf, sync::Arc};
 use tokio::net::UnixListener;
+mod supervisor;
 const HOST_SOCKET: &str = "/run/drydock/host.sock";
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -14,6 +15,12 @@ async fn main() -> io::Result<()> {
     }
     reap_inherited_children();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--supervise") {
+        return supervisor::start(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "--supervisor") {
+        return supervisor::run(&args[1..]).await;
+    }
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
     let mut options = args.iter();

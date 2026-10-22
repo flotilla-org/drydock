@@ -19,11 +19,11 @@ Licensed under either of Apache License 2.0 or MIT, at your option.
 
 ## Standalone daemon and CLI
 
-Build and install `drydock`, `drydockd` and `drydock-host` together:
+Build and install `drydock`, `drydockd`, `drydock-host` and `drydock-agent` together:
 
 ```sh
-cargo build -p drydock -p drydock-host --locked
-# Install the three binaries beside one another on PATH.
+cargo build -p drydock -p drydock-host -p drydock-agent --locked
+# Install the four binaries beside one another on PATH.
 ```
 
 Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
@@ -32,13 +32,12 @@ Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
 [provider.daytona]
 module = "daytona"
 credential = { file = "~/.config/flotilla/credentials/daytona.token" }
-image = "registry.example/team/agent-image:current"
+image = "ubuntu:24.04"
 size = { cpus = 1, memory = "1GiB", disk = "1GiB" }
 egress = "open"
 settings = {
   organization_id = "YOUR_ORGANIZATION_ID",
   ssh_host_key = "ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY",
-  agent_command = "/opt/drydock/drydock-agent",
 }
 ```
 
@@ -49,8 +48,10 @@ and re-execs its current agent when fingerprints differ. Before the first image
 is published the pin reads `unpublished`; publish through the operator workflow
 and merge its generated pin PR before using `launch` or `prepare` (or compile
 with a published image override). See the [tools image and module guide](ci/tools-image/README.md).
-Daytona's provider integration and removal of `agent_command` remain in
-[#54](https://github.com/flotilla-org/drydock/issues/54).
+Daytona prepare layers the tools under `/opt/drydock` without changing the base
+entrypoint or command. Launch returns after the agent hello and any required
+upgrade. Its baked supervisor restarts the agent after a crash; start and resume
+run bootstrap again. No Python, `flock`, or agent command setting is needed.
 
 ```sh
 drydock providers

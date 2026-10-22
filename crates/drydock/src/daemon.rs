@@ -316,8 +316,44 @@ impl Daemon {
         let result = host.handle.client.clone().with_request_timeout(Duration::from_secs(600)).provision(provider, &request).await;
         let cache = host.cache.lock().await.1.clone();
         cache.invalidate(provider).await;
-        result
+        let environment = result?;
+        if self.config.provider[provider].module == "daytona" {
+            self.agent_ready(provider, &environment).await?;
+        }
+        Ok(environment)
     }
+    async fn agent_ready(&self, provider: &str, environment: &Environment) -> Result<(), Error> {
+        let executable = crate::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")
+            .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason }))?;
+        let executable = tokio::fs::read(executable).await.map_err(|_| Error::Transport)?;
+        let identity = self.key_for(environment)?;
+        let client = &self.ready_host(provider)?.handle.client;
+        let open = || async {
+            let reach = client.reach(provider, &environment.id).await.map_err(|_| std::io::Error::other("agent reach failed"))?;
+            let Reach::Ssh { endpoint, user, host_key } = reach else {
+                return Err(std::io::Error::other("Daytona requires SSH reach"));
+            };
+            let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| std::io::Error::other("invalid SSH endpoint"))?;
+            drydock_transport::ssh::connect(
+                drydock_transport::ssh::SshConfig {
+                    connect_timeout: Duration::from_secs(10),
+                    host: host.into(),
+                    port: port.parse().map_err(std::io::Error::other)?,
+                    user: user.expose().into(),
+                    host_key,
+                    identity_file: identity.clone(),
+                    agent_socket: "/run/drydock/agent.sock".into(),
+                    reverse_socket: "/run/drydock/host.sock".into(),
+                },
+                drydock_transport::Limits::default(),
+            )
+            .await
+        };
+        wait_for_agent(open, &executable, Duration::from_secs(60))
+            .await
+            .map_err(|_| Error::Protocol(ProtocolError::unavailable("Daytona agent did not complete its hello handshake", None)))
+    }
+
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
         let label = environment
             .label
@@ -630,5 +666,81 @@ impl Daemon {
                 yield Ok(record);
             }
         })
+    }
+}
+
+// Provider startup can precede the socket listener. connect_current itself owns
+// upgrade/re-exec reconnects and only returns a compatible hello.
+async fn wait_for_agent<F, Fut>(mut open: F, executable: &[u8], timeout: Duration) -> std::io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<drydock_transport::Transport>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "agent hello timed out"));
+        }
+        if matches!(
+            tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, executable, remaining)).await,
+            Ok(Ok(_))
+        ) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod agent_readiness_tests {
+    use super::*;
+    // A transport connection alone is not readiness. Fail initial opens, then
+    // serve the real agent API over yamux and require its compatible hello.
+    #[tokio::test]
+    async fn retries_startup_until_current_hello() {
+        use sha2::{Digest, Sha256};
+        let binary = b"current agent";
+        let mut attempts = 0;
+        wait_for_agent(
+            || {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt < 3 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+                    }
+                    let (host, guest) = tokio::io::duplex(4096);
+                    let (host, guest) = tokio::join!(
+                        drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+                        drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+                    );
+                    tokio::spawn(drydock_agent::Agent::new(guest?, format!("{:x}", Sha256::digest(binary)), "/unused".into()).run());
+                    host
+                }
+            },
+            binary,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attempts, 3);
+    }
+    // A reachable transport whose peer never sends hello must time out.
+    #[tokio::test]
+    async fn transport_without_hello_is_not_ready() {
+        let (host, guest) = tokio::io::duplex(4096);
+        let (host, _guest) = tokio::join!(
+            drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+            drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+        );
+        let mut host = Some(host.unwrap());
+        let result = wait_for_agent(
+            || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+            b"current",
+            Duration::from_millis(25),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 }

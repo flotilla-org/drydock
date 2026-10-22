@@ -37,8 +37,6 @@ struct Settings {
     region: String,
     #[serde(default = "tier")]
     tier: u8,
-    /// Fixed image contract, shared by every sandbox; no per-vessel arguments.
-    agent_command: String,
     #[serde(default = "analytics_url")]
     analytics_url: String,
     /// Operator-supplied conformance command, executed as root. No declaration
@@ -72,10 +70,9 @@ impl Module for DaytonaModule {
         if !(1..=4).contains(&settings.tier)
             || settings.organization_id.is_empty()
             || settings.ssh_host_key.is_empty()
-            || settings.agent_command.is_empty()
             || settings.region.is_empty()
         {
-            return Err(refused("Daytona requires organization_id, ssh_host_key, agent_command, region and tier 1..4"));
+            return Err(refused("Daytona requires organization_id, ssh_host_key, region and tier 1..4"));
         }
         for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
             endpoint_url(endpoint, true)?;
@@ -328,28 +325,10 @@ impl Daytona {
         Ok(output.into())
     }
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<()> {
-        // Connecting verifies an actual listener, not merely a leftover inode.
-        // Python is part of the baked tools contract; a missing liveness tool
-        // fails closed instead of reporting a ready agent.
-        let check = "import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(1); s.connect(sys.argv[1]); s.close()";
-        let alive = format!("python3 -c {} /run/drydock/agent.sock >/dev/null 2>&1", shell_command(&[check.into()]));
-        let start = format!(
-            "command -v python3 >/dev/null || {{ echo missing-python3 >&2; exit 2; }}; alive() {{ {alive}; }}; alive && exit 0; rm -f /run/drydock/agent.sock; nohup {} </dev/null >/tmp/drydock-agent.log 2>&1 & for i in 1 2 3 4 5; do alive && exit 0; sleep 1; done; exit 1",
-            self.settings.agent_command
-        );
-        let command =
-            format!("mkdir -p /run/drydock && flock --close --wait 8 /run/drydock/bootstrap.lock sh -c {}", shell_command(&[start]));
-        // 8s lock + at most 6 one-second connects + 5s sleeps, with headroom.
-        self.execute(id, &command, 25, c).await.map_err(|error| match error {
-            ProtocolError::CommandFailed { exit_code: 2, output, .. } if output.expose().trim() == "missing-python3" => {
-                ProtocolError::CommandFailed {
-                    reason: "Daytona image is missing python3 required for agent liveness".into(),
-                    exit_code: 2,
-                    output,
-                }
-            }
-            error => error,
-        })?;
+        // The baked executable owns detachment, singleton locking and crash
+        // recovery. Guest packages and a socket inode are not readiness proof;
+        // the daemon waits for the agent client's normal hello handshake.
+        self.execute(id, "/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock", 25, c).await?;
         Ok(())
     }
     // Lifecycle state checks deliberately avoid explicit inspect's root probe.
@@ -530,6 +509,22 @@ impl Provider for Daytona {
         {
             return Err(refused("Daytona requires an image reference pinned by sha256 digest"));
         }
+        if !r.tools_digest.split_once("@sha256:").is_some_and(|(image, digest)| {
+            !image.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && !image.contains(['\n', '\r', ' ', '\t'])
+        }) {
+            return Err(refused("Daytona requires a published tools image pinned by sha256 digest"));
+        }
+        // These references become Dockerfile instructions; refuse extra tokens.
+        if r.image_digest.contains(['\n', '\r', ' ', '\t']) {
+            return Err(refused("invalid Daytona base image reference"));
+        }
+        let dockerfile = format!(
+            "FROM {} AS drydock_tools\nFROM {}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
+            r.tools_digest, r.image_digest
+        );
         validate_size(&r.size)?;
         // CreateSnapshot labels memory/disk "GB", but the resource guide and
         // default snapshot table specify GiB for the resulting sandbox:
@@ -544,7 +539,7 @@ impl Provider for Daytona {
                 match self
                     .create(
                         self.path(&self.settings.api_url, &["snapshots"])?,
-                        json!({"name":snapshot_name,"imageName":r.image_digest,"regionId":self.settings.region,"sandboxClass":"container","cpu":r.size.cpus as u64,"memory":r.size.memory_bytes/GIB,"disk":r.size.disk_bytes/GIB}),
+                        json!({"name":snapshot_name,"buildInfo":{"dockerfileContent":dockerfile},"regionId":self.settings.region,"sandboxClass":"container","cpu":r.size.cpus as u64,"memory":r.size.memory_bytes/GIB,"disk":r.size.disk_bytes/GIB}),
                         c,
                     )
                     .await?
@@ -610,6 +605,8 @@ impl Provider for Daytona {
             // provision does not implicitly resume an existing label.
             let mut row = self.environment(v)?;
             if matches!(row.environment.state, Observation::Running) {
+                // Every Running re-adoption bootstraps; the guest supervisor's
+                // lock makes this idempotent even across concurrent hosts.
                 self.bootstrap(&row.environment.id, c).await?;
                 row = self.inspect_after_lifecycle(&row.environment.id, c).await?;
             }
