@@ -324,3 +324,77 @@ async fn older_tools_pin_is_upgraded_during_connect() {
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }
+
+// If the candidate is rejected and the old binary rolls back, the bounded
+// handshake must explain which fingerprint kept answering hello, not merely
+// report that the deadline expired. This uses the real loader/rollback process.
+#[tokio::test]
+async fn upgrade_timeout_reports_the_last_hello_fingerprint() {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("drydock-agent");
+    let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let fingerprint = format!("{:x}", Sha256::digest(&old));
+    std::fs::write(&executable, &old).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    drop(connect(&socket, &fingerprint).await);
+    let error = Client::connect_current(
+        || async {
+            let stream = UnixStream::connect(&socket).await?;
+            Transport::yamux(Box::new(stream), true, Limits::default()).await
+        },
+        b"not an executable",
+        Duration::from_secs(3),
+    )
+    .await
+    .err()
+    .expect("a rejected candidate cannot become the current agent");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains(&format!("last hello fingerprint {fingerprint}")), "{error}");
+    assert_eq!(std::fs::read(&executable).unwrap(), old);
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+// Provider transport failures during reconnect must survive in the timeout
+// diagnostic. Only the provider connection boundary is unavailable here; the
+// real guest upgrades successfully and is independently reachable afterwards.
+#[tokio::test]
+async fn upgrade_timeout_reports_the_last_transport_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("drydock-agent");
+    let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let old_fingerprint = format!("{:x}", Sha256::digest(&old));
+    std::fs::write(&executable, &old).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    drop(connect(&socket, &old_fingerprint).await);
+    let mut desired = old;
+    desired.extend_from_slice(b"transport failure test");
+    let calls = AtomicUsize::new(0);
+    let error = Client::connect_current(
+        || async {
+            if calls.fetch_add(1, Ordering::Relaxed) > 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "provider reconnect unavailable"));
+            }
+            let stream = UnixStream::connect(&socket).await?;
+            Transport::yamux(Box::new(stream), true, Limits::default()).await
+        },
+        &desired,
+        Duration::from_secs(3),
+    )
+    .await
+    .err()
+    .expect("an unavailable provider reconnect must time out");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("last transport error: provider reconnect unavailable"), "{error}");
+    assert!(calls.load(Ordering::Relaxed) > 1);
+    let current = connect(&socket, &format!("{:x}", Sha256::digest(&desired))).await;
+    assert!(current.is_compatible());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}

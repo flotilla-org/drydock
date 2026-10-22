@@ -27,6 +27,10 @@ pushes the binary plus re-execs when fingerprints differ. It reconnects through
 the supplied provider transport factory and returns only after verifying the
 current fingerprint. A matching hello avoids an unnecessary upgrade. Supply the
 binary for the vessel's architecture; push configuration after this handshake.
+The first transport/hello failure returns immediately: provider startup readiness
+is the caller's responsibility. Only reconnects after an accepted upgrade are
+retried until the deadline. A timeout includes the last observed fingerprint or
+transport/hello error to distinguish rollback from reconnect failures.
 
 Low-level `Client::connect(transport, expected_fingerprint)` remains available
 for explicit hello/upgrade tooling. Until fingerprints match, its client refuses
