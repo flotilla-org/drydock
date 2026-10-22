@@ -108,6 +108,20 @@ jobs:
           for arch in amd64 arm64; do
             docker --config "$anonymous" pull "$(cat "target/tools-platform/platform-$arch.txt")"
           done
+      # The host pushes the agent build matching each guest's hello platform,
+      # so the release carries the exact agent from each published platform
+      # image, installed beside drydockd as drydock-agent-linux-<arch>.
+      - name: Extract each platform's agent from its published image
+        run: |
+          mkdir -p target/release
+          for arch in amd64 arm64; do
+            container=$(docker create --platform "linux/$arch" "$(cat "target/tools-platform/platform-$arch.txt")" /opt/drydock/drydock-agent)
+            docker cp "$container:/opt/drydock/drydock-agent" "target/release/drydock-agent-linux-$arch"
+            docker rm "$container"
+          done
+          file target/release/drydock-agent-linux-amd64 | grep -q 'ELF 64-bit LSB.*x86-64'
+          file target/release/drydock-agent-linux-arm64 | grep -q 'ELF 64-bit LSB.*ARM aarch64'
+          chmod 0755 target/release/drydock-agent-linux-amd64 target/release/drydock-agent-linux-arm64
       - name: Stamp matching tools into drydock build
         run: echo "DRYDOCK_TOOLS_IMAGE=$(cat target/tools-image/tools-image.txt)" >> "$GITHUB_ENV"
       - name: Test stamped prepare and launch
@@ -127,6 +141,8 @@ jobs:
             target/release/drydock
             target/release/drydockd
             target/release/drydock-host
+            target/release/drydock-agent-linux-amd64
+            target/release/drydock-agent-linux-arm64
       - name: Update checked-in bootstrap pin
         run: cp target/tools-image/tools-image.txt crates/drydock/tools-image.txt
       - name: Open pin-bump PR for operator review

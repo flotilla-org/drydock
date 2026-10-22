@@ -323,9 +323,11 @@ impl Daemon {
         Ok(environment)
     }
     async fn agent_ready(&self, provider: &str, environment: &Environment) -> Result<(), Error> {
-        let executable = crate::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")
-            .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason }))?;
-        let executable = tokio::fs::read(executable).await.map_err(|_| Error::Transport)?;
+        // The guest's hello names its platform; push only that platform's build.
+        let executable_for = |platform: drydock_agent::Platform| async move {
+            let path = crate::local::agent_build(&platform).map_err(|reason| std::io::Error::new(std::io::ErrorKind::NotFound, reason))?;
+            tokio::fs::read(&path).await.map_err(|error| std::io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+        };
         let identity = self.key_for(environment)?;
         let client = &self.ready_host(provider)?.handle.client;
         let open = || async {
@@ -349,9 +351,12 @@ impl Daemon {
             )
             .await
         };
-        wait_for_agent(open, &executable, Duration::from_secs(60))
-            .await
-            .map_err(|_| Error::Protocol(ProtocolError::unavailable("Daytona agent did not complete its hello handshake", None)))
+        wait_for_agent(open, executable_for, Duration::from_secs(60)).await.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Unsupported {
+                return Error::Protocol(ProtocolError::Refused { reason: error.to_string() });
+            }
+            Error::Protocol(ProtocolError::unavailable("Daytona agent did not complete its hello handshake", None))
+        })
     }
 
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
@@ -670,11 +675,14 @@ impl Daemon {
 }
 
 // Provider startup can precede the socket listener. connect_current itself owns
-// upgrade/re-exec reconnects and only returns a compatible hello.
-async fn wait_for_agent<F, Fut>(mut open: F, executable: &[u8], timeout: Duration) -> std::io::Result<()>
+// upgrade/re-exec reconnects and only returns a compatible hello. A guest whose
+// platform has no build here is refused at once: waiting cannot install one.
+async fn wait_for_agent<F, Fut, R, RFut>(mut open: F, mut executable_for: R, timeout: Duration) -> std::io::Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<drydock_transport::Transport>>,
+    R: FnMut(drydock_agent::Platform) -> RFut,
+    RFut: std::future::Future<Output = std::io::Result<Vec<u8>>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -682,11 +690,10 @@ where
         if remaining.is_zero() {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "agent hello timed out"));
         }
-        if matches!(
-            tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, executable, remaining)).await,
-            Ok(Ok(_))
-        ) {
-            return Ok(());
+        match tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, &mut executable_for, remaining)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Unsupported => return Err(error),
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
     }
@@ -719,12 +726,41 @@ mod agent_readiness_tests {
                     host
                 }
             },
-            binary,
+            |_| std::future::ready(Ok(binary.to_vec())),
             Duration::from_secs(5),
         )
         .await
         .unwrap();
         assert_eq!(attempts, 3);
+    }
+    // No build for the guest's platform is final: refuse at once, before the
+    // readiness deadline, instead of retrying a lookup that cannot change.
+    #[tokio::test]
+    async fn missing_platform_build_is_refused_without_waiting() {
+        let mut opens = 0;
+        let started = tokio::time::Instant::now();
+        let error = wait_for_agent(
+            || {
+                opens += 1;
+                async move {
+                    let (host, guest) = tokio::io::duplex(4096);
+                    let (host, guest) = tokio::join!(
+                        drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+                        drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+                    );
+                    tokio::spawn(drydock_agent::Agent::new(guest?, "older".into(), "/unused".into()).run());
+                    host
+                }
+            },
+            |platform| std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no build for {platform}")))),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains(&drydock_agent::Platform::current().to_string()), "{error}");
+        assert_eq!(opens, 1);
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
     // A reachable transport whose peer never sends hello must time out.
     #[tokio::test]
@@ -737,7 +773,7 @@ mod agent_readiness_tests {
         let mut host = Some(host.unwrap());
         let result = wait_for_agent(
             || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
-            b"current",
+            |_| std::future::ready(Ok(b"current".to_vec())),
             Duration::from_millis(25),
         )
         .await;

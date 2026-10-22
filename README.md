@@ -26,6 +26,16 @@ cargo build -p drydock -p drydock-host -p drydock-agent --locked
 # Install the four binaries beside one another on PATH.
 ```
 
+`drydockd` upgrades an older vessel agent to the build for the platform that the
+agent's hello reports. Install each guest platform's agent beside `drydockd` as
+`drydock-agent-<os>-<arch>`, for example `drydock-agent-linux-amd64` and
+`drydock-agent-linux-arm64`, or point `DRYDOCK_AGENT_BIN_LINUX_AMD64` and
+`DRYDOCK_AGENT_BIN_LINUX_ARM64` at them. The tools-image release artifact carries
+both, extracted from the published images. The plain `drydock-agent` serves only
+guests of the host's own platform, so a macOS host needs the Linux builds. A guest
+whose platform has no build is refused at launch; no other platform's build is
+pushed.
+
 Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
 
 ```toml

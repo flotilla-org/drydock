@@ -27,13 +27,23 @@ the fixed host socket `/run/drydock/host.sock` (`HOST_SOCKET` in the binary);
 host-initiated yamux requires no reverse socket. Live provider isolation and
 startup/supervision are verified in the provider integration work (#54).
 
-The host normally calls `Client::connect_current(open_transport, executable,
+The host normally calls `Client::connect_current(open_transport, executable_for,
 timeout)`. The tools image pin is a bootstrap reference and may contain an older
-agent. This handshake hashes the host's desired executable, reads hello, and
-pushes the binary plus re-execs when fingerprints differ. It reconnects through
-the supplied provider transport factory and returns only after verifying the
-current fingerprint. A matching hello avoids an unnecessary upgrade. Supply the
-binary for the vessel's architecture; push configuration after this handshake.
+agent. This handshake reads hello, asks `executable_for` for the build matching
+the platform hello reports, hashes it, and pushes the binary plus re-execs when
+fingerprints differ. It reconnects through the supplied provider transport
+factory and returns only after verifying the current fingerprint. A matching
+hello avoids an unnecessary upgrade. Push configuration after this handshake.
+
+Hello's `platform` uses OCI names (`{"os": "linux", "architecture": "arm64"}`).
+The agent reports the platform its running executable was built for, not the
+kernel's `uname`: the guest is demonstrably running that build, so a replacement
+for the same platform runs the same way, natively or under emulation. A hello
+with no `platform` comes from an agent older than platform reporting; the host
+cannot tell which build would run there, so `connect_current` fails with
+`Unsupported` without consulting `executable_for` or pushing anything. It fails the
+same way, also pushing nothing, when `executable_for` returns an error. Both are
+final: retrying cannot help until the vessel or the host's builds change.
 The first transport/hello failure returns immediately: provider startup readiness
 is the caller's responsibility. Only reconnects after an accepted upgrade are
 retried until the deadline. A timeout includes the last observed fingerprint or
