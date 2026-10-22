@@ -31,6 +31,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - if: steps.workspace.outputs.present == 'true'
         run: cargo test --workspace --locked
+      - name: Test compile-time tools selection with fixture metadata
+        if: steps.workspace.outputs.present == 'true'
+        env:
+          DRYDOCK_TOOLS_IMAGE: registry.example/test/drydock-tools@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: cargo test --locked -p drydock --test cli
       - if: steps.workspace.outputs.present == 'true'
         uses: actions/setup-python@v5
         with:
