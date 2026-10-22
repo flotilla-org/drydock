@@ -2,7 +2,6 @@
 //! Reads hello from the running agent; does not add a diagnostic flag to it.
 use drydock_agent::Client;
 use drydock_transport::{Limits, Transport, native::UnixConnections};
-use sha2::{Digest, Sha256};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
 
@@ -12,11 +11,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(args.len(), 2, "tools_probe SOCKET EXECUTABLE");
     let socket = PathBuf::from(&args[0]);
     let executable = PathBuf::from(&args[1]);
-    let expected = format!("{:x}", Sha256::digest(std::fs::read(&executable)?));
+    let current = std::fs::read(&executable)?;
     let host = socket.parent().unwrap().join("host.sock");
     let listener = UnixListener::bind(&host)?;
-    let transport = Transport::native(Arc::new(UnixConnections::new(listener, &socket)), Limits::default())?;
-    let client = tokio::time::timeout(Duration::from_secs(30), Client::connect(transport, &expected)).await??;
+    let connections = Arc::new(UnixConnections::new(listener, &socket));
+    let client = Client::connect_current(
+        || std::future::ready(Transport::native(connections.clone(), Limits::default())),
+        &current,
+        Duration::from_secs(30),
+    )
+    .await?;
     assert!(client.is_compatible(), "hello fingerprint differs from installed agent");
     // The provider starts the fixed binary alongside the base's own process.
     let mut found = false;

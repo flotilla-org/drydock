@@ -76,6 +76,46 @@ impl Drop for Client {
     }
 }
 impl Client {
+    /// Connect to a vessel started from any published tools pin. A mismatched
+    /// hello triggers push + re-exec, then a fresh transport and verified hello.
+    /// The factory must open a new provider transport on every invocation.
+    /// Returns only a compatible client; callers push configuration afterwards.
+    pub async fn connect_current<F, Fut>(mut open: F, executable: &[u8], timeout: std::time::Duration) -> io::Result<Self>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Transport>>,
+    {
+        use sha2::{Digest, Sha256};
+        if executable.is_empty() {
+            return Err(invalid("current agent executable is empty"));
+        }
+        let expected = format!("{:x}", Sha256::digest(executable));
+        tokio::time::timeout(timeout, async {
+            let client = Self::connect(open().await?, &expected).await?;
+            if client.is_compatible() {
+                return Ok(client);
+            }
+            client.stage_upgrade(executable.to_vec()).await?;
+            // Activation acknowledgement is advisory: re-exec can close the
+            // stream before the response arrives. Only the next hello decides.
+            let _ = client.activate_upgrade().await;
+            drop(client);
+            loop {
+                if let Ok(transport) = open().await
+                    && let Ok(client) = Self::connect(transport, &expected).await
+                    && client.is_compatible()
+                {
+                    return Ok(client);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "agent did not report the current fingerprint after hello/upgrade"))?
+    }
+
+    /// Low-level connection for explicit hello/upgrade tooling. Normal hosts
+    /// should use connect_current so an older tools pin upgrades automatically.
     pub async fn connect(mut transport: Transport, expected: impl Into<String>) -> io::Result<Self> {
         let (sender, driver) = http2::connect(&transport.opener, Purpose::Control).await?;
         let targets: Targets = Arc::default();

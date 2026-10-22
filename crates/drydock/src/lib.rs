@@ -418,3 +418,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tools_image_pin.rs"]
+mod tools_image_pin;

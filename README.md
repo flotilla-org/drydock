@@ -42,11 +42,15 @@ settings = {
 }
 ```
 
-Drydock's release build selects its own immutable tools image; users never name
-its digest. See the [tools image build and module contract](ci/tools-image/README.md)
-for preparation, startup and conformance. Source builds without
-`DRYDOCK_TOOLS_IMAGE` refuse `launch` and `prepare`. Daytona's provider integration
-and removal of `agent_command` remain in [#54](https://github.com/flotilla-org/drydock/issues/54).
+Every drydock build uses the checked-in [tools image pin](crates/drydock/tools-image.txt),
+including `cargo install` and Git dependencies. `DRYDOCK_TOOLS_IMAGE` can override
+it at build time. The pin can lag the host build: after hello, the host pushes
+and re-execs its current agent when fingerprints differ. Before the first image
+is published the pin reads `unpublished`; publish through the operator workflow
+and merge its generated pin PR before using `launch` or `prepare` (or compile
+with a published image override). See the [tools image and module guide](ci/tools-image/README.md).
+Daytona's provider integration and removal of `agent_command` remain in
+[#54](https://github.com/flotilla-org/drydock/issues/54).
 
 ```sh
 drydock providers

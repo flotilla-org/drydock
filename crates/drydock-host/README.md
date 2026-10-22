@@ -243,6 +243,12 @@ and upgrade layout, and the `drydock::conformance::vessel_tools` probe. The
 reference module supplies explicitly simulated guest evidence; stock-Ubuntu OCI
 acceptance runs separately in CI.
 
+Every host build uses drydock's checked-in bootstrap tools pin unless a build-time
+override is supplied. The pin can be older than the host: use the agent client's
+`connect_current` handshake to push/re-exec the current binary after mismatched
+hello, then verify hello before configuration. Before the first image publish,
+prepare/launch explain how to publish and merge the pin; see the guide above.
+
 ## Daytona module
 
 The binary also registers `daytona`; embedders can register `daytona::DaytonaModule`.
@@ -275,7 +281,7 @@ read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
 
 Drydock's agent is supplied by the tools OCI image described above; its build
-selects the matching tools digest. Daytona still accepts the fixed `agent_command`
+selects its checked-in bootstrap tools digest (which may predate the host). Daytona still accepts the fixed `agent_command`
 setting. Its tools-image layering/start integration and removal of that setting
 are tracked in #54; this image-build change does not implement those provider
 operations. The current Daytona bootstrap also needs `flock` and Python 3 for

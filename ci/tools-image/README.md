@@ -47,19 +47,50 @@ binaries. The operator must configure registry visibility to public. CI must
 verify an anonymous pull with an empty Docker credential configuration before
 acceptance; the image's existence does not imply public visibility.
 
-The first build creates the tools image. The second builds drydock with that
-image reference compiled in through `DRYDOCK_TOOLS_IMAGE`. There is no digest
-cycle: the agent does not embed its own image reference. Unstamped development
-builds refuse prepare/launch rather than inventing a pin. An explicitly empty
-`DRYDOCK_TOOLS_IMAGE=` or malformed reference fails compilation with a diagnostic;
-unset the variable to build an unstamped development binary. Changing a runtime
-variable cannot change the compiled selection. The workflow diff is supplied in
-the implementing PR description for the operator to land.
+## Checked-in pin and first publication
+
+[`crates/drydock/tools-image.txt`](../../crates/drydock/tools-image.txt) holds the
+published registry/name@sha256 reference. Every drydock build reads this file
+relative to the crate manifest, including `cargo install` and a Git dependency
+built in another workspace. A build-time `DRYDOCK_TOOLS_IMAGE` overrides the pin;
+runtime environment cannot replace the compiled selection. The crate includes
+the file so consumers need no CI release metadata.
+
+Before the first publish the file contains the explicit sentinel `unpublished`.
+Builds still work, but prepare/launch explain that the tools image has not been
+published yet: run the operator publish workflow and merge its pin-bump PR, or
+compile with an override naming an already published image. Empty/malformed pins
+and explicitly empty/malformed overrides fail compilation. They never silently
+fall back to a different image.
+
+The pin need not match the host build exactly. It selects the bootstrap agent;
+a host connects with `drydock_agent::Client::connect_current`, supplying its
+current agent executable and a factory for fresh provider transports. A
+fingerprint mismatch at hello triggers push plus re-exec, followed by reconnect
+and verification of the new hello. The host pushes configuration only afterwards.
+Raw `Client::connect` is for tooling that explicitly manages this upgrade flow;
+its generation-specific methods remain gated until fingerprints match.
+
+After each successful publication/acceptance, the proposed workflow opens or
+updates a PR changing only the pin. The operator merges that PR; it is never
+merged automatically. A pin-only merge is excluded from the publication trigger
+to avoid an endless publish/pin-bump loop. Enable GitHub Actions' permission to
+create pull requests (or supply `DRYDOCK_PIN_PR_TOKEN`); a suitable injected token
+also allows the pin PR to trigger normal PR checks.
+
+**The first GHCR push creates a private package. The anonymous pull check fails
+until the operator makes the package public, once.** Then rerun the publication
+job to finish acceptance and open the pin PR. Never merge a pin that points to a
+private/unverified image. Other registries likewise need public pull visibility.
+The full workflow diff remains in the implementing PR description for the
+operator to land.
 
 ## Module prepare and start contract
 
-`PrepareRequest.tools_digest` is this drydock build's immutable tools image
-reference, including the registry location and index digest. Resolve the index
+`PrepareRequest.tools_digest` is the immutable bootstrap tools reference selected
+by this build's checked-in pin (or build-time override), including registry
+location and index digest. It may identify an older agent; upgrade it after hello
+as described above, rather than refusing the vessel for a fingerprint mismatch. Resolve the index
 for the guest architecture. The prepared form is the selected base plus the
 tools layer, built at the provider when possible, otherwise by appending its
 layer. Record the prepared form at the provider. Leave the base's entrypoint,
@@ -89,9 +120,12 @@ python3 -m unittest discover -s ci -p 'test_tools_*.py'
 cargo test --workspace --locked
 ```
 
-Run the CLI tests again with a test-only valid `DRYDOCK_TOOLS_IMAGE` at compile
-time to cover the stamped-build prepare/launch path. The default run covers the
-unstamped refusal. A fixture reference is test data, never a release default.
+Run the CLI tests again with a test-only published reference in the pin or a
+build-time `DRYDOCK_TOOLS_IMAGE` to cover prepare/launch. Before first publication
+the default run covers the explicit unpublished refusal. Selection properties
+cover pin fallback and override precedence; real-process tests prove hello from
+an older pin upgrades automatically. Fixture references are test data, never a
+release default.
 
 `conformance::vessel_tools` runs a supplied module guest probe via exec. Its
 argv receives a phase (`initial`, `crash`, or `resumed`) and a fresh challenge;

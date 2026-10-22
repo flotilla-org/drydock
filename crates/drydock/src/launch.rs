@@ -12,12 +12,15 @@ use std::{
     time::Duration,
 };
 
-/// Immutable tools index selected when this drydock build was compiled.
-/// Source builds without release metadata can inspect providers, but cannot launch
-/// or prepare until rebuilt with the matching published tools image.
+/// Checked-in tools index, optionally overridden when compiling this build.
+/// The pin may be older than this build: the host upgrades after agent hello.
 pub fn build_tools_digest() -> Result<&'static str, Error> {
-    option_env!("DRYDOCK_TOOLS_IMAGE")
-        .ok_or_else(|| refused("this drydock build has no tools image; rebuild with DRYDOCK_TOOLS_IMAGE from the tools-image CI artifact"))
+    match env!("DRYDOCK_TOOLS_IMAGE") {
+        "unpublished" => Err(refused(
+            "the tools image has not been published yet; run the operator tools-image publish workflow and merge its pin PR, or rebuild with DRYDOCK_TOOLS_IMAGE set to a published registry/name@sha256 reference",
+        )),
+        reference => Ok(reference),
+    }
 }
 #[derive(Clone, Default, Deserialize, Serialize, clap::Args)]
 #[serde(deny_unknown_fields)]

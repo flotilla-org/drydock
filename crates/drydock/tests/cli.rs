@@ -134,15 +134,17 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     let mut records = client.observe(None).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(2), records.next()).await.unwrap().unwrap().unwrap();
     assert!(matches!(first, ObserveRecord::Snapshot { .. }));
-    // Unstamped development builds must refuse to invent an image pin. The
-    // release-stamped branch below is exercised with DRYDOCK_TOOLS_IMAGE at build.
+    // Before the first publish, builds must refuse to invent an image pin. The
+    // published branch below uses a checked-in pin or a build-time override.
     if drydock::launch::build_tools_digest().is_err() {
         let output = cli_xdg(&xdg, &shim, &["launch", "demo"]).await;
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("this drydock build has no tools image"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("the tools image has not been published yet"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("publish workflow and merge its pin PR"));
         let output = cli_xdg(&xdg, &shim, &["prepare", "demo"]).await;
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("this drydock build has no tools image"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("the tools image has not been published yet"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("publish workflow and merge its pin PR"));
         assert!(client.list("demo").await.unwrap().is_empty());
         task.abort();
         return;
@@ -208,7 +210,7 @@ async fn cli_starts_reuses_and_observes_between_calls() {
 }
 
 // Routing tests use the host's explicit reference prepared form when the CLI
-// was built without release metadata; the separate CLI test checks that refusal.
+// was built before the first pin is published; the separate CLI test checks that refusal.
 async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Environment {
     if drydock::launch::build_tools_digest().is_ok() {
         return daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();

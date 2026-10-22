@@ -280,3 +280,47 @@ fn assert_mismatch<T>(result: std::io::Result<T>) {
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("agent fingerprint mismatch"), "{error}");
 }
+
+// A checked-in tools pin can predate the host. The normal handshake must push
+// the current binary on mismatched hello, re-exec in place, and return a usable
+// client only after the new hello. A matching pin must not rewrite rollback.
+#[tokio::test]
+async fn older_tools_pin_is_upgraded_during_connect() {
+    let dir = tempfile::tempdir().unwrap();
+    let install = dir.path().join("opt/drydock");
+    std::fs::create_dir_all(&install).unwrap();
+    let executable = install.join("drydock-agent");
+    let current = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let mut older = current.clone();
+    older.extend_from_slice(b"older tools pin");
+    std::fs::write(&executable, &older).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    let desired = format!("{:x}", Sha256::digest(&current));
+    let initial = connect(&socket, &desired).await;
+    assert!(!initial.is_compatible());
+    drop(initial);
+    let pid = child.id();
+    for _ in 0..2 {
+        let client = Client::connect_current(
+            || async {
+                let stream = UnixStream::connect(&socket).await?;
+                Transport::yamux(Box::new(stream), true, Limits::default()).await
+            },
+            &current,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert!(client.is_compatible());
+        assert_eq!(client.hello().fingerprint, desired);
+        client.configure(Configuration::default()).await.unwrap();
+        assert_eq!(child.id(), pid);
+        assert!(child.try_wait().unwrap().is_none());
+        assert_eq!(std::fs::read(&executable).unwrap(), current);
+        assert_eq!(std::fs::read(executable.with_extension("prev")).unwrap(), older);
+    }
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}

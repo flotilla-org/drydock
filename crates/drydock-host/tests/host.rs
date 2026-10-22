@@ -1663,7 +1663,7 @@ settings = {
     .await
     .unwrap();
     assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
-    // Discovery works without release metadata; only prepare/launch need the
+    // Discovery works before the first pin is published; only prepare/launch need the
     // build's image pin. Stamped builds retain the complete launch assertion.
     let launch = daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await;
     if drydock::launch::build_tools_digest().is_ok() {
@@ -1671,7 +1671,7 @@ settings = {
         assert_eq!(environment.provider, "demo");
         assert_eq!(drydock::daemon::ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), vec![environment]);
     } else {
-        assert!(launch.unwrap_err().to_string().contains("this drydock build has no tools image"));
+        assert!(launch.unwrap_err().to_string().contains("the tools image has not been published yet"));
         assert!(drydock::daemon::ProviderApi::list(daemon.as_ref(), "demo").await.unwrap().is_empty());
     }
     drop(daemon);
