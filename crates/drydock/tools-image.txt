@@ -1,1 +1,1 @@
-unpublished
+ghcr.io/flotilla-org/drydock-tools@sha256:e0f776ea255128ada39c0dc01bec397e912c8729fa6143f732043d893288d569
