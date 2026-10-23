@@ -24,7 +24,8 @@ async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
         loop {
             match Client::connect_current(
                 || ssh::connect(config.clone(), Limits::default()),
-                |_| std::future::ready(Ok(binary.clone())),
+                &drydock_agent::Platform::current(),
+                &binary,
                 Duration::from_secs(5),
             )
             .await

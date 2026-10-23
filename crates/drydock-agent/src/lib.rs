@@ -37,44 +37,14 @@ pub fn fingerprint() -> io::Result<String> {
 pub struct Hello {
     pub fingerprint: String,
     pub features: Vec<String>,
-    /// Absent from agents that predate platform reporting. The host cannot
-    /// choose an upgrade build for such an agent and refuses to push one.
+    /// The platform this agent's executable was built for. Absent from agents
+    /// that predate platform reporting; hosts then rely on the prepared form.
     #[serde(default)]
     pub platform: Option<Platform>,
 }
-/// An OCI platform (`linux`, `amd64`/`arm64`). An agent reports the platform
-/// its own running executable was built for, not the kernel's `uname`: the
-/// guest is already running that build, so a replacement for the same
-/// platform runs the same way, natively or under emulation.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Platform {
-    pub os: String,
-    pub architecture: String,
-}
-impl Platform {
-    pub fn new(os: impl Into<String>, architecture: impl Into<String>) -> Self {
-        Self { os: os.into(), architecture: architecture.into() }
-    }
-    /// The platform of this executable. Rust target names the tools image
-    /// does not build for pass through unchanged.
-    pub fn current() -> Self {
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            os => os,
-        };
-        let architecture = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            architecture => architecture,
-        };
-        Self::new(os, architecture)
-    }
-}
-impl std::fmt::Display for Platform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", self.os, self.architecture)
-    }
-}
+/// The OCI platform type shared with the provider API; an agent reports the
+/// platform its own executable was built for.
+pub use drydock_protocol::Platform;
 /// Desired state replaces the previous configuration. Capture forwards traffic;
 /// the kind and the upstream own enforcement.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

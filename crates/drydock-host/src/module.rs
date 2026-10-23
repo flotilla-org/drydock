@@ -12,6 +12,21 @@ pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
 }
+/// The platform a module prepares for. The host resolves it from the request
+/// and the module's declared platforms before calling `prepare`.
+pub fn prepare_platform(request: &PrepareRequest) -> Result<Platform> {
+    request.platform.clone().ok_or_else(|| refused("prepare reached the module without a resolved platform"))
+}
+/// A requested platform, or the first declared one, provided it is declared.
+pub fn resolve_platform(requested: Option<Platform>, declared: &[Platform]) -> Result<Platform> {
+    let offered = || declared.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    match requested {
+        None => declared.first().cloned().ok_or_else(|| refused("provider declares no platforms it can run")),
+        Some(platform) if declared.contains(&platform) => Ok(platform),
+        Some(platform) if declared.is_empty() => Err(refused(format!("provider cannot run {platform}: it declares no platforms"))),
+        Some(platform) => Err(refused(format!("provider cannot run {platform}; it offers {}", offered()))),
+    }
+}
 
 /// Factories are transactional: do not spawn observers or publish before commit.
 /// Poll modules are stateless translators; the host owns observation. Push modules
@@ -116,7 +131,9 @@ pub trait Provider: Send + Sync {
     }
     /// Append this build's tools image under /opt/drydock, preserving the base's
     /// entrypoint, command and init. Record the provider's prepared form using
-    /// the module's key (both digests plus provider prepare-time constraints).
+    /// the module's key (both digests, the platform and provider prepare-time
+    /// constraints). The request's platform is resolved and declared; build for
+    /// it (see [`prepare_platform`]) and return it in the prepared form.
     /// Upload bootstrap installs the same files at the same paths instead.
     /// See ci/tools-image/README.md for the full prepare/start outcome contract.
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
@@ -171,4 +188,38 @@ pub trait UsageOperation: Send + Sync {
 #[async_trait]
 pub trait QuotaOperation: Send + Sync {
     async fn quota(&self, c: &Credentials) -> Result<Quota>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Omitted means the first declared platform; anything undeclared is refused
+    // naming what the provider offers.
+    #[test]
+    fn platform_resolution() {
+        let amd = Platform::new("linux", "amd64");
+        let arm = Platform::new("linux", "arm64");
+        let declared = [arm.clone(), amd.clone()];
+        assert_eq!(resolve_platform(None, &declared).unwrap(), arm);
+        assert_eq!(resolve_platform(Some(amd.clone()), &declared).unwrap(), amd);
+        let reason = |e: ProtocolError| match e {
+            ProtocolError::Refused { reason } => reason,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason(resolve_platform(Some(Platform::new("linux", "s390x")), &declared).unwrap_err()),
+            "provider cannot run linux/s390x; it offers linux/arm64, linux/amd64"
+        );
+        assert_eq!(reason(resolve_platform(None, &[]).unwrap_err()), "provider declares no platforms it can run");
+        assert_eq!(reason(resolve_platform(Some(amd), &[]).unwrap_err()), "provider cannot run linux/amd64: it declares no platforms");
+        assert!(
+            prepare_platform(&PrepareRequest {
+                platform: None,
+                size: Size { cpus: 1.0, memory_bytes: 1, disk_bytes: 1 },
+                image_digest: "i".into(),
+                tools_digest: "t".into()
+            })
+            .is_err()
+        );
+    }
 }

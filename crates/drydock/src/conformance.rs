@@ -448,6 +448,7 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
     let prepared = &provision.prepared;
     let request = PrepareRequest {
         size: provision.size.clone(),
+        platform: Some(prepared.platform.clone()),
         image_digest: prepared.image_digest.clone(),
         tools_digest: prepared.tools_digest.clone(),
     };
@@ -458,8 +459,9 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
             && first.provider == provider
             && !first.id.is_empty()
             && first.image_digest == request.image_digest
-            && first.tools_digest == request.tools_digest,
-        "prepare must be idempotent and preserve provider/digest identity",
+            && first.tools_digest == request.tools_digest
+            && request.platform.as_ref() == Some(&first.platform),
+        "prepare must be idempotent and preserve provider/digest/platform identity",
     )?;
     Ok(first)
 }
@@ -475,7 +477,8 @@ fn capabilities(hello: &Hello, provider: &str) -> Result<()> {
         !c.material_modes.is_empty()
             && !c.checkout_strategies.is_empty()
             && c.workspace_root.starts_with('/')
-            && !c.egress.routes.is_empty(),
+            && !c.egress.routes.is_empty()
+            && !c.platforms.is_empty(),
         "incomplete capability declaration",
     )?;
     require(

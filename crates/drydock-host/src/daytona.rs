@@ -240,6 +240,8 @@ impl Daytona {
                 state,
                 granted_size: size,
                 egress: Enforcement::Advisory,
+                // Every Daytona sandbox runs on x86_64 (see `platform`).
+                platform: Some(platform()),
             },
             timestamp,
         })
@@ -475,6 +477,7 @@ impl Provider for Daytona {
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,
             agent: true,
+            platforms: vec![platform()],
             usage: true,
             quota: true,
         }
@@ -522,8 +525,11 @@ impl Provider for Daytona {
         if r.image_digest.contains(['\n', '\r', ' ', '\t']) {
             return Err(refused("invalid Daytona base image reference"));
         }
+        let platform = prepare_platform(&r)?;
+        // Daytona's snapshot API takes no platform; pin both multi-arch references
+        // in the build so the snapshot matches the recorded prepared form.
         let dockerfile = format!(
-            "FROM {} AS drydock_tools\nFROM {}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
+            "FROM --platform={platform} {} AS drydock_tools\nFROM --platform={platform} {}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
             r.tools_digest, r.image_digest
         );
         validate_size(&r.size)?;
@@ -532,7 +538,7 @@ impl Provider for Daytona {
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
         // Keep binary units consistent with sandbox readback; decimal conversion
         // would also produce fractions rejected by CreateSnapshot's integer fields.
-        let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &r.size);
+        let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &platform, &r.size);
         let url = self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?;
         let snapshot = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
@@ -567,6 +573,7 @@ impl Provider for Daytona {
                     return Ok(Prepared {
                         provider: self.name.clone(),
                         id: snapshot_name,
+                        platform,
                         image_digest: r.image_digest,
                         tools_digest: r.tools_digest,
                     });
@@ -592,7 +599,7 @@ impl Provider for Daytona {
         let policy = allowlist(r.egress)?;
         let size = &r.size;
         validate_size(size)?;
-        if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.tools_digest, size) {
+        if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.tools_digest, &r.prepared.platform, size) {
             return Err(refused("Daytona size does not match the prepared snapshot"));
         }
         if let Some(v) = self
@@ -941,8 +948,13 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 // The provider records the prepared form under this deterministic resource key.
 // Call only after validate_size: whole positive CPUs make the integer cast lossless.
-fn snapshot_name(image: &str, tools: &str, size: &Size) -> String {
-    name("snapshot", &format!("{image}\0{tools}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+fn snapshot_name(image: &str, tools: &str, platform: &Platform, size: &Size) -> String {
+    name("snapshot", &format!("{image}\0{tools}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+}
+/// Daytona runs x86_64 sandboxes only: "Daytona expects the local image to be
+/// built for AMD64 architecture" (docs, per the sandbox survey, 2026-10).
+fn platform() -> Platform {
+    Platform::new("linux", "amd64")
 }
 fn validate_size(size: &Size) -> Result<()> {
     if !size.cpus.is_finite()
@@ -978,6 +990,14 @@ mod tests {
         for invalid in ["-1e2", ".5e1", "1.e2", "1ee2", "1e", "NaN", "", "1e-99999"] {
             assert!(decimal_lexeme(invalid).is_none(), "{invalid}");
         }
+    }
+    // The snapshot is built for one platform, so the platform is part of its name.
+    #[test]
+    fn snapshot_name_includes_platform() {
+        let size = Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 };
+        let amd = snapshot_name("image", "tools", &Platform::new("linux", "amd64"), &size);
+        assert_eq!(amd, snapshot_name("image", "tools", &platform(), &size));
+        assert_ne!(amd, snapshot_name("image", "tools", &Platform::new("linux", "arm64"), &size));
     }
     // Vendor normalization must not break an exact label retry.
     #[test]

@@ -100,45 +100,49 @@ impl Client {
     /// Connect to a vessel started from any published tools pin. A mismatched
     /// hello triggers push + re-exec, then a fresh transport and verified hello.
     /// The factory must open a new provider transport on every invocation.
-    /// `executable_for` supplies the current agent build for the platform the
-    /// guest's hello reports; it is called once per connection attempt.
-    /// Returns only a compatible client; callers push configuration afterwards.
-    /// Initial transport/hello errors return immediately; only post-upgrade
-    /// reconnects retry. The caller must arrange initial provider readiness.
+    /// `platform` is the platform the vessel was prepared for and `executable`
+    /// the current agent build for it; the caller chose both from the prepared
+    /// form, never from the guest. Returns only a compatible client; callers
+    /// push configuration afterwards. Initial transport/hello errors return
+    /// immediately; only post-upgrade reconnects retry. The caller must arrange
+    /// initial provider readiness.
     ///
-    /// Fails with [`io::ErrorKind::Unsupported`], pushing nothing, when the
-    /// hello reports no platform or `executable_for` cannot supply a build for
-    /// it. Retrying cannot help: the host needs that platform's build installed.
-    pub async fn connect_current<F, Fut, R, RFut>(mut open: F, mut executable_for: R, timeout: std::time::Duration) -> io::Result<Self>
+    /// A hello that reports a platform is checked against `platform`. A
+    /// different one fails with [`io::ErrorKind::Unsupported`], pushing
+    /// nothing. Agents older than platform reporting send none, so the check
+    /// is skipped and the build is pushed.
+    pub async fn connect_current<F, Fut>(
+        mut open: F,
+        platform: &Platform,
+        executable: &[u8],
+        timeout: std::time::Duration,
+    ) -> io::Result<Self>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = io::Result<Transport>>,
-        R: FnMut(Platform) -> RFut,
-        RFut: std::future::Future<Output = io::Result<Vec<u8>>>,
     {
         use sha2::{Digest, Sha256};
+        if executable.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent build for platform {platform} is empty")));
+        }
         let mut observation = "no hello received".to_owned();
         let result = tokio::time::timeout(timeout, async {
             let mut client = Self::connect(open().await?, String::new()).await?;
             observation = format!("last hello fingerprint {}", client.hello.fingerprint);
-            let Some(platform) = client.hello.platform.clone() else {
+            if let Some(reported) = &client.hello.platform
+                && reported != platform
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "agent hello reports no platform, so no build can be chosen for it; start the vessel from a tools image whose agent reports its platform",
+                    format!("vessel was prepared for {platform} but its agent reports {reported}"),
                 ));
-            };
-            let executable = executable_for(platform.clone())
-                .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Unsupported, format!("no agent build for guest platform {platform}: {error}")))?;
-            if executable.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent build for guest platform {platform} is empty")));
             }
-            let expected = format!("{:x}", Sha256::digest(&executable));
+            let expected = format!("{:x}", Sha256::digest(executable));
             client.expected = expected.clone();
             if client.is_compatible() {
                 return Ok(client);
             }
-            client.stage_upgrade(executable).await?;
+            client.stage_upgrade(executable.to_vec()).await?;
             // Activation acknowledgement is advisory: re-exec can close the
             // stream before the response arrives. Only the next hello decides.
             let _ = client.activate_upgrade().await;

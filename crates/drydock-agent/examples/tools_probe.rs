@@ -17,18 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connections = Arc::new(UnixConnections::new(listener, &socket));
     let client = Client::connect_current(
         || std::future::ready(Transport::native(connections.clone(), Limits::default())),
-        |platform| {
-            // The probe and the agent come from the same image platform.
-            let result = if platform == Platform::current() {
-                Ok(current.clone())
-            } else {
-                Err(std::io::Error::other(format!("agent reports {platform}, probe is {}", Platform::current())))
-            };
-            std::future::ready(result)
-        },
+        // The probe and the agent come from the same image platform.
+        &Platform::current(),
+        &current,
         Duration::from_secs(30),
     )
     .await?;
+    if client.hello().platform.as_ref() != Some(&Platform::current()) {
+        return Err(format!("agent reports {:?}, probe is {}", client.hello().platform, Platform::current()).into());
+    }
     assert!(client.is_compatible(), "hello fingerprint differs from installed agent");
     // The provider starts the fixed binary alongside the base's own process.
     let mut found = false;

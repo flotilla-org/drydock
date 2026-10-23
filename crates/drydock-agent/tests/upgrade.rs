@@ -1,20 +1,8 @@
 use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward, Platform};
 use drydock_transport::{Limits, Transport};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use tokio::{net::UnixStream, process::Command};
-/// The host's agent builds, keyed by the guest platform each one runs on.
-fn builds(builds: impl IntoIterator<Item = (Platform, Vec<u8>)>) -> impl FnMut(Platform) -> std::future::Ready<std::io::Result<Vec<u8>>> {
-    let builds: HashMap<_, _> = builds.into_iter().collect();
-    move |platform| {
-        std::future::ready(
-            builds
-                .get(&platform)
-                .cloned()
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no build for {platform}"))),
-        )
-    }
-}
 /// A Linux platform whose build the test process cannot be running.
 fn foreign() -> Platform {
     let current = Platform::current();
@@ -327,7 +315,8 @@ async fn older_tools_pin_is_upgraded_during_connect() {
                 let stream = UnixStream::connect(&socket).await?;
                 Transport::yamux(Box::new(stream), true, Limits::default()).await
             },
-            builds([(Platform::current(), current.clone()), (foreign(), b"#!/bin/sh\nexit 42\n".to_vec())]),
+            &Platform::current(),
+            &current,
             Duration::from_secs(10),
         )
         .await
@@ -363,7 +352,8 @@ async fn upgrade_timeout_reports_the_last_hello_fingerprint() {
             let stream = UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
-        builds([(Platform::current(), b"not an executable".to_vec())]),
+        &Platform::current(),
+        b"not an executable",
         Duration::from_secs(3),
     )
     .await
@@ -403,7 +393,8 @@ async fn upgrade_timeout_reports_the_last_transport_error() {
             let stream = UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
-        builds([(Platform::current(), desired.clone())]),
+        &Platform::current(),
+        &desired,
         Duration::from_secs(3),
     )
     .await
@@ -418,11 +409,11 @@ async fn upgrade_timeout_reports_the_last_transport_error() {
     child.wait().await.unwrap();
 }
 
-// No build for the guest's platform: fail with an error naming the platform,
-// push nothing, and leave the running generation untouched. Never substitute
-// a build for another platform, even when one is available.
+// A vessel prepared for one platform whose agent reports another: fail naming
+// both, push nothing, and leave the running generation untouched. The build
+// offered is for the prepared platform, so pushing it would not run here.
 #[tokio::test]
-async fn missing_platform_build_pushes_nothing() {
+async fn prepared_platform_mismatch_pushes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let executable = dir.path().join("drydock-agent");
     let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
@@ -439,14 +430,15 @@ async fn missing_platform_build_pushes_nothing() {
             let stream = UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
-        builds([(foreign(), newer)]),
+        &foreign(),
+        &newer,
         Duration::from_secs(5),
     )
     .await
     .err()
-    .expect("a guest platform without a build cannot become current");
+    .expect("an agent on another platform than the prepared one cannot be upgraded");
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    assert!(error.to_string().contains(&format!("guest platform {}", Platform::current())), "{error}");
+    assert!(error.to_string().contains(&format!("prepared for {} but its agent reports {}", foreign(), Platform::current())), "{error}");
     assert_eq!(std::fs::read(&executable).unwrap(), old);
     for suffix in ["upgrade", "prev", "probation"] {
         assert!(!dir.path().join(format!("drydock-agent.{suffix}")).exists(), "{suffix} must not exist");

@@ -28,7 +28,8 @@ size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
 capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clone"],
                 "workspace_root": "/workspace", "suspend_resume": True, "export": True,
                 "egress": {"routes": ["none"], "enforcement": "advisory"},
-                "fallback_runner": True, "bootstrap": "bake", "usage": True, "quota": True}
+                "fallback_runner": True, "bootstrap": "bake", "usage": True, "quota": True,
+                "platforms": [{"os": "linux", "architecture": "amd64"}]}
 if fault.startswith("egress-"):
     capabilities["egress"]["enforcement"] = "enforced"
 if fault == "capabilities":
@@ -125,7 +126,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "6", "host_version": "fixture", "modules": modules,
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "7", "host_version": "fixture", "modules": modules,
                 "providers": [{"provider": name, "module": config["module"], "readiness": {"status": readiness.get(name, "ready"), **({"reason": "missing"} if readiness.get(name) == "missing_credential" else {})},
                                "capabilities": capabilities, "rate_limits": []} for name, config in providers.items()]})
         if parsed.path == "/v1/config":
@@ -192,8 +193,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(status, error, retry=error.get("retry_after"))
         if len(parts) == 5 and parts[-1] == "prepare":
             prepare_calls += 1
-            key = (provider, body["image_digest"], body["tools_digest"])
-            prepared.setdefault(key, {"provider":provider,"id":str(len(prepared)+1),"image_digest":body["image_digest"],"tools_digest":body["tools_digest"]})
+            platform = body.get("platform") or capabilities["platforms"][0]
+            if platform not in capabilities["platforms"]:
+                return self.respond(422, {"kind": "refused", "reason": "provider cannot run that platform"})
+            key = (provider, body["image_digest"], body["tools_digest"], platform["os"], platform["architecture"])
+            prepared.setdefault(key, {"provider":provider,"id":str(len(prepared)+1),"platform":platform,"image_digest":body["image_digest"],"tools_digest":body["tools_digest"]})
             value = dict(prepared[key])
             if fault == "prepare": value["id"] = str(prepare_calls)
             return self.respond(200, value)

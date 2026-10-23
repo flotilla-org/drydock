@@ -28,6 +28,7 @@ async fn prepare(client: &Client) -> Prepared {
         .prepare(
             "a",
             &PrepareRequest {
+                platform: None,
                 size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
                 image_digest: "sha256:image".into(),
                 tools_digest: "sha256:tools".into(),
@@ -620,6 +621,7 @@ async fn reference_preparation_ignores_size() {
     let mut host = supervisor(dir.path()).start(spec()).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
     let mut preparation = PrepareRequest {
+        platform: None,
         image_digest: "image".into(),
         tools_digest: "tools".into(),
         size: Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 },

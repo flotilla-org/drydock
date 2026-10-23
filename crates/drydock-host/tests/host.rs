@@ -1019,6 +1019,7 @@ interactions:
     let prepared = provider
         .prepare(
             PrepareRequest {
+                platform: Some(drydock_protocol::Platform::new("linux", "amd64")),
                 size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),
@@ -1071,6 +1072,7 @@ async fn poll_uses_matching_inspect_timestamp() {
     let time = "2026-01-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
     *control.timestamp.lock().unwrap() = Some(time);
     control.vendor.lock().unwrap().row = Some(Environment {
+        platform: None,
         id: "external".into(),
         label: None,
         provider: "a".into(),
@@ -1377,6 +1379,7 @@ async fn push_snapshot_lists_share_deadline_and_isolate_partial_results() {
             control.hold_list.store(n % 2 == 0, SeqCst);
             control.hold_list_result.store(n % 2 != 0, SeqCst);
             control.vendor.lock().unwrap().row = Some(Environment {
+                platform: None,
                 id: "unfinished".into(),
                 provider: name.clone(),
                 label: None,
@@ -1500,6 +1503,7 @@ async fn progress_retains_billing_baseline_and_inventory() {
     let mut events = h.stream(None).await;
     events.next().await;
     let environment = Environment {
+        platform: None,
         id: "progress".into(),
         provider: "a".into(),
         label: None,
@@ -1543,6 +1547,7 @@ async fn cheap_inventory_carries_measured_egress() {
     h.configure(vec![provider("a", json!({}))]).await;
     h.credential("a", "ready").await;
     let env = Environment {
+        platform: None,
         id: "measured".into(),
         provider: "a".into(),
         label: None,

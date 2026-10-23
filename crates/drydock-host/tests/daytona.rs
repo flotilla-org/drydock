@@ -385,8 +385,8 @@ impl Drop for StandIn {
                 let dockerfile = body["buildInfo"]["dockerfileContent"].as_str().expect("prepare must build the tools layer");
                 let instructions: Vec<_> = dockerfile.lines().collect();
                 assert_eq!(instructions.len(), 3, "only FROM and COPY preserve the base entrypoint and command");
-                assert!(instructions[0].starts_with("FROM registry.invalid/drydock-tools@sha256:"));
-                assert!(instructions[1].starts_with("FROM ") && instructions[1].contains("@sha256:"));
+                assert!(instructions[0].starts_with("FROM --platform=linux/amd64 registry.invalid/drydock-tools@sha256:"));
+                assert!(instructions[1].starts_with("FROM --platform=linux/amd64 ") && instructions[1].contains("@sha256:"));
                 assert_eq!(instructions[2], "COPY --from=drydock_tools /opt/drydock/ /opt/drydock/");
                 assert!(body.get("entrypoint").is_none());
                 assert!(body.get("imageName").is_none());
@@ -447,6 +447,7 @@ fn daytona_size() -> Size {
 }
 async fn prepared(p: &dyn Provider, c: &Credentials) -> Prepared {
     let request = PrepareRequest {
+        platform: Some(Platform::new("linux", "amd64")),
         size: daytona_size(),
         image_digest: format!("docker.io/test/image@sha256:{}", "a".repeat(64)),
         tools_digest: tools_image('a'),
@@ -764,8 +765,12 @@ async fn preparation_converges_by_digest_pair() {
     let a = provider(http.clone()).await;
     let b = provider(http.clone()).await;
     let c = credentials(false);
-    let mut r =
-        PrepareRequest { size: daytona_size(), image_digest: format!("image@sha256:{}", "b".repeat(64)), tools_digest: tools_image('a') };
+    let mut r = PrepareRequest {
+        platform: Some(Platform::new("linux", "amd64")),
+        size: daytona_size(),
+        image_digest: format!("image@sha256:{}", "b".repeat(64)),
+        tools_digest: tools_image('a'),
+    };
     let (x, y) = tokio::join!(a.prepare(r.clone(), &c), b.prepare(r.clone(), &c));
     let x = x.unwrap();
     assert_eq!(x, y.unwrap());
@@ -775,9 +780,17 @@ async fn preparation_converges_by_digest_pair() {
     assert_ne!(x.id, other.id);
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 2);
     assert!(
-        a.prepare(PrepareRequest { size: daytona_size(), image_digest: "image:latest".into(), tools_digest: tools_image('a') }, &c)
-            .await
-            .is_err()
+        a.prepare(
+            PrepareRequest {
+                platform: Some(Platform::new("linux", "amd64")),
+                size: daytona_size(),
+                image_digest: "image:latest".into(),
+                tools_digest: tools_image('a')
+            },
+            &c
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -796,8 +809,12 @@ fn prepared_sizes_route_to_snapshots(tc: hegel::TestCase) {
         let http = Arc::new(StandIn::default());
         let p = provider(http.clone()).await;
         let c = credentials(false);
-        let base =
-            PrepareRequest { image_digest: format!("image@sha256:{}", "c".repeat(64)), tools_digest: tools_image('a'), size: size.clone() };
+        let base = PrepareRequest {
+            platform: Some(Platform::new("linux", "amd64")),
+            image_digest: format!("image@sha256:{}", "c".repeat(64)),
+            tools_digest: tools_image('a'),
+            size: size.clone(),
+        };
         let prep = p.prepare(base.clone(), &c).await.unwrap();
         let other_host = provider(http.clone()).await;
         assert_eq!(other_host.prepare(base.clone(), &c).await.unwrap(), prep);
@@ -837,7 +854,12 @@ async fn preparation_refuses_existing_snapshot_resource_mismatch() {
         let c = credentials(false);
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().snapshots.get_mut(&prep.id).unwrap()[key] = json!(1);
-        let r = PrepareRequest { image_digest: prep.image_digest, tools_digest: prep.tools_digest, size: daytona_size() };
+        let r = PrepareRequest {
+            platform: Some(Platform::new("linux", "amd64")),
+            image_digest: prep.image_digest,
+            tools_digest: prep.tools_digest,
+            size: daytona_size(),
+        };
         assert!(matches!(p.prepare(r, &c).await, Err(ProtocolError::Refused { .. })));
         assert_eq!(http.0.lock().unwrap().snapshot_requests.len(), 1);
     }
@@ -864,8 +886,12 @@ async fn invalid_preparation_sizes_do_not_call_vendor() {
     }
     let before = http.0.lock().unwrap().requests;
     for size in sizes {
-        let preparation =
-            PrepareRequest { image_digest: prep.image_digest.clone(), tools_digest: prep.tools_digest.clone(), size: size.clone() };
+        let preparation = PrepareRequest {
+            platform: Some(Platform::new("linux", "amd64")),
+            image_digest: prep.image_digest.clone(),
+            tools_digest: prep.tools_digest.clone(),
+            size: size.clone(),
+        };
         assert!(matches!(p.prepare(preparation, &c).await, Err(ProtocolError::Refused { .. })));
         let mut r = request(prep.clone(), "invalid");
         r.size = size;
@@ -904,8 +930,17 @@ async fn inactive_snapshot_activates_once_then_polls() {
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!("inactive");
     let start = tokio::time::Instant::now();
-    let result =
-        p.prepare(PrepareRequest { size: daytona_size(), image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await;
+    let result = p
+        .prepare(
+            PrepareRequest {
+                platform: Some(Platform::new("linux", "amd64")),
+                size: daytona_size(),
+                image_digest: prep.image_digest,
+                tools_digest: prep.tools_digest,
+            },
+            &c,
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(http.0.lock().unwrap().activations, 1);
     assert!(start.elapsed() >= std::time::Duration::from_secs(2));
@@ -951,7 +986,16 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!(state);
         assert!(matches!(
-            p.prepare(PrepareRequest { size: daytona_size(), image_digest: prep.image_digest, tools_digest: prep.tools_digest }, &c).await,
+            p.prepare(
+                PrepareRequest {
+                    platform: Some(Platform::new("linux", "amd64")),
+                    size: daytona_size(),
+                    image_digest: prep.image_digest,
+                    tools_digest: prep.tools_digest
+                },
+                &c
+            )
+            .await,
             Err(ProtocolError::Refused { .. })
         ));
     }
@@ -1419,7 +1463,7 @@ async fn standin_validates_snapshot_create_schema() {
     let req = client.post("https://app.daytona.io/api/snapshots/missing/activate").bearer_auth("key-a").build().unwrap();
     assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 404);
     assert_eq!(http.0.lock().unwrap().activations, 0);
-    let base = json!({"name":"fixture","buildInfo":{"dockerfileContent":format!("FROM {} AS drydock_tools\nFROM image@sha256:{}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n", tools_image('a'), "b".repeat(64))},"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
+    let base = json!({"name":"fixture","buildInfo":{"dockerfileContent":format!("FROM --platform=linux/amd64 {} AS drydock_tools\nFROM --platform=linux/amd64 image@sha256:{}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n", tools_image('a'), "b".repeat(64))},"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
     let mut invalid = vec![json!({}), json!(null)];
     let mut unknown = base.clone();
     unknown["mem"] = json!(4);
@@ -1843,7 +1887,12 @@ async fn prepare_refuses_unpublished_or_unsafe_tools() {
     ] {
         assert!(
             p.prepare(
-                PrepareRequest { size: daytona_size(), image_digest: format!("ubuntu@sha256:{}", "a".repeat(64)), tools_digest: tools },
+                PrepareRequest {
+                    platform: Some(Platform::new("linux", "amd64")),
+                    size: daytona_size(),
+                    image_digest: format!("ubuntu@sha256:{}", "a".repeat(64)),
+                    tools_digest: tools
+                },
                 &c
             )
             .await
@@ -1853,6 +1902,7 @@ async fn prepare_refuses_unpublished_or_unsafe_tools() {
     assert!(
         p.prepare(
             PrepareRequest {
+                platform: Some(Platform::new("linux", "amd64")),
                 size: daytona_size(),
                 image_digest: format!("ubuntu\nRUN bad@sha256:{}", "a".repeat(64)),
                 tools_digest: tools_image('a')

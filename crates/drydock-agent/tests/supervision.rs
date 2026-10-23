@@ -178,10 +178,8 @@ async fn supervised_tools_upgrade_and_restart_current_agent() {
             let stream = tokio::net::UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
-        |platform| {
-            assert_eq!(platform, drydock_agent::Platform::current());
-            std::future::ready(Ok(current.clone()))
-        },
+        &drydock_agent::Platform::current(),
+        &current,
         Duration::from_secs(15),
     )
     .await

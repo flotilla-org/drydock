@@ -696,21 +696,20 @@ async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
     }
 }
 
-// Guest stand-in at the HTTP boundary: serves a fixed hello body and counts
-// upgrade requests, so a test observes exactly what the host pushed.
-async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::atomic::AtomicUsize>) {
+// Guest stand-in at the HTTP boundary: serves a fixed hello body and records
+// upgrade bodies, so a test observes exactly what the host pushed.
+async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
     use axum::routing::{get, put};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let (a, b) = tokio::io::duplex(4096);
+    let (a, b) = tokio::io::duplex(1 << 16);
     let (host, guest) =
         tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
     let mut guest = guest.unwrap();
-    let pushes = Arc::new(AtomicUsize::new(0));
-    let counted = pushes.clone();
+    let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = pushes.clone();
     let router = axum::Router::new().route("/hello", get(move || std::future::ready(axum::Json(hello.clone())))).route(
         "/upgrade",
-        put(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
+        put(move |body: bytes::Bytes| {
+            recorded.lock().unwrap().push(body.to_vec());
             std::future::ready(())
         }),
     );
@@ -722,55 +721,44 @@ async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync
     (host.unwrap(), pushes)
 }
 
-// An agent that predates platform reporting sends no platform. The host cannot
-// know which build runs there, so it refuses without consulting its builds or
-// pushing anything; it never guesses the host's own platform.
+// An agent that predates platform reporting sends no platform. The host
+// already knows the vessel's platform from its prepared form, so it pushes
+// that platform's build; it never needs to ask the guest.
 #[tokio::test]
-async fn hello_without_platform_is_refused_without_a_push() {
-    use std::sync::atomic::Ordering;
+async fn hello_without_platform_gets_the_prepared_platforms_build() {
     let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"]})).await;
     let mut host = Some(host);
-    let mut consulted = false;
+    // The fake guest never re-executes, so the reconnect after the push times out.
     let error = Client::connect_current(
         || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
-        |_| {
-            consulted = true;
-            std::future::ready(Ok(b"current".to_vec()))
-        },
-        Duration::from_secs(5),
+        &Platform::new("linux", "amd64"),
+        b"linux amd64 build",
+        Duration::from_millis(500),
     )
     .await
     .err()
-    .expect("a hello without platform cannot be upgraded");
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    assert!(error.to_string().contains("reports no platform"), "{error}");
-    assert!(!consulted);
-    assert_eq!(pushes.load(Ordering::SeqCst), 0);
+    .expect("the fake guest never reports the pushed build");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(*pushes.lock().unwrap(), [b"linux amd64 build".to_vec()]);
 }
 
-// The resolver receives the guest's reported platform verbatim, and a failure
-// to supply that build is reported with the platform and pushes nothing.
+// A reported platform other than the prepared one is refused, naming both,
+// and nothing is pushed: the prepared platform's build would not run there.
 #[tokio::test]
-async fn missing_build_for_reported_platform_pushes_nothing() {
-    use std::sync::atomic::Ordering;
-    let hello =
-        serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "platform": {"os": "linux", "architecture": "riscv64"}});
+async fn reported_platform_other_than_prepared_pushes_nothing() {
+    let hello = serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "platform": {"os": "linux", "architecture": "arm64"}});
     let (host, pushes) = hello_only_guest(hello).await;
     let mut host = Some(host);
-    let mut asked = vec![];
     let error = Client::connect_current(
         || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
-        |platform| {
-            asked.push(platform);
-            std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, "install drydock-agent-linux-riscv64")))
-        },
+        &Platform::new("linux", "amd64"),
+        b"linux amd64 build",
         Duration::from_secs(5),
     )
     .await
     .err()
-    .expect("no build means no upgrade");
-    assert_eq!(asked, [Platform::new("linux", "riscv64")]);
+    .expect("a mismatched platform cannot be upgraded");
     assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    assert!(error.to_string().contains("guest platform linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");
-    assert_eq!(pushes.load(Ordering::SeqCst), 0);
+    assert!(error.to_string().contains("prepared for linux/amd64 but its agent reports linux/arm64"), "{error}");
+    assert!(pushes.lock().unwrap().is_empty());
 }

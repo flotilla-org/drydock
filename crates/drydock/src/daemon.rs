@@ -295,6 +295,7 @@ impl Daemon {
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
         let (prepared, size) = self.prepare(provider, options).await?;
+        let platform = prepared.platform.clone();
         let label = uuid::Uuid::new_v4().to_string();
         let dir = self.keys.join(&label);
         let (_, public) = launch::keypair(&dir).await?;
@@ -315,21 +316,20 @@ impl Daemon {
         let host = self.ready_host(provider)?;
         // The provider declares whether its vessels run the agent; the module name does not.
         let agent = host.handle.status.borrow().providers.iter().any(|d| d.provider == provider && d.capabilities.agent);
+        // Find the agent build for the prepared platform before creating anything.
+        let agent_build = if agent { Some(agent_build(&platform).await?) } else { None };
         let result = host.handle.client.clone().with_request_timeout(Duration::from_secs(600)).provision(provider, &request).await;
         let cache = host.cache.lock().await.1.clone();
         cache.invalidate(provider).await;
         let environment = result?;
-        if agent {
-            self.agent_ready(provider, &environment).await?;
+        if let Some(build) = agent_build {
+            self.agent_ready(provider, &environment, &platform, &build).await?;
         }
         Ok(environment)
     }
-    async fn agent_ready(&self, provider: &str, environment: &Environment) -> Result<(), Error> {
-        // The guest's hello names its platform; push only that platform's build.
-        let executable_for = |platform: drydock_agent::Platform| async move {
-            let path = crate::local::agent_build(&platform).map_err(|reason| std::io::Error::new(std::io::ErrorKind::NotFound, reason))?;
-            tokio::fs::read(&path).await.map_err(|error| std::io::Error::new(error.kind(), format!("{}: {error}", path.display())))
-        };
+    /// Wait for the vessel agent's current hello, pushing `build` (the agent for
+    /// the prepared `platform`) to an older one.
+    async fn agent_ready(&self, provider: &str, environment: &Environment, platform: &Platform, build: &[u8]) -> Result<(), Error> {
         let identity = self.key_for(environment)?;
         let client = &self.ready_host(provider)?.handle.client;
         // Each reach mints a fresh gateway username, which is an access token.
@@ -346,7 +346,7 @@ impl Daemon {
             )
             .await
         };
-        let result = wait_for_agent(open, executable_for, Duration::from_secs(60), |text| masker.lock().unwrap().text(text)).await;
+        let result = wait_for_agent(open, platform, build, Duration::from_secs(60), |text| masker.lock().unwrap().text(text)).await;
         result.map(drop).map_err(|error| {
             let reason = format!("vessel agent did not complete its hello handshake: {error}");
             Error::Protocol(match error.kind() {
@@ -701,22 +701,28 @@ fn agent_ssh(
     })
 }
 
+/// The host's agent build for a prepared platform. A missing build refuses the
+/// launch, naming the file or variable that would supply it.
+async fn agent_build(platform: &Platform) -> Result<Vec<u8>, Error> {
+    let refused = |reason: String| Error::Protocol(ProtocolError::Refused { reason });
+    let path = crate::local::agent_build(platform).map_err(|reason| refused(format!("no vessel agent build for {platform}: {reason}")))?;
+    tokio::fs::read(&path).await.map_err(|error| refused(format!("vessel agent build {}: {error}", path.display())))
+}
 // Provider startup can precede the socket listener. connect_current itself owns
 // upgrade/re-exec reconnects and only returns a compatible hello. Unsupported
-// errors (including a guest whose platform has no build here) return at once;
-// others retry until the deadline. `mask` removes credentials from each
-// attempt's error before it is logged or returned.
-async fn wait_for_agent<F, Fut, R, RFut>(
+// errors (including an agent reporting another platform than the prepared one)
+// return at once; others retry until the deadline. `mask` removes credentials
+// from each attempt's error before it is logged or returned.
+async fn wait_for_agent<F, Fut>(
     mut open: F,
-    mut executable_for: R,
+    platform: &Platform,
+    executable: &[u8],
     timeout: Duration,
     mask: impl Fn(&str) -> String,
 ) -> std::io::Result<drydock_agent::Client>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<drydock_transport::Transport>>,
-    R: FnMut(drydock_agent::Platform) -> RFut,
-    RFut: std::future::Future<Output = std::io::Result<Vec<u8>>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = None;
@@ -725,7 +731,7 @@ where
         if remaining.is_zero() {
             break;
         }
-        match tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, &mut executable_for, remaining)).await {
+        match tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, platform, executable, remaining)).await {
             Ok(Ok(client)) => return Ok(client),
             // Retrying cannot change an unsupported arrangement.
             Ok(Err(error)) if error.kind() == std::io::ErrorKind::Unsupported => return Err(error),
@@ -778,7 +784,8 @@ mod agent_readiness_tests {
                     host
                 }
             },
-            |_| std::future::ready(Ok(binary.to_vec())),
+            &Platform::current(),
+            binary,
             Duration::from_secs(5),
             str::to_owned,
         )
@@ -786,10 +793,12 @@ mod agent_readiness_tests {
         .unwrap();
         assert_eq!(attempts, 3);
     }
-    // No build for the guest's platform is final: refuse at once, before the
-    // readiness deadline, instead of retrying a lookup that cannot change.
+    // An agent reporting another platform than the prepared one is final:
+    // refuse at once, before the readiness deadline, naming both platforms.
     #[tokio::test]
-    async fn missing_platform_build_is_refused_without_waiting() {
+    async fn platform_mismatch_is_refused_without_waiting() {
+        let current = Platform::current();
+        let prepared = Platform::new("linux", if current == Platform::new("linux", "amd64") { "arm64" } else { "amd64" });
         let mut opens = 0;
         let started = tokio::time::Instant::now();
         let error = wait_for_agent(
@@ -805,7 +814,8 @@ mod agent_readiness_tests {
                     host
                 }
             },
-            |platform| std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no build for {platform}")))),
+            &prepared,
+            b"prepared platform build",
             Duration::from_secs(30),
             str::to_owned,
         )
@@ -813,7 +823,7 @@ mod agent_readiness_tests {
         .err()
         .unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        assert!(error.to_string().contains(&drydock_agent::Platform::current().to_string()), "{error}");
+        assert!(error.to_string().contains(&format!("prepared for {prepared} but its agent reports {current}")), "{error}");
         assert_eq!(opens, 1);
         assert!(started.elapsed() < Duration::from_secs(30));
     }
@@ -828,7 +838,8 @@ mod agent_readiness_tests {
         let mut host = Some(host.unwrap());
         let result = wait_for_agent(
             || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
-            |_| std::future::ready(Ok(b"current".to_vec())),
+            &Platform::current(),
+            b"current",
             Duration::from_millis(25),
             str::to_owned,
         )
@@ -847,7 +858,8 @@ mod agent_readiness_tests {
                     "SSH forwarding rejected: remote port forwarding failed for minted-gateway-token",
                 )))
             },
-            |_| std::future::ready(Ok(b"current".to_vec())),
+            &Platform::current(),
+            b"current",
             Duration::from_millis(100),
             |text| masker.text(text),
         )
@@ -891,7 +903,8 @@ mod agent_readiness_tests {
         config.agent_socket = agent_socket;
         let client = wait_for_agent(
             || drydock_transport::ssh::connect(config.clone(), Default::default()),
-            |_| std::future::ready(Ok(binary.to_vec())),
+            &Platform::current(),
+            binary,
             Duration::from_secs(10),
             str::to_owned,
         )

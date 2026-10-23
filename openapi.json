@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "6"
+    "version": "7"
   },
   "paths": {
     "/v1/config": {
@@ -1138,6 +1138,13 @@
               "$ref": "#/components/schemas/MaterialMode"
             }
           },
+          "platforms": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Platform"
+            },
+            "description": "Platforms this provider can run, preferred first. A prepare request\nthat names none gets the first; one naming another is refused."
+          },
           "quota": {
             "type": "boolean"
           },
@@ -1415,6 +1422,17 @@
               "null"
             ],
             "description": "Unlabelled resources are listable, inspectable and destroyable."
+          },
+          "platform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Platform",
+                "description": "The platform the environment runs, when the provider records it."
+              }
+            ]
           },
           "provider": {
             "type": "string"
@@ -2012,6 +2030,24 @@
           "start <= end"
         ]
       },
+      "Platform": {
+        "type": "object",
+        "description": "An OCI platform: `os` and `architecture` by OCI names (`linux`, `amd64`,\n`arm64`), each 1 to 32 lowercase letters or digits. They become agent build\nfile and variable names, so decoding refuses anything else.",
+        "required": [
+          "os",
+          "architecture"
+        ],
+        "properties": {
+          "architecture": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{1,32}$"
+          },
+          "os": {
+            "type": "string",
+            "pattern": "^[a-z0-9]{1,32}$"
+          }
+        }
+      },
       "Port": {
         "type": "integer",
         "format": "int32",
@@ -2032,6 +2068,17 @@
             "type": "string",
             "minLength": 1
           },
+          "platform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Platform",
+                "description": "Omitted: the provider's first declared platform. Hosts resolve it before\na module prepares, so modules always receive a declared platform."
+              }
+            ]
+          },
           "size": {
             "$ref": "#/components/schemas/Size"
           },
@@ -2046,6 +2093,7 @@
         "required": [
           "provider",
           "id",
+          "platform",
           "image_digest",
           "tools_digest"
         ],
@@ -2056,6 +2104,10 @@
           "image_digest": {
             "type": "string",
             "minLength": 1
+          },
+          "platform": {
+            "$ref": "#/components/schemas/Platform",
+            "description": "The platform this prepared form was built for; part of the module's key."
           },
           "provider": {
             "type": "string"

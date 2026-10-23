@@ -1,6 +1,6 @@
 //! Local daemon startup and private directories shared by CLI and daemon.
 use crate::client::Client;
-use drydock_agent::Platform;
+use drydock_protocol::Platform;
 use rigging_process::EnvVars;
 use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
@@ -12,8 +12,8 @@ use std::{
 pub fn companion(name: &str, override_var: &str) -> Result<PathBuf, String> {
     rigging_process::resolve_sibling_binary(name, override_var, &rigging_process::ProcessEnvVars, std::env::current_exe, |p| p.is_file())
 }
-/// The host's drydock-agent build for a guest platform, which an older vessel
-/// agent is upgraded to. Overrides win over installed files. The plain sibling
+/// The host's drydock-agent build for a vessel's prepared platform, which an
+/// older vessel agent is upgraded to. Overrides win over installed files. The plain sibling
 /// `drydock-agent` is the host's own build, so it is a candidate only when the
 /// guest shares the host's platform; no build for another platform is chosen.
 pub fn agent_build(guest: &Platform) -> Result<PathBuf, String> {
@@ -26,9 +26,8 @@ fn agent_build_from(
     current_exe: impl Fn() -> std::io::Result<PathBuf>,
     is_file: impl Fn(&Path) -> bool,
 ) -> Result<PathBuf, String> {
-    // Guest-reported names become a file name and a variable name.
-    let plain = |part: &str| !part.is_empty() && part.len() <= 32 && part.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
-    if !plain(&guest.os) || !plain(&guest.architecture) {
+    // Platform names become a file name and a variable name.
+    if !guest.is_plain() {
         return Err(format!("guest platform {guest:?} is not a lowercase OCI os/architecture pair"));
     }
     let binary = format!("drydock-agent-{}-{}", guest.os, guest.architecture);

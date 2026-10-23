@@ -11,7 +11,7 @@ fn checked_in_openapi_does_not_drift() {
 #[test]
 fn omitted_egress_denies_all() {
     let request: ProvisionRequest = serde_json::from_value(serde_json::json!({
-        "label": "env", "prepared": {"provider":"p", "id":"prepared",
+        "label": "env", "prepared": {"provider":"p", "id":"prepared", "platform": {"os":"linux","architecture":"amd64"},
         "image_digest":"sha256:image", "tools_digest":"sha256:tools"},
         "size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}
     }))

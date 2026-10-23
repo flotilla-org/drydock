@@ -128,7 +128,7 @@ fn hello_requires_exact_protocol_version() {
     let old =
         Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], loadable_modules: vec![], providers: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6.0.0", "6 "] {
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6", "6.0.0", "6 "] {
         let hello = Hello {
             protocol_version: version.into(),
             host_version: "test".into(),
@@ -170,11 +170,11 @@ fn exact_cost_roundtrips(tc: hegel::TestCase) {
     assert!(ResourceKind::Memory.accepts_unit("By.s"));
 }
 
-// Protocol 6 changes diagnostic field semantics and the permission-error mapping;
-// protocol-5 peers must not pass the exact handshake after that contract change.
+// Protocol 7 records the platform in every prepared form; protocol-6 peers
+// return prepared forms without one and must not pass the exact handshake.
 #[test]
-fn diagnostic_contract_requires_protocol_six() {
-    for (version, compatible) in [("5", false), ("6", true)] {
+fn prepared_platform_requires_protocol_seven() {
+    for (version, compatible) in [("6", false), ("7", true)] {
         let hello = Hello {
             protocol_version: version.into(),
             host_version: "test".into(),
@@ -183,5 +183,41 @@ fn diagnostic_contract_requires_protocol_six() {
             providers: vec![],
         };
         assert_eq!(hello.is_compatible(), compatible);
+    }
+}
+
+// The platform is recorded at prepare: prepared forms require it, requests and
+// environments may omit it, and capabilities without platforms decode as none.
+#[test]
+fn platform_wire_shapes() {
+    let amd64 = json!({"os": "linux", "architecture": "amd64"});
+    let size = json!({"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0});
+    fixture::<Prepared>(json!({"provider": "p", "id": "i", "platform": amd64, "image_digest": "image", "tools_digest": "tools"}));
+    assert!(
+        serde_json::from_value::<Prepared>(json!({"provider": "p", "id": "i", "image_digest": "image", "tools_digest": "tools"})).is_err()
+    );
+    fixture::<PrepareRequest>(json!({"size": size, "platform": amd64, "image_digest": "image", "tools_digest": "tools"}));
+    fixture::<PrepareRequest>(json!({"size": size, "image_digest": "image", "tools_digest": "tools"}));
+    let environment =
+        json!({"id": "e", "label": null, "provider": "p", "state": {"state": "running"}, "granted_size": null, "egress": "advisory"});
+    fixture::<Environment>(environment.clone());
+    let mut recorded = environment;
+    recorded["platform"] = amd64;
+    fixture::<Environment>(recorded);
+}
+
+// Platform names become agent build file and variable names, so decoding
+// accepts only plain lowercase OCI names; parsing takes os/architecture.
+#[test]
+fn platform_names_are_plain_oci_names() {
+    let platform = |os: &str, architecture: &str| serde_json::from_value::<Platform>(json!({"os": os, "architecture": architecture}));
+    assert_eq!(platform("linux", "arm64").unwrap(), Platform::new("linux", "arm64"));
+    for (os, architecture) in [("", "amd64"), ("Linux", "amd64"), ("linux", "../x"), ("linux", "amd 64"), ("linux", &"a".repeat(33))] {
+        assert!(platform(os, architecture).is_err(), "{os}/{architecture}");
+    }
+    assert_eq!("linux/amd64".parse::<Platform>().unwrap(), Platform::new("linux", "amd64"));
+    assert_eq!(Platform::new("linux", "amd64").to_string(), "linux/amd64");
+    for text in ["linux", "linux/", "/amd64", "Linux/amd64", "linux/amd64/v8"] {
+        assert!(text.parse::<Platform>().is_err(), "{text}");
     }
 }
