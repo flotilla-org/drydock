@@ -119,7 +119,7 @@ impl Agent {
     pub fn new(transport: Transport, fingerprint: String, executable: PathBuf) -> Self {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
-            hello: Hello { fingerprint, features: FEATURES.iter().map(|s| (*s).into()).collect() },
+            hello: Hello { fingerprint, features: FEATURES.iter().map(|s| (*s).into()).collect(), platform: Some(Platform::current()) },
             egress_system: crate::egress::System::default(),
             opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),

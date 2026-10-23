@@ -1,4 +1,4 @@
-use drydock_agent::{Agent, Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward};
+use drydock_agent::{Agent, Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward, Platform};
 use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -62,6 +62,7 @@ async fn control_contract_on_both_transports() {
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         assert_eq!(h.client.hello().fingerprint, "test-build");
+        assert_eq!(h.client.hello().platform, Some(Platform::current()));
         assert!(h.client.hello().features.contains(&"forwards".into()));
         for value in ["one", "two", ""] {
             let config = Configuration {
@@ -693,4 +694,83 @@ async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
         assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
         assert!(!unix.exists());
     }
+}
+
+// Guest stand-in at the HTTP boundary: serves a fixed hello body and counts
+// upgrade requests, so a test observes exactly what the host pushed.
+async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::{get, put};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (a, b) = tokio::io::duplex(4096);
+    let (host, guest) =
+        tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+    let mut guest = guest.unwrap();
+    let pushes = Arc::new(AtomicUsize::new(0));
+    let counted = pushes.clone();
+    let router = axum::Router::new().route("/hello", get(move || std::future::ready(axum::Json(hello.clone())))).route(
+        "/upgrade",
+        put(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(())
+        }),
+    );
+    tokio::spawn(async move {
+        while let Ok(Some(incoming)) = guest.accept().await {
+            tokio::spawn(drydock_transport::http2::serve(incoming, router.clone()));
+        }
+    });
+    (host.unwrap(), pushes)
+}
+
+// An agent that predates platform reporting sends no platform. The host cannot
+// know which build runs there, so it refuses without consulting its builds or
+// pushing anything; it never guesses the host's own platform.
+#[tokio::test]
+async fn hello_without_platform_is_refused_without_a_push() {
+    use std::sync::atomic::Ordering;
+    let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"]})).await;
+    let mut host = Some(host);
+    let mut consulted = false;
+    let error = Client::connect_current(
+        || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+        |_| {
+            consulted = true;
+            std::future::ready(Ok(b"current".to_vec()))
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .err()
+    .expect("a hello without platform cannot be upgraded");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("reports no platform"), "{error}");
+    assert!(!consulted);
+    assert_eq!(pushes.load(Ordering::SeqCst), 0);
+}
+
+// The resolver receives the guest's reported platform verbatim, and a failure
+// to supply that build is reported with the platform and pushes nothing.
+#[tokio::test]
+async fn missing_build_for_reported_platform_pushes_nothing() {
+    use std::sync::atomic::Ordering;
+    let hello =
+        serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "platform": {"os": "linux", "architecture": "riscv64"}});
+    let (host, pushes) = hello_only_guest(hello).await;
+    let mut host = Some(host);
+    let mut asked = vec![];
+    let error = Client::connect_current(
+        || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+        |platform| {
+            asked.push(platform);
+            std::future::ready(Err(std::io::Error::new(std::io::ErrorKind::NotFound, "install drydock-agent-linux-riscv64")))
+        },
+        Duration::from_secs(5),
+    )
+    .await
+    .err()
+    .expect("no build means no upgrade");
+    assert_eq!(asked, [Platform::new("linux", "riscv64")]);
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("guest platform linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");
+    assert_eq!(pushes.load(Ordering::SeqCst), 0);
 }

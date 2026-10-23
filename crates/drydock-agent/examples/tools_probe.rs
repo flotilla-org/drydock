@@ -1,6 +1,6 @@
 //! Stock-Ubuntu acceptance helper, built for the same architecture as the tools.
 //! Reads hello from the running agent; does not add a diagnostic flag to it.
-use drydock_agent::Client;
+use drydock_agent::{Client, Platform};
 use drydock_transport::{Limits, Transport, native::UnixConnections};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
@@ -17,7 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connections = Arc::new(UnixConnections::new(listener, &socket));
     let client = Client::connect_current(
         || std::future::ready(Transport::native(connections.clone(), Limits::default())),
-        &current,
+        |platform| {
+            // The probe and the agent come from the same image platform.
+            let result = if platform == Platform::current() {
+                Ok(current.clone())
+            } else {
+                Err(std::io::Error::other(format!("agent reports {platform}, probe is {}", Platform::current())))
+            };
+            std::future::ready(result)
+        },
         Duration::from_secs(30),
     )
     .await?;
