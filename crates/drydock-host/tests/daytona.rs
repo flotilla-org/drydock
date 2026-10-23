@@ -514,10 +514,14 @@ async fn lifecycle_and_credential_modes() {
         assert_eq!(output, "guest output");
         assert!(http.0.lock().unwrap().executed.last().unwrap().contains("'one'\\''; touch /bad'"));
         for expected in ["ephemeral-1", "ephemeral-2"] {
-            let Connection::Ssh { user, endpoint, .. } = p.reach(&id, &c).await.unwrap() else { panic!("SSH recipe required") };
+            let Connection::Ssh { user, endpoint, reverse_forwards, .. } = p.reach(&id, &c).await.unwrap() else {
+                panic!("SSH recipe required")
+            };
             assert_eq!(user.expose(), expected);
+            // Daytona's gateway refuses remote port forwarding.
+            assert!(!reverse_forwards);
             assert_eq!(endpoint, "ssh.app.daytona.io:22");
-            let recipe = Reach::Ssh { user, endpoint, host_key: "key".into() };
+            let recipe = Reach::Ssh { user, endpoint, host_key: "key".into(), reverse_forwards };
             assert!(!format!("{recipe:?}").contains(expected));
         }
         let quota = ops.quota.unwrap().quota(&c).await.unwrap();

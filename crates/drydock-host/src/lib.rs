@@ -1085,7 +1085,7 @@ async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
             url.path_segments_mut().expect("base URL").extend(["v1", "providers", &p, "environments", &environment, "relay"]);
             Reach::Relay { path: url.path().into() }
         }
-        Connection::Ssh { endpoint, user, host_key } => Reach::Ssh { endpoint, user, host_key },
+        Connection::Ssh { endpoint, user, host_key, reverse_forwards } => Reach::Ssh { endpoint, user, host_key, reverse_forwards },
         Connection::Dial { url, token, expires_at } => Reach::Dial { url, token, expires_at },
     };
     Ok(Json(reach))

@@ -69,8 +69,18 @@ pub enum Provisioned {
     Existing(ObservedEnvironment),
 }
 pub enum Connection {
-    Ssh { endpoint: String, user: Secret, host_key: String },
-    Dial { url: String, token: Secret, expires_at: Timestamp },
+    /// `reverse_forwards`: whether the SSH server accepts remote Unix-socket forwards.
+    Ssh {
+        endpoint: String,
+        user: Secret,
+        host_key: String,
+        reverse_forwards: bool,
+    },
+    Dial {
+        url: String,
+        token: Secret,
+        expires_at: Timestamp,
+    },
     Relay,
 }
 

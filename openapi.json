@@ -2486,6 +2486,10 @@
                   "ssh"
                 ]
               },
+              "reverse_forwards": {
+                "type": "boolean",
+                "description": "Whether this SSH server accepts remote (reverse) Unix-socket forwards.\nWhen it does, guest-to-host streams get their own SSH channels; when it\ndoesn't (Daytona's gateway), they share a link through the local forward."
+              },
               "user": {
                 "$ref": "#/components/schemas/Secret",
                 "description": "May contain a short-lived gateway token; always redact diagnostics."

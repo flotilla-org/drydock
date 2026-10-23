@@ -21,12 +21,16 @@ fn tagged_wire_fixtures() {
         fixture::<Observation>(value);
     }
     for value in [
-        json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"}),
+        json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":true}),
+        json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":false}),
         json!({"kind":"dial","url":"wss://h","token":"secret","expires_at":"2026-10-19T00:00:00Z"}),
         json!({"kind":"relay","path":"/relay"}),
     ] {
         fixture::<Reach>(value);
     }
+    // A host that says nothing about reverse forwards gets the capable default.
+    let reach: Reach = serde_json::from_value(json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"})).unwrap();
+    assert!(matches!(reach, Reach::Ssh { reverse_forwards: true, .. }));
     for value in [
         json!({"mode":"open"}),
         json!({"mode":"deny_all","direct":[]}),

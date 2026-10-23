@@ -189,9 +189,12 @@ impl Provider for Reference {
         self.check()?;
         self.find(id)?;
         Ok(match &self.settings.reach {
-            Some(Reach::Ssh { endpoint, user, host_key }) => {
-                Connection::Ssh { endpoint: endpoint.clone(), user: user.clone(), host_key: host_key.clone() }
-            }
+            Some(Reach::Ssh { endpoint, user, host_key, reverse_forwards }) => Connection::Ssh {
+                endpoint: endpoint.clone(),
+                user: user.clone(),
+                host_key: host_key.clone(),
+                reverse_forwards: *reverse_forwards,
+            },
             Some(Reach::Dial { url, token, expires_at }) => {
                 Connection::Dial { url: url.clone(), token: token.clone(), expires_at: expires_at.clone() }
             }

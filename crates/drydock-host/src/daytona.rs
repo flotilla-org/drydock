@@ -677,6 +677,8 @@ impl Provider for Daytona {
             endpoint: self.settings.ssh_endpoint.clone(),
             user: Secret::new(text(&v, "token")?),
             host_key: self.settings.ssh_host_key.clone(),
+            // The gateway refuses remote port forwarding.
+            reverse_forwards: false,
         })
     }
     async fn relay(&self, _: &str, _: &Credentials) -> Result<ByteStream> {

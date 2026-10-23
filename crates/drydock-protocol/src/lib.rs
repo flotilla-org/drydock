@@ -280,6 +280,9 @@ pub struct Environment {
     pub granted_size: Option<Size>,
     pub egress: Enforcement,
 }
+fn accepts_reverse_forwards() -> bool {
+    true
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reach {
@@ -288,6 +291,11 @@ pub enum Reach {
         /// May contain a short-lived gateway token; always redact diagnostics.
         user: Secret,
         host_key: String,
+        /// Whether this SSH server accepts remote (reverse) Unix-socket forwards.
+        /// When it does, guest-to-host streams get their own SSH channels; when it
+        /// doesn't (Daytona's gateway), they share a link through the local forward.
+        #[serde(default = "accepts_reverse_forwards")]
+        reverse_forwards: bool,
     },
     Dial {
         url: String,

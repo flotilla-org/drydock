@@ -16,7 +16,7 @@ pub struct SshCommand {
 impl SshCommand {
     pub fn new(session: Session) -> Result<Self, String> {
         let (endpoint, user, host_key) = match session.reach {
-            Reach::Ssh { endpoint, user, host_key } => (endpoint, user, host_key),
+            Reach::Ssh { endpoint, user, host_key, .. } => (endpoint, user, host_key),
             Reach::Dial { .. } => return Err("shell over Dial needs the vessel agent; only SSH is available yet".into()),
             Reach::Relay { .. } => return Err("shell over Relay needs the vessel agent; only SSH is available yet".into()),
         };
@@ -89,7 +89,12 @@ mod tests {
     fn ssh_recipe_is_pinned_and_arguments_are_separate() {
         for endpoint in ["gateway.example:2222", "[::1]:22"] {
             let command = SshCommand::new(Session {
-                reach: Reach::Ssh { endpoint: endpoint.into(), user: Secret::new("gateway-user"), host_key: "ssh-ed25519 AAAAtest".into() },
+                reach: Reach::Ssh {
+                    endpoint: endpoint.into(),
+                    user: Secret::new("gateway-user"),
+                    host_key: "ssh-ed25519 AAAAtest".into(),
+                    reverse_forwards: true,
+                },
                 identity_file: "/private/key".into(),
             })
             .unwrap();
@@ -103,7 +108,12 @@ mod tests {
         for endpoint in ["-oProxyCommand=bad:22", "host\nother:22", "host:0", "host:70000", "host"] {
             assert!(
                 SshCommand::new(Session {
-                    reach: Reach::Ssh { endpoint: endpoint.into(), user: Secret::new("u"), host_key: "ssh-ed25519 key".into() },
+                    reach: Reach::Ssh {
+                        endpoint: endpoint.into(),
+                        user: Secret::new("u"),
+                        host_key: "ssh-ed25519 key".into(),
+                        reverse_forwards: true
+                    },
                     identity_file: "key".into()
                 })
                 .is_err()

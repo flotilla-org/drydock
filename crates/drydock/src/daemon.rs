@@ -336,12 +336,12 @@ impl Daemon {
         let masker = std::sync::Mutex::new(DiagnosticMasker::default());
         let open = || async {
             let reach = client.reach(provider, &environment.id).await.map_err(|e| std::io::Error::other(format!("agent reach: {e}")))?;
-            let Reach::Ssh { endpoint, user, host_key } = reach else {
+            let Reach::Ssh { endpoint, user, host_key, reverse_forwards } = reach else {
                 return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "agent hello requires an SSH reach"));
             };
             masker.lock().unwrap().remember(user.expose());
             drydock_transport::ssh::connect(
-                agent_ssh(&endpoint, user.expose(), host_key, identity.clone())?,
+                agent_ssh(&endpoint, user.expose(), host_key, identity.clone(), reverse_forwards)?,
                 drydock_transport::Limits::default(),
             )
             .await
@@ -674,7 +674,16 @@ impl Daemon {
 // Guest-to-host streams ride the host's link through the local forward. That
 // works whether or not the server grants remote Unix-socket forwards, and
 // Daytona's SSH gateway does not.
-fn agent_ssh(endpoint: &str, user: &str, host_key: String, identity: PathBuf) -> std::io::Result<drydock_transport::ssh::SshConfig> {
+/// The agent link follows what the provider's SSH server accepts: guest-to-host
+/// streams get their own channels through a reverse forward to the agent's fixed
+/// host socket, unless the provider declares that its server refuses reverse forwards.
+fn agent_ssh(
+    endpoint: &str,
+    user: &str,
+    host_key: String,
+    identity: PathBuf,
+    reverse_forwards: bool,
+) -> std::io::Result<drydock_transport::ssh::SshConfig> {
     let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| std::io::Error::other("invalid SSH endpoint"))?;
     Ok(drydock_transport::ssh::SshConfig {
         connect_timeout: Duration::from_secs(10),
@@ -684,7 +693,11 @@ fn agent_ssh(endpoint: &str, user: &str, host_key: String, identity: PathBuf) ->
         host_key,
         identity_file: identity,
         agent_socket: "/run/drydock/agent.sock".into(),
-        guest_streams: drydock_transport::ssh::GuestStreams::OverLocalForward,
+        guest_streams: if reverse_forwards {
+            drydock_transport::ssh::GuestStreams::ReverseForward("/run/drydock/host.sock".into())
+        } else {
+            drydock_transport::ssh::GuestStreams::OverLocalForward
+        },
     })
 }
 
@@ -845,6 +858,15 @@ mod agent_readiness_tests {
         assert!(message.contains("last error: SSH forwarding rejected: remote port forwarding failed"), "{message}");
         assert!(!message.contains("minted-gateway-token"), "{message}");
     }
+    // The provider's declaration picks the layout: reverse forwards are the
+    // default, and only a provider whose server refuses them shares the local forward.
+    #[test]
+    fn agent_link_layout_follows_the_reach_declaration() {
+        use drydock_transport::ssh::GuestStreams;
+        let config = |reverse| agent_ssh("gw.example:22", "u", "ssh-ed25519 AAAA".into(), "/k".into(), reverse).unwrap().guest_streams;
+        assert_eq!(config(true), GuestStreams::ReverseForward("/run/drydock/host.sock".into()));
+        assert_eq!(config(false), GuestStreams::OverLocalForward);
+    }
     // The agent reach path against an OpenSSH server that, like Daytona's
     // gateway, refuses remote Unix-socket forwards. The agent listens with its
     // fixed native transport and its guest-to-host socket never appears; hello
@@ -864,7 +886,8 @@ mod agent_readiness_tests {
         let (sshd_config, mut server) =
             sshd::start(dir.path(), &agent_socket, drydock_transport::ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
         let endpoint = format!("{}:{}", sshd_config.host, sshd_config.port);
-        let mut config = agent_ssh(&endpoint, &sshd_config.user, sshd_config.host_key.clone(), sshd_config.identity_file.clone()).unwrap();
+        let mut config =
+            agent_ssh(&endpoint, &sshd_config.user, sshd_config.host_key.clone(), sshd_config.identity_file.clone(), false).unwrap();
         config.agent_socket = agent_socket;
         let client = wait_for_agent(
             || drydock_transport::ssh::connect(config.clone(), Default::default()),
