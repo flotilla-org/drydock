@@ -1,6 +1,7 @@
-//! OpenSSH local/remote Unix-socket forwards. Each stream gets an independent
-//! SSH channel. OpenSSH must be on PATH; the caller supplies an explicit key file
-//! and the reach recipe's host public key. No ambient SSH configuration is read.
+//! OpenSSH Unix-socket forwards. With a reverse forward each stream gets an
+//! independent SSH channel; without one, streams share a yamux connection over
+//! the local forward. OpenSSH must be on PATH; the caller supplies an explicit
+//! key file and the reach recipe's host public key. No ambient SSH configuration is read.
 use crate::{ByteStream, Connections, Limits, Transport, native::UnixConnections};
 use async_trait::async_trait;
 use std::{
@@ -12,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    net::UnixListener,
+    net::{UnixListener, UnixStream},
     process::Command,
     sync::{oneshot, watch},
 };
@@ -28,8 +29,19 @@ pub struct SshConfig {
     pub host_key: String,
     pub identity_file: PathBuf,
     pub agent_socket: PathBuf,
-    /// A unique per-vessel path created on the guest by the remote forward.
-    pub reverse_socket: PathBuf,
+    pub guest_streams: GuestStreams,
+}
+
+/// How streams the guest opens reach the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuestStreams {
+    /// A remote forward from this unique per-vessel guest path to a private host
+    /// listener. Every stream, in either direction, gets its own SSH channel.
+    ReverseForward(PathBuf),
+    /// No remote forward, for servers that refuse one (Daytona's SSH gateway).
+    /// The host opens one yamux connection through the local forward and streams
+    /// in both directions share it; the agent opens its streams on that link.
+    OverLocalForward,
 }
 
 /// Starts and owns one SSH session. Local temporary files and the process are
@@ -56,12 +68,14 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         tokio::task::spawn_blocking(|| tempfile::Builder::new().prefix("dd-ssh-").tempdir_in("/tmp")).await.map_err(io::Error::other)??;
     let incoming_path = dir.path().join("in");
     let outgoing_path = dir.path().join("out");
-    let listener = UnixListener::bind(&incoming_path)?;
+    let reverse = match &config.guest_streams {
+        GuestStreams::ReverseForward(guest) => Some((UnixListener::bind(&incoming_path)?, forward(guest, &incoming_path)?)),
+        GuestStreams::OverLocalForward => None,
+    };
     let known_hosts = dir.path().join("known_hosts");
     tokio::fs::write(&known_hosts, format!("drydock-vessel {}\n", config.host_key)).await?;
     let control = dir.path().join("master");
     let local = forward(&outgoing_path, &config.agent_socket)?;
-    let remote = forward(&config.reverse_socket, &incoming_path)?;
     let mut child = Command::new("ssh")
         .args([
             "-F",
@@ -119,27 +133,24 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     tokio::time::timeout(config.connect_timeout, async {
         loop {
             if let Some(status) = child.try_wait()? {
-                return Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("SSH exited ({status}): {}", stderr.text())));
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    format!("SSH exited ({status}): {}", redact(&one_line(stderr.text().as_bytes()), &config.user)),
+                ));
             }
             if tokio::fs::try_exists(&control).await? {
                 // The multiplexing control command waits for the remote forward
                 // acknowledgement. Local socket existence alone is not readiness.
-                let output = Command::new("ssh")
-                    .args(["-F", "/dev/null", "-S"])
-                    .arg(&control)
-                    .args(["-O", "forward", "-L"])
-                    .arg(&local)
-                    .arg("-R")
-                    .arg(&remote)
-                    .arg(&config.host)
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .output()
-                    .await?;
+                let mut request = Command::new("ssh");
+                request.args(["-F", "/dev/null", "-S"]).arg(&control).args(["-O", "forward", "-L"]).arg(&local);
+                if let Some((_, remote)) = &reverse {
+                    request.arg("-R").arg(remote);
+                }
+                let output = request.arg(&config.host).stdin(Stdio::null()).kill_on_drop(true).output().await?;
                 if !output.status.success() {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
-                        format!("SSH forwarding rejected: {}", String::from_utf8_lossy(&output.stderr)),
+                        format!("SSH forwarding rejected: {}", redact(&one_line(&output.stderr), &config.user)),
                     ));
                 }
                 return Ok(());
@@ -165,8 +176,26 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
         // Reap the owned child before removing its private socket directory.
         let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
     });
-    let connections = SshConnections { native: UnixConnections::new(listener, outgoing_path), status, stop: Some(stop) };
-    Transport::native(Arc::new(connections), limits)
+    let session = Session { status, stop: Some(stop) };
+    match reverse {
+        Some((listener, _)) => {
+            Transport::native(Arc::new(SshConnections { native: UnixConnections::new(listener, outgoing_path), session }), limits)
+        }
+        None => {
+            // The SSH channel opens when the local forward is dialled. If the
+            // guest socket is absent, OpenSSH closes this stream, so callers see
+            // the failure on their first request rather than here.
+            let stream = UnixStream::connect(&outgoing_path).await?;
+            Transport::yamux(Box::new(SessionStream { stream, _session: session }), true, limits).await
+        }
+    }
+}
+fn one_line(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr).lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join("; ")
+}
+// The user can be a bearer credential (Daytona mints the gateway username).
+fn redact(text: &str, user: &str) -> String {
+    text.replace(user, "<ssh user>")
 }
 fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<String> {
     // OpenSSH parses ':' separators itself; reject ambiguous relative paths and
@@ -179,32 +208,63 @@ fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<Stri
     };
     Ok(format!("{}:{}", path(local)?, path(remote)?))
 }
-struct SshConnections {
-    native: UnixConnections,
+/// Dropping the session stops the SSH process; the monitor then reaps it.
+struct Session {
     status: watch::Receiver<bool>,
     stop: Option<oneshot::Sender<()>>,
 }
-impl Drop for SshConnections {
+impl Drop for Session {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
     }
 }
+struct SshConnections {
+    native: UnixConnections,
+    session: Session,
+}
 #[async_trait]
 impl Connections for SshConnections {
     async fn connect(&self) -> io::Result<ByteStream> {
-        if *self.status.borrow() {
+        if *self.session.status.borrow() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected"));
         }
         self.native.connect().await
     }
     async fn accept(&self) -> io::Result<ByteStream> {
-        let mut status = self.status.clone();
+        let mut status = self.session.status.clone();
         tokio::select! {
             result = self.native.accept() => result,
             _ = status.wait_for(|ended| *ended) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected")),
         }
+    }
+}
+
+/// The yamux link's only connection owns the SSH session: the transport's
+/// driver drops it when the transport closes. SSH exit ends the stream.
+struct SessionStream {
+    stream: UnixStream,
+    _session: Session,
+}
+impl tokio::io::AsyncRead for SessionStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+impl tokio::io::AsyncWrite for SessionStream {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 

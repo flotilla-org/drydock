@@ -1110,6 +1110,10 @@
           "quota"
         ],
         "properties": {
+          "agent": {
+            "type": "boolean",
+            "description": "Vessels run the drydock agent from the tools image. Launch reports\nsuccess only after the agent's current hello over the SSH reach."
+          },
           "bootstrap": {
             "$ref": "#/components/schemas/BootstrapRoute"
           },

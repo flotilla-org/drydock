@@ -143,6 +143,10 @@ pub struct Capabilities {
     pub egress: EgressCapability,
     pub fallback_runner: bool,
     pub bootstrap: BootstrapRoute,
+    /// Vessels run the drydock agent from the tools image. Launch reports
+    /// success only after the agent's current hello over the SSH reach.
+    #[serde(default)]
+    pub agent: bool,
     pub usage: bool,
     pub quota: bool,
 }

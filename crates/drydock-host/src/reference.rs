@@ -36,6 +36,9 @@ struct ReferenceSettings {
     fixture_bad_relay: bool,
     #[serde(default)]
     reach: Option<Reach>,
+    /// Declare that vessels run the drydock agent (no guest exists here).
+    #[serde(default)]
+    agent: bool,
     #[serde(default)]
     rate_limits: Vec<RateLimit>,
     #[serde(default = "default_poll_interval")]
@@ -104,6 +107,7 @@ impl Provider for Reference {
             egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::Open], enforcement: Enforcement::Advisory },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,
+            agent: self.settings.agent,
             usage: true,
             quota: true,
         }

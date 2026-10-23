@@ -303,7 +303,11 @@ Toolbox bootstrap has a 25-second execution budget; ordinary exec/probes get
 `drydockd` waits up to 60 seconds for the agent's `Client::connect_current`
 handshake over the SSH gateway before returning launch success. It uses the
 installed sibling `drydock-agent` (override `DRYDOCK_AGENT_BIN`) to upgrade an
-older tools agent and verifies its current hello. A failed bootstrap leaves a labelled
+older tools agent and verifies its current hello. The gateway refuses remote
+Unix-socket forwards, so the link uses only a local forward to the agent socket,
+and guest-to-host streams share that connection. If the handshake never succeeds,
+launch fails with the last attempt's error (SSH user redacted), and `drydockd`
+logs each failed attempt to stderr. A failed bootstrap leaves a labelled
 resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
 resource; size or egress mismatches (including missing policy evidence) are refused
 with guidance to use a new label. They never change the existing resource's policy.

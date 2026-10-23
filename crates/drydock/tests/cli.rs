@@ -487,3 +487,42 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     drop(daemon);
     task.abort();
 }
+
+// Launch waits for the agent hello because the provider declares that its
+// vessels run the agent, whatever its module. The reference module has no
+// guest, so a declaring provider must fail launch naming the agent, while an
+// identical provider that does not declare it launches as before.
+#[tokio::test]
+async fn launch_waits_for_agent_hello_only_when_declared() {
+    if drydock::launch::build_tools_digest().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, task) = reference(dir.path()).await;
+    let image = format!("image@sha256:{}", "a".repeat(64));
+    let text = format!(
+        "[provider.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n\
+         [provider.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{agent=true}}\n"
+    );
+    let run = dir.path().join("run");
+    let daemon = Daemon::start(
+        Config::parse(&text).unwrap(),
+        &run,
+        run.join("keys"),
+        vec![HostOption { optional: false, name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
+    )
+    .await
+    .unwrap();
+    let hello = Client::unix(&socket).unwrap().hello().await.unwrap();
+    let declares = |name: &str| hello.providers.iter().find(|p| p.provider == name).unwrap().capabilities.agent;
+    assert_eq!((declares("plain"), declares("agent")), (false, true));
+    daemon.launch("plain", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), daemon.launch("agent", &drydock::launch::LaunchOptions::default()))
+        .await
+        .expect("a reach without SSH is refused at once, not retried")
+        .err()
+        .unwrap();
+    let message = error.to_string();
+    assert!(message.contains("drydock-agent") || message.contains("agent hello requires an SSH reach"), "{message}");
+    task.abort();
+}

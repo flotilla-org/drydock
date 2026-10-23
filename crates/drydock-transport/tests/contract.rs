@@ -13,6 +13,7 @@ use tokio::{
 enum Kind {
     Unix,
     Ssh,
+    SshGateway,
     Yamux,
 }
 struct Pair {
@@ -64,65 +65,31 @@ async fn pair(kind: Kind) -> Pair {
             let guest = Transport::native(Arc::new(UnixConnections::new(listener, rp)), Limits::default()).unwrap();
             (host, guest)
         }
+        Kind::SshGateway => {
+            // The agent's native listener, with a guest-to-host socket that
+            // never exists: the gateway cannot create it.
+            let gp = dir.path().join("guest");
+            let listener = UnixListener::bind(&gp).unwrap();
+            let guest = Transport::native(Arc::new(UnixConnections::new(listener, dir.path().join("absent"))), Limits::default()).unwrap();
+            let (config, child) = sshd::start(dir.path(), &gp, ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
+            tasks.push(tokio::spawn(async move {
+                let mut child = child;
+                let _ = child.wait().await;
+            }));
+            let host = ssh::connect(config, Limits::default()).await.unwrap();
+            let mut guest = guest;
+            // Guest-to-host streams ride the host's link, so they can start only
+            // once the guest has accepted it, as the agent does after a request.
+            transfer(&host, &mut guest, Purpose::Control, b"link").await;
+            (host, guest)
+        }
     };
     Pair { host, guest, _dir: dir, tasks }
 }
-// Real OpenSSH test server at the provider boundary, with disposable host and
-// user keys. It runs as the current user and never reads ambient SSH config.
+#[path = "support/sshd.rs"]
+mod sshd;
 async fn ssh_server(dir: &std::path::Path, guest: &str, reverse: &str) -> (ssh::SshConfig, tokio::process::Child) {
-    use std::process::Stdio;
-    use tokio::process::Command;
-    for name in ["host_key", "user_key"] {
-        let result = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(dir.join(name))
-            .status()
-            .await
-            .expect("install openssh-client: ssh-keygen is required by the SSH contract tests");
-        assert!(result.success());
-    }
-    let user = Command::new("id").arg("-un").output().await.unwrap();
-    let user = String::from_utf8(user.stdout).unwrap().trim().to_owned();
-    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = socket.local_addr().unwrap().port();
-    drop(socket);
-    let config_path = dir.join("sshd_config");
-    std::fs::write(&config_path, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPidFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin yes\nAllowUsers {user}\nAllowStreamLocalForwarding yes\nStreamLocalBindUnlink yes\n", dir.join("host_key").display(), dir.join("user_key.pub").display(), dir.join("sshd.pid").display())).unwrap();
-    let sshd = std::env::var("DRYDOCK_TEST_SSHD").unwrap_or_else(|_| "/usr/sbin/sshd".into());
-    let log = std::fs::File::create(dir.join("sshd.log")).unwrap();
-    let mut child = Command::new(sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(config_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log)
-        .kill_on_drop(true)
-        .spawn()
-        .expect("install openssh-server or set DRYDOCK_TEST_SSHD");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            assert!(child.try_wait().unwrap().is_none(), "sshd exited: {}", std::fs::read_to_string(dir.join("sshd.log")).unwrap());
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    (
-        ssh::SshConfig {
-            connect_timeout: Duration::from_secs(5),
-            host: "127.0.0.1".into(),
-            port,
-            user,
-            host_key: std::fs::read_to_string(dir.join("host_key.pub")).unwrap().trim().into(),
-            identity_file: dir.join("user_key"),
-            agent_socket: guest.into(),
-            reverse_socket: reverse.into(),
-        },
-        child,
-    )
+    sshd::start(dir, guest.as_ref(), ssh::GuestStreams::ReverseForward(reverse.into()), sshd::Forwarding::Both).await
 }
 fn purposes() -> Vec<Purpose> {
     vec![Purpose::Control, Purpose::Forward { id: "crew/α".into() }, Purpose::Forward { id: "service".into() }]
@@ -203,9 +170,11 @@ macro_rules! contract {
 }
 contract!(unix_routes, Kind::Unix, routing_contract);
 contract!(ssh_routes, Kind::Ssh, routing_contract);
+contract!(ssh_gateway_routes, Kind::SshGateway, routing_contract);
 contract!(yamux_routes, Kind::Yamux, routing_contract);
 contract!(unix_isolation, Kind::Unix, isolation_contract);
 contract!(ssh_isolation, Kind::Ssh, isolation_contract);
+contract!(ssh_gateway_isolation, Kind::SshGateway, isolation_contract);
 contract!(yamux_isolation, Kind::Yamux, isolation_contract);
 
 // Generated operation sequences exercise both opening directions and every
@@ -225,7 +194,7 @@ fn generated_bidirectional_routes(tc: hegel::TestCase) {
         .collect();
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         tokio::time::timeout(Duration::from_secs(20), async {
-            for kind in [Kind::Unix, Kind::Ssh, Kind::Yamux] {
+            for kind in [Kind::Unix, Kind::Ssh, Kind::SshGateway, Kind::Yamux] {
                 let mut p = pair(kind).await;
                 for &(reverse, tag, length) in &operations {
                     let purpose = purposes()[tag].clone();
@@ -311,6 +280,7 @@ async fn concurrent_contract(kind: Kind) {
 }
 contract!(unix_concurrent, Kind::Unix, concurrent_contract);
 contract!(ssh_concurrent, Kind::Ssh, concurrent_contract);
+contract!(ssh_gateway_concurrent, Kind::SshGateway, concurrent_contract);
 contract!(yamux_concurrent, Kind::Yamux, concurrent_contract);
 
 // The reach recipe pins the host key and the vessel identity key. An unknown
@@ -657,7 +627,7 @@ async fn ssh_rejects_host_key_options_and_markers() {
             host_key: key.into(),
             identity_file: "/nonexistent-drydock-identity".into(),
             agent_socket: "/tmp/unused-agent".into(),
-            reverse_socket: "/tmp/unused-reverse".into(),
+            guest_streams: ssh::GuestStreams::ReverseForward("/tmp/unused-reverse".into()),
         };
         let error = ssh::connect(config, Limits { header_timeout: Duration::from_millis(20), ..Limits::default() }).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
@@ -672,9 +642,9 @@ async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
     let guest = dir.path().join("guest");
     let reverse = dir.path().join("reverse");
     let (mut config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
-    config.reverse_socket = dir.path().join("missing-directory/reverse");
+    config.guest_streams = ssh::GuestStreams::ReverseForward(dir.path().join("missing-directory/reverse"));
     assert_eq!(ssh::connect(config.clone(), Limits::default()).await.err().unwrap().kind(), io::ErrorKind::ConnectionAborted);
-    config.reverse_socket = reverse.clone();
+    config.guest_streams = ssh::GuestStreams::ReverseForward(reverse.clone());
     let transport = ssh::connect(config, Limits::default()).await.unwrap();
     assert!(UnixStream::connect(reverse).await.is_ok());
     drop(transport);
@@ -717,5 +687,47 @@ async fn ssh_setup_timeout_is_independent_of_raw_headers() {
     config.connect_timeout = Duration::from_millis(50);
     let error = tokio::time::timeout(Duration::from_secs(2), ssh::connect(config, Limits::default())).await.unwrap().err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    server.kill().await.unwrap();
+}
+
+// A gateway that refuses remote Unix-socket forwards (Daytona's) rejects the
+// reverse-forward arrangement with OpenSSH's own reason, never the SSH user,
+// which can be a minted access token. The same reach works without one.
+#[tokio::test]
+async fn ssh_gateway_refuses_reverse_forward_with_a_redacted_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("guest");
+    let reverse = dir.path().join("reverse");
+    let _listener = UnixListener::bind(&guest).unwrap();
+    let (mut config, mut server) =
+        sshd::start(dir.path(), &guest, ssh::GuestStreams::ReverseForward(reverse.clone()), sshd::Forwarding::Gateway).await;
+    let error = ssh::connect(config.clone(), Limits::default()).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    let message = error.to_string();
+    assert!(message.contains("remote port forwarding failed for listen path"), "{message}");
+    assert!(!message.contains(&config.user), "{message}");
+    assert!(!reverse.exists());
+    config.guest_streams = ssh::GuestStreams::OverLocalForward;
+    drop(ssh::connect(config, Limits::default()).await.unwrap());
+    server.kill().await.unwrap();
+}
+
+// Without a reverse forward the link's one connection owns the SSH session:
+// dropping the transport ends the session, closing the guest's end of the link.
+#[tokio::test]
+async fn ssh_gateway_transport_drop_closes_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let guest = dir.path().join("guest");
+    let listener = UnixListener::bind(&guest).unwrap();
+    let (config, mut server) = sshd::start(dir.path(), &guest, ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
+    let transport = ssh::connect(config, Limits::default()).await.unwrap();
+    let (mut link, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    assert_eq!(drydock_transport::read_connection_kind(&mut link).await.unwrap(), drydock_transport::ConnectionKind::Yamux);
+    drop(transport);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), link.read_to_end(&mut rest))
+        .await
+        .expect("SSH session must end after transport drop")
+        .ok();
     server.kill().await.unwrap();
 }

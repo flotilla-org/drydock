@@ -31,17 +31,24 @@ fn supervisor(socket: &Path) -> ProcessGroup {
             .unwrap(),
     )
 }
-fn agents(socket: &Path) -> Vec<i32> {
-    let suffix = format!("--socket\0{}\0", socket.display());
-    std::fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse().ok()?;
-            let command = std::fs::read(entry.path().join("cmdline")).ok()?;
-            let command = String::from_utf8_lossy(&command);
-            (command.ends_with(&suffix) && !command.contains("--supervisor") && !command.contains("--supervise\0")).then_some(pid)
+// Every process's PID and space-joined argv, from ps rather than /proc so the
+// listing (and cleanup that depends on it) also works off Linux.
+fn processes() -> Vec<(i32, String)> {
+    let output = Command::new("ps").args(["-axww", "-o", "pid=,command="]).output().expect("ps lists processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, command) = line.trim_start().split_once(' ')?;
+            Some((pid.parse().ok()?, command.trim().to_owned()))
         })
+        .collect()
+}
+fn agents(socket: &Path) -> Vec<i32> {
+    let suffix = format!("--socket {}", socket.display());
+    processes()
+        .into_iter()
+        .filter(|(_, command)| command.ends_with(&suffix) && !command.contains("--supervisor ") && !command.contains("--supervise "))
+        .map(|(pid, _)| pid)
         .collect()
 }
 async fn hello(socket: &Path) -> String {
@@ -108,22 +115,16 @@ async fn singleton_recovers_after_crash_and_start_resume() {
 // Two invocations must return and leave one supervisor and one helloing agent.
 #[tokio::test]
 async fn public_bootstrap_detaches_without_guest_packages() {
+    // Runs even when an assertion fails, so detached supervisors never outlive
+    // the test and hold its output pipe open.
     struct Detached(std::path::PathBuf);
     impl Drop for Detached {
         fn drop(&mut self) {
-            for entry in std::fs::read_dir("/proc").unwrap().flatten() {
-                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-                    continue;
-                };
-                let Ok(command) = std::fs::read(entry.path().join("cmdline")) else {
-                    continue;
-                };
-                let command = String::from_utf8_lossy(&command);
-                if command.contains("--supervisor\0") && command.ends_with(&format!("{}\0", self.0.display())) {
-                    // SAFETY: supervisor uses setsid; its child shares this group.
-                    unsafe {
-                        libc::kill(-pid, libc::SIGKILL);
-                    }
+            let suffix = format!("--supervisor --socket {}", self.0.display());
+            for (pid, _) in processes().into_iter().filter(|(_, command)| command.ends_with(&suffix)) {
+                // SAFETY: supervisor uses setsid; its child shares this group.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
                 }
             }
         }

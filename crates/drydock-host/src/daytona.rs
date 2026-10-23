@@ -474,6 +474,7 @@ impl Provider for Daytona {
             },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,
+            agent: true,
             usage: true,
             quota: true,
         }
