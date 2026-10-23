@@ -22,7 +22,13 @@ async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
     let binary = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match Client::connect_current(|| ssh::connect(config.clone(), Limits::default()), &binary, Duration::from_secs(5)).await {
+            match Client::connect_current(
+                || ssh::connect(config.clone(), Limits::default()),
+                |_| std::future::ready(Ok(binary.clone())),
+                Duration::from_secs(5),
+            )
+            .await
+            {
                 Ok(client) => return client,
                 // The agent may not have bound its socket yet.
                 Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
