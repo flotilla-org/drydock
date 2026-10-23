@@ -1,8 +1,13 @@
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward};
+use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward, Platform};
 use drydock_transport::{Limits, Transport};
 use sha2::{Digest, Sha256};
 use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 use tokio::{net::UnixStream, process::Command};
+/// A Linux platform whose build the test process cannot be running.
+fn foreign() -> Platform {
+    let current = Platform::current();
+    Platform::new("linux", if current.os == "linux" && current.architecture == "amd64" { "arm64" } else { "amd64" })
+}
 async fn connect(socket: &Path, expected: &str) -> Client {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -284,6 +289,8 @@ fn assert_mismatch<T>(result: std::io::Result<T>) {
 // A checked-in tools pin can predate the host. The normal handshake must push
 // the current binary on mismatched hello, re-exec in place, and return a usable
 // client only after the new hello. A matching pin must not rewrite rollback.
+// The host holds a build per guest platform; the guest's hello picks the one
+// pushed. The foreign platform's "build" exits at once, so pushing it fails.
 #[tokio::test]
 async fn older_tools_pin_is_upgraded_during_connect() {
     let dir = tempfile::tempdir().unwrap();
@@ -308,6 +315,7 @@ async fn older_tools_pin_is_upgraded_during_connect() {
                 let stream = UnixStream::connect(&socket).await?;
                 Transport::yamux(Box::new(stream), true, Limits::default()).await
             },
+            &Platform::current(),
             &current,
             Duration::from_secs(10),
         )
@@ -344,6 +352,7 @@ async fn upgrade_timeout_reports_the_last_hello_fingerprint() {
             let stream = UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
+        &Platform::current(),
         b"not an executable",
         Duration::from_secs(3),
     )
@@ -384,6 +393,7 @@ async fn upgrade_timeout_reports_the_last_transport_error() {
             let stream = UnixStream::connect(&socket).await?;
             Transport::yamux(Box::new(stream), true, Limits::default()).await
         },
+        &Platform::current(),
         &desired,
         Duration::from_secs(3),
     )
@@ -395,6 +405,46 @@ async fn upgrade_timeout_reports_the_last_transport_error() {
     assert!(calls.load(Ordering::Relaxed) > 1);
     let current = connect(&socket, &format!("{:x}", Sha256::digest(&desired))).await;
     assert!(current.is_compatible());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+// A vessel prepared for one platform whose agent reports another: fail naming
+// both, push nothing, and leave the running generation untouched. The build
+// offered is for the prepared platform, so pushing it would not run here.
+#[tokio::test]
+async fn prepared_platform_mismatch_pushes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("drydock-agent");
+    let old = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
+    let fingerprint = format!("{:x}", Sha256::digest(&old));
+    std::fs::write(&executable, &old).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = dir.path().join("agent.sock");
+    let mut child = Command::new(&executable).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
+    drop(connect(&socket, &fingerprint).await);
+    let mut newer = old.clone();
+    newer.extend_from_slice(b"newer build for another platform");
+    let error = Client::connect_current(
+        || async {
+            let stream = UnixStream::connect(&socket).await?;
+            Transport::yamux(Box::new(stream), true, Limits::default()).await
+        },
+        &foreign(),
+        &newer,
+        Duration::from_secs(5),
+    )
+    .await
+    .err()
+    .expect("an agent on another platform than the prepared one cannot be upgraded");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains(&format!("prepared for {} but its agent reports {}", foreign(), Platform::current())), "{error}");
+    assert_eq!(std::fs::read(&executable).unwrap(), old);
+    for suffix in ["upgrade", "prev", "probation"] {
+        assert!(!dir.path().join(format!("drydock-agent.{suffix}")).exists(), "{suffix} must not exist");
+    }
+    assert_eq!(connect(&socket, &fingerprint).await.hello().fingerprint, fingerprint);
+    assert!(child.try_wait().unwrap().is_none());
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }

@@ -11,7 +11,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "6";
+pub const PROTOCOL_VERSION: &str = "7";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -143,6 +143,14 @@ pub struct Capabilities {
     pub egress: EgressCapability,
     pub fallback_runner: bool,
     pub bootstrap: BootstrapRoute,
+    /// Vessels run the drydock agent from the tools image. Launch reports
+    /// success only after the agent's current hello over the SSH reach.
+    #[serde(default)]
+    pub agent: bool,
+    /// Platforms this provider can run, preferred first. A prepare request
+    /// that names none gets the first; one naming another is refused.
+    #[serde(default)]
+    pub platforms: Vec<Platform>,
     pub usage: bool,
     pub quota: bool,
 }
@@ -227,6 +235,10 @@ pub enum Destination {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
     pub size: Size,
+    /// Omitted: the provider's first declared platform. Hosts resolve it before
+    /// a module prepares, so modules always receive a declared platform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub image_digest: String,
@@ -238,6 +250,8 @@ pub struct PrepareRequest {
 pub struct Prepared {
     pub provider: String,
     pub id: String,
+    /// The platform this prepared form was built for; part of the module's key.
+    pub platform: Platform,
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub image_digest: String,
@@ -275,6 +289,60 @@ pub struct Environment {
     pub state: Observation,
     pub granted_size: Option<Size>,
     pub egress: Enforcement,
+    /// The platform the environment runs, when the provider records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<Platform>,
+}
+/// An OCI platform: `os` and `architecture` by OCI names (`linux`, `amd64`,
+/// `arm64`), each 1 to 32 lowercase letters or digits. They become agent build
+/// file and variable names, so decoding refuses anything else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+pub struct Platform {
+    #[serde(deserialize_with = "validation::platform_part")]
+    #[schema(pattern = "^[a-z0-9]{1,32}$")]
+    pub os: String,
+    #[serde(deserialize_with = "validation::platform_part")]
+    #[schema(pattern = "^[a-z0-9]{1,32}$")]
+    pub architecture: String,
+}
+impl Platform {
+    pub fn new(os: impl Into<String>, architecture: impl Into<String>) -> Self {
+        Self { os: os.into(), architecture: architecture.into() }
+    }
+    /// The platform this executable was built for. Rust target names without
+    /// an OCI equivalent pass through unchanged.
+    pub fn current() -> Self {
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            os => os,
+        };
+        let architecture = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            architecture => architecture,
+        };
+        Self::new(os, architecture)
+    }
+    /// Whether both names are plain OCI names (see the type's docs).
+    pub fn is_plain(&self) -> bool {
+        validation::is_platform_part(&self.os) && validation::is_platform_part(&self.architecture)
+    }
+}
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.os, self.architecture)
+    }
+}
+impl std::str::FromStr for Platform {
+    type Err = String;
+    /// Parses `os/architecture`, for example `linux/amd64`.
+    fn from_str(text: &str) -> Result<Self, String> {
+        let platform = text.split_once('/').map(|(os, architecture)| Self::new(os, architecture));
+        platform.filter(Platform::is_plain).ok_or_else(|| format!("platform {text:?} must be os/architecture in lowercase OCI names"))
+    }
+}
+fn accepts_reverse_forwards() -> bool {
+    true
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -284,6 +352,11 @@ pub enum Reach {
         /// May contain a short-lived gateway token; always redact diagnostics.
         user: Secret,
         host_key: String,
+        /// Whether this SSH server accepts remote (reverse) Unix-socket forwards.
+        /// When it does, guest-to-host streams get their own SSH channels; when it
+        /// doesn't (Daytona's gateway), they share a link through the local forward.
+        #[serde(default = "accepts_reverse_forwards")]
+        reverse_forwards: bool,
     },
     Dial {
         url: String,

@@ -36,10 +36,20 @@ struct ReferenceSettings {
     fixture_bad_relay: bool,
     #[serde(default)]
     reach: Option<Reach>,
+    /// Declare that vessels run the drydock agent (no guest exists here).
+    #[serde(default)]
+    agent: bool,
+    /// Platforms to declare, preferred first. The default models Linux vessels
+    /// on both published tools platforms, so results don't depend on the host.
+    #[serde(default = "default_platforms")]
+    platforms: Vec<Platform>,
     #[serde(default)]
     rate_limits: Vec<RateLimit>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
+}
+fn default_platforms() -> Vec<Platform> {
+    vec![Platform::new("linux", "amd64"), Platform::new("linux", "arm64")]
 }
 fn default_poll_interval() -> u64 {
     10
@@ -51,7 +61,7 @@ struct Reference {
 }
 #[derive(Default)]
 struct Memory {
-    prepared: BTreeMap<(String, String), Prepared>,
+    prepared: BTreeMap<(String, String, Platform), Prepared>,
     environments: BTreeMap<String, Environment>,
     tokens: BTreeMap<String, ResumeToken>,
     next: u64,
@@ -104,20 +114,24 @@ impl Provider for Reference {
             egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::Open], enforcement: Enforcement::Advisory },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,
+            agent: self.settings.agent,
+            platforms: self.settings.platforms.clone(),
             usage: true,
             quota: true,
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {
         self.check()?;
+        let platform = prepare_platform(&r)?;
         let mut state = self.state.recover();
         let n = state.prepared.len() + 1;
         Ok(state
             .prepared
-            .entry((r.image_digest.clone(), r.tools_digest.clone()))
+            .entry((r.image_digest.clone(), r.tools_digest.clone(), platform.clone()))
             .or_insert_with(|| Prepared {
                 provider: self.name.clone(),
                 id: format!("prepared-{n}"),
+                platform,
                 image_digest: r.image_digest,
                 tools_digest: r.tools_digest,
             })
@@ -143,6 +157,7 @@ impl Provider for Reference {
             state: Observation::Running,
             granted_size: Some(r.size.clone()),
             egress: Enforcement::Advisory,
+            platform: Some(r.prepared.platform.clone()),
         };
         state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());
@@ -185,9 +200,12 @@ impl Provider for Reference {
         self.check()?;
         self.find(id)?;
         Ok(match &self.settings.reach {
-            Some(Reach::Ssh { endpoint, user, host_key }) => {
-                Connection::Ssh { endpoint: endpoint.clone(), user: user.clone(), host_key: host_key.clone() }
-            }
+            Some(Reach::Ssh { endpoint, user, host_key, reverse_forwards }) => Connection::Ssh {
+                endpoint: endpoint.clone(),
+                user: user.clone(),
+                host_key: host_key.clone(),
+                reverse_forwards: *reverse_forwards,
+            },
             Some(Reach::Dial { url, token, expires_at }) => {
                 Connection::Dial { url: url.clone(), token: token.clone(), expires_at: expires_at.clone() }
             }
@@ -258,6 +276,7 @@ impl Exec for Reference {
                         state: Observation::Unknown { reason: UnknownReason::ProviderApiError },
                         granted_size: None,
                         egress: Enforcement::Advisory,
+                        platform: None,
                     };
                     state.environments.insert(row.id.clone(), row.clone());
                     serde_json::to_value(row).expect("environment")

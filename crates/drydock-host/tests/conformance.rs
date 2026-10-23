@@ -18,6 +18,7 @@ async fn reference_binary_passes_conformance() {
             "a",
             &PrepareRequest {
                 size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                platform: None,
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),
             },
@@ -158,7 +159,13 @@ async fn python_report_selection(
     let mut options = Options {
         request: ProvisionRequest {
             label: "conformance".into(),
-            prepared: Prepared { provider: "a".into(), id: "prepared".into(), image_digest: "image".into(), tools_digest: "tools".into() },
+            prepared: Prepared {
+                provider: "a".into(),
+                id: "prepared".into(),
+                platform: Platform::new("linux", "amd64"),
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+            },
             size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
             egress: EgressRequest::default(),
             ssh_public_key: None,
@@ -325,7 +332,7 @@ async fn declared_reach_recipes_and_faults() {
         for broken in [false, true] {
             let provider = format!("{kind}-{broken}");
             let options: Options = serde_json::from_value(serde_json::json!({
-                "request":{"label":"recipes","prepared":{"provider":provider,"id":"prepare-in-run","image_digest":"image","tools_digest":"tools"},"size":{"cpus":1.,"memory_bytes":1024,"disk_bytes":0}},
+                "request":{"label":"recipes","prepared":{"provider":provider,"id":"prepare-in-run","image_digest":"image","tools_digest":"tools","platform":{"os":"linux","architecture":"amd64"}},"size":{"cpus":1.,"memory_bytes":1024,"disk_bytes":0}},
                 "scenarios":["prepare","reach","destroy"],"echo_relay":kind=="relay",
                 "reach_probe":if kind=="relay" {serde_json::Value::Null} else {serde_json::json!(["python3",concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/recipe-probe.py"),"--identity",manifest["identity"]])}
             })).unwrap();

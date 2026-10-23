@@ -58,7 +58,13 @@ builder image tag.
 
 `tools-image.txt` contains the canonical registry/name@sha256 index reference;
 `revision.txt` records the source. Archive these beside the resulting drydock
-binaries. The operator must configure registry visibility to public. CI must
+binaries.
+
+The publish job also copies `/opt/drydock/drydock-agent` out of each platform
+image into the release artifact as `drydock-agent-linux-amd64` and
+`drydock-agent-linux-arm64`, beside `drydockd`. A host upgrades an older vessel
+agent to the build for the platform recorded when the vessel was prepared, so it
+needs one per guest platform; those are byte-identical to the agents in this release's tools index. The operator must configure registry visibility to public. CI must
 verify an anonymous pull with an empty Docker credential configuration before
 acceptance; the image's existence does not imply public visibility.
 
@@ -79,8 +85,9 @@ and explicitly empty/malformed overrides fail compilation. They never silently
 fall back to a different image.
 
 The pin need not match the host build exactly. It selects the bootstrap agent;
-a host connects with `drydock_agent::Client::connect_current`, supplying its
-current agent executable and a factory for fresh provider transports. A
+a host connects with `drydock_agent::Client::connect_current`, supplying the vessel's prepared platform, its
+current agent build for that platform and a factory for fresh provider
+transports. A
 fingerprint mismatch at hello triggers push plus re-exec, followed by reconnect
 and verification of the new hello. The host pushes configuration only afterwards.
 Raw `Client::connect` is for tooling that explicitly manages this upgrade flow;

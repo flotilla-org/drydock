@@ -218,7 +218,15 @@ async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Envir
     let host = Client::unix(socket).unwrap();
     let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
     let prepared = host
-        .prepare("demo", &PrepareRequest { size: size.clone(), image_digest: "routing-image".into(), tools_digest: "routing-tools".into() })
+        .prepare(
+            "demo",
+            &PrepareRequest {
+                platform: None,
+                size: size.clone(),
+                image_digest: "routing-image".into(),
+                tools_digest: "routing-tools".into(),
+            },
+        )
         .await
         .unwrap();
     host.provision(
@@ -346,7 +354,12 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
                     let prepared = api
                         .prepare(
                             provider,
-                            &PrepareRequest { size: size.clone(), image_digest: "image".into(), tools_digest: "tools".into() },
+                            &PrepareRequest {
+                                platform: None,
+                                size: size.clone(),
+                                image_digest: "image".into(),
+                                tools_digest: "tools".into(),
+                            },
                         )
                         .await
                         .unwrap();
@@ -485,5 +498,83 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     let error = Daemon::start(config, &required_run, required_run.join("keys"), vec![broken(false)]).await.err().unwrap();
     assert!(error.contains("host exited during discovery"));
     drop(daemon);
+    task.abort();
+}
+
+// Launch waits for the agent hello because the provider declares that its
+// vessels run the agent, whatever its module. The reference module has no
+// guest, so a declaring provider must fail launch naming the agent, while an
+// identical provider that does not declare it launches as before.
+#[tokio::test]
+async fn launch_waits_for_agent_hello_only_when_declared() {
+    if drydock::launch::build_tools_digest().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, task) = reference(dir.path()).await;
+    let image = format!("image@sha256:{}", "a".repeat(64));
+    let text = format!(
+        "[provider.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n\
+         [provider.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{agent=true}}\n\
+         [provider.foreign]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\n\
+         settings={{agent=true, platforms=[{{os='linux', architecture='riscv64'}}]}}\n"
+    );
+    let run = dir.path().join("run");
+    let daemon = Daemon::start(
+        Config::parse(&text).unwrap(),
+        &run,
+        run.join("keys"),
+        vec![HostOption { optional: false, name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
+    )
+    .await
+    .unwrap();
+    let host = Client::unix(&socket).unwrap();
+    let hello = host.hello().await.unwrap();
+    let declares = |name: &str| hello.providers.iter().find(|p| p.provider == name).unwrap().capabilities.agent;
+    assert_eq!((declares("plain"), declares("agent")), (false, true));
+    daemon.launch("plain", &drydock::launch::LaunchOptions::default()).await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(10), daemon.launch("agent", &drydock::launch::LaunchOptions::default()))
+        .await
+        .expect("a reach without SSH is refused at once, not retried")
+        .err()
+        .unwrap();
+    let message = error.to_string();
+    assert!(message.contains("drydock-agent") || message.contains("agent hello requires an SSH reach"), "{message}");
+    // No build for the prepared platform: refused before anything is created.
+    let error = daemon.launch("foreign", &drydock::launch::LaunchOptions::default()).await.err().unwrap().to_string();
+    assert!(error.contains("no vessel agent build for linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");
+    assert!(host.list("foreign").await.unwrap().is_empty());
+    task.abort();
+}
+// The prepared platform defaults to the provider's first declared one, can be
+// chosen among the declared ones, is recorded on the environment, and a
+// platform the provider doesn't declare is refused naming what it offers.
+#[tokio::test]
+async fn launch_records_the_prepared_platform() {
+    if drydock::launch::build_tools_digest().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (socket, task) = reference(dir.path()).await;
+    let image = format!("image@sha256:{}", "a".repeat(64));
+    let text = format!("[provider.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n");
+    let run = dir.path().join("run");
+    let daemon = Daemon::start(
+        Config::parse(&text).unwrap(),
+        &run,
+        run.join("keys"),
+        vec![HostOption { optional: false, name: "external".into(), connection: HostConnection::ExternalUnix { path: socket.clone() } }],
+    )
+    .await
+    .unwrap();
+    let launch = |platform: Option<&str>| {
+        let options = drydock::launch::LaunchOptions { platform: platform.map(|p| p.parse().unwrap()), ..Default::default() };
+        let daemon = &daemon;
+        async move { daemon.launch("plain", &options).await }
+    };
+    assert_eq!(launch(None).await.unwrap().platform, Some(Platform::new("linux", "amd64")));
+    assert_eq!(launch(Some("linux/arm64")).await.unwrap().platform, Some(Platform::new("linux", "arm64")));
+    let error = launch(Some("linux/s390x")).await.err().unwrap().to_string();
+    assert!(error.contains("provider cannot run linux/s390x; it offers linux/amd64, linux/arm64"), "{error}");
     task.abort();
 }

@@ -27,13 +27,24 @@ the fixed host socket `/run/drydock/host.sock` (`HOST_SOCKET` in the binary);
 host-initiated yamux requires no reverse socket. Live provider isolation and
 startup/supervision are verified in the provider integration work (#54).
 
-The host normally calls `Client::connect_current(open_transport, executable,
-timeout)`. The tools image pin is a bootstrap reference and may contain an older
-agent. This handshake hashes the host's desired executable, reads hello, and
-pushes the binary plus re-execs when fingerprints differ. It reconnects through
-the supplied provider transport factory and returns only after verifying the
-current fingerprint. A matching hello avoids an unnecessary upgrade. Supply the
-binary for the vessel's architecture; push configuration after this handshake.
+The host normally calls `Client::connect_current(open_transport, platform,
+executable, timeout)`, passing the platform recorded in the vessel's prepared
+form and the agent build for it. The tools image pin is a bootstrap reference
+and may contain an older agent. This handshake reads hello, hashes the build,
+and pushes the binary plus re-execs when fingerprints differ. It reconnects through the supplied provider transport
+factory and returns only after verifying the current fingerprint. A matching
+hello avoids an unnecessary upgrade. Push configuration after this handshake.
+
+Hello's `platform` uses OCI names (`{"os": "linux", "architecture": "arm64"}`).
+The agent reports the platform its running executable was built for, not the
+kernel's `uname`: the guest is demonstrably running that build, so a replacement
+for the same platform runs the same way, natively or under emulation. The hello
+platform is only a check: when it differs from the prepared platform,
+`connect_current` fails with `Unsupported` naming both and pushes nothing. A
+hello with no `platform` comes from an agent older than platform reporting; the
+check is skipped and the prepared platform's build is pushed. An empty build is
+also `Unsupported`. These failures are final: retrying cannot help until the
+vessel or the host's builds change.
 The first transport/hello failure returns immediately: provider startup readiness
 is the caller's responsibility. Only reconnects after an accepted upgrade are
 retried until the deadline. A timeout includes the last observed fingerprint or

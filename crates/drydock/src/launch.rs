@@ -35,6 +35,10 @@ pub struct LaunchOptions {
     pub disk: Option<String>,
     #[arg(long, value_enum)]
     pub egress: Option<Egress>,
+    /// OCI os/architecture, for example linux/amd64. Defaults to the provider's
+    /// first declared platform.
+    #[arg(long)]
+    pub platform: Option<Platform>,
 }
 impl LaunchOptions {
     pub fn size(&self, provider: &Provider, minimum: &Size) -> Result<Size, String> {
@@ -200,7 +204,10 @@ pub async fn prepare(
     let prepared = client
         .clone()
         .with_request_timeout(Duration::from_secs(600))
-        .prepare(name, &PrepareRequest { size: size.clone(), image_digest, tools_digest: tools_digest.into() })
+        .prepare(
+            name,
+            &PrepareRequest { size: size.clone(), platform: options.platform.clone(), image_digest, tools_digest: tools_digest.into() },
+        )
         .await?;
     Ok((prepared, size))
 }

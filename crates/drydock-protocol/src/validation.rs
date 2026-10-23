@@ -155,6 +155,17 @@ pub(crate) fn nonempty_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<
     let value = String::deserialize(d)?;
     if value.is_empty() { Err(serde::de::Error::custom("must not be empty")) } else { Ok(value) }
 }
+pub(crate) fn is_platform_part(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 32 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+pub(crate) fn platform_part<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = String::deserialize(d)?;
+    if is_platform_part(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("platform names are 1 to 32 lowercase letters or digits"))
+    }
+}
 pub(crate) fn nonempty_secret<'de, D: serde::Deserializer<'de>>(d: D) -> Result<crate::Secret, D::Error> {
     nonempty_string(d).map(crate::Secret::new)
 }

@@ -248,6 +248,7 @@ pub async fn optional_contract(
             provider,
             &PrepareRequest {
                 size: request.size.clone(),
+                platform: Some(request.prepared.platform.clone()),
                 image_digest: request.prepared.image_digest.clone(),
                 tools_digest: request.prepared.tools_digest.clone(),
             },
@@ -261,6 +262,7 @@ pub async fn optional_contract(
                     provider,
                     &PrepareRequest {
                         size: request.size.clone(),
+                        platform: Some(prepared.platform.clone()),
                         image_digest: prepared.image_digest.clone(),
                         tools_digest: prepared.tools_digest.clone(),
                     },
@@ -467,6 +469,7 @@ pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &st
         // Reference-host scenarios accept tiny sizes; vendor conformance uses options.request.size.
         let preparation = PrepareRequest {
             size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            platform: None,
             image_digest: "sequence-image".into(),
             tools_digest: "sequence-tools".into(),
         };
@@ -534,6 +537,7 @@ async fn provider_isolation(client: &Client, providers: [&str; 2], main: &Enviro
                 providers[1],
                 &PrepareRequest {
                     size: options.request.size.clone(),
+                    platform: Some(options.request.prepared.platform.clone()),
                     image_digest: "isolation-image".into(),
                     tools_digest: "isolation-tools".into(),
                 },

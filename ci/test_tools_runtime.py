@@ -124,6 +124,8 @@ def main():
                 hello = json.loads(run("docker", "exec", container, "/tmp/tools_probe", "/run/drydock/agent.sock", "/opt/drydock/drydock-agent"))
                 binary = subprocess.check_output(["docker", "exec", container, "cat", "/opt/drydock/drydock-agent"])
                 assert hello["fingerprint"] == hashlib.sha256(binary).hexdigest()
+                # The host picks the upgrade build from this platform.
+                assert hello.get("platform") == {"os": "linux", "architecture": arch}, f"hello platform {hello.get('platform')}"
                 print(f"{platform}: unchanged base config, fixed agent command, hello {hello['fingerprint']}")
             finally:
                 for identifier in [container]:

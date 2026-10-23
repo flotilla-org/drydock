@@ -37,7 +37,14 @@ pub fn fingerprint() -> io::Result<String> {
 pub struct Hello {
     pub fingerprint: String,
     pub features: Vec<String>,
+    /// The platform this agent's executable was built for. Absent from agents
+    /// that predate platform reporting; hosts then rely on the prepared form.
+    #[serde(default)]
+    pub platform: Option<Platform>,
 }
+/// The OCI platform type shared with the provider API; an agent reports the
+/// platform its own executable was built for.
+pub use drydock_protocol::Platform;
 /// Desired state replaces the previous configuration. Capture forwards traffic;
 /// the kind and the upstream own enforcement.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

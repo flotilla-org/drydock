@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 drydock-transport = { path = "../drydock-transport" }
+drydock-protocol = { path = "../drydock-protocol" }
 axum = { version = "0.8", default-features = false, features = ["http2", "tokio", "json"] }
 bytes = "1"
 http = "1"

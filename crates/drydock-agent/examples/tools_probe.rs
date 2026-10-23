@@ -1,6 +1,6 @@
 //! Stock-Ubuntu acceptance helper, built for the same architecture as the tools.
 //! Reads hello from the running agent; does not add a diagnostic flag to it.
-use drydock_agent::Client;
+use drydock_agent::{Client, Platform};
 use drydock_transport::{Limits, Transport, native::UnixConnections};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::UnixListener;
@@ -17,10 +17,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connections = Arc::new(UnixConnections::new(listener, &socket));
     let client = Client::connect_current(
         || std::future::ready(Transport::native(connections.clone(), Limits::default())),
+        // The probe and the agent come from the same image platform.
+        &Platform::current(),
         &current,
         Duration::from_secs(30),
     )
     .await?;
+    if client.hello().platform.as_ref() != Some(&Platform::current()) {
+        return Err(format!("agent reports {:?}, probe is {}", client.hello().platform, Platform::current()).into());
+    }
     assert!(client.is_compatible(), "hello fingerprint differs from installed agent");
     // The provider starts the fixed binary alongside the base's own process.
     let mut found = false;

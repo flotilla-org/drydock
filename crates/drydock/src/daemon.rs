@@ -295,6 +295,7 @@ impl Daemon {
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
         let (prepared, size) = self.prepare(provider, options).await?;
+        let platform = prepared.platform.clone();
         let label = uuid::Uuid::new_v4().to_string();
         let dir = self.keys.join(&label);
         let (_, public) = launch::keypair(&dir).await?;
@@ -313,45 +314,46 @@ impl Daemon {
         // Preparation can outlast a host generation or credential change. Use
         // this fresh readiness check and its host for the actual provision call.
         let host = self.ready_host(provider)?;
+        // The provider declares whether its vessels run the agent; the module name does not.
+        let agent = host.handle.status.borrow().providers.iter().any(|d| d.provider == provider && d.capabilities.agent);
+        // Find the agent build for the prepared platform before creating anything.
+        let agent_build = if agent { Some(agent_build(&platform).await?) } else { None };
         let result = host.handle.client.clone().with_request_timeout(Duration::from_secs(600)).provision(provider, &request).await;
         let cache = host.cache.lock().await.1.clone();
         cache.invalidate(provider).await;
         let environment = result?;
-        if self.config.provider[provider].module == "daytona" {
-            self.agent_ready(provider, &environment).await?;
+        if let Some(build) = agent_build {
+            self.agent_ready(provider, &environment, &platform, &build).await?;
         }
         Ok(environment)
     }
-    async fn agent_ready(&self, provider: &str, environment: &Environment) -> Result<(), Error> {
-        let executable = crate::local::companion("drydock-agent", "DRYDOCK_AGENT_BIN")
-            .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason }))?;
-        let executable = tokio::fs::read(executable).await.map_err(|_| Error::Transport)?;
+    /// Wait for the vessel agent's current hello, pushing `build` (the agent for
+    /// the prepared `platform`) to an older one.
+    async fn agent_ready(&self, provider: &str, environment: &Environment, platform: &Platform, build: &[u8]) -> Result<(), Error> {
         let identity = self.key_for(environment)?;
         let client = &self.ready_host(provider)?.handle.client;
+        // Each reach mints a fresh gateway username, which is an access token.
+        let masker = std::sync::Mutex::new(DiagnosticMasker::default());
         let open = || async {
-            let reach = client.reach(provider, &environment.id).await.map_err(|_| std::io::Error::other("agent reach failed"))?;
-            let Reach::Ssh { endpoint, user, host_key } = reach else {
-                return Err(std::io::Error::other("Daytona requires SSH reach"));
+            let reach = client.reach(provider, &environment.id).await.map_err(|e| std::io::Error::other(format!("agent reach: {e}")))?;
+            let Reach::Ssh { endpoint, user, host_key, reverse_forwards } = reach else {
+                return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "agent hello requires an SSH reach"));
             };
-            let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| std::io::Error::other("invalid SSH endpoint"))?;
+            masker.lock().unwrap().remember(user.expose());
             drydock_transport::ssh::connect(
-                drydock_transport::ssh::SshConfig {
-                    connect_timeout: Duration::from_secs(10),
-                    host: host.into(),
-                    port: port.parse().map_err(std::io::Error::other)?,
-                    user: user.expose().into(),
-                    host_key,
-                    identity_file: identity.clone(),
-                    agent_socket: "/run/drydock/agent.sock".into(),
-                    reverse_socket: "/run/drydock/host.sock".into(),
-                },
+                agent_ssh(&endpoint, user.expose(), host_key, identity.clone(), reverse_forwards)?,
                 drydock_transport::Limits::default(),
             )
             .await
         };
-        wait_for_agent(open, &executable, Duration::from_secs(60))
-            .await
-            .map_err(|_| Error::Protocol(ProtocolError::unavailable("Daytona agent did not complete its hello handshake", None)))
+        let result = wait_for_agent(open, platform, build, Duration::from_secs(60), |text| masker.lock().unwrap().text(text)).await;
+        result.map(drop).map_err(|error| {
+            let reason = format!("vessel agent did not complete its hello handshake: {error}");
+            Error::Protocol(match error.kind() {
+                std::io::ErrorKind::Unsupported => ProtocolError::Refused { reason },
+                _ => ProtocolError::unavailable(reason, None),
+            })
+        })
     }
 
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
@@ -669,27 +671,90 @@ impl Daemon {
     }
 }
 
+// Guest-to-host streams ride the host's link through the local forward. That
+// works whether or not the server grants remote Unix-socket forwards, and
+// Daytona's SSH gateway does not.
+/// The agent link follows what the provider's SSH server accepts: guest-to-host
+/// streams get their own channels through a reverse forward to the agent's fixed
+/// host socket, unless the provider declares that its server refuses reverse forwards.
+fn agent_ssh(
+    endpoint: &str,
+    user: &str,
+    host_key: String,
+    identity: PathBuf,
+    reverse_forwards: bool,
+) -> std::io::Result<drydock_transport::ssh::SshConfig> {
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| std::io::Error::other("invalid SSH endpoint"))?;
+    Ok(drydock_transport::ssh::SshConfig {
+        connect_timeout: Duration::from_secs(10),
+        host: host.into(),
+        port: port.parse().map_err(|e| std::io::Error::other(format!("invalid SSH endpoint port: {e}")))?,
+        user: user.into(),
+        host_key,
+        identity_file: identity,
+        agent_socket: "/run/drydock/agent.sock".into(),
+        guest_streams: if reverse_forwards {
+            drydock_transport::ssh::GuestStreams::ReverseForward("/run/drydock/host.sock".into())
+        } else {
+            drydock_transport::ssh::GuestStreams::OverLocalForward
+        },
+    })
+}
+
+/// The host's agent build for a prepared platform. A missing build refuses the
+/// launch, naming the file or variable that would supply it.
+async fn agent_build(platform: &Platform) -> Result<Vec<u8>, Error> {
+    let refused = |reason: String| Error::Protocol(ProtocolError::Refused { reason });
+    let path = crate::local::agent_build(platform).map_err(|reason| refused(format!("no vessel agent build for {platform}: {reason}")))?;
+    tokio::fs::read(&path).await.map_err(|error| refused(format!("vessel agent build {}: {error}", path.display())))
+}
 // Provider startup can precede the socket listener. connect_current itself owns
-// upgrade/re-exec reconnects and only returns a compatible hello.
-async fn wait_for_agent<F, Fut>(mut open: F, executable: &[u8], timeout: Duration) -> std::io::Result<()>
+// upgrade/re-exec reconnects and only returns a compatible hello. Unsupported
+// errors (including an agent reporting another platform than the prepared one)
+// return at once; others retry until the deadline. `mask` removes credentials
+// from each attempt's error before it is logged or returned.
+async fn wait_for_agent<F, Fut>(
+    mut open: F,
+    platform: &Platform,
+    executable: &[u8],
+    timeout: Duration,
+    mask: impl Fn(&str) -> String,
+) -> std::io::Result<drydock_agent::Client>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<drydock_transport::Transport>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
-    loop {
+    let mut last = None;
+    for attempt in 1.. {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "agent hello timed out"));
+            break;
         }
-        if matches!(
-            tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, executable, remaining)).await,
-            Ok(Ok(_))
-        ) {
-            return Ok(());
+        match tokio::time::timeout(remaining, drydock_agent::Client::connect_current(&mut open, platform, executable, remaining)).await {
+            Ok(Ok(client)) => return Ok(client),
+            // Retrying cannot change an unsupported arrangement.
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::Unsupported => return Err(error),
+            Ok(Err(error)) => {
+                let interrupted = error.kind() == std::io::ErrorKind::TimedOut && tokio::time::Instant::now() >= deadline;
+                let error = mask(&error.to_string());
+                // Log a reason once, not on every 250ms retry.
+                if last.as_deref() != Some(error.as_str()) {
+                    eprintln!("agent hello attempt {attempt} failed: {error}");
+                }
+                // An attempt cut short by the deadline says less than the one before it.
+                if !interrupted || last.is_none() {
+                    last = Some(error);
+                }
+            }
+            Err(_) => break,
         }
         tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
     }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("agent hello timed out after {timeout:?}; last error: {}", last.as_deref().unwrap_or("no attempt finished")),
+    ))
 }
 
 #[cfg(test)]
@@ -719,12 +784,48 @@ mod agent_readiness_tests {
                     host
                 }
             },
+            &Platform::current(),
             binary,
             Duration::from_secs(5),
+            str::to_owned,
         )
         .await
         .unwrap();
         assert_eq!(attempts, 3);
+    }
+    // An agent reporting another platform than the prepared one is final:
+    // refuse at once, before the readiness deadline, naming both platforms.
+    #[tokio::test]
+    async fn platform_mismatch_is_refused_without_waiting() {
+        let current = Platform::current();
+        let prepared = Platform::new("linux", if current == Platform::new("linux", "amd64") { "arm64" } else { "amd64" });
+        let mut opens = 0;
+        let started = tokio::time::Instant::now();
+        let error = wait_for_agent(
+            || {
+                opens += 1;
+                async move {
+                    let (host, guest) = tokio::io::duplex(4096);
+                    let (host, guest) = tokio::join!(
+                        drydock_transport::Transport::yamux(Box::new(host), true, Default::default()),
+                        drydock_transport::Transport::yamux(Box::new(guest), false, Default::default())
+                    );
+                    tokio::spawn(drydock_agent::Agent::new(guest?, "older".into(), "/unused".into()).run());
+                    host
+                }
+            },
+            &prepared,
+            b"prepared platform build",
+            Duration::from_secs(30),
+            str::to_owned,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains(&format!("prepared for {prepared} but its agent reports {current}")), "{error}");
+        assert_eq!(opens, 1);
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
     // A reachable transport whose peer never sends hello must time out.
     #[tokio::test]
@@ -737,10 +838,98 @@ mod agent_readiness_tests {
         let mut host = Some(host.unwrap());
         let result = wait_for_agent(
             || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+            &Platform::current(),
             b"current",
             Duration::from_millis(25),
+            str::to_owned,
         )
         .await;
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
+    }
+    // Readiness failure names the last real reason, with the minted gateway
+    // username masked, rather than a bare "did not complete its hello".
+    #[tokio::test]
+    async fn timeout_reports_the_last_masked_error() {
+        let mut masker = DiagnosticMasker::default();
+        masker.remember("minted-gateway-token");
+        let result = wait_for_agent(
+            || {
+                std::future::ready(Err(std::io::Error::other(
+                    "SSH forwarding rejected: remote port forwarding failed for minted-gateway-token",
+                )))
+            },
+            &Platform::current(),
+            b"current",
+            Duration::from_millis(100),
+            |text| masker.text(text),
+        )
+        .await;
+        let error = result.err().unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        assert!(message.contains("last error: SSH forwarding rejected: remote port forwarding failed"), "{message}");
+        assert!(!message.contains("minted-gateway-token"), "{message}");
+    }
+    // The provider's declaration picks the layout: reverse forwards are the
+    // default, and only a provider whose server refuses them shares the local forward.
+    #[test]
+    fn agent_link_layout_follows_the_reach_declaration() {
+        use drydock_transport::ssh::GuestStreams;
+        let config = |reverse| agent_ssh("gw.example:22", "u", "ssh-ed25519 AAAA".into(), "/k".into(), reverse).unwrap().guest_streams;
+        assert_eq!(config(true), GuestStreams::ReverseForward("/run/drydock/host.sock".into()));
+        assert_eq!(config(false), GuestStreams::OverLocalForward);
+    }
+    // The agent reach path against an OpenSSH server that, like Daytona's
+    // gateway, refuses remote Unix-socket forwards. The agent listens with its
+    // fixed native transport and its guest-to-host socket never appears; hello
+    // and a guest-to-host forward stream must both work over the host's link.
+    #[tokio::test]
+    async fn agent_reach_works_through_a_gateway_without_reverse_forwards() {
+        use drydock_agent::{Endpoint, GuestForward};
+        use sha2::{Digest, Sha256};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let agent_socket = dir.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&agent_socket).unwrap();
+        let connections = drydock_transport::native::UnixConnections::new(listener, dir.path().join("host.sock"));
+        let guest = drydock_transport::Transport::native(std::sync::Arc::new(connections), Default::default()).unwrap();
+        let binary = b"current agent";
+        let agent = tokio::spawn(drydock_agent::Agent::new(guest, format!("{:x}", Sha256::digest(binary)), "/unused".into()).run());
+        let (sshd_config, mut server) =
+            sshd::start(dir.path(), &agent_socket, drydock_transport::ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
+        let endpoint = format!("{}:{}", sshd_config.host, sshd_config.port);
+        let mut config =
+            agent_ssh(&endpoint, &sshd_config.user, sshd_config.host_key.clone(), sshd_config.identity_file.clone(), false).unwrap();
+        config.agent_socket = agent_socket;
+        let client = wait_for_agent(
+            || drydock_transport::ssh::connect(config.clone(), Default::default()),
+            &Platform::current(),
+            binary,
+            Duration::from_secs(10),
+            str::to_owned,
+        )
+        .await
+        .unwrap();
+        let target = dir.path().join("target");
+        let target_listener = tokio::net::UnixListener::bind(&target).unwrap();
+        let forward = GuestForward { id: "service".into(), unix: dir.path().join("forward"), tcp: None };
+        client.add_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
+        assert!(!dir.path().join("host.sock").exists());
+        let mut guest_stream = tokio::net::UnixStream::connect(&forward.unix).await.unwrap();
+        guest_stream.write_all(b"guest to host").await.unwrap();
+        let (mut host_end, _) = tokio::time::timeout(Duration::from_secs(5), target_listener.accept()).await.unwrap().unwrap();
+        let mut received = [0; 13];
+        host_end.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"guest to host");
+        host_end.write_all(b"reply").await.unwrap();
+        let mut reply = [0; 5];
+        guest_stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        drop(client);
+        agent.abort();
+        server.kill().await.unwrap();
     }
 }
+#[cfg(test)]
+#[path = "../../drydock-transport/tests/support/sshd.rs"]
+mod sshd;

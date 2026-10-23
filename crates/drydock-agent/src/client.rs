@@ -100,23 +100,45 @@ impl Client {
     /// Connect to a vessel started from any published tools pin. A mismatched
     /// hello triggers push + re-exec, then a fresh transport and verified hello.
     /// The factory must open a new provider transport on every invocation.
-    /// Returns only a compatible client; callers push configuration afterwards.
-    /// Initial transport/hello errors return immediately; only post-upgrade
-    /// reconnects retry. The caller must arrange initial provider readiness.
-    pub async fn connect_current<F, Fut>(mut open: F, executable: &[u8], timeout: std::time::Duration) -> io::Result<Self>
+    /// `platform` is the platform the vessel was prepared for and `executable`
+    /// the current agent build for it; the caller chose both from the prepared
+    /// form, never from the guest. Returns only a compatible client; callers
+    /// push configuration afterwards. Initial transport/hello errors return
+    /// immediately; only post-upgrade reconnects retry. The caller must arrange
+    /// initial provider readiness.
+    ///
+    /// A hello that reports a platform is checked against `platform`. A
+    /// different one fails with [`io::ErrorKind::Unsupported`], pushing
+    /// nothing. Agents older than platform reporting send none, so the check
+    /// is skipped and the build is pushed.
+    pub async fn connect_current<F, Fut>(
+        mut open: F,
+        platform: &Platform,
+        executable: &[u8],
+        timeout: std::time::Duration,
+    ) -> io::Result<Self>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = io::Result<Transport>>,
     {
         use sha2::{Digest, Sha256};
         if executable.is_empty() {
-            return Err(invalid("current agent executable is empty"));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent build for platform {platform} is empty")));
         }
-        let expected = format!("{:x}", Sha256::digest(executable));
         let mut observation = "no hello received".to_owned();
         let result = tokio::time::timeout(timeout, async {
-            let client = Self::connect(open().await?, &expected).await?;
+            let mut client = Self::connect(open().await?, String::new()).await?;
             observation = format!("last hello fingerprint {}", client.hello.fingerprint);
+            if let Some(reported) = &client.hello.platform
+                && reported != platform
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("vessel was prepared for {platform} but its agent reports {reported}"),
+                ));
+            }
+            let expected = format!("{:x}", Sha256::digest(executable));
+            client.expected = expected.clone();
             if client.is_compatible() {
                 return Ok(client);
             }
@@ -182,7 +204,7 @@ impl Client {
         let mut client = Self {
             sender,
             opener,
-            hello: Hello { fingerprint: String::new(), features: vec![] },
+            hello: Hello { fingerprint: String::new(), features: vec![], platform: None },
             expected: expected.into(),
             targets,
             tasks: vec![driver.abort_handle(), task.abort_handle()],

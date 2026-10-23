@@ -26,6 +26,21 @@ cargo build -p drydock -p drydock-host -p drydock-agent --locked
 # Install the four binaries beside one another on PATH.
 ```
 
+Each provider declares the platforms its sandboxes run (Daytona: `linux/amd64`;
+the reference module: its `platforms` setting). Prepare builds for one of them,
+the first unless `--platform os/arch` names another, and the prepared form
+records it. `drydockd` upgrades an older vessel agent to the build for that
+recorded platform; the agent's hello platform is only checked against it. Install each guest platform's agent beside `drydockd` as
+`drydock-agent-<os>-<arch>`, for example `drydock-agent-linux-amd64` and
+`drydock-agent-linux-arm64`, or point `DRYDOCK_AGENT_BIN_LINUX_AMD64` and
+`DRYDOCK_AGENT_BIN_LINUX_ARM64` at them. The tools-image release artifact carries
+both, extracted from the published images. The plain `drydock-agent` serves only
+guests of the host's own platform, so a macOS host needs the Linux builds. A
+platform with no build is refused at launch before anything is provisioned. A
+hello reporting a different platform is refused naming both, and nothing is
+pushed. A hello without a platform (an agent older than platform reporting) gets
+the recorded platform's build.
+
 Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
 
 ```toml
@@ -57,6 +72,7 @@ run bootstrap again. No Python, `flock`, or agent command setting is needed.
 drydock providers
 drydock launch daytona
 drydock launch daytona --image registry.example/team/agent-image:current --cpus 2
+drydock launch PROVIDER --platform linux/arm64   # a provider declaring arm64
 drydock list daytona
 drydock inspect daytona PROVIDER_ID
 drydock shell daytona PROVIDER_ID
@@ -140,6 +156,14 @@ The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
 
+Protocol version 7 adds platforms. Capabilities list the platforms a provider
+runs, preferred first (absent decodes as none). Prepare takes an optional
+`platform`; the host fills in the first declared one and refuses an undeclared
+one, naming those offered. The prepared form records its required `platform`,
+and environments may report theirs. Modules include the platform in their
+prepared key; Daytona pins both `FROM` lines with `--platform` because its
+snapshot API takes none.
+
 Protocol version 6 exposes masked provider diagnostics and maps permission
 denials to `Refused`. It retains version 5's required `size` in every prepare request. Modules choose their
 prepared key; Daytona includes size because snapshots fix sandbox resources.
@@ -176,7 +200,7 @@ Wire conventions chosen for this first protocol version:
   placeholders. Direct credential values are sent separately through the
   authenticated credential refresh route, including initial delivery.
 - Prepare is look-up-or-build by a module-defined key (Daytona: image/tools
-  digests and size); a prepared form belongs to its named provider. Hosts must
+  digests, platform and size); a prepared form belongs to its named provider. Hosts must
   refuse cross-provider use. Baking and upload start the agent with fixed flags,
   without per-vessel configuration.
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
@@ -306,7 +330,8 @@ For example, choose the image and tools digests in the request:
     "label": "conformance-unique-run-id",
     "prepared": {
       "provider": "reference", "id": "prepared-1",
-      "image_digest": "sha256:image", "tools_digest": "sha256:tools"
+      "image_digest": "sha256:image", "tools_digest": "sha256:tools",
+      "platform": {"os": "linux", "architecture": "amd64"}
     },
     "size": {"cpus": 1, "memory_bytes": 1024, "disk_bytes": 0},
     "egress": {"mode": "deny_all", "direct": []},

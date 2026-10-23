@@ -13,7 +13,9 @@ use axum::{
     routing::{get, post, put},
 };
 use drydock_protocol::*;
-use module::{Connection, Credentials, ObservationMode, ObservedEnvironment, Provider, Provisioned, Registry, Result, refused};
+use module::{
+    Connection, Credentials, ObservationMode, ObservedEnvironment, Provider, Provisioned, Registry, Result, refused, resolve_platform,
+};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -947,7 +949,21 @@ fn operation_port<T: ?Sized>(port: Option<&T>) -> Result<&T> {
 }
 
 async fn prepare(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<PrepareRequest>) -> ApiResult<Json<Prepared>> {
-    Ok(Json(h.call(&p, Gate::Prepare, |p, c| async move { p.prepare(r, &c).await }).await?))
+    Ok(Json(h.call(&p, Gate::Prepare, |p, c| async move { prepare_for_platform(&*p, r, &c).await }).await?))
+}
+/// Modules always receive a declared platform: the requested one, or the first.
+async fn prepare_for_platform(p: &dyn Provider, mut r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+    let platform = resolve_platform(r.platform.take(), &p.capabilities().platforms)?;
+    r.platform = Some(platform.clone());
+    let prepared = p.prepare(r, c).await?;
+    // The prepared form names what was built; a different platform is a module bug.
+    if prepared.platform != platform {
+        return Err(ProtocolError::Internal {
+            reason: format!("module prepared {} for a {platform} request", prepared.platform),
+            provider_error: String::new(),
+        });
+    }
+    Ok(prepared)
 }
 async fn provision(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<ProvisionRequest>) -> ApiResult<Response> {
     if r.prepared.provider != p {
@@ -1085,7 +1101,7 @@ async fn reach(State(h): State<Host>, ApiPath((p, id)): ApiPath<(String, String)
             url.path_segments_mut().expect("base URL").extend(["v1", "providers", &p, "environments", &environment, "relay"]);
             Reach::Relay { path: url.path().into() }
         }
-        Connection::Ssh { endpoint, user, host_key } => Reach::Ssh { endpoint, user, host_key },
+        Connection::Ssh { endpoint, user, host_key, reverse_forwards } => Reach::Ssh { endpoint, user, host_key, reverse_forwards },
         Connection::Dial { url, token, expires_at } => Reach::Dial { url, token, expires_at },
     };
     Ok(Json(reach))
@@ -1442,6 +1458,39 @@ mod operation_tests {
         }
     }
 
+    // Reports a platform other than the one it was asked for.
+    struct Lying(Arc<dyn Provider>);
+    #[async_trait::async_trait]
+    impl Provider for Lying {
+        fn observation(&self) -> ObservationMode {
+            self.0.observation()
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.0.capabilities()
+        }
+        async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+            Ok(Prepared { platform: Platform::new("linux", "riscv64"), ..self.0.prepare(r, c).await? })
+        }
+        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+            self.0.provision(r, c).await
+        }
+        async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
+            self.0.list(c).await
+        }
+        async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+            self.0.inspect(id, c).await
+        }
+        async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
+            self.0.destroy(id, c).await
+        }
+        async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
+            self.0.reach(id, c).await
+        }
+        async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
+            self.0.relay(id, c).await
+        }
+    }
+
     struct BasicModule(bool);
     #[async_trait::async_trait]
     impl Module for BasicModule {
@@ -1531,6 +1580,7 @@ mod operation_tests {
             i.call(Gate::Prepare, |p, c| async move {
                 p.prepare(
                     PrepareRequest {
+                        platform: Some(Platform::new("linux", "amd64")),
                         size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
                         image_digest: "image".into(),
                         tools_digest: "tools".into(),
@@ -1547,6 +1597,32 @@ mod operation_tests {
             assert!(matches!(result, Err(ProtocolError::Refused { .. })));
         }
     }
+    // The host defaults and checks the platform for every module, and a module
+    // that reports building something else is an internal error, not a success.
+    #[tokio::test]
+    async fn prepare_resolves_and_checks_the_platform() {
+        let i = instance("list").await;
+        let request = |platform: Option<Platform>| PrepareRequest {
+            platform,
+            size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+            image_digest: "image".into(),
+            tools_digest: "tools".into(),
+        };
+        let first = i.provider.capabilities().platforms[0].clone();
+        let prepared = i.call(Gate::Prepare, |p, c| async move { prepare_for_platform(&*p, request(None), &c).await }).await.unwrap();
+        assert_eq!(prepared.platform, first);
+        let undeclared = i
+            .call(Gate::Prepare, |p, c| async move { prepare_for_platform(&*p, request(Some(Platform::new("linux", "s390x"))), &c).await })
+            .await;
+        assert!(matches!(undeclared, Err(ProtocolError::Refused { reason }) if reason.contains("cannot run linux/s390x; it offers")));
+        let lying = Lying(i.provider.clone());
+        let c = Credentials::new(CredentialMode::Direct { credential_reference: "test".into() });
+        let error = prepare_for_platform(&lying, request(None), &c).await.unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Internal { ref reason, .. } if reason == &format!("module prepared linux/riscv64 for a {first} request")),
+            "{error:?}"
+        );
+    }
     // One cache path is shared by provision, inspect and resume. Only explicit
     // evidence gets an age stamp; push providers retain no polling metadata.
     #[tokio::test(start_paused = true)]
@@ -1558,6 +1634,7 @@ mod operation_tests {
             let mut row = ObservedEnvironment {
                 egress_policy: None,
                 environment: Environment {
+                    platform: None,
                     id: "e".into(),
                     provider: "a".into(),
                     label: None,
@@ -1609,6 +1686,7 @@ mod operation_tests {
         i.poll_interval = Some(std::time::Duration::from_secs(30));
         let row = ObservedEnvironment {
             environment: Environment {
+                platform: None,
                 id: "e".into(),
                 provider: "a".into(),
                 label: None,

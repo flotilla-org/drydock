@@ -56,7 +56,11 @@ and use `&self`. Push providers retain the post-commit `run(PushContext)` hook.
 Factories validate settings before commit and must not publish or start detached
 work while configuring. The reference parses a typed settings struct, accepts an
 optional `poll_interval_ms` (positive, default 10) and `fault: <ProtocolError>` for
-error-class conformance, and rejects unknown settings. Exact repeated documents
+error-class conformance, `platforms` (`{"os", "architecture"}` objects; default linux/amd64 then linux/arm64, the
+first preferred), and rejects unknown settings. The host resolves each prepare
+request's platform against the declared list before the module sees it; modules
+read it with `prepare_platform` and must record that platform in the prepared
+form, or the host returns `Internal`. Exact repeated documents
 preserve providers and credentials; additions commit atomically. Replacement or
 removal currently requires restart, protecting in-memory resources. Stateless
 settings replacement is tracked in #22.
@@ -301,9 +305,27 @@ neither Python nor util-linux `flock`. PID 1 remains Daytona's daemon.
 Toolbox bootstrap has a 25-second execution budget; ordinary exec/probes get
 20 seconds. Bootstrap starts supervision; it does not claim agent readiness.
 `drydockd` waits up to 60 seconds for the agent's `Client::connect_current`
-handshake over the SSH gateway before returning launch success. It uses the
-installed sibling `drydock-agent` (override `DRYDOCK_AGENT_BIN`) to upgrade an
-older tools agent and verifies its current hello. A failed bootstrap leaves a labelled
+handshake over the SSH gateway before returning launch success. It upgrades an
+older tools agent to the build for the platform recorded in the prepared form,
+then verifies the current hello. Daytona declares only `linux/amd64`: its
+sandboxes run on x86_64, and its snapshot API takes no platform, so both `FROM`
+lines of the snapshot Dockerfile carry `--platform=linux/amd64` and the snapshot
+name includes the platform. Lookup order for platform `<os>/<arch>`:
+
+1. `DRYDOCK_AGENT_BIN_<OS>_<ARCH>` (for example `DRYDOCK_AGENT_BIN_LINUX_ARM64`);
+2. `DRYDOCK_AGENT_BIN`, only when the guest's platform is the host's own;
+3. `drydock-agent-<os>-<arch>` installed beside `drydockd`;
+4. the sibling `drydock-agent`, only when the guest's platform is the host's own.
+
+Each variable holds one path. With no build for the prepared platform, launch is
+refused before provisioning with the platform and the file or variable that
+would supply it. A hello reporting a different platform is refused naming both;
+a hello without a platform (an agent older than platform reporting) is not
+checked, and the prepared platform's build is pushed.
+The gateway refuses remote Unix-socket forwards, so the link uses only a local
+forward to the agent socket, and guest-to-host streams share that connection. If
+the handshake never succeeds, launch fails with the last attempt's error (SSH
+user redacted), and `drydockd` logs each failed attempt to stderr. A failed bootstrap leaves a labelled
 resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
 resource; size or egress mismatches (including missing policy evidence) are refused
 with guidance to use a new label. They never change the existing resource's policy.

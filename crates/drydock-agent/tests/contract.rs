@@ -1,4 +1,4 @@
-use drydock_agent::{Agent, Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward};
+use drydock_agent::{Agent, Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward, Platform};
 use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
@@ -62,6 +62,7 @@ async fn control_contract_on_both_transports() {
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         assert_eq!(h.client.hello().fingerprint, "test-build");
+        assert_eq!(h.client.hello().platform, Some(Platform::current()));
         assert!(h.client.hello().features.contains(&"forwards".into()));
         for value in ["one", "two", ""] {
             let config = Configuration {
@@ -693,4 +694,71 @@ async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
         assert_eq!(h.client.configuration().await.unwrap(), Configuration::default());
         assert!(!unix.exists());
     }
+}
+
+// Guest stand-in at the HTTP boundary: serves a fixed hello body and records
+// upgrade bodies, so a test observes exactly what the host pushed.
+async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+    use axum::routing::{get, put};
+    let (a, b) = tokio::io::duplex(1 << 16);
+    let (host, guest) =
+        tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+    let mut guest = guest.unwrap();
+    let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = pushes.clone();
+    let router = axum::Router::new().route("/hello", get(move || std::future::ready(axum::Json(hello.clone())))).route(
+        "/upgrade",
+        put(move |body: bytes::Bytes| {
+            recorded.lock().unwrap().push(body.to_vec());
+            std::future::ready(())
+        }),
+    );
+    tokio::spawn(async move {
+        while let Ok(Some(incoming)) = guest.accept().await {
+            tokio::spawn(drydock_transport::http2::serve(incoming, router.clone()));
+        }
+    });
+    (host.unwrap(), pushes)
+}
+
+// An agent that predates platform reporting sends no platform. The host
+// already knows the vessel's platform from its prepared form, so it pushes
+// that platform's build; it never needs to ask the guest.
+#[tokio::test]
+async fn hello_without_platform_gets_the_prepared_platforms_build() {
+    let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"]})).await;
+    let mut host = Some(host);
+    // The fake guest never re-executes, so the reconnect after the push times out.
+    let error = Client::connect_current(
+        || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+        &Platform::new("linux", "amd64"),
+        b"linux amd64 build",
+        Duration::from_millis(500),
+    )
+    .await
+    .err()
+    .expect("the fake guest never reports the pushed build");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(*pushes.lock().unwrap(), [b"linux amd64 build".to_vec()]);
+}
+
+// A reported platform other than the prepared one is refused, naming both,
+// and nothing is pushed: the prepared platform's build would not run there.
+#[tokio::test]
+async fn reported_platform_other_than_prepared_pushes_nothing() {
+    let hello = serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "platform": {"os": "linux", "architecture": "arm64"}});
+    let (host, pushes) = hello_only_guest(hello).await;
+    let mut host = Some(host);
+    let error = Client::connect_current(
+        || std::future::ready(host.take().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::ConnectionRefused))),
+        &Platform::new("linux", "amd64"),
+        b"linux amd64 build",
+        Duration::from_secs(5),
+    )
+    .await
+    .err()
+    .expect("a mismatched platform cannot be upgraded");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(error.to_string().contains("prepared for linux/amd64 but its agent reports linux/arm64"), "{error}");
+    assert!(pushes.lock().unwrap().is_empty());
 }
