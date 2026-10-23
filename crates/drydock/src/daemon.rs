@@ -719,7 +719,10 @@ where
             Ok(Err(error)) => {
                 let interrupted = error.kind() == std::io::ErrorKind::TimedOut && tokio::time::Instant::now() >= deadline;
                 let error = mask(&error.to_string());
-                eprintln!("agent hello attempt {attempt} failed: {error}");
+                // Log a reason once, not on every 250ms retry.
+                if last.as_deref() != Some(error.as_str()) {
+                    eprintln!("agent hello attempt {attempt} failed: {error}");
+                }
                 // An attempt cut short by the deadline says less than the one before it.
                 if !interrupted || last.is_none() {
                     last = Some(error);

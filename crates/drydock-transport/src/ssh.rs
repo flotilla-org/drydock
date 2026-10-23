@@ -195,6 +195,10 @@ fn one_line(stderr: &[u8]) -> String {
 }
 // The user can be a bearer credential (Daytona mints the gateway username).
 fn redact(text: &str, user: &str) -> String {
+    // An empty pattern would match between every character.
+    if user.is_empty() {
+        return text.to_owned();
+    }
     text.replace(user, "<ssh user>")
 }
 fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<String> {
@@ -383,5 +387,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(tail.text().as_bytes(), &data[data.len() - 8192..]);
+    }
+}
+#[cfg(test)]
+mod redact_tests {
+    #[test]
+    fn redact_masks_the_user_and_leaves_text_alone_when_there_is_none() {
+        assert_eq!(super::redact("denied for tok-1 at gw", "tok-1"), "denied for <ssh user> at gw");
+        assert_eq!(super::redact("denied at gw", ""), "denied at gw");
     }
 }
