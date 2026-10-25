@@ -1,3 +1,4 @@
+import { DiagnosticSecrets } from "./diagnostic.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { EventEmitter } from "node:events";
@@ -95,24 +96,26 @@ export class Host {
       return { status: "unknown", reason: "proxy credential rejected" };
     return { status: "ready" };
   }
-  private secrets = new Set<string>();
-  remember(value: string) {
-    if (value) this.secrets.add(value);
+  private secrets = new DiagnosticSecrets();
+  private sanitized = new WeakSet<ProtocolFailure>();
+  mask(value: unknown, extra?: string): unknown {
+    return this.secrets.mask(value, extra);
   }
-  mask(value: unknown): unknown {
-    if (typeof value === "string") {
-      for (const secret of [...this.secrets].sort(
-        (a, b) => b.length - a.length,
-      ))
-        value = (value as string).split(secret).join("[REDACTED]");
-      return value;
-    }
-    if (Array.isArray(value)) return value.map((v) => this.mask(v));
-    if (value && typeof value === "object")
-      return Object.fromEntries(
-        Object.entries(value).map(([k, v]) => [k, this.mask(v)]),
-      );
-    return value;
+  /** Never re-mask a captured-token diagnostic after that token is retired. */
+  errorDetail(error: ProtocolFailure): Types["ProtocolError"] {
+    return this.sanitized.has(error)
+      ? error.detail
+      : (this.mask(error.detail) as Types["ProtocolError"]);
+  }
+  private failure(
+    detail: Types["ProtocolError"],
+    extra?: string,
+  ): ProtocolFailure {
+    const error = new ProtocolFailure(
+      this.mask(detail, extra) as Types["ProtocolError"],
+    );
+    this.sanitized.add(error);
+    return error;
   }
   async configure(document: Types["HostConfiguration"]) {
     validate("HostConfiguration", document);
@@ -145,7 +148,6 @@ export class Host {
       )
         fail("refused", "cannot replace a configured provider; restart host");
       if (p.credential.mode === "proxied") {
-        this.remember(p.credential.placeholder_token);
         try {
           const url = new URL(p.credential.proxy_url);
           if (!["http:", "https:"].includes(url.protocol)) throw Error();
@@ -159,11 +161,23 @@ export class Host {
     const additions: [string, Instance][] = [];
     for (const p of document.providers) {
       if (this.instances.has(p.name)) continue;
-      const provider = await this.cancel(
-        this.registry
-          .get(modules.get(p.module)!)!
-          .configure(p, this.stop.signal),
-      );
+      let provider: Provider;
+      try {
+        provider = await this.cancel(
+          this.registry
+            .get(modules.get(p.module)!)!
+            .configure(p, this.stop.signal),
+        );
+      } catch (error) {
+        if (error instanceof ProtocolFailure)
+          throw this.failure(
+            error.detail,
+            p.credential.mode === "proxied"
+              ? p.credential.placeholder_token
+              : undefined,
+          );
+        throw error;
+      }
       validate("Capabilities", provider.capabilities);
       const ports = [
         ["fallback_runner", "exec"],
@@ -209,7 +223,11 @@ export class Host {
     }
     if (this.stop.signal.aborted) fail("unavailable", "host stopping");
     this.modules = document.modules;
-    for (const [name, i] of additions) this.instances.set(name, i);
+    for (const [name, i] of additions) {
+      this.instances.set(name, i);
+      if (i.config.credential.mode === "proxied")
+        this.secrets.remember(name, i.config.credential.placeholder_token);
+    }
     for (const [, i] of additions) this.observe(i);
     this.changes.emit("change");
   }
@@ -218,7 +236,7 @@ export class Host {
     const i = this.instance(name);
     if (i.credentials.mode.mode !== "direct")
       fail("refused", "proxied provider cannot accept direct credentials");
-    this.remember(value);
+    this.secrets.remember(name, value);
     i.credentials = {
       ...i.credentials,
       value,
@@ -364,11 +382,14 @@ export class Host {
           i.rejectionGeneration++;
           this.changes.emit("change");
         }
-        throw new ProtocolFailure(
-          this.mask({
+        throw this.failure(
+          {
             ...error.detail,
             reason: `provider ${name} operation ${operation}: ${error.detail.reason}`,
-          }) as Types["ProtocolError"],
+          },
+          credentials.mode.mode === "direct"
+            ? credentials.value
+            : credentials.mode.placeholder_token,
         );
       }
       throw new ProtocolFailure({

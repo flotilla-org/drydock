@@ -74,7 +74,7 @@ export async function serve(
     }
     const detail =
       error instanceof ProtocolFailure
-        ? (host.mask(error.detail) as Types["ProtocolError"])
+        ? host.errorDetail(error)
         : {
             kind: "internal" as const,
             reason: "host request failed",
@@ -379,6 +379,20 @@ export async function serve(
     fail("not_found", "unknown route");
   }
   server.on("upgrade", (req, socket, head) => {
+    const setup = new AbortController();
+    const disconnected = () => {
+      setup.abort();
+      socket.destroy();
+    };
+    const cleanup = () => {
+      socket.off("close", disconnected);
+      socket.off("end", disconnected);
+      socket.off("error", disconnected);
+    };
+    socket.once("close", disconnected);
+    socket.once("end", disconnected);
+    socket.once("error", disconnected);
+    if (socket.destroyed || socket.readableEnded) setup.abort();
     void (async () => {
       const refusal = admission(req);
       if (refusal) {
@@ -419,19 +433,33 @@ export async function serve(
         }
         validate("ExecRequest", request);
       }
-      const stream = await host.call(parts[2], op, (p, c) =>
-        op === "relay"
-          ? p.relay(parts[4], c)
-          : p.exec
-            ? p.exec(parts[4], request!, c)
-            : Promise.reject(
-                new ProtocolFailure({
-                  kind: "refused",
-                  reason: "operation port unavailable",
-                }),
-              ),
+      const stream = await host.call(
+        parts[2],
+        op,
+        async (p, c) => {
+          const value = await (op === "relay"
+            ? p.relay(parts[4], c)
+            : p.exec
+              ? p.exec(parts[4], request!, c)
+              : Promise.reject(
+                  new ProtocolFailure({
+                    kind: "refused",
+                    reason: "operation port unavailable",
+                  }),
+                ));
+          if (c.signal.aborted || socket.destroyed || socket.readableEnded)
+            value.destroy();
+          return value;
+        },
+        false,
+        setup.signal,
       );
-      if (host.stop.signal.aborted) {
+      if (
+        setup.signal.aborted ||
+        host.stop.signal.aborted ||
+        socket.destroyed ||
+        socket.readableEnded
+      ) {
         stream.destroy();
         socket.destroy();
         return;
@@ -439,21 +467,25 @@ export async function serve(
       socket.write(
         `HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: ${protocol}\r\n\r\n`,
       );
+      cleanup();
       bridge(socket, stream, remainder);
-    })().catch((e) => {
-      const detail =
-        e instanceof ProtocolFailure
-          ? (host.mask(e.detail) as Types["ProtocolError"])
-          : {
-              kind: "internal" as const,
-              reason: "stream failed",
-              provider_error: "",
-            };
-      const data = JSON.stringify(detail);
-      socket.end(
-        `HTTP/1.1 ${status[detail.kind]} Error\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(data)}\r\n\r\n${data}`,
-      );
-    });
+    })()
+      .catch((e) => {
+        if (setup.signal.aborted || socket.destroyed) return;
+        const detail =
+          e instanceof ProtocolFailure
+            ? host.errorDetail(e)
+            : {
+                kind: "internal" as const,
+                reason: "stream failed",
+                provider_error: "",
+              };
+        const data = JSON.stringify(detail);
+        socket.end(
+          `HTTP/1.1 ${status[detail.kind]} Error\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(data)}\r\n\r\n${data}`,
+        );
+      })
+      .finally(cleanup);
   });
   try {
     if ("unix" in listener) {

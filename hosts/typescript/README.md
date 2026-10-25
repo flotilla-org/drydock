@@ -117,7 +117,7 @@ The reference accepts `poll_interval_ms` (positive; default 10), `platforms`,
 Deliver direct credentials via `PUT /v1/providers/test/credential` with
 `{"value":"test-only-secret"}`, repeating on refresh. The host stores values only
 in memory, never logs bodies or raw module errors, and masks delivered credentials
-in typed error/readiness diagnostics. No credential reference resolution occurs in
+in typed error/readiness diagnostics, including JSON/UTF-16, percent/form and standard/URL-safe base64 echoes. The diagnostic owner caches active values and at most 32 retired credentials, protects each in-flight call's captured credential separately, and bounds masked diagnostic text to 16 KiB at UTF-8 character boundaries. No credential reference resolution occurs in
 the host. Proxied instances refuse direct refresh and receive the supervisor's
 inherited `HTTPS_PROXY`, `NODE_USE_ENV_PROXY` and `NODE_EXTRA_CA_CERTS` environment.
 Modules must honor their credential mode and cancellation context, avoid logging
@@ -158,7 +158,7 @@ socket. No terminal NDJSON error variant is invented.
 
 Relay uses GET with `Upgrade: drydock-relay`; exec uses POST JSON with
 `Upgrade: drydock-stream`. Both require `Connection: Upgrade`, return 101 and hand
-modules raw duplex streams with backpressure and half-close propagation. Exec
+modules raw duplex streams with backpressure and half-close propagation. Client disconnect cancels relay/exec setup; a late stream from a provider that ignores cancellation is disposed. Exec
 upgrade bodies accept content-length and chunked framing. Reach relay
 paths are built and escaped by the host. Implement all optional ports actually
 advertised by a module.

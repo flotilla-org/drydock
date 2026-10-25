@@ -961,3 +961,251 @@ test("shutdown cancels configuration and cold observation", async (t) => {
   await cold.shutdown();
   await assert.rejects(snapshot, (e: any) => e.detail.kind === "unavailable");
 });
+
+function credentialForms(secret: string) {
+  const json = JSON.stringify(secret).slice(1, -1),
+    percent = encodeURIComponent(secret).replace(
+      /[!'()*]/g,
+      (ch) => "%" + ch.charCodeAt(0).toString(16).toUpperCase(),
+    ),
+    base64 = Buffer.from(secret).toString("base64");
+  return [
+    ...new Set([
+      secret,
+      json,
+      ...[false, true].map((upper) =>
+        json.replace(
+          /[^\x00-\x7f]/g,
+          (ch) =>
+            "\\u" +
+            (upper
+              ? ch.charCodeAt(0).toString(16).toUpperCase()
+              : ch.charCodeAt(0).toString(16)
+            ).padStart(4, "0"),
+        ),
+      ),
+      percent,
+      percent.replace(/%[0-9A-F]{2}/g, (x) => x.toLowerCase()),
+      percent.replace(/%20/g, "+"),
+      base64,
+      base64.replace(/=+$/, ""),
+      base64.replace(/\+/g, "-").replace(/\//g, "_"),
+      base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+    ]),
+  ];
+}
+async function diagnosticFixture(t: {
+  after: (fn: () => Promise<void>) => void;
+}) {
+  let detail = "",
+    readiness = false,
+    delay = false,
+    finish: (() => void) | undefined,
+    entered: (() => void) | undefined;
+  const { ProtocolFailure } = await import("../dist/provider.js");
+  const module = {
+    version: "test",
+    async configure(config: any, signal: AbortSignal) {
+      const p = await reference.configure(config, signal);
+      p.observation = { mode: "push" };
+      p.readiness = () =>
+        readiness ? { status: "unknown", reason: detail } : { status: "ready" };
+      p.list = async () => {
+        if (delay) {
+          entered?.();
+          await new Promise<void>((r) => (finish = r));
+        }
+        throw new ProtocolFailure({
+          kind: "internal",
+          reason: detail,
+          provider_error: detail,
+        });
+      };
+      return p;
+    },
+  };
+  const dir = await mkdtemp(`${tmpdir()}/drydock-ts-diagnostic-`),
+    socketPath = `${dir}/host.sock`,
+    host = new Host(new Map([["reference", module]])),
+    running = await serve(host, { unix: socketPath });
+  t.after(async () => {
+    await running.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const call = (method: string, path: string, body?: unknown) =>
+    request({ socketPath, method, path }, body);
+  assert.equal((await call("PUT", "/v1/config", configuration())).status, 204);
+  return {
+    host,
+    call,
+    setDetail: (value: string) => (detail = value),
+    setReadiness: (value: boolean) => (readiness = value),
+    startDelayed: () => {
+      delay = true;
+      return new Promise<void>((r) => (entered = r));
+    },
+    finishDelayed: () => {
+      delay = false;
+      finish?.();
+    },
+  };
+}
+// Typed HTTP errors and hello readiness must redact literal and common encoded
+// forms of both current and recently retired credentials across instances.
+test("diagnostics redact encoded old and current credential echoes over HTTP", async (t) => {
+  const f = await diagnosticFixture(t),
+    old = 'old é😀"\\\n /+=!#%',
+    current = 'new 雪😀"\\\t /+=!#%',
+    peer = "peer-secret-credential";
+  for (const [name, value] of [
+    ["a", old],
+    ["b", peer],
+    ["a", current],
+  ])
+    assert.equal(
+      (await f.call("PUT", `/v1/providers/${name}/credential`, { value }))
+        .status,
+      204,
+    );
+  for (const form of [
+    ...credentialForms(old),
+    ...credentialForms(current),
+    ...credentialForms(peer),
+  ]) {
+    f.setDetail("diagnostic " + form + " end");
+    const response = await f.call("GET", "/v1/providers/a/environments");
+    assert.equal(response.status, 500);
+    for (const field of ["reason", "provider_error"])
+      assert.ok(
+        !response.body[field].includes(form),
+        "encoded credential escaped error redaction",
+      );
+    f.setReadiness(true);
+    for (const p of (await f.call("GET", "/v1/hello")).body.providers)
+      assert.ok(
+        !p.readiness.reason.includes(form),
+        "encoded credential escaped readiness redaction",
+      );
+    f.setReadiness(false);
+  }
+});
+// Retire old credentials after a bounded window; an in-flight older generation
+// must remain protected when it eventually returns a diagnostic.
+test("diagnostics bound retired credentials and protect delayed generations", async (t) => {
+  const f = await diagnosticFixture(t),
+    old = "generation-000-token";
+  await f.call("PUT", "/v1/providers/a/credential", { value: old });
+  const entered = f.startDelayed(),
+    delayed = f.call("GET", "/v1/providers/a/environments");
+  await entered;
+  for (let n = 1; n <= 100; n++)
+    await f.call("PUT", "/v1/providers/a/credential", {
+      value: `generation-${String(n).padStart(3, "0")}-token`,
+    });
+  f.setDetail(credentialForms(old).join(" | "));
+  f.finishDelayed();
+  const response = await delayed;
+  assert.equal(response.status, 500);
+  for (const form of credentialForms(old))
+    assert.ok(!response.body.provider_error.includes(form));
+  f.setDetail(old + " generation-099-token generation-100-token");
+  const later = await f.call("GET", "/v1/providers/a/environments");
+  assert.ok(
+    later.body.provider_error.includes(old),
+    "retired generation should no longer be retained",
+  );
+  assert.ok(!later.body.provider_error.includes("generation-099-token"));
+  assert.ok(!later.body.provider_error.includes("generation-100-token"));
+});
+// Mask before a Unicode-safe 16 KiB truncation, including credentials spanning
+// the truncation point, in both typed errors and readiness diagnostics.
+test("diagnostics bound UTF-8 text after redacting boundary secrets", async (t) => {
+  const f = await diagnosticFixture(t),
+    secret = "CROSSING-BOUNDARY-CREDENTIAL-1234567890";
+  await f.call("PUT", "/v1/providers/a/credential", { value: secret });
+  f.setDetail("🙂".repeat(4090) + secret + "界".repeat(1000));
+  const error = (await f.call("GET", "/v1/providers/a/environments")).body;
+  for (const key of ["reason", "provider_error"]) {
+    assert.ok(Buffer.byteLength(error[key]) <= 16384);
+    assert.ok(!error[key].includes("CROSSING"));
+    assert.ok(!error[key].includes("\uFFFD"));
+    assert.ok(error[key].endsWith("...<truncated>"));
+  }
+  f.setReadiness(true);
+  for (const p of (await f.call("GET", "/v1/hello")).body.providers) {
+    assert.ok(Buffer.byteLength(p.readiness.reason) <= 16384);
+    assert.ok(!p.readiness.reason.includes("\uFFFD"));
+  }
+});
+// Disconnecting during relay/exec setup cancels the provider context and disposes
+// a late Duplex even if its provider ignores cancellation.
+test("upgrade disconnect cancels setup and disposes late streams", async (t) => {
+  const { PassThrough } = await import("node:stream");
+  for (const operation of ["relay", "exec"]) {
+    let signal: AbortSignal | undefined,
+      release: ((stream: any) => void) | undefined,
+      entered: () => void = () => {};
+    const started = new Promise<void>((r) => (entered = r));
+    const module = {
+      version: "test",
+      async configure(config: any, abort: AbortSignal) {
+        const p = await reference.configure(config, abort),
+          setup = async (_id: string, context: any) => {
+            signal = context.signal;
+            entered();
+            return await new Promise<any>((r) => (release = r));
+          };
+        p.relay = setup;
+        p.exec = async (id, _request, context) => setup(id, context);
+        return p;
+      },
+    };
+    const dir = await mkdtemp(`${tmpdir()}/drydock-ts-upgrade-cancel-`),
+      socketPath = `${dir}/host.sock`,
+      host = new Host(new Map([["reference", module]])),
+      running = await serve(host, { unix: socketPath });
+    t.after(async () => {
+      await running.close();
+      await rm(dir, { recursive: true, force: true });
+    });
+    await host.configure(configuration());
+    host.refresh("a", "test");
+    const socket = net.connect(socketPath);
+    await new Promise<void>((r) => socket.once("connect", r));
+    const body =
+      operation === "exec" ? JSON.stringify({ command: ["cat"] }) : "";
+    socket.write(
+      `${operation === "exec" ? "POST" : "GET"} /v1/providers/a/environments/example/${operation} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: ${operation === "exec" ? "drydock-stream" : "drydock-relay"}\r\n${body ? `Content-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n` : ""}\r\n${body}`,
+    );
+    await started;
+    socket.destroy();
+    const deadline = Date.now() + 1000;
+    while (!signal?.aborted && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 5));
+    const stream = new PassThrough();
+    release!(stream);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(
+      signal?.aborted,
+      true,
+      "disconnected upgrade must cancel setup",
+    );
+    assert.equal(stream.destroyed, true, "late stream must be disposed");
+  }
+});
+// Longest matching credentials win; inserted redaction markers and protocol
+// discriminants must survive a second HTTP serialization boundary unchanged.
+test("short credentials cannot corrupt redaction markers or error kinds", async (t) => {
+  const f = await diagnosticFixture(t);
+  await f.call("PUT", "/v1/providers/a/credential", { value: "ABCDE" });
+  await f.call("PUT", "/v1/providers/a/credential", { value: "E" });
+  f.setDetail("ABCDE E");
+  const error = (await f.call("GET", "/v1/providers/a/environments")).body;
+  assert.equal(error.kind, "internal");
+  assert.equal(error.provider_error, "<REDACTED> <REDACTED>");
+  f.setReadiness(true);
+  assert.equal(
+    (await f.call("GET", "/v1/hello")).body.providers[0].readiness.reason,
+    "<REDACTED> <REDACTED>",
+  );
+});
