@@ -71,6 +71,8 @@ impl ToolDetector for PathDetector {
 }
 #[derive(Clone, Debug)]
 pub struct HostStatus {
+    pub modules: Vec<LoadedModule>,
+    pub loadable_modules: Vec<LoadableModule>,
     pub readiness: Readiness,
     pub providers: Vec<ProviderDeclaration>,
     /// Incremented only after successful handshake/configuration of a new process.
@@ -78,7 +80,7 @@ pub struct HostStatus {
 }
 impl HostStatus {
     fn new(readiness: Readiness, generation: u64) -> Self {
-        Self { readiness, providers: Vec::new(), generation }
+        Self { readiness, modules: Vec::new(), loadable_modules: Vec::new(), providers: Vec::new(), generation }
     }
 }
 pub struct HostHandle {
@@ -216,6 +218,7 @@ impl Supervisor {
         spec: &HostSpec,
         client: &Client,
         previous: &mut BTreeMap<String, Secret>,
+        masker: &mut DiagnosticMasker,
     ) -> Result<BTreeMap<String, Readiness>, client::Error> {
         let mut unavailable = BTreeMap::new();
         for provider in &spec.configuration.providers {
@@ -226,6 +229,7 @@ impl Supervisor {
                 if credential.value.expose().is_empty() || credential.expires_at.is_some_and(|at| at <= SystemTime::now()) {
                     return Err(missing_credential());
                 }
+                masker.remember(credential.value.expose());
                 if previous.get(&provider.name) != Some(&credential.value) {
                     client.credential(&provider.name, credential.value.clone()).await?;
                     previous.insert(provider.name.clone(), credential.value);
@@ -245,6 +249,30 @@ impl Supervisor {
         Ok(unavailable)
     }
     async fn run(&self, spec: HostSpec, socket: PathBuf, client: Client, status: watch::Sender<HostStatus>) {
+        let mut masker = DiagnosticMasker::default();
+        // Settings are not diagnostics. Mask string values even if a host
+        // mistakenly includes them in its readiness reason.
+        fn remember_settings(value: &serde_json::Value, masker: &mut DiagnosticMasker) {
+            match value {
+                serde_json::Value::String(s) => masker.remember(s),
+                serde_json::Value::Array(a) => {
+                    for v in a {
+                        remember_settings(v, masker);
+                    }
+                }
+                serde_json::Value::Object(o) => {
+                    for v in o.values() {
+                        remember_settings(v, masker);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for provider in &spec.configuration.providers {
+            for value in provider.settings.values() {
+                remember_settings(value, &mut masker);
+            }
+        }
         let mut generation = 0;
         loop {
             let mut child = None;
@@ -310,9 +338,16 @@ impl Supervisor {
                         initialized = true;
                         previous.clear();
                     }
-                    let mut unavailable = self.refresh(&spec, &client, &mut previous).await?;
+                    let mut unavailable = self.refresh(&spec, &client, &mut previous, &mut masker).await?;
                     let mut hello = client.hello().await?;
                     for provider in &mut hello.providers {
+                        match &mut provider.readiness {
+                            Readiness::Ready => {}
+                            Readiness::MissingTool { reason }
+                            | Readiness::MissingCredential { reason }
+                            | Readiness::VersionMismatch { reason }
+                            | Readiness::Unknown { reason } => *reason = masker.text(reason),
+                        }
                         if let Some(readiness) = unavailable.remove(&provider.provider) {
                             provider.readiness = readiness;
                         }
@@ -322,7 +357,13 @@ impl Supervisor {
                 .await;
                 let readiness = match result {
                     Ok(hello) => {
-                        status.send_replace(HostStatus { readiness: Readiness::Ready, providers: hello.providers, generation });
+                        status.send_replace(HostStatus {
+                            readiness: Readiness::Ready,
+                            modules: hello.modules,
+                            loadable_modules: hello.loadable_modules,
+                            providers: hello.providers,
+                            generation,
+                        });
                         None
                     }
                     Err(client::Error::VersionMismatch) => {
