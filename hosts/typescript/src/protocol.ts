@@ -1,4 +1,11 @@
-// Generated from openapi.json; run corepack pnpm generate.
+// GENERATED / DO NOT EDIT.
+// Canonical Rust contract: crates/drydock-protocol/src/{lib.rs,validation.rs,openapi.rs}.
+// Rust exporter: crates/drydock-protocol/src/bin/generate-openapi.rs.
+// Input: /openapi.json (canonical generated OpenAPI document at repository root).
+// Export from repository root:
+//   cargo run --locked -p drydock-protocol --bin generate-openapi > openapi.json
+// Regenerate TypeScript bindings and packaged runtime schema from repository root:
+//   (cd hosts/typescript && corepack pnpm generate)
 export interface paths {
     "/v1/config": {
         parameters: {

@@ -14,7 +14,7 @@
     "generate": "node scripts/generate.mjs",
     "check:generated": "node scripts/generate.mjs --check",
     "typecheck": "tsc --noEmit",
-    "build": "tsc && node scripts/executable.mjs",
+    "build": "corepack pnpm check:generated && tsc && node scripts/executable.mjs",
     "test": "corepack pnpm build && node --test test/*.test.ts",
     "check": "corepack pnpm check:generated && corepack pnpm format:check && corepack pnpm typecheck && corepack pnpm test",
     "format": "prettier --write src test scripts/*.mjs *.json *.yaml README.md",

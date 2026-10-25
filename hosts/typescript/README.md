@@ -37,12 +37,34 @@ Authentication, module declarations, null fixtures and host configuration are
 checked directly because the daemon's public API does not forward those host
 contracts. No conformance checks or workflows are weakened.
 
-Regenerate after a protocol document change:
+Generated ownership follows this chain:
+
+```text
+crates/drydock-protocol/src/{lib.rs,validation.rs,openapi.rs}
+  -> Rust generate-openapi exporter
+  -> /openapi.json (canonical generated document)
+  -> src/protocol.ts (generated bindings)
+     src/openapi.json (byte-identical runtime AJV schema)
+  -> dist/ (standalone package, including its runtime schema)
+```
+
+`src/provider.ts` and the runtime implementation are handwritten. The JSON files
+and protocol bindings are generated artifacts; do not hand-edit them. See
+[AGENTS.md](AGENTS.md) for the short source map.
+
+After a Rust protocol change, export the canonical document from the repository
+root, then generate the TypeScript outputs:
 
 ```sh
-corepack pnpm generate
-corepack pnpm check:generated
+cargo run --locked -p drydock-protocol --bin generate-openapi > openapi.json
+(cd hosts/typescript && corepack pnpm generate)
+(cd hosts/typescript && corepack pnpm check:generated)
 ```
+
+Ordinary `corepack pnpm build` runs the same drift check before compiling;
+`corepack pnpm pack:companion` invokes that build before packaging. Production
+installation and execution use the packaged schema and do not need the repository
+root or a Rust export step.
 
 The types and runtime schema are generated from the same document; the host reads
 its protocol version from that document. The generator preserves the schema's
