@@ -40,6 +40,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install pinned Node for the TypeScript companion
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.18.0'
+      - name: Check TypeScript companion and endpoint conformance
+        env:
+          COREPACK_HOME: ${{ runner.temp }}/drydock-corepack-home
+        run: |
+          mkdir -m 700 -p "$COREPACK_HOME"
+          npm install --prefix "$RUNNER_TEMP/drydock-corepack" corepack@0.35.0
+          export PATH="$RUNNER_TEMP/drydock-corepack/node_modules/.bin:$PATH"
+          cd hosts/typescript
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm check
+          corepack pnpm conformance
       - name: Validate OpenAPI 3.1
         if: steps.workspace.outputs.present == 'true'
         run: |

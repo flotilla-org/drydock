@@ -492,3 +492,9 @@ Daytona API key permissions for this module (see [Daytona API keys](https://www.
 
 Organization membership must also match the key. Permission failures
 report the exact upstream operation and message; they do not invalidate the key.
+
+## TypeScript language host
+
+The [Node companion](hosts/typescript/README.md) implements the same generated
+OpenAPI protocol and includes a reference in-memory module. See its README for
+pinned pnpm build, installation, module loading and conformance commands.
