@@ -33,3 +33,16 @@ corepack pnpm check:generated
 pack:companion` invokes that build and packages the runtime schema without needing
 repository sources at install/run time. Run `corepack pnpm check` and `corepack pnpm
 conformance` for host validation. Do not change the wire contract to suit generation.
+
+Handwritten runtime ownership:
+
+- `http.ts`: Fastify route bindings from canonical OpenAPI operation IDs and schemas.
+  Preserve explicit methods, strict AJV input validation, sanitized errors and raw upgrades.
+- `server.ts` / `upgrade.ts`: authenticated listeners and raw duplex framing/lifecycle.
+- `host.ts` / `operations.ts`: configuration, readiness, credential/rate admission and
+  one optional-operation declaration plus checked invocation.
+- `observation.ts`: inventory, push/poll lifetime, diffing, cursor history and NDJSON source.
+- `reference.ts`: reference-owned settings schema and in-memory provider.
+
+Keep Fastify types inside `http.ts`; provider ports remain transport independent.
+Do not enable request/error logging or AJV coercion, defaults or field stripping.

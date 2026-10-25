@@ -156,6 +156,19 @@ entrypoint is that exact allowlisted value. A wire request cannot import an
 unregistered path. A factory must validate settings without starting background
 work, and observe cancellation before/while allocating resources.
 
+Fastify owns ordinary HTTP routing, body parsing/limits and response piping. Route
+paths, methods and body schemas come from the canonical OpenAPI document; typed
+bindings use its generated operation IDs. The shared AJV2020 validator never
+coerces values, inserts defaults or removes fields. Request/error logging stays
+disabled, and all HTTP failures use the host's sanitized protocol envelope.
+Provider interfaces contain no Fastify types. Custom transport admission and raw
+exec/relay framing stay outside the framework's HTTP parsing.
+
+`operations.ts` owns the optional-operation metadata and checked invocation;
+`observation.ts` owns inventory, poll/push lifetime, history and stream cursors.
+The reference module owns its settings schema, reusing canonical protocol schema
+references for wire-shaped values.
+
 The host owns readiness, credential generations, cached capabilities, rate budgets,
 prepare platform resolution, optional operation gates and HTTP statuses. Optional
 ports must agree with capabilities; unsupported operations return typed `Refused`.

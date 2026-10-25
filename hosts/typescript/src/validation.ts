@@ -2,7 +2,13 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import document from "./openapi.json" with { type: "json" };
 import { fail } from "./provider.js";
-const ajv = new Ajv2020({ strict: false, validateFormats: true });
+const ajv = new Ajv2020({
+  strict: false,
+  validateFormats: true,
+  coerceTypes: false,
+  useDefaults: false,
+  removeAdditional: false,
+});
 (addFormats as unknown as (ajv: Ajv2020) => void)(ajv);
 // OpenAPI integer formats describe Rust wire widths; AJV does not enforce them.
 function widths(value: unknown): void {
@@ -19,6 +25,12 @@ function widths(value: unknown): void {
 const runtime = structuredClone(document);
 widths(runtime);
 ajv.addSchema({ $id: "protocol", ...runtime });
+export function protocolSchema(name: keyof import("./provider.js").Types) {
+  return { $ref: `protocol#/components/schemas/${name}` };
+}
+export function compile(schema: object | boolean) {
+  return ajv.compile(schema);
+}
 const validators = new Map<string, ReturnType<typeof ajv.compile>>();
 export const protocolVersion = document.info.version;
 export function validate(name: string, value: unknown): void {

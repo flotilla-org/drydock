@@ -492,6 +492,37 @@ test("binary shutdown closes streams and removes socket", async (t) => {
       await new Promise((r) => setTimeout(r, 20));
     }
   }
+  assert.equal(
+    (
+      await request(
+        { socketPath, method: "PUT", path: "/v1/config" },
+        configuration(),
+      )
+    ).status,
+    204,
+  );
+  assert.equal(
+    (
+      await request(
+        { socketPath, method: "PUT", path: "/v1/providers/a/credential" },
+        { value: "never-log-this-test-credential" },
+      )
+    ).status,
+    204,
+  );
+  assert.equal(
+    (
+      await request(
+        { socketPath, method: "POST", path: "/v1/providers/a/prepare" },
+        {
+          image_digest: "never-log-this-test-credential",
+          tools_digest: "test",
+          size: { ...size, cpus: "1" },
+        },
+      )
+    ).status,
+    422,
+  );
   const stream = await observe(socketPath);
   await stream.next();
   const exited = new Promise((r) => child.once("exit", r));
@@ -515,7 +546,7 @@ test("exact observation sequences retain stable billing baseline", async (t) => 
   ) => {
     const until = Date.now() + 2000;
     while (true) {
-      const records = await host.records(since);
+      const records = await host.observation.records(since);
       if (predicate(records)) return records;
       if (Date.now() > until) throw Error("observation deadline");
       await new Promise((r) => setTimeout(r, 5));
@@ -530,20 +561,12 @@ test("exact observation sequences retain stable billing baseline", async (t) => 
   )[0];
   let cursor = snapshot.type === "snapshot" ? snapshot.cursor : "";
   const control = async (state: unknown) => {
-    const stream = await host.call("a", "exec", (p, c) =>
-      p.exec!(
-        id,
-        {
-          command: [
-            "drydock-fixture",
-            "state",
-            id,
-            JSON.stringify(state),
-          ] as any,
-        },
-        c,
-      ),
-    );
+    const stream = await host.invoke("a", "exec", [
+      id,
+      {
+        command: ["drydock-fixture", "state", id, JSON.stringify(state)] as any,
+      },
+    ]);
     stream.resume();
   };
   await control({ state: "stopped", cause: "paused_by_provider" });
@@ -560,7 +583,7 @@ test("exact observation sequences retain stable billing baseline", async (t) => 
   cursor = (paused.at(-1) as any).event.cursor;
   await control({ state: "transitioning", phase: "starting" });
   await new Promise((r) => setTimeout(r, 25));
-  assert.deepEqual(await host.records(cursor), []);
+  assert.deepEqual(await host.observation.records(cursor), []);
   await control({ state: "running" });
   const resumed = await wait((r) => r.length > 0, cursor);
   assert.deepEqual(
@@ -575,12 +598,13 @@ test("exact observation sequences retain stable billing baseline", async (t) => 
     ["gone"],
   );
   cursor = (gone.at(-1) as any).event.cursor;
-  const stream = await host.call("a", "exec", (p, c) =>
-    p.exec!(id, { command: ["drydock-fixture", "forget", id] as any }, c),
-  );
+  const stream = await host.invoke("a", "exec", [
+    id,
+    { command: ["drydock-fixture", "forget", id] as any },
+  ]);
   stream.resume();
   await new Promise((r) => setTimeout(r, 30));
-  assert.deepEqual(await host.records(cursor), []);
+  assert.deepEqual(await host.observation.records(cursor), []);
 });
 // A push observer starts once after commit. Refresh changes the credential view,
 // while snapshot list failures withhold only that provider's inventory.
@@ -616,7 +640,7 @@ test("push lifetime, credential generations and partial snapshots", async (t) =>
   assert.equal(current().generation, 0); // last callback belongs to b
   host.refresh("b", "third");
   assert.equal(current().generation, 1);
-  const records = await host.records();
+  const records = await host.observation.records();
   assert.equal(records[0].type, "snapshot");
   assert.equal((records[0] as any).unavailable_providers, undefined);
   release?.();
@@ -649,7 +673,7 @@ test("event history eviction and retained exclusive replay", async (t) => {
   config.providers = config.providers.slice(0, 1);
   await host.configure(config);
   host.refresh("a", "test");
-  const first = await host.records();
+  const first = await host.observation.records();
   const initial = (first[0] as any).cursor;
   const row = {
     environment: {
@@ -663,16 +687,16 @@ test("event history eviction and retained exclusive replay", async (t) => {
     },
   };
   sink(row, { kind: "created" });
-  const one = await host.records(initial);
+  const one = await host.observation.records(initial);
   const oldest = (one[0] as any).event.cursor;
   for (let n = 0; n < 1025; n++)
     sink(row, { kind: "running", granted_size: size });
-  const gap = await host.records(oldest);
+  const gap = await host.observation.records(oldest);
   assert.equal(gap[0].type, "snapshot");
   const count = lists;
   const latest = (gap[0] as any).cursor;
   sink(row, { kind: "stopped", cause: "suspended_by_request" });
-  const replay = await host.records(latest);
+  const replay = await host.observation.records(latest);
   assert.equal(replay.length, 1);
   assert.equal(replay[0].type, "event");
   assert.equal(lists, count);
@@ -737,11 +761,11 @@ test("overlapping rate windows retain long-window history", async (t) => {
   let now = 10000;
   t.mock.method(Date, "now", () => now);
   for (let n = 0; n < 3; n++) {
-    await host.call("a", "list", (p, c) => p.list(c));
+    await host.invoke("a", "list", []);
     now += 1001;
   }
   await assert.rejects(
-    host.call("a", "list", (p, c) => p.list(c)),
+    host.invoke("a", "list", []),
     (error: any) => error.detail.kind === "rate_limited",
   );
 });
@@ -894,7 +918,7 @@ test("credential refresh wakes a poll after stale rejection", async (t) => {
     await new Promise((r) => setTimeout(r, 5));
   }
   assert.equal(host.hello().providers[0].readiness.status, "ready");
-  const snapshot = (await host.records())[0];
+  const snapshot = (await host.observation.records())[0];
   assert.equal(snapshot.type, "snapshot");
   assert.equal((snapshot as any).unavailable_providers, undefined);
 });
@@ -957,7 +981,7 @@ test("shutdown cancels configuration and cold observation", async (t) => {
   config.providers = config.providers.slice(0, 1);
   await cold.configure(config);
   cold.refresh("a", "test");
-  const snapshot = cold.records();
+  const snapshot = cold.observation.records();
   await cold.shutdown();
   await assert.rejects(snapshot, (e: any) => e.detail.kind === "unavailable");
 });
@@ -1207,5 +1231,206 @@ test("short credentials cannot corrupt redaction markers or error kinds", async 
   assert.equal(
     (await f.call("GET", "/v1/hello")).body.providers[0].readiness.reason,
     "<REDACTED> <REDACTED>",
+  );
+});
+
+// Exclusive resume can be idle: the HTTP headers must arrive before any new
+// event, rather than leaving a reconnect blocked waiting for a body record.
+test("idle retained-cursor observation flushes headers immediately", async (t) => {
+  const { host, call, socketPath } = await fixture(t);
+  await ready(call);
+  const snapshot = (await host.observation.records())[0];
+  assert.equal(snapshot.type, "snapshot");
+  const req = http.get({
+    socketPath,
+    path: "/v1/events?since=" + encodeURIComponent((snapshot as any).cursor),
+    agent: false,
+  });
+  try {
+    let timer: NodeJS.Timeout | undefined;
+    const response = await Promise.race([
+      new Promise<http.IncomingMessage>((resolve, reject) => {
+        req.once("response", resolve);
+        req.once("error", reject);
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(Error("idle resume headers timed out")),
+          1000,
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers["content-type"], "application/x-ndjson");
+    response.destroy();
+  } finally {
+    req.destroy();
+  }
+});
+// Framework validation must neither coerce wire values nor insert defaults or
+// strip fields in opaque module settings. Provider interfaces see unchanged JSON.
+test("strict framework validation preserves opaque settings and typed refusals", async (t) => {
+  let received: unknown;
+  const module = {
+    version: "test",
+    async configure(config: any, signal: AbortSignal) {
+      received = structuredClone(config.settings);
+      return reference.configure({ ...config, settings: {} }, signal);
+    },
+  };
+  const dir = await mkdtemp(`${tmpdir()}/drydock-ts-strict-`),
+    socketPath = `${dir}/host.sock`,
+    host = new Host(new Map([["reference", module]])),
+    running = await serve(host, { unix: socketPath });
+  t.after(async () => {
+    await running.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const settings = JSON.parse(
+    '{"nested":{"count":"1","constructor":{"keep":true},"__proto__":{"kept":"opaque"}},"extra":false}',
+  );
+  const config = configuration(settings);
+  config.providers = config.providers.slice(0, 1);
+  const call = (method: string, path: string, body?: unknown) =>
+    request({ socketPath, method, path }, body);
+  assert.equal((await call("PUT", "/v1/config", config)).status, 204);
+  assert.deepEqual(received, settings);
+  await ready(call);
+  for (const bad of [
+    { ...size, cpus: "2" },
+    { ...size, memory_bytes: "1024" },
+  ]) {
+    const response = await call("POST", "/v1/providers/a/prepare", {
+      size: bad,
+      image_digest: "image",
+      tools_digest: "tools",
+    });
+    assert.equal(response.status, 422);
+    assert.equal(response.body.kind, "refused");
+  }
+  const { body } = await provision(call);
+  const response = await call("POST", "/v1/providers/a/environments", {
+    ...body,
+    label: "missing-size",
+    size: { cpus: 1, disk_bytes: 0 },
+  });
+  assert.equal(response.status, 422);
+});
+// Fastify supplies matching/decoding; preserve Rust's typed 404/405/422 contract,
+// including HEAD (no automatic GET alias), bad escapes and long opaque names.
+test("router keeps methods, encoded provider names and path errors typed", async (t) => {
+  const name = "space / percent% " + "x".repeat(180),
+    config = configuration();
+  config.providers = config.providers.slice(0, 1);
+  config.providers[0].name = name;
+  const { call } = await fixture(t, config),
+    base = "/v1/providers/" + encodeURIComponent(name);
+  assert.equal(
+    (await call("PUT", base + "/credential", { value: "test-secret-one" }))
+      .status,
+    204,
+  );
+  const prepared = await call("POST", base + "/prepare", {
+    size,
+    image_digest: "image",
+    tools_digest: "tools",
+  });
+  assert.equal(prepared.status, 200);
+  for (const [method, path, status, kind] of [
+    ["POST", "/v1/hello", 405, "method_not_allowed"],
+    ["GET", base + "/prepare", 405, "method_not_allowed"],
+    ["GET", "/v1/absent", 404, "not_found"],
+    ["GET", "/v1/providers/%ZZ/environments", 422, "refused"],
+  ] as const) {
+    const response = await call(method, path);
+    assert.equal(response.status, status);
+    assert.equal(response.body.kind, kind);
+  }
+  assert.equal((await call("HEAD", "/v1/hello")).status, 405);
+  assert.equal((await call("GET", "/v1/../v1/hello")).status, 200);
+});
+// The reference settings schema is module-owned, shares canonical protocol refs,
+// rejects unknown/ill-typed settings and makes no coercion/default mutations.
+test("reference settings schema rejects wrong types and declaration mismatches", async (t) => {
+  const { call } = await fixture(t);
+  for (const settings of [
+    { extra: true },
+    { fixture: "true" },
+    { platforms: {} },
+    { rate_limits: {} },
+    { poll_interval_ms: 0 },
+    { poll_interval_ms: "10" },
+    { disabled: ["not-an-operation"] },
+  ]) {
+    const config = configuration();
+    config.providers.push({
+      ...config.providers[0],
+      name: "invalid",
+      settings,
+    });
+    const response = await call("PUT", "/v1/config", config);
+    assert.equal(response.status, 422);
+    assert.equal(response.body.kind, "refused");
+    assert.equal((await call("GET", "/v1/hello")).body.providers.length, 2);
+  }
+});
+// Framework parser errors must retain typed Refused responses, including the
+// exact existing 2 MiB boundary; JSON-compatible media types remain accepted.
+test("HTTP parser keeps typed JSON errors and the 2 MiB boundary", async (t) => {
+  const { socketPath } = await fixture(t);
+  const config = JSON.stringify(configuration());
+  const raw = (body: string, type?: string) =>
+    new Promise<{ status: number; body: any }>((resolve, reject) => {
+      const req = http.request(
+        {
+          socketPath,
+          method: "PUT",
+          path: "/v1/config",
+          agent: false,
+          headers: {
+            ...(type ? { "content-type": type } : {}),
+            "content-length": Buffer.byteLength(body),
+          },
+        },
+        (res) => {
+          let text = "";
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => (text += chunk));
+          res.on("end", () =>
+            resolve({
+              status: res.statusCode!,
+              body: text ? JSON.parse(text) : null,
+            }),
+          );
+        },
+      );
+      req.once("error", reject);
+      req.end(body);
+    });
+  for (const [body, media] of [
+    ["{", "application/json"],
+    [config, "text/plain"],
+    [config, undefined],
+    [
+      config + " ".repeat(2 * 1024 * 1024 - config.length + 1),
+      "application/json",
+    ],
+  ]) {
+    const response = await raw(body!, media);
+    assert.equal(response.status, 422);
+    assert.equal(response.body.kind, "refused");
+  }
+  assert.equal(
+    (
+      await raw(
+        config + " ".repeat(2 * 1024 * 1024 - config.length),
+        "application/json",
+      )
+    ).status,
+    204,
+  );
+  assert.equal(
+    (await raw(config, "application/vnd.drydock+json; charset=utf-8")).status,
+    204,
   );
 });

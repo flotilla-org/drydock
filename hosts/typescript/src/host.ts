@@ -1,7 +1,14 @@
 import { DiagnosticSecrets } from "./diagnostic.js";
-import { randomUUID } from "node:crypto";
+import { Observation } from "./observation.js";
+import {
+  checkDeclaration,
+  checkSupported,
+  invoke,
+  type Operation,
+  type OperationArgs,
+  type OperationResult,
+} from "./operations.js";
 import { isDeepStrictEqual } from "node:util";
-import { EventEmitter } from "node:events";
 import {
   fail,
   ProtocolFailure,
@@ -22,33 +29,16 @@ type Instance = {
   credentials: Credentials;
   rejected: boolean;
   rejectionGeneration: number;
-  cache?: Observed[];
-  pollError?: Types["ProtocolError"];
-  destroyed: Set<string>;
-  pendingDestroy: Map<string, number>;
   budget: Map<string, number[]>;
   pollBudget: Map<string, number[]>;
-  pollPending: boolean;
-  pushStarted?: boolean;
-  refreshPending?: boolean;
-  seen?: Observed[];
-  timer?: NodeJS.Timeout;
-  polling?: Promise<void>;
 };
 export class Host {
-  readonly changes = new EventEmitter();
   readonly stop = new AbortController();
+  readonly observation = new Observation(this.stop.signal);
   private instances = new Map<string, Instance>();
   private modules: Types["ModuleConfiguration"][] = [];
-  private history: Types["Event"][] = [];
-  private cursor: string;
-  private sequence = 0;
-  private epoch = randomUUID();
   private configuring: Promise<unknown> = Promise.resolve();
-  private tasks = new Set<Promise<void>>();
-  constructor(readonly registry: Map<string, ProviderModule>) {
-    this.cursor = `${this.epoch}:0`;
-  }
+  constructor(readonly registry: Map<string, ProviderModule>) {}
   hello(): Types["Hello"] {
     return {
       protocol_version: protocolVersion,
@@ -179,20 +169,7 @@ export class Host {
         throw error;
       }
       validate("Capabilities", provider.capabilities);
-      const ports = [
-        ["fallback_runner", "exec"],
-        ["suspend_resume", "suspend"],
-        ["suspend_resume", "resume"],
-        ["export", "export"],
-        ["usage", "usage"],
-        ["quota", "quota"],
-      ] as const;
-      for (const [cap, port] of ports)
-        if (
-          provider.capabilities[cap] !==
-          (typeof provider[port] === "function")
-        )
-          fail("refused", "capabilities must match optional operation ports");
+      checkDeclaration(provider);
       for (const rate of provider.rateLimits ?? []) {
         validate("RateLimit", rate);
         if (!rate.requests || !rate.period_seconds)
@@ -213,11 +190,8 @@ export class Host {
           credentials: { mode: p.credential, generation: 0 },
           rejected: false,
           rejectionGeneration: 0,
-          destroyed: new Set(),
-          pendingDestroy: new Map(),
           budget: new Map(),
           pollBudget: new Map(),
-          pollPending: false,
         },
       ]);
     }
@@ -228,8 +202,16 @@ export class Host {
       if (i.config.credential.mode === "proxied")
         this.secrets.remember(name, i.config.credential.placeholder_token);
     }
-    for (const [, i] of additions) this.observe(i);
-    this.changes.emit("change");
+    for (const [name, i] of additions)
+      this.observation.register({
+        name,
+        observation: i.provider.observation,
+        rateLimits: i.rateLimits,
+        credentials: () => i.credentials,
+        readiness: () => this.readiness(i),
+        list: (poll, signal) => this.invoke(name, "list", [], { poll, signal }),
+        run: i.provider.run?.bind(i.provider),
+      });
   }
   refresh(name: string, value: string) {
     validate("CredentialRefresh", { value });
@@ -243,11 +225,7 @@ export class Host {
       generation: i.credentials.generation + 1,
     };
     i.rejected = false;
-    i.pollError = undefined;
-    if (i.polling) i.refreshPending = true;
-    if (i.timer) clearTimeout(i.timer);
-    this.observe(i);
-    this.changes.emit("change");
+    this.observation.credentialsChanged(name);
   }
   private async cancel<T>(
     task: Promise<T>,
@@ -268,7 +246,7 @@ export class Host {
       signal.removeEventListener("abort", listener!);
     }
   }
-  private reserve(i: Instance, operation: string, poll: boolean) {
+  private reserve(i: Instance, operation: Operation, poll: boolean) {
     const now = Date.now();
     const limits = i.rateLimits.filter(
       (r) =>
@@ -294,7 +272,9 @@ export class Host {
             (r.requests === 1 &&
               now - (pollTimes.at(-1) ?? -Infinity) <
                 2 * r.period_seconds * 1000))) ||
-        (!poll && i.pollPending && r.requests === 1)
+        (!poll &&
+          this.observation.pendingPoll(i.config.name) &&
+          r.requests === 1)
       ) {
         throw new ProtocolFailure({
           kind: "rate_limited",
@@ -327,24 +307,15 @@ export class Host {
     }
   }
 
-  async call<T>(
+  private async call<T>(
     name: string,
-    operation: string,
+    operation: Operation,
     invoke: (p: Provider, c: Context) => Promise<T>,
     poll = false,
     signal?: AbortSignal,
   ): Promise<T> {
     const i = this.instance(name);
-    const capability = {
-      exec: "fallback_runner",
-      suspend: "suspend_resume",
-      resume: "suspend_resume",
-      export: "export",
-      usage: "usage",
-      quota: "quota",
-    }[operation] as keyof Types["Capabilities"] | undefined;
-    if (capability && !i.capabilities[capability])
-      fail("refused", "unsupported operation");
+    checkSupported(i.capabilities, operation);
     const readiness = this.readiness(i);
     if (
       readiness.status !== "ready" &&
@@ -380,7 +351,7 @@ export class Host {
         ) {
           i.rejected = true;
           i.rejectionGeneration++;
-          this.changes.emit("change");
+          this.observation.notify();
         }
         throw this.failure(
           {
@@ -399,15 +370,29 @@ export class Host {
       });
     }
   }
+  invoke<K extends Operation>(
+    name: string,
+    operation: K,
+    args: OperationArgs<K>,
+    options: { poll?: boolean; signal?: AbortSignal } = {},
+  ) {
+    return this.call<OperationResult<K>>(
+      name,
+      operation,
+      (provider, context) => invoke(provider, operation, args, context),
+      options.poll,
+      options.signal,
+    );
+  }
   async prepare(name: string, request: Types["PrepareRequest"]) {
     validate("PrepareRequest", request);
     const platforms = this.instance(name).capabilities.platforms ?? [];
     const platform = request.platform ?? platforms[0];
     if (!platform || !platforms.some((p) => isDeepStrictEqual(p, platform)))
       fail("refused", "provider does not support requested platform");
-    const result = await this.call(name, "prepare", (p, c) =>
-      p.prepare({ ...request, platform }, c),
-    );
+    const result = await this.invoke(name, "prepare", [
+      { ...request, platform },
+    ]);
     if (!isDeepStrictEqual(result.platform, platform))
       throw new ProtocolFailure({
         kind: "internal",
@@ -420,295 +405,22 @@ export class Host {
     validate("ProvisionRequest", request);
     if (request.prepared.provider !== name)
       fail("refused", "prepared provider mismatch");
-    return this.call(name, "provision", (p, c) => p.provision(request, c));
+    return this.invoke(name, "provision", [request]);
   }
   async destroy(name: string, id: string) {
-    const i = this.instance(name);
-    i.pendingDestroy.set(id, (i.pendingDestroy.get(id) ?? 0) + 1);
+    this.instance(name);
+    const finish = this.observation.destroying(name, id);
     try {
-      await this.call(name, "destroy", (p, c) => p.destroy(id, c));
-      i.destroyed.add(id);
-    } finally {
-      const count = (i.pendingDestroy.get(id) ?? 1) - 1;
-      if (count) i.pendingDestroy.set(id, count);
-      else i.pendingDestroy.delete(id);
+      await this.invoke(name, "destroy", [id]);
+      finish(true);
+    } catch (error) {
+      finish(false);
+      throw error;
     }
-  }
-  private emit(i: Instance, row: Observed, event: Types["EventKind"]) {
-    const cursor = `${this.epoch}:${++this.sequence}`;
-    this.cursor = cursor;
-    this.history.push({
-      cursor,
-      id: row.environment.id,
-      label: row.environment.label,
-      provider: i.config.name,
-      timestamp: row.timestamp ?? new Date().toISOString(),
-      timestamp_source: row.timestamp ? "provider" : "adaptor",
-      event,
-    });
-    if (this.history.length > 1024) this.history.shift();
-    this.changes.emit("change");
-  }
-  private reconcile(i: Instance, rows: Observed[]) {
-    const old = new Map((i.seen ?? []).map((r) => [r.environment.id, r]));
-    for (const row of rows) {
-      const before = old.get(row.environment.id),
-        state = row.environment.state;
-      old.delete(row.environment.id);
-      if (!before) this.emit(i, row, { kind: "created" });
-      if (
-        state.state === "running" &&
-        before?.environment.state.state === "stopped"
-      )
-        this.emit(i, row, { kind: "resumed" });
-      if (
-        state.state === "running" &&
-        row.environment.granted_size &&
-        (!before ||
-          before.environment.state.state !== "running" ||
-          !isDeepStrictEqual(
-            before.environment.granted_size,
-            row.environment.granted_size,
-          ))
-      ) {
-        this.emit(i, row, {
-          kind: "running",
-          granted_size: row.environment.granted_size,
-        });
-      }
-      if (
-        state.state === "stopped" &&
-        !isDeepStrictEqual(before?.environment.state, state)
-      ) {
-        this.emit(i, row, {
-          kind: state.cause === "paused_by_provider" ? "paused" : "stopped",
-          cause: state.cause,
-        });
-      }
-      if (
-        state.state === "gone" &&
-        !isDeepStrictEqual(before?.environment.state, state)
-      )
-        this.emit(i, row, { kind: "gone", cause: state.cause });
-    }
-    const deferred: Observed[] = [];
-    for (const [id, row] of old) {
-      if (i.pendingDestroy.has(id) && !i.destroyed.has(id)) {
-        deferred.push(row);
-        continue;
-      }
-      if (row.environment.state.state === "gone") continue;
-      this.emit(
-        i,
-        { environment: row.environment },
-        {
-          kind: "gone",
-          cause: {
-            kind: i.destroyed.has(id)
-              ? "destroyed_by_request"
-              : "missing_on_list",
-          },
-        },
-      );
-      i.destroyed.delete(id);
-    }
-    i.cache = structuredClone(rows);
-    i.seen = [
-      ...deferred,
-      ...rows.map((row) =>
-        row.environment.state.state === "transitioning"
-          ? (i.seen?.find((old) => old.environment.id === row.environment.id) ??
-            row)
-          : row,
-      ),
-    ];
-    i.pollError = undefined;
-    this.changes.emit("change");
-  }
-  private observe(i: Instance) {
-    if (this.stop.signal.aborted || i.polling) return;
-    if (i.provider.observation.mode === "push") {
-      if (i.provider.run && !i.pushStarted) {
-        i.pushStarted = true;
-        const task = i.provider
-          .run(
-            (row, event) => {
-              if (!this.stop.signal.aborted) this.emit(i, row, event);
-            },
-            () => i.credentials,
-            this.stop.signal,
-          )
-          .catch(() => {});
-        this.tasks.add(task);
-        void task.finally(() => this.tasks.delete(task));
-      }
-      return;
-    }
-    let interval = i.provider.observation.intervalMs;
-    for (const r of i.rateLimits)
-      if (r.operation === "list" || r.operation === "*")
-        interval = Math.max(
-          interval,
-          (r.period_seconds * 1000 * (r.requests === 1 ? 2 : 1)) /
-            Math.max(1, Math.floor(r.requests / 2)),
-        );
-    const generation = i.credentials.generation;
-    i.polling = (async () => {
-      try {
-        i.pollPending = true;
-        const rows = await this.call(
-          i.config.name,
-          "list",
-          (p, c) => p.list(c),
-          true,
-        );
-        i.pollPending = false;
-        if (generation === i.credentials.generation) this.reconcile(i, rows);
-      } catch (error) {
-        i.pollPending =
-          error instanceof ProtocolFailure &&
-          error.detail.kind === "rate_limited";
-        if (generation === i.credentials.generation && !i.rejected)
-          i.pollError =
-            error instanceof ProtocolFailure
-              ? error.detail
-              : { kind: "unavailable", reason: "observation failed" };
-        this.changes.emit("change");
-      } finally {
-        i.polling = undefined;
-        if (!this.stop.signal.aborted) {
-          const delay = i.refreshPending ? 0 : interval;
-          i.refreshPending = false;
-          i.timer = setTimeout(() => this.observe(i), delay);
-        }
-      }
-    })();
-  }
-  async records(since?: string): Promise<Types["ObserveRecord"][]> {
-    if (this.stop.signal.aborted) fail("unavailable", "host stopping");
-    if (since === this.cursor) return [];
-    const index = this.history.findIndex((e) => e.cursor === since);
-    if (since === `${this.epoch}:0` && this.sequence <= 1024)
-      return this.history.map((event) => ({ type: "event", event }));
-    if (since && index >= 0)
-      return this.history
-        .slice(index + 1)
-        .map((event) => ({ type: "event", event }));
-    // Capture cursor before push lists, so events arriving during listing are replayed.
-    const before = this.cursor;
-    const push = new Map<string, Observed[] | Types["ProtocolError"]>();
-    await Promise.all(
-      [...this.instances]
-        .filter(([, i]) => i.provider.observation.mode === "push")
-        .map(async ([name]) => {
-          let timer: NodeJS.Timeout | undefined;
-          try {
-            push.set(
-              name,
-              await Promise.race([
-                this.call(
-                  name,
-                  "list",
-                  (p, c) => p.list(c),
-                  false,
-                  AbortSignal.timeout(5000),
-                ),
-                new Promise<never>((_, reject) => {
-                  timer = setTimeout(
-                    () =>
-                      reject(
-                        new ProtocolFailure({
-                          kind: "unavailable",
-                          reason: "snapshot deadline",
-                        }),
-                      ),
-                    5000,
-                  );
-                }),
-              ]),
-            );
-          } catch (e) {
-            push.set(
-              name,
-              e instanceof ProtocolFailure
-                ? e.detail
-                : { kind: "unavailable", reason: "snapshot failed" },
-            );
-          } finally {
-            clearTimeout(timer);
-          }
-        }),
-    );
-    while (
-      [...this.instances.values()].some(
-        (i) =>
-          i.provider.observation.mode === "poll" &&
-          this.readiness(i).status === "ready" &&
-          !i.cache &&
-          !i.pollError,
-      )
-    ) {
-      if (this.stop.signal.aborted) fail("unavailable", "host stopping");
-      await this.changed();
-    }
-    if (this.stop.signal.aborted) fail("unavailable", "host stopping");
-    const environments: Types["Environment"][] = [],
-      unavailable: Record<string, Types["ProtocolError"]> = {};
-    for (const [name, i] of this.instances) {
-      if (this.readiness(i).status !== "ready") {
-        unavailable[name] = {
-          kind: "unavailable",
-          reason: "provider not ready",
-        };
-        continue;
-      }
-      const rows =
-        i.provider.observation.mode === "poll" ? i.cache : push.get(name);
-      if (!rows || !Array.isArray(rows))
-        unavailable[name] = (rows as Types["ProtocolError"]) ??
-          i.pollError ?? {
-            kind: "unavailable",
-            reason: "inventory unavailable",
-          };
-      else environments.push(...rows.map((r) => r.environment));
-    }
-    const cursor = push.size ? before : this.cursor;
-    return [
-      {
-        type: "snapshot",
-        cursor,
-        environments,
-        ...(Object.keys(unavailable).length
-          ? { unavailable_providers: unavailable }
-          : {}),
-      },
-    ];
-  }
-  async changed(signal?: AbortSignal) {
-    if (this.stop.signal.aborted || signal?.aborted) return;
-    await new Promise<void>((resolve) => {
-      const done = () => {
-        this.changes.off("change", done);
-        this.stop.signal.removeEventListener("abort", done);
-        signal?.removeEventListener("abort", done);
-        resolve();
-      };
-      this.changes.once("change", done);
-      this.stop.signal.addEventListener("abort", done, { once: true });
-      signal?.addEventListener("abort", done, { once: true });
-    });
   }
   async shutdown() {
     this.stop.abort();
-    for (const i of this.instances.values()) clearTimeout(i.timer);
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([
-      Promise.allSettled([...this.tasks]),
-      new Promise((resolve) => {
-        timer = setTimeout(resolve, 5000);
-      }),
-    ]);
-    clearTimeout(timer);
+    await this.observation.shutdown();
     this.instances.clear();
     this.secrets.clear();
   }

@@ -9,7 +9,8 @@ import {
   type ProviderModule,
   type Types,
 } from "./provider.js";
-import { validate } from "./validation.js";
+import { validate, compile, protocolSchema } from "./validation.js";
+import { disableOperations, optionalControls } from "./operations.js";
 type Settings = {
   fault?: Types["ProtocolError"];
   fixture?: boolean;
@@ -22,77 +23,37 @@ type Settings = {
   poll_interval_ms?: number;
   disabled?: string[];
 };
+const settingsSchema = compile({
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    fault: { anyOf: [protocolSchema("ProtocolError"), { type: "null" }] },
+    reach: { anyOf: [protocolSchema("Reach"), { type: "null" }] },
+    fixture: { type: "boolean" },
+    fixture_push: { type: "boolean" },
+    fixture_bad_relay: { type: "boolean" },
+    agent: { type: "boolean" },
+    platforms: { type: "array", items: protocolSchema("Platform") },
+    rate_limits: { type: "array", items: protocolSchema("RateLimit") },
+    poll_interval_ms: {
+      type: "integer",
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+    },
+    disabled: {
+      type: "array",
+      items: { type: "string", enum: optionalControls },
+    },
+  },
+});
 export const reference: ProviderModule = {
   version: "0.1.0",
   async configure(config) {
-    const allowed = [
-      "fault",
-      "fixture",
-      "fixture_push",
-      "fixture_bad_relay",
-      "reach",
-      "agent",
-      "platforms",
-      "rate_limits",
-      "poll_interval_ms",
-      "disabled",
-    ];
-    if (Object.keys(config.settings).some((k) => !allowed.includes(k)))
+    if (!settingsSchema(config.settings))
       fail("refused", "invalid reference settings");
     const settings = config.settings as Settings;
-    if (
-      settings.rate_limits !== undefined &&
-      !Array.isArray(settings.rate_limits)
-    )
-      fail("refused", "invalid reference rate limits");
-    for (const [key, schema] of [
-      ["fault", "ProtocolError"],
-      ["reach", "Reach"],
-    ] as const)
-      if (settings[key]) validate(schema, settings[key]);
-    if (settings.platforms) {
-      if (!Array.isArray(settings.platforms))
-        fail("refused", "invalid platforms");
-      for (const p of settings.platforms) validate("Platform", p);
-    }
-    if (
-      settings.poll_interval_ms !== undefined &&
-      (!Number.isSafeInteger(settings.poll_interval_ms) ||
-        settings.poll_interval_ms <= 0)
-    )
-      fail("refused", "invalid poll interval");
-    for (const key of [
-      "fixture",
-      "fixture_push",
-      "fixture_bad_relay",
-      "agent",
-    ] as const)
-      if (settings[key] !== undefined && typeof settings[key] !== "boolean")
-        fail("refused", "invalid reference settings");
-    if (
-      settings.disabled &&
-      (!Array.isArray(settings.disabled) ||
-        settings.disabled.some(
-          (k) => !["exec", "suspend", "export", "usage", "quota"].includes(k),
-        ))
-    )
-      fail("refused", "invalid disabled operations");
     const provider = new Reference(config.name, settings);
-    for (const key of settings.disabled ?? []) {
-      const capability = {
-        exec: "fallback_runner",
-        suspend: "suspend_resume",
-        export: "export",
-        usage: "usage",
-        quota: "quota",
-      }[key]!;
-      (provider.capabilities as unknown as Record<string, unknown>)[
-        capability
-      ] = false;
-      Object.defineProperty(provider, key, { value: undefined });
-      if (key === "suspend")
-        Object.defineProperty(provider, "resume", { value: undefined });
-    }
+    disableOperations(provider, settings.disabled ?? []);
     return provider;
   },
 };
@@ -241,66 +202,70 @@ class Reference implements Provider {
   ): Promise<Duplex> {
     this.find(id);
     if (this.settings.fixture && r.command[0] === "drydock-fixture") {
-      const [, action, target = id, arg] = r.command as string[];
-      let value: unknown = null;
-      if (action === "tools") {
-        if (
-          !["initial", "crash", "resumed"].includes(target) ||
-          this.find(id).state.state !== "running"
-        )
-          fail("refused", "invalid tools probe");
-        let generation = this.generation.get(id) ?? 2;
-        if (target === "crash") generation++;
-        this.generation.set(id, generation);
-        value = {
-          files: ["/opt/drydock/drydock-agent"],
-          base_entrypoint: ["base-init"],
-          prepared_entrypoint: ["base-init"],
-          base_command: ["base-command"],
-          prepared_command: ["base-command"],
-          command: ["/opt/drydock/drydock-agent"],
-          pid: generation,
-          incarnation: `reference-model-${generation}`,
-          fingerprint: "reference-model",
-          challenge: arg,
-        };
-      } else if (action === "forget") {
-        this.stop(target);
-        this.rows.delete(target);
-      } else if (action === "timestamp") {
-        if (target) validate("Timestamp", target);
-        this.timestamp = target || undefined;
-      } else if (action === "inventory_error")
-        this.inventoryError = target === "true";
-      else if (action === "pause" || action === "state") {
-        const state =
-          action === "pause"
-            ? { state: "stopped", cause: "paused_by_provider" }
-            : JSON.parse(arg);
-        validate("Observation", state);
-        this.stop(target);
-        this.find(target).state = state;
-        if (state.state === "running") this.running.set(target, Date.now());
-      } else if (action === "null_environment") {
-        const row: Types["Environment"] = {
-          id: `null-${id}`,
-          label: null,
-          provider: this.name,
-          state: { state: "unknown", reason: "provider_api_error" },
-          granted_size: null,
-          egress: "advisory",
-          platform: null,
-        };
-        this.rows.set(row.id, row);
-        value = row;
-      } else fail("refused", "unknown fixture action");
-      return output(JSON.stringify(value));
+      return this.fixture(id, r.command);
     }
     this.check();
     if (r.command.length === 1 && r.command[0] === "cat") return this.relay(id);
     if (r.command[0] !== "echo")
       fail("refused", "reference exec supports cat and echo");
     return output(r.command.slice(1).join(" ") + "\n");
+  }
+  /** Explicit conformance-only guest model; ordinary exec stays a small example. */
+  private async fixture(id: string, command: string[]): Promise<Duplex> {
+    const [, action, target = id, arg] = command;
+    let value: unknown = null;
+    if (action === "tools") {
+      if (
+        !["initial", "crash", "resumed"].includes(target) ||
+        this.find(id).state.state !== "running"
+      )
+        fail("refused", "invalid tools probe");
+      let generation = this.generation.get(id) ?? 2;
+      if (target === "crash") generation++;
+      this.generation.set(id, generation);
+      value = {
+        files: ["/opt/drydock/drydock-agent"],
+        base_entrypoint: ["base-init"],
+        prepared_entrypoint: ["base-init"],
+        base_command: ["base-command"],
+        prepared_command: ["base-command"],
+        command: ["/opt/drydock/drydock-agent"],
+        pid: generation,
+        incarnation: `reference-model-${generation}`,
+        fingerprint: "reference-model",
+        challenge: arg,
+      };
+    } else if (action === "forget") {
+      this.stop(target);
+      this.rows.delete(target);
+    } else if (action === "timestamp") {
+      if (target) validate("Timestamp", target);
+      this.timestamp = target || undefined;
+    } else if (action === "inventory_error")
+      this.inventoryError = target === "true";
+    else if (action === "pause" || action === "state") {
+      const state =
+        action === "pause"
+          ? { state: "stopped", cause: "paused_by_provider" }
+          : JSON.parse(arg);
+      validate("Observation", state);
+      this.stop(target);
+      this.find(target).state = state;
+      if (state.state === "running") this.running.set(target, Date.now());
+    } else if (action === "null_environment") {
+      const row: Types["Environment"] = {
+        id: `null-${id}`,
+        label: null,
+        provider: this.name,
+        state: { state: "unknown", reason: "provider_api_error" },
+        granted_size: null,
+        egress: "advisory",
+        platform: null,
+      };
+      this.rows.set(row.id, row);
+      value = row;
+    } else fail("refused", "unknown fixture action");
+    return output(JSON.stringify(value));
   }
   async suspend(id: string) {
     this.check();
