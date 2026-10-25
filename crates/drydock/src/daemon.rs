@@ -18,7 +18,7 @@ use axum::{
 use drydock_protocol::*;
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -78,6 +78,7 @@ struct Placement {
 }
 pub struct Daemon {
     config: Config,
+    modules: BTreeMap<String, (usize, LoadableModule)>,
     hosts: Vec<ManagedHost>,
     placements: BTreeMap<String, Placement>,
     unavailable: BTreeMap<String, Readiness>,
@@ -102,15 +103,27 @@ impl Daemon {
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
-        let mut failed_optional = Vec::new();
+        let mut failed_optional = BTreeSet::new();
         for option in options {
             match discover(&option, run).await {
                 Ok(hello) => discovered.push((option, hello)),
                 Err(error) if option.optional => {
-                    eprintln!("optional host {} discovery failed: {error}", option.name);
-                    failed_optional.push(format!("{}: {error}", option.name));
+                    eprintln!("optional host discovery failed");
+                    failed_optional.insert(if error == "host protocol version mismatch" {
+                        "optional host protocol version mismatch".to_owned()
+                    } else {
+                        "optional host unavailable".to_owned()
+                    });
                 }
                 Err(error) => return Err(error),
+            }
+        }
+        // Input order is the routing priority. Select once for both routing and
+        // advertisements, including modules without configured instances.
+        let mut selected = BTreeMap::new();
+        for (i, (_, hello)) in discovered.iter().enumerate() {
+            for module in &hello.loadable_modules {
+                selected.entry(module.name.clone()).or_insert((i, module.clone()));
             }
         }
         let mut assignments: Vec<Vec<String>> = (0..discovered.len()).map(|_| vec![]).collect();
@@ -118,56 +131,80 @@ impl Daemon {
         let mut unavailable = BTreeMap::new();
         for (name, provider) in &config.provider {
             // Stable host order prefers the bundled Rust implementation.
-            if let Some((i, module)) = discovered
-                .iter()
-                .enumerate()
-                .find_map(|(i, (_, hello))| hello.loadable_modules.iter().find(|m| m.name == provider.module).map(|m| (i, m)))
-            {
+            if let Some((i, module)) = selected.get(&provider.module) {
+                let i = *i;
                 assignments[i].push(name.clone());
                 chosen.insert(name.clone(), (i, module.smallest_size.clone()));
             } else {
-                let mut reason = format!("no installed host can load module {}", provider.module);
+                let mut reason = "no installed host can load configured module".to_owned();
                 if !failed_optional.is_empty() {
-                    reason.push_str(&format!("; optional hosts unavailable: {}", failed_optional.join("; ")));
+                    reason.push_str(&format!("; {}", failed_optional.iter().map(String::as_str).collect::<Vec<_>>().join("; ")));
                 }
                 unavailable.insert(name.clone(), Readiness::MissingTool { reason });
             }
         }
         let mut hosts = Vec::new();
         let mut placements = BTreeMap::new();
+        let mut modules = BTreeMap::new();
         for (i, (option, _)) in discovered.into_iter().enumerate() {
-            if assignments[i].is_empty() {
-                continue;
-            }
-            let mut modules = BTreeMap::new();
+            let mut configured_modules = BTreeMap::new();
             let mut providers = vec![];
             let mut credentials = BTreeMap::new();
             for name in &assignments[i] {
                 let p = &config.provider[name];
-                modules.insert(p.module.clone(), ModuleConfiguration { name: p.module.clone(), entrypoint: p.module.clone() });
+                configured_modules.insert(p.module.clone(), ModuleConfiguration { name: p.module.clone(), entrypoint: p.module.clone() });
                 providers.push(ProviderConfiguration {
                     name: name.clone(),
                     module: p.module.clone(),
                     settings: p.settings.clone(),
                     credential: CredentialMode::Direct { credential_reference: name.clone() },
                 });
-                credentials.insert(name.clone(), p.credential.reference(&rigging_process::ProcessEnvVars)?);
+                // A credential path that cannot be resolved (for example, no
+                // HOME for ~/...) is missing evidence, not a daemon failure.
+                // The supervisor reports MissingCredential for absent references.
+                if let Ok(reference) = p.credential.reference(&rigging_process::ProcessEnvVars) {
+                    credentials.insert(name.clone(), reference);
+                }
                 placements.insert(name.clone(), Placement { host: hosts.len(), minimum: chosen[name].1.clone() });
             }
             let spec = HostSpec {
                 name: option.name,
                 connection: option.connection,
-                configuration: HostConfiguration { modules: modules.into_values().collect(), providers },
+                configuration: HostConfiguration { modules: configured_modules.into_values().collect(), providers },
                 credentials,
             };
-            let mut handle = supervisor.start(spec).await.map_err(|e| e.to_string())?;
+            let mut handle = match supervisor.start(spec).await {
+                Ok(handle) => handle,
+                Err(_) if option.optional => {
+                    for name in &assignments[i] {
+                        placements.remove(name);
+                        unavailable.insert(name.clone(), Readiness::Unknown { reason: "optional host could not start".into() });
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            for (name, (selected_host, module)) in &selected {
+                if *selected_host == i {
+                    modules.insert(name.clone(), (hosts.len(), module.clone()));
+                }
+            }
             // Providers with absent credentials remain visible with their reason.
             let _ = handle.ready(Duration::from_secs(15)).await;
             let status = handle.status.borrow().clone();
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
-        Ok(Arc::new(Self { config, hosts, placements, unavailable, keys, resolver, stopping: tokio::sync::watch::channel(false).0 }))
+        Ok(Arc::new(Self {
+            config,
+            modules,
+            hosts,
+            placements,
+            unavailable,
+            keys,
+            resolver,
+            stopping: tokio::sync::watch::channel(false).0,
+        }))
     }
     fn host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let placement = self.placements.get(provider).ok_or_else(|| {
@@ -197,27 +234,51 @@ impl Daemon {
         Ok(cache.1.clone())
     }
     pub fn hello(&self) -> Hello {
+        let statuses: Vec<_> = self.hosts.iter().map(|h| h.handle.status.borrow().clone()).collect();
         Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: env!("CARGO_PKG_VERSION").into(),
-            modules: vec![],
-            loadable_modules: vec![],
-            providers: self
-                .hosts
+            modules: self
+                .modules
                 .iter()
-                .flat_map(|h| {
-                    let status = h.handle.status.borrow();
-                    status
-                        .providers
-                        .iter()
+                .filter_map(|(name, (host, _))| statuses[*host].modules.iter().find(|m| &m.name == name).cloned())
+                .collect(),
+            loadable_modules: self
+                .modules
+                .iter()
+                .filter_map(|(name, (host, module))| {
+                    let status = &statuses[*host];
+                    if matches!(status.readiness, Readiness::Ready) {
+                        status.loadable_modules.iter().find(|m| &m.name == name).cloned()
+                    } else {
+                        Some(module.clone())
+                    }
+                })
+                .collect(),
+            providers: self
+                .config
+                .provider
+                .iter()
+                .map(|(name, configured)| {
+                    let status = self.placements.get(name).map(|p| &statuses[p.host]);
+                    let mut declaration = status
+                        .and_then(|s| s.providers.iter().find(|p| &p.provider == name && p.module == configured.module))
                         .cloned()
-                        .map(|mut p| {
-                            if !matches!(status.readiness, Readiness::Ready) {
-                                p.readiness = status.readiness.clone();
-                            }
-                            p
-                        })
-                        .collect::<Vec<_>>()
+                        .unwrap_or_else(|| ProviderDeclaration {
+                            provider: name.clone(),
+                            module: configured.module.clone(),
+                            capabilities: conservative_capabilities(),
+                            rate_limits: vec![],
+                            readiness: Readiness::Unknown { reason: "instance absent from hello".into() },
+                        });
+                    if let Some(readiness) = self.unavailable.get(name) {
+                        declaration.readiness = readiness.clone();
+                    } else if let Some(status) = status
+                        && !matches!(status.readiness, Readiness::Ready)
+                    {
+                        declaration.readiness = status.readiness.clone();
+                    }
+                    declaration
                 })
                 .collect(),
         }
@@ -368,6 +429,9 @@ impl Daemon {
 }
 #[async_trait::async_trait]
 impl ProviderApi for Daemon {
+    async fn hello(&self) -> Result<Hello, Error> {
+        Ok(Daemon::hello(self))
+    }
     async fn observe(&self, since: Option<&str>) -> Result<crate::api::ObservationStream, Error> {
         Ok(self.observation_stream(since))
     }
@@ -933,3 +997,23 @@ mod agent_readiness_tests {
 #[cfg(test)]
 #[path = "../../drydock-transport/tests/support/sshd.rs"]
 mod sshd;
+
+// No unknown operation or platform is advertised as supported. BootstrapRoute
+// has no unknown variant; Upload is inert while readiness is unavailable.
+fn conservative_capabilities() -> Capabilities {
+    Capabilities {
+        material_modes: vec![],
+        checkout_strategies: vec![],
+        workspace_root: String::new(),
+        suspend_resume: false,
+        suspend_preserves_memory: None,
+        export: false,
+        egress: EgressCapability { routes: vec![], enforcement: Enforcement::Advisory },
+        fallback_runner: false,
+        bootstrap: BootstrapRoute::Upload,
+        agent: false,
+        platforms: vec![],
+        usage: false,
+        quota: false,
+    }
+}

@@ -9,6 +9,8 @@ pub type ObservationStream = futures::stream::BoxStream<'static, Result<ObserveR
 /// Host configuration and credential refresh are deliberately outside this API.
 #[async_trait::async_trait]
 pub trait ProviderApi: Send + Sync {
+    /// Typed discovery with the same protocol compatibility checks as the socket client.
+    async fn hello(&self) -> Result<Hello, Error>;
     async fn observe(&self, since: Option<&str>) -> Result<ObservationStream, Error>;
     async fn request(
         &self,
@@ -100,6 +102,9 @@ async fn api_json<T: serde::de::DeserializeOwned>(
 }
 #[async_trait::async_trait]
 impl ProviderApi for Client {
+    async fn hello(&self) -> Result<Hello, Error> {
+        Client::hello(self).await
+    }
     async fn observe(&self, since: Option<&str>) -> Result<ObservationStream, Error> {
         let mut records = Client::observe(self, since).await?;
         Ok(Box::pin(async_stream::stream! {

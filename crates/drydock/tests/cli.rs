@@ -287,26 +287,26 @@ async fn daemon_routes_provider_api_and_streams() {
         matches!(client.list("missing").await,Err(drydock::client::Error::Protocol(ProtocolError::Unavailable {reason,..})) if reason.contains("MissingTool"))
     );
     assert!(client.credential("demo", Secret::new("bad")).await.is_err());
-    let mut relay = client.relay("demo", &env.id).await.unwrap();
-    relay.write_all(b"hello").await.unwrap();
-    let mut echo = [0; 5];
-    relay.read_exact(&mut echo).await.unwrap();
-    assert_eq!(&echo, b"hello");
-    drop(relay);
     let command: ExecRequest = serde_json::from_value(serde_json::json!({"command":["echo","hello"],"env":{},"cwd":null})).unwrap();
-    let mut exec = client.exec("demo", &env.id, &command).await.unwrap();
-    let mut output = Vec::new();
-    exec.read_to_end(&mut output).await.unwrap();
-    assert!(!output.is_empty());
+    for api in [daemon.clone() as std::sync::Arc<dyn ProviderApi>, std::sync::Arc::new(client.clone())] {
+        assert_eq!(api.inspect("demo", &env.id).await.unwrap(), env);
+        let mut relay = api.relay("demo", &env.id).await.unwrap();
+        relay.write_all(b"hello").await.unwrap();
+        let mut echo = [0; 5];
+        relay.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"hello");
+        drop(relay);
+        let mut exec = api.exec("demo", &env.id, &command).await.unwrap();
+        let mut output = Vec::new();
+        exec.read_to_end(&mut output).await.unwrap();
+        assert!(!output.is_empty());
+        use futures::StreamExt;
+        let mut events = api.observe(None).await.unwrap();
+        assert!(events.next().await.unwrap().is_ok());
+    }
     client.destroy("demo", &env.id).await.unwrap();
     client.destroy("demo", &env.id).await.unwrap();
     assert!(client.list("demo").await.unwrap().is_empty());
-    use futures::StreamExt;
-    let mut embedded_events = ProviderApi::observe(daemon.as_ref(), None).await.unwrap();
-    assert!(embedded_events.next().await.unwrap().is_ok());
-    drop(embedded_events);
-    let mut events = client.observe(None).await.unwrap();
-    assert!(events.next().await.unwrap().is_some());
     stop.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
     drop(daemon);
@@ -487,7 +487,7 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
     let row = daemon.providers().as_array().unwrap().iter().find(|p| p["provider"] == "python").unwrap().clone();
     assert_eq!(row["readiness"]["status"], "missing_tool");
-    assert!(row["readiness"]["reason"].as_str().unwrap().contains("python: host exited during discovery"));
+    assert!(row["readiness"]["reason"].as_str().unwrap().contains("optional host unavailable"));
     assert!(matches!(
         ProviderApi::list(daemon.as_ref(), "python").await,
         Err(drydock::client::Error::NotReady(Readiness::MissingTool { .. }))
@@ -577,4 +577,191 @@ async fn launch_records_the_prepared_platform() {
     let error = launch(Some("linux/s390x")).await.err().unwrap().to_string();
     assert!(error.contains("provider cannot run linux/s390x; it offers linux/amd64, linux/arm64"), "{error}");
     task.abort();
+}
+
+// A language-host boundary double alters advertisements while retaining the
+// real reference host's configuration, credentials, provider calls and streams.
+async fn advertised_host(
+    dir: &std::path::Path,
+    version: &'static str,
+    incompatible: bool,
+) -> (std::path::PathBuf, tokio::task::JoinHandle<()>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::{
+        body::{Body, to_bytes},
+        extract::Request,
+        middleware::{self, Next},
+    };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let host = drydock_host::Host::new(drydock_host::reference::registry());
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let current = state.clone();
+    let router = host.router().layer(middleware::from_fn(move |req: Request, next: Next| {
+        let current = current.clone();
+        async move {
+            let hello = req.uri().path() == "/v1/hello";
+            let response = next.run(req).await;
+            if !hello {
+                return response;
+            }
+            let (parts, body) = response.into_parts();
+            let mut hello: Hello = serde_json::from_slice(&to_bytes(body, usize::MAX).await.unwrap()).unwrap();
+            let phase = current.load(std::sync::atomic::Ordering::SeqCst);
+            let version = if phase > 0 { "upgraded" } else { version };
+            if phase == 2 {
+                for p in &mut hello.providers {
+                    p.readiness =
+                        Readiness::Unknown { reason: format!("host diagnostic test-identity nested-setting {}", "界".repeat(20000)) };
+                }
+            }
+            for m in &mut hello.modules {
+                m.version = version.into();
+            }
+            for m in &mut hello.loadable_modules {
+                m.version = version.into();
+            }
+            hello.loadable_modules.push(LoadableModule {
+                name: format!("unused-{version}"),
+                version: version.into(),
+                smallest_size: Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 },
+            });
+            if incompatible {
+                hello.protocol_version = "incompatible".into();
+            }
+            axum::response::Response::from_parts(parts, Body::from(serde_json::to_vec(&hello).unwrap()))
+        }
+    }));
+    let socket = dir.join(format!("{version}.sock"));
+    let server = rigging_http_serve::UnixServer::bind(&socket, 0o600).await.unwrap();
+    let task = tokio::spawn(async move {
+        server.serve(router, rigging_http_serve::Caller::<()>::Unix, std::future::pending()).await.unwrap();
+    });
+    (socket, task, state)
+}
+
+async fn discovery_contract(api: std::sync::Arc<dyn ProviderApi>, recovered: bool) -> Hello {
+    let hello = api.hello().await.unwrap();
+    assert!(hello.is_compatible());
+    assert_eq!(hello.providers.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["demo", "missing", "other", "recover"]);
+    assert_eq!(hello.modules.iter().map(|m| (m.name.as_str(), m.version.as_str())).collect::<Vec<_>>(), [("reference", "first")]);
+    assert_eq!(
+        hello.loadable_modules.iter().map(|m| (m.name.as_str(), m.version.as_str())).collect::<Vec<_>>(),
+        [("reference", "first"), ("unused-first", "first"), ("unused-second", "second")]
+    );
+    let missing = &hello.providers[1];
+    assert!(
+        matches!(&missing.readiness, Readiness::MissingTool { reason } if reason.len() <= 16384 && reason.contains("optional host protocol version mismatch"))
+    );
+    assert!(missing.capabilities.platforms.is_empty());
+    assert!(missing.capabilities.material_modes.is_empty());
+    assert!(!missing.capabilities.agent && !missing.capabilities.quota && !missing.capabilities.usage);
+    assert!(matches!(hello.providers[0].readiness, Readiness::Ready));
+    if recovered {
+        assert!(matches!(hello.providers[3].readiness, Readiness::Ready));
+    } else {
+        assert!(matches!(hello.providers[3].readiness, Readiness::MissingCredential { .. }));
+    }
+    hello
+}
+
+// Discovery is identical through an object-safe embedded API (before any daemon
+// listener exists) and its real Unix socket, including duplicate module choice,
+// optional protocol failure, missing modules and credential readiness recovery.
+#[tokio::test]
+async fn typed_discovery_parity_and_recovery() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let (first, first_task, phase) = advertised_host(dir.path(), "first", false).await;
+    let (second, second_task, _) = advertised_host(dir.path(), "second", false).await;
+    let (bad, bad_task, _) = advertised_host(dir.path(), "bad", true).await;
+    let incompatible: Arc<dyn ProviderApi> = Arc::new(Client::unix(&bad).unwrap());
+    assert!(matches!(incompatible.hello().await, Err(drydock::client::Error::VersionMismatch)));
+    let token = dir.path().join("token");
+    let recovery = dir.path().join("recover");
+    std::fs::write(&token, "test-identity").unwrap();
+    let config = Config::parse(&(config_text(&token).replace("fixture = true,", "fixture = true, reach = {kind = 'relay', path = 'nested-setting'},") + &format!("\n[provider.missing]\nmodule='absent'\ncredential={{file={:?}}}\n[provider.recover]\nmodule='reference'\ncredential={{file={:?}}}\nsettings={{fixture=true}}\n", token, recovery))).unwrap();
+    let run = dir.path().join("run");
+    let options = [("first", first), ("second", second), ("bad", bad)]
+        .into_iter()
+        .map(|(name, path)| HostOption { name: name.into(), optional: true, connection: HostConnection::ExternalUnix { path } })
+        .collect();
+    let daemon = Daemon::start(config, &run, run.join("keys"), options).await.unwrap();
+    let embedded: Arc<dyn ProviderApi> = daemon.clone();
+    let expected = discovery_contract(embedded.clone(), false).await;
+    let socket = run.join("api.sock");
+    assert!(!socket.exists());
+    let d = daemon.clone();
+    let bind = socket.clone();
+    let server = tokio::spawn(async move {
+        d.serve(&bind, std::future::pending()).await.unwrap();
+    });
+    let client = Client::unix(&socket).unwrap();
+    for _ in 0..200 {
+        if client.hello().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let remote: Arc<dyn ProviderApi> = Arc::new(client);
+    assert_eq!(discovery_contract(remote.clone(), false).await, expected);
+    std::fs::write(&recovery, "recovered-test-identity").unwrap();
+    for _ in 0..400 {
+        if matches!(embedded.hello().await.unwrap().providers[3].readiness, Readiness::Ready) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(discovery_contract(embedded.clone(), true).await, discovery_contract(remote.clone(), true).await);
+    phase.store(1, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..400 {
+        if embedded.hello().await.unwrap().modules[0].version == "upgraded" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let upgraded = embedded.hello().await.unwrap();
+    assert_eq!(upgraded.modules[0].version, "upgraded");
+    assert_eq!(upgraded.loadable_modules[0].version, "upgraded");
+    assert!(!upgraded.loadable_modules.iter().any(|m| m.name == "unused-first"));
+    assert_eq!(upgraded, remote.hello().await.unwrap());
+    phase.store(2, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..400 {
+        if matches!(embedded.hello().await.unwrap().providers[0].readiness, Readiness::Unknown { .. }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let diagnostic = embedded.hello().await.unwrap();
+    let Readiness::Unknown { reason } = &diagnostic.providers[0].readiness else {
+        panic!("expected host diagnostic");
+    };
+    assert!(reason.len() <= 16384 && reason.contains("host diagnostic") && reason.contains("<REDACTED>"));
+    assert!(!reason.contains("test-identity") && !reason.contains("nested-setting"));
+    assert_eq!(diagnostic, remote.hello().await.unwrap());
+    server.abort();
+    first_task.abort();
+    second_task.abort();
+    bad_task.abort();
+}
+
+// With no hosts or configured instances, embedded discovery is a compatible
+// empty document; adding an unserved instance preserves its identity honestly.
+#[tokio::test]
+async fn discovery_without_hosts_or_listener() {
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    for text in ["", "[provider.unavailable]\nmodule='absent'\ncredential={env='DRYDOCK_TEST_MISSING_CREDENTIAL'}\n"] {
+        let run = dir.path().join(if text.is_empty() { "empty" } else { "configured" });
+        let api: Arc<dyn ProviderApi> = Daemon::start(Config::parse(text).unwrap(), &run, run.join("keys"), vec![]).await.unwrap();
+        let hello = api.hello().await.unwrap();
+        assert!(hello.is_compatible());
+        assert!(hello.modules.is_empty() && hello.loadable_modules.is_empty());
+        if text.is_empty() {
+            assert!(hello.providers.is_empty());
+        } else {
+            assert_eq!(hello.providers.len(), 1);
+            assert_eq!(hello.providers[0].provider, "unavailable");
+            assert!(matches!(hello.providers[0].readiness, Readiness::MissingTool { .. }));
+        }
+        assert!(!run.join("api.sock").exists());
+    }
 }
