@@ -1,11 +1,13 @@
 //! Drydock's vessel control API and host client. The transport is the trust boundary:
 //! only its host-facing side may serve control; guest forwards carry opaque IDs.
 mod client;
+mod durable;
 mod egress;
 mod error;
 pub use egress::{CA_PATH, Egress, PROXY_PORT};
 mod exec;
 mod forward;
+mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
 pub mod socket;
@@ -16,21 +18,12 @@ use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configure", "exec", "files", "forwards", "egress", "upgrade"];
+pub const FEATURES: &[&str] = &["configuration", "exec", "files", "forwards", "egress", "upgrade"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut executable = std::fs::File::open(std::env::current_exe()?)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let n = executable.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        digest.update(&buffer[..n]);
-    }
+    std::io::copy(&mut std::fs::File::open(std::env::current_exe()?)?, &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,26 +34,48 @@ pub struct Hello {
     /// that predate platform reporting; hosts then rely on the prepared form.
     #[serde(default)]
     pub platform: Option<Platform>,
+    /// A fresh random ID for each agent process. A different boot ID means the
+    /// agent restarted and lost its configuration, forwards and processes.
+    /// Empty from agents that predate boot IDs.
+    #[serde(default)]
+    pub boot_id: String,
 }
 /// The OCI platform type shared with the provider API; an agent reports the
 /// platform its own executable was built for.
 pub use drydock_protocol::Platform;
 /// Desired state replaces the previous configuration. Capture forwards traffic;
-/// the kind and the upstream own enforcement.
+/// the kind and the upstream own enforcement. Forwards are separate resources.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub egress: Option<Egress>,
     pub ca: String,
     pub features: Vec<String>,
     pub environment: BTreeMap<String, String>,
-    pub forwards: Vec<GuestForward>,
 }
+/// A configuration together with the entity tag the agent gave it. The tag
+/// changes whenever the configuration does and whenever the agent restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tagged<T> {
+    pub value: T,
+    pub etag: String,
+}
+/// A guest listener whose connections reach the host endpoint registered
+/// under the same ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GuestForward {
     pub id: String,
     pub unix: PathBuf,
     /// Concrete loopback bind address; wildcard and non-loopback binds are refused.
     pub tcp: Option<SocketAddr>,
+}
+/// A guest endpoint the host may open streams to under this ID.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostForward {
+    pub id: String,
+    pub endpoint: Endpoint,
 }
 /// TCP addresses are numeric, so host ownership cannot change through DNS.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -106,11 +121,6 @@ pub(crate) struct FileWrite {
     pub path: PathBuf,
     pub bytes: Vec<u8>,
     pub executable: bool,
-}
-#[derive(Serialize, Deserialize)]
-pub(crate) struct GuestTarget {
-    pub id: String,
-    pub endpoint: Endpoint,
 }
 pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())

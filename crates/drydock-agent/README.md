@@ -63,26 +63,39 @@ The host-facing `Purpose::Control` stream carries HTTP/2 through
 
 | Method | Route | Body / result |
 | --- | --- | --- |
-| GET | `/hello` | `Hello { fingerprint, features }` |
-| PUT / GET | `/configure` | Replace / read `Configuration` |
+| GET | `/hello` | `Hello { fingerprint, features, platform, boot_id }` |
+| GET / PUT | `/configuration` | Read / replace `Configuration`, with an `ETag`; PUT honours `If-Match` |
+| GET / PUT / DELETE | `/forwards/guest/{id}` | Read / upsert / remove one `GuestForward`; GET `/forwards/guest` lists them |
+| GET / PUT / DELETE | `/forwards/host/{id}` | Read / upsert / remove one `HostForward`; GET `/forwards/host` lists them |
 | POST | `/exec` | `Exec { program, args, cwd }`; NDJSON `ExecEvent` stream |
 | POST | `/files/write` | `{ path, bytes, executable }`; atomic sibling write, fsync, rename, parent fsync |
 | POST | `/files/read` | `{ path }`; raw bytes |
 | POST | `/files/flush` | `{ path }`; fsync file or directory |
-| PUT / DELETE | `/forwards/guest` | `GuestForward` / JSON ID |
-| PUT / DELETE | `/forwards/host` | `{ id, endpoint }` / JSON ID |
 | PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
 | POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
 
-I/O failures return JSON `AgentError { operation, subject, kind, message }`,
-with missing paths (404), permissions (403), conflicts (409), malformed input
-(400) and internal errors (500). The client preserves the error kind and retains
-the structured body as its `io::Error` source.
+### One error layer
+
+Every refusal is a JSON `AgentError { operation, subject, kind, status,
+message, causes }` with a fitting status: missing paths and IDs 404,
+permissions 403, malformed input 400, well-formed input of the wrong shape or
+a digest mismatch 422, duplicates and wrong-state calls 409, a failed
+`If-Match` 412, an unsatisfiable range 416, a wrong content type 415, and a
+deliberate size limit 413. `causes` keeps the chain behind the message, such
+as the OS error. The framework's own refusals (unknown routes, wrong methods,
+JSON bodies and paths it cannot decode, oversized JSON) are the same
+structured error; a last-resort layer converts anything else that is not,
+and a handler that panics is answered with a structured 500. The
+client rebuilds the `AgentError` as the source of its `io::Error`
+(`AgentError::of(&error)`), keeping the I/O kind for kinds that have one.
+
+### Files
 
 JSON byte fields are deliberately arrays of integers for this push-focused API;
 exec events use the same representation, with roughly 2–4 encoded bytes per
-output byte. Streaming general file transfer remains part of #50. Requests and read-back are limited to
-128 MiB (oversized reads return 413 before buffering). For JSON writes this is
+output byte. Streaming general file transfer remains part of #50. File writes, upgrade images and read-back are
+limited to 128 MiB (oversized reads return 413 before buffering); other JSON
+control bodies are capped at 16 MiB. For JSON writes this is
 the encoded body limit: three-digit byte arrays fit slightly less than 32 MiB
 of file data, and single-digit arrays fit slightly less than 64 MiB, after path
 and JSON metadata. The near-limit test covers accepted 31 MiB and rejected
@@ -96,24 +109,41 @@ permissions allow replacement; root and other I/O failures remain strict.
 A destination symlink is replaced rather than followed.
 `flush` can also sync a parent directory. File routes require absolute paths within the vessel.
 
-Configuration replaces egress, CA, enabled features, process environment and
-guest forwards together. Invalid configuration leaves the previous state intact;
-unchanged listeners and their streams survive replacement. The first Control
-connection binds the reverse opener; later Control connections cannot replace
-it. The transport may reconnect its own native carrier. Every configured guest
-forward must have a host endpoint registered in that client. TCP-only changes reuse the Unix binding. Transient accept errors
-back off; finished listener tasks are rebuilt on the next configuration push.
-An address held by a different forward ID is not transferred in one push.
-Port swaps/transfers require removing the old owners first, then adding the new
-configuration; a refused swap preserves the previous configuration and listeners.
-Refused preparations await cleanup of newly created listeners before returning,
-so retrying immediately cannot race deferred socket removal.
-The feature list remains descriptive configuration. `egress: null` disables
-capture; `egress: {"upstream": "proxy-forward-id"}` activates it. The client must
-first register that forward ID against this vessel's dedicated host endpoint.
-The agent opens the forward directly; it needs no additional `GuestForward` for
-the upstream. Capture configuration and guest TCP forward changes use a full
-configuration push. Dynamic Unix-only forward changes remain available.
+### Configuration, forwards and restarts
+
+`Configuration` replaces egress, CA, enabled features and process environment
+together. Invalid configuration leaves the previous state intact. The reply's
+`ETag` names the configuration's content and the agent's boot, so it changes
+whenever either does. `Hello.boot_id` is fresh for each agent process: a host
+that sees a new boot ID, or a configuration tag it did not set, knows the
+agent restarted with empty configuration, no forwards and no processes, and
+pushes its state again. `PUT` with `If-Match` replaces only the expected
+configuration (412 otherwise); any tag in the list may match, and an
+`If-Match` that is not `*` or a list of entity tags is refused (400).
+
+Each forward is its own resource. Its ID is one route segment, percent-encoded
+by the client, so an ID may contain `/`. `PUT` is an idempotent upsert: an unchanged
+forward with a live listener is left alone, streams and all. A changed guest
+forward is rebound before the old listener stops; a TCP-only change reuses the
+Unix binding, and live guest streams survive the rebind. A changed host
+endpoint ends the old endpoint's streams. `DELETE` has no body and ends the
+forward's streams. Every forward, guest and host, can be read back and
+listed. The body's `id` must equal the route's. An address held by a
+different forward is not transferred (409); move it by removing the old owner
+first. Transient accept errors back off; a finished listener is rebuilt by
+the next upsert. Refused upserts release anything they bound before
+returning, so an immediate retry cannot race socket removal.
+
+The first Control connection binds the reverse opener; later Control
+connections cannot replace it. The transport may reconnect its own native
+carrier. Every guest forward must have a host endpoint registered in that
+client. The feature list remains descriptive configuration. `egress: null`
+disables capture; `egress: {"upstream": "proxy-forward-id"}` activates it. The
+client must first register that forward ID against this vessel's dedicated host
+endpoint (`register_host_endpoint`); the agent opens it directly and needs no
+`GuestForward` for it. While capture is enabled, adding, changing or removing
+a guest TCP forward reinstalls the capture table with the new exemptions in
+the same call.
 
 ## Egress and guest requirements
 
@@ -186,9 +216,11 @@ forward; there is no blanket loopback/private-network exemption. Direct access
 to capture/DNS service ports is also captured; use port 53 for fake DNS.
 Other guest TCP is captured regardless of environment. Refused configuration cleans up prepared listeners; unchanged
 egress listeners, DNS leases and active streams survive configuration pushes.
-Disabling capture removes redirects before stopping listeners. An agent crash
-leaves redirects installed (connections fail until configuration is restored).
-Agent re-exec loses DNS leases; callers must resolve names again.
+Disabling capture removes redirects before stopping listeners. Redirects never
+outlive the configuration that installed them: the agent removes its table at
+startup, so a crashed agent's redirects go when it restarts with empty
+configuration, and before a re-exec. Agent re-exec loses DNS leases; callers
+must resolve names again.
 
 Capture, explicit-proxy and DNS-TCP connections share a 128-stream budget.
 Overflow connections are accepted and immediately closed, preserving descriptor
@@ -246,7 +278,8 @@ then clears the marker. If exec fails immediately, rollback happens in-process.
 If the candidate dies before hello (including a loader failure after successful
 exec), the next ordinary provider start restores `.prev` and clears probation.
 Crashes after hello belong to provider supervision (#54).
-Re-exec drops control and forward streams, removes owned guest sockets, and resets configuration.
+Re-exec drops control and forward streams, removes owned guest sockets,
+clears the capture table and resets configuration.
 Stale socket inodes from a crash are reclaimed only when they refuse a connection;
 live listeners and ordinary files are preserved.
 The host pushes it again after hello. Children continue running with their
@@ -269,12 +302,12 @@ UID separation must omit loopback TCP.
 Host endpoints apply their own policy (for example per-terminal hook tokens);
 the agent inspects no forwarded bytes and holds no token.
 
-* Guest to host: `add_guest_forward` reserves a host endpoint in this client's
+* Guest to host: `put_guest_forward` reserves a host endpoint in this client's
   registry, then creates a guest Unix listener and optional loopback TCP listener.
-  `register_host_endpoint` reserves endpoints for forwards installed through a
-  configuration push. The guest receives only IDs; it never receives a host
+  `register_host_endpoint` reserves endpoints without a guest listener, as for
+  the egress upstream. The guest receives only IDs; it never receives a host
   target. An arriving ID resolves only in the client for that vessel.
-* Host to guest: `add_host_forward` configures a guest Unix/TCP target;
+* Host to guest: `put_host_forward` configures a guest Unix/TCP target;
   `forward(id)` opens a raw stream. TCP port zero is rejected. Unix endpoints
   connect lazily, allowing the host to register services before their sockets exist. `remove_*_forward` removes a route at runtime.
   Removal closes the route’s live streams in both directions and guest listeners;
@@ -292,7 +325,8 @@ the agent inspects no forwarded bytes and holds no token.
 ## Verification
 
 `cargo test -p drydock-agent` covers the control contract over in-memory yamux
-and Unix connections, generated configuration/refusal sequences, atomic file
+and Unix connections: tagged configuration, forward resources and generated
+upsert/removal sequences, every refusal as a structured error, atomic file
 visibility, streamed exec, byte-transparent HTTP/1.1, WebSocket upgrade frames,
 chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
 A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,

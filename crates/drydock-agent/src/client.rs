@@ -1,12 +1,13 @@
-use crate::*;
+use crate::{rest::encode_segment, *};
 use bytes::{Bytes, BytesMut};
 use drydock_transport::{Opener, Purpose, Transport, http2};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, OnceLock},
 };
 use tokio::task::JoinSet;
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum EndpointKey {
     Unix(u64, u64),
@@ -32,11 +33,14 @@ impl Drop for Claim {
         }
     }
 }
-fn claim(endpoint: Endpoint) -> io::Result<Claim> {
-    let endpoint = match endpoint {
+fn canonical(endpoint: Endpoint) -> io::Result<Endpoint> {
+    Ok(match endpoint {
         Endpoint::Unix(path) => Endpoint::Unix(std::fs::canonicalize(path)?),
         other => other,
-    };
+    })
+}
+fn claim(endpoint: Endpoint) -> io::Result<Claim> {
+    let endpoint = canonical(endpoint)?;
     #[cfg(target_os = "linux")]
     let inode = if let Endpoint::Unix(path) = &endpoint {
         use std::os::unix::fs::OpenOptionsExt;
@@ -78,11 +82,93 @@ fn claim(endpoint: Endpoint) -> io::Result<Claim> {
     })
 }
 type Targets = Arc<Mutex<HashMap<String, Arc<Claim>>>>;
+type RequestBody = UnsyncBoxBody<Bytes, io::Error>;
+
+/// A transport failure on the control link, keeping the underlying error.
+#[derive(Debug, thiserror::Error)]
+#[error("{context}: {source}")]
+struct LinkError {
+    context: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+fn link_error(context: impl Into<String>, source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, LinkError { context: context.into(), source: source.into() })
+}
+fn empty() -> RequestBody {
+    Empty::new().map_err(|never| match never {}).boxed_unsync()
+}
+fn full(bytes: impl Into<Bytes>) -> RequestBody {
+    Full::new(bytes.into()).map_err(|never| match never {}).boxed_unsync()
+}
+fn json_body(value: &impl Serialize) -> io::Result<RequestBody> {
+    Ok(full(serde_json::to_vec(value).map_err(invalid)?))
+}
+/// The HTTP/2 control link, shared by a client and its process handles.
+#[derive(Clone)]
+struct Control {
+    sender: http2::Client<RequestBody>,
+    compatible: bool,
+}
+impl Control {
+    async fn send(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: RequestBody,
+    ) -> io::Result<http::Response<axum::body::Body>> {
+        if !self.compatible && !(uri == "/hello" || uri.starts_with("/upgrade")) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "agent fingerprint mismatch: only hello and upgrade are permitted"));
+        }
+        let mut request = http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        let request = request.body(body).map_err(invalid)?;
+        let response = self.sender.clone().send_request(request).await.map_err(|e| link_error(format!("{method} {uri}"), e))?;
+        let status = response.status();
+        let (parts, body) = response.into_parts();
+        let body = axum::body::Body::new(body);
+        if !status.is_success() {
+            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+            return Err(match serde_json::from_slice::<AgentError>(&bytes) {
+                Ok(error) => error.into_io(),
+                Err(_) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let message =
+                        if text.is_empty() { status.canonical_reason().unwrap_or("refused").to_owned() } else { text.into_owned() };
+                    AgentError::new("request", format!("{method} {uri}"), ErrorKind::from_status(status.as_u16()), message)
+                        .with_status(status.as_u16())
+                        .into_io()
+                }
+            });
+        }
+        Ok(http::Response::from_parts(parts, body))
+    }
+    async fn json<T: serde::de::DeserializeOwned>(&self, method: &str, uri: &str, body: RequestBody) -> io::Result<T> {
+        decode(self.send(method, uri, &[("content-type", "application/json".into())], body).await?, method, uri).await
+    }
+    async fn empty(&self, method: &str, uri: &str, body: RequestBody) -> io::Result<http::Response<axum::body::Body>> {
+        let response = self.send(method, uri, &[("content-type", "application/json".into())], body).await?;
+        let (parts, body) = response.into_parts();
+        body.collect().await.map_err(|e| link_error(format!("{method} {uri}"), e))?;
+        Ok(http::Response::from_parts(parts, axum::body::Body::empty()))
+    }
+}
+/// A reply's JSON body.
+async fn decode<T: serde::de::DeserializeOwned>(response: http::Response<axum::body::Body>, method: &str, uri: &str) -> io::Result<T> {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await.map_err(|e| link_error(format!("{method} {uri}"), e))?;
+    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{method} {uri}: malformed reply: {e}")))
+}
+fn header(response: &http::Response<axum::body::Body>, name: &str) -> Option<String> {
+    response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
+}
+
 /// One vessel per client. A host endpoint stays exclusively claimed until all
 /// streams using it close. Controllers in separate processes must allocate
 /// separate endpoints; direct multi-controller connections are out of scope.
 pub struct Client {
-    sender: http2::Client,
+    link: Control,
     opener: Opener,
     hello: Hello,
     expected: String,
@@ -103,9 +189,9 @@ impl Client {
     /// `platform` is the platform the vessel was prepared for and `executable`
     /// the current agent build for it; the caller chose both from the prepared
     /// form, never from the guest. Returns only a compatible client; callers
-    /// push configuration afterwards. Initial transport/hello errors return
-    /// immediately; only post-upgrade reconnects retry. The caller must arrange
-    /// initial provider readiness.
+    /// push configuration afterwards. Initial transport/hello errors
+    /// return immediately; only post-upgrade reconnects retry. The caller must
+    /// arrange initial provider readiness.
     ///
     /// A hello that reports a platform is checked against `platform`. A
     /// different one fails with [`io::ErrorKind::Unsupported`], pushing
@@ -121,7 +207,6 @@ impl Client {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = io::Result<Transport>>,
     {
-        use sha2::{Digest, Sha256};
         if executable.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent build for platform {platform} is empty")));
         }
@@ -137,8 +222,9 @@ impl Client {
                     format!("vessel was prepared for {platform} but its agent reports {reported}"),
                 ));
             }
+            use sha2::{Digest, Sha256};
             let expected = format!("{:x}", Sha256::digest(executable));
-            client.expected = expected.clone();
+            client.set_expected(expected.clone());
             if client.is_compatible() {
                 return Ok(client);
             }
@@ -150,12 +236,8 @@ impl Client {
             loop {
                 match open().await {
                     Ok(transport) => match Self::connect(transport, &expected).await {
-                        Ok(client) => {
-                            if client.is_compatible() {
-                                return Ok(client);
-                            }
-                            observation = format!("last hello fingerprint {}", client.hello.fingerprint);
-                        }
+                        Ok(client) if client.is_compatible() => return Ok(client),
+                        Ok(client) => observation = format!("last hello fingerprint {}", client.hello.fingerprint),
                         Err(error) => observation = format!("last hello error: {error}"),
                     },
                     Err(error) => observation = format!("last transport error: {error}"),
@@ -175,7 +257,7 @@ impl Client {
     /// Low-level connection for explicit hello/upgrade tooling. Normal hosts
     /// should use connect_current so an older tools pin upgrades automatically.
     pub async fn connect(mut transport: Transport, expected: impl Into<String>) -> io::Result<Self> {
-        let (sender, driver) = http2::connect(&transport.opener, Purpose::Control).await?;
+        let (sender, driver) = http2::connect_with_body::<RequestBody>(&transport.opener, Purpose::Control).await?;
         let targets: Targets = Arc::default();
         let map = targets.clone();
         let opener = transport.opener.clone();
@@ -202,102 +284,83 @@ impl Client {
             }
         });
         let mut client = Self {
-            sender,
+            link: Control { sender, compatible: false },
             opener,
-            hello: Hello { fingerprint: String::new(), features: vec![], platform: None },
-            expected: expected.into(),
+            hello: Hello { fingerprint: String::new(), features: vec![], platform: None, boot_id: String::new() },
+            expected: String::new(),
             targets,
             tasks: vec![driver.abort_handle(), task.abort_handle()],
         };
-        client.hello = client.json("GET", "/hello", &()).await?;
+        client.hello = client.link.json("GET", "/hello", empty()).await?;
+        client.set_expected(expected.into());
         Ok(client)
+    }
+    fn set_expected(&mut self, expected: String) {
+        self.link.compatible = self.hello.fingerprint == expected;
+        self.expected = expected;
     }
     pub fn hello(&self) -> &Hello {
         &self.hello
     }
     pub fn is_compatible(&self) -> bool {
-        self.hello.fingerprint == self.expected
+        self.link.compatible
     }
-    fn require_compatible(&self) -> io::Result<()> {
-        if !self.is_compatible() {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "agent fingerprint mismatch: only hello and upgrade are permitted"));
-        }
-        Ok(())
+    /// Read hello again; a changed boot ID means the agent restarted.
+    pub async fn refresh_hello(&mut self) -> io::Result<&Hello> {
+        self.hello = self.link.json("GET", "/hello", empty()).await?;
+        self.link.compatible = self.hello.fingerprint == self.expected;
+        Ok(&self.hello)
     }
-    async fn request(&self, method: &str, route: &str, bytes: Vec<u8>) -> io::Result<axum::body::Body> {
-        if !matches!(route, "/hello" | "/upgrade") {
-            self.require_compatible()?;
-        }
-        let request = http::Request::builder()
-            .method(method)
-            .uri(route)
-            .header("content-type", if method == "PUT" && route == "/upgrade" { "application/octet-stream" } else { "application/json" })
-            .body(Full::new(Bytes::from(bytes)))
-            .map_err(invalid)?;
-        let response = self.sender.clone().send_request(request).await.map_err(io::Error::other)?;
-        let status = response.status();
-        let body = axum::body::Body::new(response.into_body());
-        if !status.is_success() {
-            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(io::Error::other)?;
-            return Err(match serde_json::from_slice::<AgentError>(&bytes) {
-                Ok(error) => error.into_io(),
-                Err(_) => io::Error::other(format!("{status}: {}", String::from_utf8_lossy(&bytes))),
-            });
-        }
-        Ok(body)
+
+    /// Replace the configuration; returns its new entity tag.
+    pub async fn configure(&self, config: Configuration) -> io::Result<String> {
+        self.put_configuration(config, None).await
     }
-    async fn json<T: serde::de::DeserializeOwned>(&self, method: &str, route: &str, value: &impl Serialize) -> io::Result<T> {
-        let body = self.request(method, route, serde_json::to_vec(value).map_err(invalid)?).await?;
-        let bytes = axum::body::to_bytes(body, 128 * 1024 * 1024).await.map_err(io::Error::other)?;
-        serde_json::from_slice(&bytes).map_err(invalid)
+    /// Replace the configuration only if it still has `etag`; a different
+    /// tag is refused with 412 (the agent restarted or another host changed it).
+    pub async fn configure_if(&self, config: Configuration, etag: &str) -> io::Result<String> {
+        self.put_configuration(config, Some(etag)).await
     }
-    async fn empty(&self, method: &str, route: &str, value: &impl Serialize) -> io::Result<()> {
-        self.request(method, route, serde_json::to_vec(value).map_err(invalid)?).await?.collect().await.map_err(io::Error::other)?;
-        Ok(())
-    }
-    pub async fn configure(&self, config: Configuration) -> io::Result<()> {
-        self.require_compatible()?;
-        {
-            let targets = self.targets.lock().unwrap();
-            if let Some(egress) = &config.egress {
-                check_id(&egress.upstream)?;
-                if !targets.contains_key(&egress.upstream) {
-                    return Err(invalid("egress upstream host endpoint was never registered"));
-                }
-            }
-            for forward in &config.forwards {
-                check_id(&forward.id).map_err(|error| crate::error::context("configure", &forward.id, error))?;
-                if !targets.contains_key(&forward.id) {
-                    return Err(crate::error::context(
-                        "configure",
-                        &forward.id,
-                        io::Error::new(io::ErrorKind::NotFound, "host endpoint was never registered"),
-                    ));
-                }
+    async fn put_configuration(&self, config: Configuration, etag: Option<&str>) -> io::Result<String> {
+        if let Some(egress) = &config.egress {
+            check_id(&egress.upstream)?;
+            if !self.targets.lock().unwrap().contains_key(&egress.upstream) {
+                return Err(crate::error::context(
+                    "configuration",
+                    &egress.upstream,
+                    invalid("egress upstream host endpoint was never registered"),
+                ));
             }
         }
-        self.empty("PUT", "/configure", &config).await
+        let mut headers = vec![("content-type", "application/json".to_owned())];
+        if let Some(etag) = etag {
+            headers.push(("if-match", etag.to_owned()));
+        }
+        let response = self.link.send("PUT", "/configuration", &headers, json_body(&config)?).await?;
+        header(&response, "etag").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "configuration reply lacks an ETag"))
     }
-    pub async fn configuration(&self) -> io::Result<Configuration> {
-        self.json("GET", "/configure", &()).await
+    pub async fn configuration(&self) -> io::Result<Tagged<Configuration>> {
+        let response = self.link.send("GET", "/configuration", &[], empty()).await?;
+        let etag = header(&response, "etag").unwrap_or_default();
+        Ok(Tagged { value: decode(response, "GET", "/configuration").await?, etag })
     }
+
     pub async fn exec(&self, request: Exec) -> io::Result<ExecOutput> {
-        Ok(ExecOutput {
-            body: self.request("POST", "/exec", serde_json::to_vec(&request).map_err(invalid)?).await?,
-            pending: BytesMut::new(),
-            seen_exit: false,
-        })
+        let response = self.link.send("POST", "/exec", &[("content-type", "application/json".into())], json_body(&request)?).await?;
+        Ok(ExecOutput { body: response.into_body(), pending: BytesMut::new(), seen_exit: false })
     }
     pub async fn write(&self, path: PathBuf, bytes: Vec<u8>, executable: bool) -> io::Result<()> {
-        self.empty("POST", "/files/write", &FileWrite { path, bytes, executable }).await
+        self.link.empty("POST", "/files/write", json_body(&FileWrite { path, bytes, executable })?).await.map(drop)
     }
     pub async fn read(&self, path: PathBuf) -> io::Result<Vec<u8>> {
-        let body = self.request("POST", "/files/read", serde_json::to_vec(&FilePath { path }).map_err(invalid)?).await?;
-        Ok(axum::body::to_bytes(body, 128 * 1024 * 1024).await.map_err(io::Error::other)?.to_vec())
+        let response =
+            self.link.send("POST", "/files/read", &[("content-type", "application/json".into())], json_body(&FilePath { path })?).await?;
+        Ok(axum::body::to_bytes(response.into_body(), 128 * 1024 * 1024).await.map_err(|e| link_error("POST /files/read", e))?.to_vec())
     }
     pub async fn flush(&self, path: PathBuf) -> io::Result<()> {
-        self.empty("POST", "/files/flush", &FilePath { path }).await
+        self.link.empty("POST", "/files/flush", json_body(&FilePath { path })?).await.map(drop)
     }
+
     /// Stage then activate via the stable route. Reconnect afterwards and verify
     /// the new hello fingerprint before using any generation-specific routes.
     pub async fn upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
@@ -306,35 +369,67 @@ impl Client {
     }
     /// Retain a staged image across activation failures without retransmission.
     pub async fn stage_upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
-        self.request("PUT", "/upgrade", executable).await?.collect().await.map_err(io::Error::other)?;
+        let response = self.link.send("PUT", "/upgrade", &[("content-type", "application/octet-stream".into())], full(executable)).await?;
+        response.into_body().collect().await.map_err(|e| link_error("PUT /upgrade", e))?;
         Ok(())
     }
     /// Retry activation of an already staged image after a filesystem failure.
     pub async fn activate_upgrade(&self) -> io::Result<()> {
-        self.empty("POST", "/upgrade", &()).await
+        self.link.empty("POST", "/upgrade", empty()).await.map(drop)
     }
+
+    /// Reserve a host endpoint for guest connections arriving under `id`.
+    /// Registering the same endpoint again is accepted.
     pub fn register_host_endpoint(&self, id: String, endpoint: Endpoint) -> io::Result<()> {
         self.require_compatible()?;
         check_id(&id)?;
-        let claim = Arc::new(claim(endpoint)?);
         let mut targets = self.targets.lock().unwrap();
-        if targets.contains_key(&id) {
-            return Err(invalid("forward ID already exists"));
+        if let Some(existing) = targets.get(&id) {
+            if canonical(endpoint)? == existing.endpoint {
+                return Ok(());
+            }
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("forward ID {id} already names another host endpoint")));
         }
-        targets.insert(id, claim);
+        targets.insert(id, Arc::new(claim(endpoint)?));
         Ok(())
     }
-    pub async fn add_guest_forward(&self, forward: GuestForward, endpoint: Endpoint) -> io::Result<()> {
-        self.register_host_endpoint(forward.id.clone(), endpoint)?;
-        if let Err(error) = self.empty("PUT", "/forwards/guest", &forward).await {
-            self.targets.lock().unwrap().remove(&forward.id);
-            return Err(error);
+    /// Release a host endpoint; live streams keep their claim until they close.
+    pub fn release_host_endpoint(&self, id: &str) {
+        self.targets.lock().unwrap().remove(id);
+    }
+    fn require_compatible(&self) -> io::Result<()> {
+        if !self.is_compatible() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "agent fingerprint mismatch: only hello and upgrade are permitted"));
         }
         Ok(())
+    }
+    /// Create or update a guest listener whose connections reach `endpoint`.
+    /// An identical forward is left as it is, live streams included.
+    pub async fn put_guest_forward(&self, forward: GuestForward, endpoint: Endpoint) -> io::Result<()> {
+        self.require_compatible()?;
+        check_id(&forward.id)?;
+        let registered = self.targets.lock().unwrap().get(&forward.id).cloned();
+        // The same endpoint, already registered under this ID, is kept.
+        let fresh = match registered {
+            Some(existing) if canonical(endpoint.clone())? == existing.endpoint => None,
+            _ => Some(Arc::new(claim(endpoint)?)),
+        };
+        let uri = format!("/forwards/guest/{}", encode_segment(&forward.id));
+        self.link.empty("PUT", &uri, json_body(&forward)?).await?;
+        if let Some(fresh) = fresh {
+            self.targets.lock().unwrap().insert(forward.id, fresh);
+        }
+        Ok(())
+    }
+    pub async fn guest_forward(&self, id: &str) -> io::Result<GuestForward> {
+        self.link.json("GET", &format!("/forwards/guest/{}", encode_segment(id)), empty()).await
+    }
+    pub async fn guest_forwards(&self) -> io::Result<Vec<GuestForward>> {
+        self.link.json("GET", "/forwards/guest", empty()).await
     }
     pub async fn remove_guest_forward(&self, id: &str) -> io::Result<()> {
         let original = self.targets.lock().unwrap().get(id).cloned();
-        self.empty("DELETE", "/forwards/guest", &id).await?;
+        self.link.empty("DELETE", &format!("/forwards/guest/{}", encode_segment(id)), empty()).await?;
         let mut targets = self.targets.lock().unwrap();
         if let Some(original) = original
             && targets.get(id).is_some_and(|current| Arc::ptr_eq(current, &original))
@@ -343,11 +438,20 @@ impl Client {
         }
         Ok(())
     }
-    pub async fn add_host_forward(&self, id: String, endpoint: Endpoint) -> io::Result<()> {
-        self.empty("PUT", "/forwards/host", &GuestTarget { id, endpoint }).await
+    /// Create or update a guest endpoint the host can open streams to. An
+    /// unchanged endpoint keeps its live streams.
+    pub async fn put_host_forward(&self, forward: HostForward) -> io::Result<()> {
+        let uri = format!("/forwards/host/{}", encode_segment(&forward.id));
+        self.link.empty("PUT", &uri, json_body(&forward)?).await.map(drop)
+    }
+    pub async fn host_forward(&self, id: &str) -> io::Result<HostForward> {
+        self.link.json("GET", &format!("/forwards/host/{}", encode_segment(id)), empty()).await
+    }
+    pub async fn host_forwards(&self) -> io::Result<Vec<HostForward>> {
+        self.link.json("GET", "/forwards/host", empty()).await
     }
     pub async fn remove_host_forward(&self, id: &str) -> io::Result<()> {
-        self.empty("DELETE", "/forwards/host", &id).await
+        self.link.empty("DELETE", &format!("/forwards/host/{}", encode_segment(id)), empty()).await.map(drop)
     }
     pub async fn forward(&self, id: &str) -> io::Result<ByteStream> {
         self.require_compatible()?;
@@ -380,7 +484,7 @@ impl ExecOutput {
                         self.pending.extend_from_slice(&bytes);
                     }
                 }
-                Some(Err(error)) => return Err(io::Error::other(error)),
+                Some(Err(error)) => return Err(link_error("exec output", error)),
                 None if self.pending.is_empty() => {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "exec stream ended without Exit"));
                 }

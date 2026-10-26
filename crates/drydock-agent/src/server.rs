@@ -1,13 +1,17 @@
-use crate::*;
+use crate::{
+    rest::{header_value, structured},
+    *,
+};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use drydock_transport::{Opener, Purpose, Transport, http2};
-use std::{collections::HashMap, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, sync::Arc};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, UnixListener},
@@ -16,49 +20,8 @@ use tokio::{
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
-type ApiError = (StatusCode, Json<AgentError>);
-enum Failure {
-    Message(String),
-    Io(io::Error),
-}
-impl From<&str> for Failure {
-    fn from(s: &str) -> Self {
-        Self::Message(s.into())
-    }
-}
-impl From<io::Error> for Failure {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-fn api(error: impl Into<Failure>) -> ApiError {
-    let error = match error.into() {
-        Failure::Message(message) => AgentError::new("control", "request", invalid(message)),
-        Failure::Io(error) => error
-            .get_ref()
-            .and_then(|e| e.downcast_ref::<AgentError>())
-            .cloned()
-            .unwrap_or_else(|| AgentError::new("control", "request", error)),
-    };
-    let status = match io::ErrorKind::from(error.kind) {
-        io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
-        io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
-        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => StatusCode::BAD_REQUEST,
-        io::ErrorKind::AlreadyExists | io::ErrorKind::AddrInUse => StatusCode::CONFLICT,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, Json(error))
-}
-fn at(operation: &'static str, subject: impl std::fmt::Display) -> impl FnOnce(io::Error) -> ApiError {
-    let subject = subject.to_string();
-    move |error| api(crate::error::context(operation, subject, error))
-}
-fn absolute(operation: &'static str, path: &Path) -> Result<(), ApiError> {
-    if !path.is_absolute() {
-        return Err(at(operation, path.display())(invalid("file path must be absolute")));
-    }
-    Ok(())
-}
+type Refusal<T> = Result<T, AgentError>;
+
 struct Target {
     endpoint: Endpoint,
     streams: JoinSet<()>,
@@ -77,10 +40,15 @@ impl Drop for GuestSocket {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+/// Live guest-to-host streams of one forward ID. They outlive a rebind of
+/// the forward's listeners and end when the forward is removed.
+type Bridges = Arc<std::sync::Mutex<JoinSet<()>>>;
 struct Listener {
+    forward: GuestForward,
     task: tokio::task::JoinHandle<()>,
     unix: Arc<GuestSocket>,
     tcp: Option<(std::net::SocketAddr, Arc<TcpListener>)>,
+    bridges: Bridges,
 }
 impl Listener {
     async fn stop(mut self) {
@@ -96,11 +64,24 @@ impl Drop for Listener {
 #[derive(Default)]
 struct Settings {
     config: Configuration,
-    listeners: HashMap<String, Listener>,
-    targets: HashMap<String, Target>,
+    listeners: BTreeMap<String, Listener>,
+    targets: BTreeMap<String, Target>,
     capture: Option<crate::egress::Capture>,
 }
-struct Shared {
+impl Settings {
+    /// Loopback listeners exempt from capture, optionally with one forward's
+    /// listener replaced or removed.
+    fn exemptions(&self, id: &str, replacement: Option<&GuestForward>) -> Vec<std::net::SocketAddr> {
+        self.listeners
+            .iter()
+            .filter(|(other, _)| other.as_str() != id)
+            .map(|(_, l)| &l.forward)
+            .chain(replacement)
+            .filter_map(|f| f.tcp)
+            .collect()
+    }
+}
+pub(crate) struct Shared {
     hello: Hello,
     egress_system: crate::egress::System,
     opener: Arc<Mutex<Opener>>,
@@ -115,11 +96,29 @@ pub struct Agent {
     shared: Arc<Shared>,
     restart: mpsc::Receiver<PathBuf>,
 }
+/// 128 random bits, drawn once per agent process. Without the kernel's
+/// source, time and PID still differ between boots: the ID only has to tell
+/// restarts apart, not be unpredictable.
+fn boot_id() -> String {
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(%error, "no kernel randomness for the boot ID; using time and PID");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        bytes[..8].copy_from_slice(&(now.as_nanos() as u64).to_le_bytes());
+        bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 impl Agent {
     pub fn new(transport: Transport, fingerprint: String, executable: PathBuf) -> Self {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
-            hello: Hello { fingerprint, features: FEATURES.iter().map(|s| (*s).into()).collect(), platform: Some(Platform::current()) },
+            hello: Hello {
+                fingerprint,
+                features: FEATURES.iter().map(|s| (*s).into()).collect(),
+                platform: Some(Platform::current()),
+                boot_id: boot_id(),
+            },
             egress_system: crate::egress::System::default(),
             opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),
@@ -133,21 +132,34 @@ impl Agent {
     pub fn add_transport(&mut self, transport: Transport) {
         self.transports.push(transport);
     }
+    fn router(&self) -> Router {
+        // Executables and JSON file writes arrive whole, so they keep a larger cap.
+        let buffered = || DefaultBodyLimit::max(128 * 1024 * 1024);
+        Router::new()
+            .route("/hello", get(hello))
+            .route("/upgrade", put(stage_upgrade).post(activate_upgrade).layer(buffered()))
+            .route("/configuration", get(configuration).put(configure))
+            .route("/exec", post(exec))
+            .route("/files/write", post(write_file).layer(buffered()))
+            .route("/files/read", post(read_file))
+            .route("/files/flush", post(flush_file))
+            .route("/forwards/guest", get(guest_forwards))
+            .route("/forwards/guest/{id}", get(guest_forward).put(put_guest).delete(remove_guest))
+            .route("/forwards/host", get(host_forwards))
+            .route("/forwards/host/{id}", get(host_forward).put(put_target).delete(remove_target))
+            // A deliberate cap on JSON control bodies only; streamed bodies have none.
+            .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+            .layer(axum::middleware::from_fn(structured))
+            .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::rest::panicked))
+            .with_state(self.shared.clone())
+    }
     /// Returns the probation candidate on upgrade. The composition root re-execs
     /// with its original fixed flags; dropping this future drops all agent streams.
     pub async fn run(mut self) -> io::Result<PathBuf> {
-        let router = Router::new()
-            .route("/hello", get(hello))
-            .route("/upgrade", put(stage_upgrade).post(activate_upgrade))
-            .route("/configure", put(configure).get(configuration))
-            .route("/exec", post(exec))
-            .route("/files/write", post(write_file))
-            .route("/files/read", post(read_file))
-            .route("/files/flush", post(flush_file))
-            .route("/forwards/guest", put(add_guest).delete(remove_guest))
-            .route("/forwards/host", put(add_target).delete(remove_target))
-            .layer(DefaultBodyLimit::max(128 * 1024 * 1024))
-            .with_state(self.shared.clone());
+        if let Err(error) = self.shared.egress_system.clear().await {
+            tracing::warn!(%error, "could not clear guest egress redirects left by an earlier agent");
+        }
+        let router = self.router();
         let mut controller_bound = false;
         let mut tasks = JoinSet::new();
         let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
@@ -180,8 +192,12 @@ impl Agent {
                     tasks.shutdown().await;
                     // Remove owned guest socket paths before exec discards the
                     // runtime. Aborting tasks alone does not synchronously drop them.
-                    let listeners = std::mem::take(&mut self.shared.settings.lock().await.listeners);
-                    for (_, listener) in listeners { listener.stop().await; }
+                    let mut settings = self.shared.settings.lock().await;
+                    for (_, listener) in std::mem::take(&mut settings.listeners) { listener.stop().await; }
+                    // The configuration dies with this process; so do its redirects.
+                    if let Err(error) = self.shared.egress_system.clear().await {
+                        tracing::warn!(%error, "could not clear guest egress redirects before re-exec");
+                    }
                     return path.ok_or_else(|| io::Error::other("upgrade channel closed"));
                 },
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
@@ -222,108 +238,94 @@ impl Agent {
         }
     }
 }
-async fn hello(State(s): State<Arc<Shared>>) -> Result<Json<Hello>, ApiError> {
+
+async fn hello(State(s): State<Arc<Shared>>) -> Refusal<Json<Hello>> {
     let _guard = s.staged.lock().await;
-    crate::upgrade::confirm(&s.executable).await.map_err(at("upgrade.confirm", s.executable.display()))?;
+    crate::upgrade::confirm(&s.executable).await.map_err(|e| AgentError::io("upgrade.confirm", s.executable.display(), e))?;
     Ok(Json(s.hello.clone()))
 }
-async fn configuration(State(s): State<Arc<Shared>>) -> Json<Configuration> {
-    Json(s.settings.lock().await.config.clone())
+
+fn configuration_tag(s: &Shared, config: &Configuration) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(config).expect("configuration serializes")));
+    format!("\"{}-{}\"", s.hello.boot_id, &digest[..16])
 }
-async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuration>) -> Result<StatusCode, ApiError> {
+async fn configuration(State(s): State<Arc<Shared>>) -> Response {
+    let config = s.settings.lock().await.config.clone();
+    ([(header::ETAG, header_value(configuration_tag(&s, &config)))], Json(config)).into_response()
+}
+async fn configure(State(s): State<Arc<Shared>>, headers: HeaderMap, Json(config): Json<Configuration>) -> Refusal<Response> {
+    const OP: &str = "configuration.replace";
     if config.environment.iter().any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
-        return Err(api("invalid process environment"));
-    }
-    if let Some(egress) = &config.egress {
-        check_id(&egress.upstream).map_err(api)?;
-        if config.forwards.iter().filter_map(|f| f.tcp).any(|a| crate::egress::RESERVED_PORTS.contains(&a.port())) {
-            return Err(api("forward conflicts with an egress listener"));
-        }
+        return Err(AgentError::new(
+            OP,
+            "environment",
+            ErrorKind::InvalidInput,
+            "variable names must be nonempty without = or NUL; values without NUL",
+        ));
     }
     let mut settings = s.settings.lock().await;
-    let mut prepared_capture = if settings.capture.is_none() {
-        if let Some(egress) = &config.egress {
-            Some(
-                crate::egress::Capture::prepare(s.opener.clone(), egress.upstream.clone())
-                    .await
-                    .map_err(at("egress.prepare", "listeners"))?,
-            )
-        } else {
-            None
+    let current = configuration_tag(&s, &settings.config);
+    if !crate::rest::if_match(OP, "configuration", &headers, Some(&current))? {
+        let expected: Vec<_> = headers.get_all(header::IF_MATCH).iter().filter_map(|v| v.to_str().ok()).collect();
+        let expected = expected.join(", ");
+        return Err(AgentError::new(
+            OP,
+            "configuration",
+            ErrorKind::PreconditionFailed,
+            format!("configuration is now {current}, not {expected}"),
+        ));
+    }
+    if let Some(egress) = &config.egress {
+        check_id(&egress.upstream).map_err(|e| AgentError::io(OP, "egress.upstream", e))?;
+        if let Some(conflict) =
+            settings.listeners.values().find(|l| l.forward.tcp.is_some_and(|a| crate::egress::RESERVED_PORTS.contains(&a.port())))
+        {
+            return Err(AgentError::new(
+                OP,
+                "egress",
+                ErrorKind::Conflict,
+                format!("guest forward {} listens on a port egress capture needs", conflict.forward.id),
+            ));
         }
-    } else {
-        None
+    }
+    let mut prepared_capture = match (&settings.capture, &config.egress) {
+        (None, Some(egress)) => Some(
+            crate::egress::Capture::prepare(s.opener.clone(), egress.upstream.clone())
+                .await
+                .map_err(|e| AgentError::io("egress.prepare", "listeners", e))?,
+        ),
+        _ => None,
     };
-    let mut prepared = HashMap::new();
-    let preparation: Result<(), ApiError> = async {
-        for forward in &config.forwards {
-            check_id(&forward.id).map_err(api)?;
-            if prepared.contains_key(&forward.id) {
-                return Err(api("duplicate forward ID"));
-            }
-            let unchanged = settings.config.forwards.iter().any(|old| old == forward)
-                && settings.listeners.get(&forward.id).is_some_and(|listener| !listener.task.is_finished());
-            let listener = if unchanged {
-                None
-            } else {
-                Some(
-                    listen(forward, s.opener.clone(), settings.listeners.get(&forward.id))
-                        .await
-                        .map_err(at("forward.listen", forward.unix.display()))?,
-                )
-            };
-            prepared.insert(forward.id.clone(), listener);
+    let installed: Refusal<()> = async {
+        if config.egress.is_none() && settings.capture.is_none() {
+            return Ok(());
         }
-        if config.egress.is_some() || settings.capture.is_some() {
-            // Stage the CA under the tools prefix before publishing capture.
-            // Configuration.ca is the complete combined trust bundle supplied
-            // by the controller; the agent does not fetch host trust material.
-            let ca = if config.egress.is_some() {
-                let file = tempfile::NamedTempFile::new_in(s.egress_system.ca.parent().unwrap())
-                    .map_err(at("egress.ca", s.egress_system.ca.display()))?;
-                std::fs::write(file.path(), config.ca.as_bytes()).map_err(at("egress.ca", s.egress_system.ca.display()))?;
-                file.as_file()
-                    .set_permissions(std::fs::Permissions::from_mode(0o644))
-                    .map_err(at("egress.ca", s.egress_system.ca.display()))?;
-                file.as_file().sync_all().map_err(at("egress.ca", s.egress_system.ca.display()))?;
-                Some(file)
-            } else {
-                None
-            };
-            s.egress_system.install(&config).await.map_err(at("egress.redirect", "nftables"))?;
-            if let Some(ca) = ca
-                && let Err(error) = ca.persist(&s.egress_system.ca)
-            {
-                // persist failed before replacing the old bundle. Reinstall
-                // the previous nft transaction before reporting refusal; if
-                // rollback itself fails, report that separately to the caller.
-                s.egress_system.install(&settings.config).await.map_err(at("egress.rollback", "nftables"))?;
-                return Err(at("egress.ca", s.egress_system.ca.display())(error.error));
-            }
+        let exempt = settings.exemptions("", None);
+        s.egress_system.install(config.egress.is_some(), &exempt).await.map_err(|e| AgentError::io("egress.redirect", "nftables", e))?;
+        // Configuration.ca is the complete combined trust bundle supplied by
+        // the controller; the agent does not fetch host trust material. A
+        // bundle that cannot be replaced leaves the old one; reinstall the
+        // previous nft transaction before reporting the refusal, and report a
+        // failed rollback separately.
+        let ca_path = &s.egress_system.ca;
+        if config.egress.is_some()
+            && let Err(error) = crate::durable::replace(ca_path, config.ca.as_bytes(), 0o644)
+        {
+            s.egress_system
+                .install(settings.config.egress.is_some(), &exempt)
+                .await
+                .map_err(|e| AgentError::io("egress.rollback", "nftables", e))?;
+            return Err(AgentError::io("egress.ca", ca_path.display(), error));
         }
         Ok(())
     }
     .await;
-    if let Err(error) = preparation {
-        // A rejected transaction must release staged socket paths before its
-        // response, so the caller can retry immediately without a bind race.
-        for listener in prepared.into_values().flatten() {
-            listener.stop().await;
-        }
+    if let Err(error) = installed {
         if let Some(capture) = prepared_capture.take() {
             capture.stop().await;
         }
         return Err(error);
-    }
-    let mut listeners = HashMap::new();
-    for (id, listener) in prepared {
-        if let Some(listener) = listener.or_else(|| settings.listeners.remove(&id)) {
-            listeners.insert(id, listener);
-        }
-    }
-    let old = std::mem::replace(&mut settings.listeners, listeners);
-    for (_, listener) in old {
-        listener.stop().await;
     }
     if let Some(egress) = &config.egress {
         if let Some(capture) = prepared_capture.take() {
@@ -333,14 +335,16 @@ async fn configure(State(s): State<Arc<Shared>>, Json(config): Json<Configuratio
     } else if let Some(capture) = settings.capture.take() {
         capture.stop().await;
     }
+    let tag = configuration_tag(&s, &config);
     settings.config = config;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((StatusCode::NO_CONTENT, [(header::ETAG, header_value(tag))]).into_response())
 }
+
 async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<&Listener>) -> io::Result<Listener> {
     if forward.tcp.is_some_and(|addr| !addr.ip().is_loopback()) {
         return Err(invalid("guest TCP listener must be loopback"));
     }
-    // Bind before publishing the new listener into the configuration.
+    // Bind before publishing the new listener.
     let tcp = if let Some(address) = forward.tcp {
         if let Some((_, listener)) = old.and_then(|old| old.tcp.as_ref()).filter(|(previous, _)| *previous == address) {
             Some((address, listener.clone()))
@@ -375,12 +379,12 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
     };
     let owned_unix = unix.clone();
     let owned_tcp = tcp.clone();
+    let bridges = old.map(|old| old.bridges.clone()).unwrap_or_default();
+    let streams = bridges.clone();
     let id = forward.id.clone();
     let task = tokio::spawn(async move {
-        let mut streams = JoinSet::new();
         loop {
             let accepted: io::Result<ByteStream> = tokio::select! {
-                Some(_) = streams.join_next(), if !streams.is_empty() => continue,
                 result = unix.listener.accept() => result.map(|(s,_)| Box::new(s) as ByteStream),
                 result = async { tcp.as_ref().unwrap().1.accept().await }, if tcp.is_some() => result.map(|(s,_)| Box::new(s) as ByteStream),
             };
@@ -406,6 +410,9 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
             };
             let opener = opener.lock().await.clone();
             let id = id.clone();
+            let mut streams = streams.lock().unwrap();
+            // Reap finished bridges without retaining an unbounded history.
+            while streams.try_join_next().is_some() {}
             streams.spawn(async move {
                 match opener.open(Purpose::Forward { id: id.clone() }).await {
                     Ok(mut remote) => {
@@ -422,64 +429,119 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
             });
         }
     });
-    Ok(Listener { task, unix: owned_unix, tcp: owned_tcp })
+    Ok(Listener { forward: forward.clone(), task, unix: owned_unix, tcp: owned_tcp, bridges })
 }
-async fn add_guest(State(s): State<Arc<Shared>>, Json(forward): Json<GuestForward>) -> Result<StatusCode, ApiError> {
-    check_id(&forward.id).map_err(api)?;
-    let mut settings = s.settings.lock().await;
-    if settings.capture.is_some() && forward.tcp.is_some() {
-        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
+fn check_path_id(operation: &str, path_id: &str, body_id: &str) -> Refusal<()> {
+    check_id(path_id).map_err(|e| AgentError::io(operation, path_id, e))?;
+    if path_id != body_id {
+        return Err(AgentError::new(operation, path_id, ErrorKind::InvalidInput, format!("body names forward {body_id:?}")));
     }
-    if settings.listeners.contains_key(&forward.id) {
-        return Err(api("forward ID already exists"));
-    }
-    let listener = listen(&forward, s.opener.clone(), None).await.map_err(at("forward.listen", forward.unix.display()))?;
-    settings.listeners.insert(forward.id.clone(), listener);
-    settings.config.forwards.push(forward);
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
-async fn remove_guest(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
-    let mut settings = s.settings.lock().await;
-    if settings.capture.is_some() && settings.config.forwards.iter().any(|f| f.id == id && f.tcp.is_some()) {
-        return Err(api("use configure to change TCP forwards while egress capture is enabled"));
-    }
+async fn guest_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<GuestForward>> {
+    Json(s.settings.lock().await.listeners.values().map(|l| l.forward.clone()).collect())
+}
+async fn guest_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<GuestForward>> {
+    let settings = s.settings.lock().await;
     let listener = settings
         .listeners
-        .remove(&id)
-        .ok_or_else(|| at("forward.remove", &id)(io::Error::new(io::ErrorKind::NotFound, "unknown guest forward ID")))?;
-    listener.stop().await;
-    settings.config.forwards.retain(|f| f.id != id);
-    Ok(StatusCode::NO_CONTENT)
+        .get(&id)
+        .ok_or_else(|| AgentError::new("forward.guest.read", &id, ErrorKind::NotFound, "no guest forward with this ID"))?;
+    Ok(Json(listener.forward.clone()))
 }
-async fn add_target(State(s): State<Arc<Shared>>, Json(target): Json<GuestTarget>) -> Result<StatusCode, ApiError> {
-    check_id(&target.id).map_err(api)?;
-    if matches!(&target.endpoint, Endpoint::Tcp(address) if address.port() == 0) {
-        return Err(api("guest target TCP port must be nonzero"));
-    }
+/// Idempotent upsert. An unchanged forward with a live listener is left
+/// alone, streams and all; a changed one is rebound before the old one stops.
+async fn put_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<GuestForward>) -> Refusal<StatusCode> {
+    const OP: &str = "forward.guest.put";
+    check_path_id(OP, &id, &forward.id)?;
     let mut settings = s.settings.lock().await;
-    if let Some(old) = settings.targets.remove(&target.id) {
+    let old = settings.listeners.get(&id);
+    if old.is_some_and(|old| old.forward == forward && !old.task.is_finished()) {
+        return Ok(StatusCode::OK);
+    }
+    let capture = settings.capture.is_some();
+    if capture && forward.tcp.is_some_and(|a| crate::egress::RESERVED_PORTS.contains(&a.port())) {
+        return Err(AgentError::new(OP, &id, ErrorKind::Conflict, "forward conflicts with an egress listener"));
+    }
+    let existed = old.is_some();
+    let tcp_changed = old.map(|old| old.forward.tcp) != Some(forward.tcp);
+    let listener =
+        listen(&forward, s.opener.clone(), old).await.map_err(|e| AgentError::io("forward.listen", forward.unix.display(), e))?;
+    if capture && tcp_changed {
+        let exempt = settings.exemptions(&id, Some(&forward));
+        if let Err(error) = s.egress_system.install(true, &exempt).await {
+            listener.stop().await;
+            return Err(AgentError::io("egress.redirect", "nftables", error));
+        }
+    }
+    if let Some(old) = settings.listeners.insert(id, listener) {
         old.stop().await;
     }
-    settings.targets.insert(target.id, Target { endpoint: target.endpoint, streams: JoinSet::new() });
+    Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
+}
+async fn remove_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
+    let mut settings = s.settings.lock().await;
+    let Some(listener) = settings.listeners.remove(&id) else {
+        return Err(AgentError::new("forward.guest.remove", &id, ErrorKind::NotFound, "no guest forward with this ID"));
+    };
+    if settings.capture.is_some() && listener.forward.tcp.is_some() {
+        let exempt = settings.exemptions(&id, None);
+        if let Err(error) = s.egress_system.install(true, &exempt).await {
+            settings.listeners.insert(id, listener);
+            return Err(AgentError::io("egress.redirect", "nftables", error));
+        }
+    }
+    listener.stop().await;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn remove_target(State(s): State<Arc<Shared>>, Json(id): Json<String>) -> Result<StatusCode, ApiError> {
+async fn host_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<HostForward>> {
+    let settings = s.settings.lock().await;
+    Json(settings.targets.iter().map(|(id, t)| HostForward { id: id.clone(), endpoint: t.endpoint.clone() }).collect())
+}
+async fn host_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<HostForward>> {
+    let settings = s.settings.lock().await;
+    let target = settings
+        .targets
+        .get(&id)
+        .ok_or_else(|| AgentError::new("forward.host.read", &id, ErrorKind::NotFound, "no host forward with this ID"))?;
+    Ok(Json(HostForward { id, endpoint: target.endpoint.clone() }))
+}
+/// A changed endpoint ends the streams to the old one, unlike a guest
+/// listener's rebind: they would otherwise keep reaching a target the host
+/// no longer names.
+async fn put_target(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<HostForward>) -> Refusal<StatusCode> {
+    const OP: &str = "forward.host.put";
+    check_path_id(OP, &id, &forward.id)?;
+    if matches!(&forward.endpoint, Endpoint::Tcp(address) if address.port() == 0) {
+        return Err(AgentError::new(OP, &id, ErrorKind::InvalidInput, "guest target TCP port must be nonzero"));
+    }
+    let mut settings = s.settings.lock().await;
+    if settings.targets.get(&id).is_some_and(|t| t.endpoint == forward.endpoint) {
+        return Ok(StatusCode::OK);
+    }
+    let old = settings.targets.insert(id, Target { endpoint: forward.endpoint, streams: JoinSet::new() });
+    let existed = old.is_some();
+    if let Some(old) = old {
+        old.stop().await;
+    }
+    Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
+}
+async fn remove_target(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
     let target = s
         .settings
         .lock()
         .await
         .targets
         .remove(&id)
-        .ok_or_else(|| at("forward.remove", &id)(io::Error::new(io::ErrorKind::NotFound, "unknown host forward ID")))?;
+        .ok_or_else(|| AgentError::new("forward.host.remove", &id, ErrorKind::NotFound, "no host forward with this ID"))?;
     target.stop().await;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Result<Body, ApiError> {
+
+async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Refusal<Body> {
     let environment = s.settings.lock().await.config.environment.clone();
     let program = request.program.clone();
-    let rx = crate::exec::launch(request, environment).map_err(|error| {
-        if error.get_ref().is_some_and(|source| source.is::<AgentError>()) { api(error) } else { at("exec.launch", &program)(error) }
-    })?;
+    let rx = crate::exec::launch(request, environment).map_err(|e| AgentError::io("exec.launch", &program, e))?;
     let stream = ReceiverStream::new(rx).map(|event| {
         let mut bytes = serde_json::to_vec(&event).expect("exec event serialization");
         bytes.push(b'\n');
@@ -487,10 +549,16 @@ async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Result
     });
     Ok(Body::from_stream(stream))
 }
+fn absolute(operation: &str, path: &std::path::Path) -> Refusal<()> {
+    if !path.is_absolute() {
+        return Err(AgentError::new(operation, path.display(), ErrorKind::InvalidInput, "file path must be absolute"));
+    }
+    Ok(())
+}
 /// Write a sibling, fsync it, rename atomically, then fsync the parent directory.
 /// Readers always observe either the complete old file or the complete new file.
-pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) -> io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+pub(crate) async fn atomic_write(path: &std::path::Path, bytes: &[u8], executable: bool) -> io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut file = tokio::fs::File::from_std(temporary.reopen()?);
     file.write_all(bytes).await?;
@@ -515,7 +583,7 @@ pub(crate) async fn atomic_write(path: &Path, bytes: &[u8], executable: bool) ->
     file.set_permissions(std::fs::Permissions::from_mode(mode)).await?;
     file.sync_all().await?;
     temporary.persist(path).map_err(|error| error.error)?;
-    tokio::fs::File::open(parent).await?.sync_all().await
+    crate::durable::sync_directory(parent)
 }
 // Unprivileged replacement may be allowed by directory permissions even when
 // preserving another user's owner is not. Preserve it when permitted; root and
@@ -526,72 +594,64 @@ fn ownership_result(result: io::Result<()>, uid: u32) -> io::Result<()> {
         other => other,
     }
 }
-async fn write_file(Json(file): Json<FileWrite>) -> Result<StatusCode, ApiError> {
+async fn write_file(Json(file): Json<FileWrite>) -> Refusal<StatusCode> {
     absolute("file.write", &file.path)?;
-    atomic_write(&file.path, &file.bytes, file.executable).await.map_err(at("file.write", file.path.display()))?;
+    atomic_write(&file.path, &file.bytes, file.executable).await.map_err(|e| AgentError::io("file.write", file.path.display(), e))?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn read_file(Json(file): Json<FilePath>) -> Result<Vec<u8>, ApiError> {
+async fn read_file(Json(file): Json<FilePath>) -> Refusal<Vec<u8>> {
     use tokio::io::AsyncReadExt;
     const LIMIT: u64 = 128 * 1024 * 1024;
+    let at = |e| AgentError::io("file.read", file.path.display(), e);
     absolute("file.read", &file.path)?;
-    let input = tokio::fs::File::open(&file.path).await.map_err(at("file.read", file.path.display()))?;
-    if input.metadata().await.map_err(at("file.read", file.path.display()))?.len() > LIMIT {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(AgentError::new("file.read", file.path.display(), invalid("read exceeds 128 MiB"))),
-        ));
+    let too_large = || AgentError::new("file.read", file.path.display(), ErrorKind::PayloadTooLarge, "read exceeds 128 MiB");
+    let input = tokio::fs::File::open(&file.path).await.map_err(at)?;
+    if input.metadata().await.map_err(at)?.len() > LIMIT {
+        return Err(too_large());
     }
     let mut bytes = Vec::new();
-    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(at("file.read", file.path.display()))?;
+    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(at)?;
     if bytes.len() as u64 > LIMIT {
-        return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(AgentError::new("file.read", file.path.display(), invalid("read exceeds 128 MiB"))),
-        ));
+        return Err(too_large());
     }
     Ok(bytes)
 }
-async fn flush_file(Json(file): Json<FilePath>) -> Result<StatusCode, ApiError> {
+async fn flush_file(Json(file): Json<FilePath>) -> Refusal<StatusCode> {
+    let at = |e| AgentError::io("file.flush", file.path.display(), e);
     absolute("file.flush", &file.path)?;
-    tokio::fs::File::open(&file.path)
-        .await
-        .map_err(at("file.flush", file.path.display()))?
-        .sync_all()
-        .await
-        .map_err(at("file.flush", file.path.display()))?;
+    tokio::fs::File::open(&file.path).await.map_err(at)?.sync_all().await.map_err(at)?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Result<StatusCode, ApiError> {
+async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Refusal<StatusCode> {
+    let path = crate::upgrade::sidecar(&s.executable, "upgrade");
     if bytes.is_empty() {
-        return Err(api("empty agent executable"));
+        return Err(AgentError::new("upgrade.stage", path.display(), ErrorKind::InvalidInput, "empty agent executable"));
     }
     let mut staged = s.staged.lock().await;
-    let path = crate::upgrade::sidecar(&s.executable, "upgrade");
-    atomic_write(&path, &bytes, true).await.map_err(at("upgrade.stage", path.display()))?;
+    atomic_write(&path, &bytes, true).await.map_err(|e| AgentError::io("upgrade.stage", path.display(), e))?;
     *staged = Some(path);
     Ok(StatusCode::NO_CONTENT)
 }
-async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, ApiError> {
+async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
     let mut staged = s.staged.lock().await;
-    let path = staged.as_ref().cloned().ok_or_else(|| api("no staged agent"))?;
+    let at = |operation: &'static str, subject: &std::path::Path| {
+        let subject = subject.display().to_string();
+        move |e| AgentError::io(operation, subject, e)
+    };
+    let path = staged
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| AgentError::new("upgrade.activate", s.executable.display(), ErrorKind::Conflict, "no staged agent"))?;
     // Keep the installed path stable over successive upgrades.
     let previous = crate::upgrade::sidecar(&s.executable, "prev");
-    let parent = s.executable.parent().unwrap_or(Path::new("."));
-    let backup_dir = tempfile::tempdir_in(parent).map_err(at("upgrade.backup", parent.display()))?;
+    let parent = s.executable.parent().unwrap_or(std::path::Path::new("."));
+    let backup_dir = tempfile::tempdir_in(parent).map_err(at("upgrade.backup", parent))?;
     let backup = backup_dir.path().join("previous");
-    tokio::fs::hard_link(&s.executable, &backup).await.map_err(at("upgrade.backup", s.executable.display()))?;
-    tokio::fs::rename(&backup, &previous).await.map_err(at("upgrade.backup", previous.display()))?;
-    crate::upgrade::prepare(&s.executable, &path).await.map_err(at("upgrade.prepare", s.executable.display()))?;
+    tokio::fs::hard_link(&s.executable, &backup).await.map_err(at("upgrade.backup", &s.executable))?;
+    tokio::fs::rename(&backup, &previous).await.map_err(at("upgrade.backup", &previous))?;
+    crate::upgrade::prepare(&s.executable, &path).await.map_err(at("upgrade.prepare", &s.executable))?;
     *staged = None;
-    if let Some(parent) = s.executable.parent() {
-        tokio::fs::File::open(parent)
-            .await
-            .map_err(at("upgrade.flush", parent.display()))?
-            .sync_all()
-            .await
-            .map_err(at("upgrade.flush", parent.display()))?;
-    }
+    crate::durable::sync_directory(parent).map_err(at("upgrade.flush", parent))?;
     let tx = s.restart.clone();
     tokio::spawn(async move {
         // Activation acknowledgement is advisory: clients reconnect and verify hello.
@@ -604,22 +664,26 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Result<StatusCode, Ap
 #[cfg(test)]
 mod tests {
     use super::*;
-    // A finished listener is rebuilt even when desired configuration is identical.
-    // Aborting the task stands in for a fatal listener boundary failure.
-    #[tokio::test]
-    async fn identical_configuration_recovers_finished_listener() {
+    use std::os::unix::fs::PermissionsExt;
+    async fn agent(dir: &std::path::Path) -> (Transport, Agent) {
         let (a, b) = tokio::io::duplex(4096);
         let (host, guest) = tokio::join!(
             Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
             Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
         );
-        let mut host = host.unwrap();
-        let guest = guest.unwrap();
+        (host.unwrap(), Agent::new(guest.unwrap(), "build".into(), dir.join("agent")))
+    }
+    fn forward(id: &str, unix: PathBuf) -> GuestForward {
+        GuestForward { id: id.into(), unix, tcp: None }
+    }
+    // A finished listener is rebuilt even when the desired forward is identical.
+    // Aborting the task stands in for a fatal listener boundary failure.
+    #[tokio::test]
+    async fn identical_forward_recovers_finished_listener() {
         let dir = tempfile::tempdir().unwrap();
-        let agent = Agent::new(guest, "build".into(), dir.path().join("agent"));
-        let f = GuestForward { id: "recover".into(), unix: dir.path().join("socket"), tcp: None };
-        let config = Configuration { forwards: vec![f.clone()], ..Configuration::default() };
-        configure(State(agent.shared.clone()), Json(config.clone())).await.unwrap();
+        let (mut host, agent) = agent(dir.path()).await;
+        let f = forward("recover", dir.path().join("socket"));
+        put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
         {
             let mut settings = agent.shared.settings.lock().await;
             let listener = settings.listeners.get_mut("recover").unwrap();
@@ -628,7 +692,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
-        configure(State(agent.shared.clone()), Json(config)).await.unwrap();
+        put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
         let _stream = tokio::net::UnixStream::connect(f.unix).await.unwrap();
         let incoming = tokio::time::timeout(std::time::Duration::from_secs(2), host.accept()).await.unwrap().unwrap().unwrap();
         assert_eq!(incoming.purpose, Purpose::Forward { id: "recover".into() });
@@ -637,17 +701,11 @@ mod tests {
     // both the staged image and previous rollback, and POST alone must retry.
     #[tokio::test]
     async fn partial_activation_failure_retains_stage_and_previous() {
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) = tokio::join!(
-            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
-            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
-        );
-        let _host = host.unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let (_host, agent) = agent(dir.path()).await;
         let executable = dir.path().join("agent");
         let previous = executable.with_extension("prev");
         std::fs::write(&previous, b"previous rollback").unwrap();
-        let agent = Agent::new(guest.unwrap(), "old".into(), executable.clone());
         stage_upgrade(State(agent.shared.clone()), Bytes::from_static(b"new image")).await.unwrap();
         assert!(activate_upgrade(State(agent.shared.clone())).await.is_err());
         let staged = agent.shared.staged.lock().await.clone().expect("stage must survive failed linking");
@@ -661,6 +719,27 @@ mod tests {
         assert_eq!(std::fs::read(previous).unwrap(), b"current image");
     }
 
+    // Redirects never outlive the configuration that installed them: an agent
+    // starts with empty configuration, so it first removes any capture table a
+    // crashed predecessor left behind. The nft stand-in records transactions.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn startup_removes_redirects_left_by_a_previous_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, mut agent) = agent(dir.path()).await;
+        let nft = dir.path().join("nft");
+        std::fs::write(&nft, "#!/bin/sh\ncat >> \"$0.log\"\n").unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft: nft.clone(), ca: dir.path().join("ca.pem") };
+        let running = tokio::spawn(agent.run());
+        let log = nft.with_extension("log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&log).is_ok_and(|log| log.contains("delete table inet drydock_egress")) {
+            assert!(std::time::Instant::now() < deadline, "startup must remove the capture table");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        running.abort();
+    }
     // A process-boundary nft stand-in records the last committed transaction.
     // Fail once after real capture preparation and once after nft installation;
     // both refusals must free every port and preserve configuration/nft state.
@@ -668,13 +747,8 @@ mod tests {
     #[tokio::test]
     async fn egress_configuration_failures_release_ports_and_restore_nft() {
         for fail_persist in [false, true] {
-            let (a, b) = tokio::io::duplex(4096);
-            let (host, guest) = tokio::join!(
-                Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
-                Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
-            );
-            let _host = host.unwrap();
             let dir = tempfile::tempdir().unwrap();
+            let (_host, mut agent) = agent(dir.path()).await;
             let nft = dir.path().join("nft");
             std::fs::write(
                 &nft,
@@ -696,26 +770,31 @@ printf '\n--transaction--\n' >> "$0.log"
             if fail_persist {
                 std::fs::create_dir(&ca).unwrap();
             }
-            let mut agent = Agent::new(guest.unwrap(), "build".into(), dir.path().join("agent"));
             Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft, ca };
+            if !fail_persist {
+                // Refused before any listener is prepared: a forward holds a capture port.
+                let f = GuestForward { id: "dns".into(), unix: dir.path().join("forward"), tcp: Some("127.0.0.1:1053".parse().unwrap()) };
+                put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f)).await.unwrap();
+            }
             let previous = Configuration { environment: [("OLD".into(), "kept".into())].into(), ..Configuration::default() };
-            configure(State(agent.shared.clone()), Json(previous.clone())).await.unwrap();
-            let forward = GuestForward { id: "duplicate".into(), unix: dir.path().join("forward"), tcp: None };
+            configure(State(agent.shared.clone()), HeaderMap::new(), Json(previous.clone())).await.unwrap();
             let rejected = Configuration {
                 egress: Some(crate::Egress { upstream: "proxy".into() }),
                 ca: "new bundle".into(),
-                forwards: if fail_persist { vec![] } else { vec![forward.clone(), forward.clone()] },
                 ..Configuration::default()
             };
-            let error = configure(State(agent.shared.clone()), Json(rejected)).await.unwrap_err();
+            let error = configure(State(agent.shared.clone()), HeaderMap::new(), Json(rejected)).await.unwrap_err();
             if fail_persist {
-                assert_eq!(error.1.0.operation, "egress.ca");
+                assert_eq!(error.operation, "egress.ca");
+            } else {
+                assert_eq!((error.kind, error.status), (ErrorKind::Conflict, 409));
+                assert!(error.message.contains("dns"), "{error}");
+                remove_guest(State(agent.shared.clone()), Path("dns".into())).await.unwrap();
             }
             let settings = agent.shared.settings.lock().await;
             assert_eq!(settings.config, previous);
             assert!(settings.capture.is_none());
             assert!(settings.listeners.is_empty());
-            assert!(!forward.unix.exists());
             assert_eq!(std::fs::read_to_string(&state_path).unwrap(), initial_rules);
             let log = std::fs::read_to_string(&log_path).unwrap();
             if fail_persist {
@@ -725,48 +804,30 @@ printf '\n--transaction--\n' >> "$0.log"
             } else {
                 assert!(log.is_empty(), "preparation refusal must not touch nft");
             }
-            // Rebind synchronously, before a caller retries configuration.
-            let _dns = std::net::TcpListener::bind("[::]:1053").unwrap();
-            let _capture = std::net::TcpListener::bind("[::]:15001").unwrap();
-            let _proxy = std::net::TcpListener::bind("127.0.0.1:15002").unwrap();
+            // The agent has released every port before replying, so a caller
+            // can retry at once. SO_REUSEADDR, as the agent binds, still
+            // refuses a live listener. Another test forking at this moment
+            // can hold a copy of a descriptor until its exec, so a bind
+            // refused by that window alone is retried briefly.
+            let listen = |address: &str| {
+                let address: std::net::SocketAddr = address.parse().unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    let socket = socket2::Socket::new(socket2::Domain::for_address(address), socket2::Type::STREAM, None).unwrap();
+                    socket.set_reuse_address(true).unwrap();
+                    match socket.bind(&address.into()) {
+                        Ok(()) => break socket,
+                        Err(error) if std::time::Instant::now() < deadline && error.kind() == io::ErrorKind::AddrInUse => {
+                            std::thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("{address} is still held (fail_persist {fail_persist}): {error}"),
+                    }
+                }
+            };
+            let _dns = listen("[::]:1053");
+            let _capture = listen("[::]:15001");
+            let _proxy = listen("127.0.0.1:15002");
             let _udp = std::net::UdpSocket::bind("[::]:1053").unwrap();
         }
-    }
-
-    // fchown is a kernel boundary: its result policy must tolerate EPERM only
-    // for unprivileged replacement, never mask root or unrelated I/O failures.
-    // Generate root/non-root identities and permission, I/O, missing-file errors.
-    #[hegel::test]
-    fn ownership_permission_policy(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let uid = if tc.draw(gs::booleans()) { 0 } else { 1000 };
-        let errors = [libc::EPERM, libc::EIO, libc::ENOENT, libc::EROFS];
-        let errno = errors[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
-        assert_eq!(ownership_result(Err(io::Error::from_raw_os_error(errno)), uid).is_ok(), uid != 0 && errno == libc::EPERM);
-        assert!(ownership_result(Ok(()), uid).is_ok());
-    }
-    // A failed preparation must synchronously clean its newly bound sockets.
-    // Retry the same valid forward without yielding to task-drop scheduling.
-    #[tokio::test]
-    async fn rejected_configuration_awaits_prepared_listener_cleanup() {
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) = tokio::join!(
-            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
-            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
-        );
-        let _host = host.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let agent = Agent::new(guest.unwrap(), "build".into(), dir.path().join("agent"));
-        let good = GuestForward { id: "good".into(), unix: dir.path().join("good"), tcp: None };
-        let occupied = dir.path().join("occupied");
-        std::fs::write(&occupied, b"keep").unwrap();
-        let bad = GuestForward { id: "bad".into(), unix: occupied.clone(), tcp: None };
-        let rejected = Configuration { forwards: vec![good.clone(), bad], ..Configuration::default() };
-        assert!(configure(State(agent.shared.clone()), Json(rejected)).await.is_err());
-        assert!(!good.unix.exists(), "prepared socket must be gone before returning refusal");
-        assert_eq!(std::fs::read(occupied).unwrap(), b"keep");
-        let retry = Configuration { forwards: vec![good.clone()], ..Configuration::default() };
-        configure(State(agent.shared.clone()), Json(retry)).await.unwrap();
-        assert!(good.unix.exists());
     }
 }

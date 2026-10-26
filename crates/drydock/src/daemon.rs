@@ -977,7 +977,7 @@ mod agent_readiness_tests {
         let target = dir.path().join("target");
         let target_listener = tokio::net::UnixListener::bind(&target).unwrap();
         let forward = GuestForward { id: "service".into(), unix: dir.path().join("forward"), tcp: None };
-        client.add_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
+        client.put_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
         assert!(!dir.path().join("host.sock").exists());
         let mut guest_stream = tokio::net::UnixStream::connect(&forward.unix).await.unwrap();
         guest_stream.write_all(b"guest to host").await.unwrap();

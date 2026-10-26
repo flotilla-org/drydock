@@ -1,5 +1,5 @@
 //! Guest capture only: destination policy belongs to the upstream and the kind.
-use crate::{ByteStream, Configuration, invalid};
+use crate::{ByteStream, invalid};
 use drydock_transport::{Opener, Purpose};
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
@@ -459,21 +459,21 @@ fn original_destination(_: &TcpStream) -> io::Result<SocketAddr> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "egress requires Linux"))
 }
 
-fn rules(config: &Configuration) -> String {
+/// The capture table for this state: empty without egress, else redirects
+/// with exemptions for agent sockets, the proxy and loopback forward listeners.
+pub(crate) fn rules(egress: bool, exempt: &[SocketAddr]) -> String {
     // add is idempotent, flush + rebuild are a single nft transaction. Agent
     // sockets carry SO_MARK; a child with the same uid receives no exemption.
     let mut rules = String::from("add table inet drydock_egress\nflush table inet drydock_egress\n");
-    if config.egress.is_none() {
+    if !egress {
         return rules;
     }
     rules.push_str(concat!("add chain inet drydock_egress output { ", "type nat hook output priority -100; policy accept; }\n",));
     rules.push_str(&format!("add rule inet drydock_egress output meta mark {SOCKET_MARK} return\n"));
     rules.push_str(&format!("add rule inet drydock_egress output ip daddr 127.0.0.1 tcp dport {PROXY_PORT} return\n"));
-    for forward in &config.forwards {
-        if let Some(addr) = forward.tcp {
-            let family = if addr.is_ipv4() { "ip" } else { "ip6" };
-            rules.push_str(&format!("add rule inet drydock_egress output {family} daddr {} tcp dport {} return\n", addr.ip(), addr.port()));
-        }
+    for addr in exempt {
+        let family = if addr.is_ipv4() { "ip" } else { "ip6" };
+        rules.push_str(&format!("add rule inet drydock_egress output {family} daddr {} tcp dport {} return\n", addr.ip(), addr.port()));
     }
     rules.push_str(&format!(
         concat!(
@@ -497,12 +497,24 @@ impl Default for System {
     }
 }
 impl System {
-    pub(crate) async fn install(&self, config: &Configuration) -> io::Result<()> {
+    pub(crate) async fn install(&self, egress: bool, exempt: &[SocketAddr]) -> io::Result<()> {
+        self.transaction(&rules(egress, exempt)).await
+    }
+    /// Remove the capture table at startup and before re-exec, so redirects
+    /// never outlive the configuration that installed them. Without the nft
+    /// executable the agent cannot have installed any.
+    pub(crate) async fn clear(&self) -> io::Result<()> {
+        if !self.nft.exists() {
+            return Ok(());
+        }
+        self.transaction("add table inet drydock_egress\ndelete table inet drydock_egress\n").await
+    }
+    async fn transaction(&self, rules: &str) -> io::Result<()> {
         use std::process::Stdio;
         let mut command = tokio::process::Command::new(&self.nft);
         command.args(["-f", "-"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
         let mut child = command.kill_on_drop(true).spawn()?;
-        child.stdin.take().unwrap().write_all(rules(config).as_bytes()).await?;
+        child.stdin.take().unwrap().write_all(rules.as_bytes()).await?;
         let result = child.wait_with_output().await?;
         if result.status.success() {
             Ok(())
@@ -725,7 +737,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires tools/test-agent-egress.sh (root, nftables and isolated namespaces)"]
     async fn kernel_redirect() {
-        use crate::{Agent, Client, Egress, Endpoint, Exec};
+        use crate::{Agent, Client, Configuration, Egress, Endpoint, Exec, HostForward};
         use drydock_transport::{Limits, Transport};
         assert!(std::env::var_os("DRYDOCK_EGRESS_NETNS").is_some(), "use tools/test-agent-egress.sh");
         assert_ne!(std::fs::read_link("/proc/self/ns/net").unwrap(), std::fs::read_link("/proc/1/ns/net").unwrap());
@@ -796,7 +808,7 @@ mod tests {
         // Agent-originated TCP sockets must escape capture, even though the
         // child's sockets (same process UID) did not.
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        client.add_host_forward("agent-tcp".into(), Endpoint::Tcp(echo.local_addr().unwrap())).await.unwrap();
+        client.put_host_forward(HostForward { id: "agent-tcp".into(), endpoint: Endpoint::Tcp(echo.local_addr().unwrap()) }).await.unwrap();
         let echo_task = tokio::spawn(async move {
             let (mut stream, _) = echo.accept().await.unwrap();
             let mut b = [0; 1];
@@ -992,16 +1004,7 @@ mod tests {
     // own listener, and only agent-marked sockets/local forwards bypass capture.
     #[test]
     fn nft_rules_cover_both_families_without_uid_exemption() {
-        let config = Configuration {
-            egress: Some(Egress { upstream: "proxy".into() }),
-            forwards: vec![crate::GuestForward {
-                id: "local".into(),
-                unix: "/tmp/local".into(),
-                tcp: Some("127.0.0.1:9000".parse().unwrap()),
-            }],
-            ..Configuration::default()
-        };
-        let text = rules(&config);
+        let text = rules(true, &["127.0.0.1:9000".parse().unwrap()]);
         assert!(text.contains("table inet drydock_egress"));
         assert!(text.contains(&format!("meta mark {SOCKET_MARK} return")));
         assert!(!text.contains("skuid"));
@@ -1020,7 +1023,7 @@ mod tests {
         .map(|rule| text.find(rule).unwrap())
         .collect();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-        let disabled = rules(&Configuration::default());
+        let disabled = rules(false, &["127.0.0.1:9000".parse().unwrap()]);
         assert_eq!(disabled, "add table inet drydock_egress\nflush table inet drydock_egress\n");
         assert!(!disabled.contains("redirect"));
     }

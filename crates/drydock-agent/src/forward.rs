@@ -24,9 +24,9 @@ pub(crate) async fn serve(stream: ByteStream, id: &str, endpoint: Option<&Endpoi
 pub(crate) async fn serve_marked(mut stream: ByteStream, id: &str, endpoint: Option<&Endpoint>, marked: bool) -> io::Result<()> {
     let connected = match endpoint {
         Some(endpoint) => {
-            endpoint.connect_marked(marked).await.map_err(|e| AgentError::new("forward.open", format!("{id}: {endpoint:?}"), e))
+            endpoint.connect_marked(marked).await.map_err(|e| AgentError::io("forward.open", format!("{id}: {endpoint:?}"), e))
         }
-        None => Err(AgentError::new("forward.open", id, io::Error::new(io::ErrorKind::NotFound, "unknown forward ID"))),
+        None => Err(AgentError::new("forward.open", id, crate::ErrorKind::NotFound, "unknown forward ID")),
     };
     match connected {
         Ok(mut destination) => {
