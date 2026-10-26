@@ -27,11 +27,9 @@ pub fn start(args: &[OsString]) -> io::Result<()> {
         .open(parent.join("supervisor.log"))?;
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("--supervisor").args(args).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
-    // SAFETY: setsid is async-signal-safe and takes no pointers. Detach from
-    // the toolbox exec session without depending on nohup or an image init.
-    unsafe {
-        command.pre_exec(|| if libc::setsid() == -1 { Err(io::Error::last_os_error()) } else { Ok(()) });
-    }
+    // Its own process group, outside the toolbox exec session's foreground
+    // group, without depending on nohup or an image init.
+    command.process_group(0);
     command.spawn()?;
     Ok(())
 }

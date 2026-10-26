@@ -17,7 +17,8 @@ impl Drop for ReleaseOnDrop {
 // Actual process boundary: run an old ELF, push a distinct new ELF, re-exec in
 // the same PID, reconnect, and verify the new fingerprint. No fake re-executor.
 // A mismatched client refuses EVERY generation-specific operation. The launched
-// child inherits the pushed env and writes after the original agent is gone.
+// child inherits the pushed env and keeps running after the original agent is
+// gone; it lost its output reader, so it writes only to a file afterwards.
 #[tokio::test]
 async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let dir = tempfile::tempdir().unwrap();
@@ -49,24 +50,23 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
         .await
         .unwrap();
     let mut output = client
-        .exec(Exec {
-            program: "/bin/sh".into(),
-            args: vec![
-                "-c".into(),
+        .exec(Exec::new(
+            "/bin/sh",
+            [
+                "-c".to_owned(),
                 format!(
-                    "echo $$ > '{}'; printf started; while test ! -f '{}'; do sleep 0.01; done; printf after; printf '%s' \"$TOKEN\" > '{}'",
+                    "echo $$ > '{}'; printf started; while test ! -f '{}'; do sleep 0.01; done; printf '%s' \"$TOKEN\" > '{}'",
                     child_pid_file.display(),
                     gate.display(),
                     marker.display()
                 ),
             ],
-            cwd: None,
-        })
+        ))
         .await
         .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), output.next()).await.unwrap().unwrap(),
-        Some(ExecEvent::Stdout(b"started".to_vec()))
+        Some(ExecEvent::Stdout(bytes::Bytes::from_static(b"started")))
     );
     let launched_pid = std::fs::read_to_string(&child_pid_file).unwrap().trim().to_owned();
     drop(output);
@@ -81,7 +81,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let file = dir.path().join("forbidden");
     assert_mismatch(mismatch.configure(Configuration::default()).await);
     assert_mismatch(mismatch.configuration().await);
-    assert_mismatch(mismatch.exec(Exec { program: "/bin/true".into(), args: vec![], cwd: None }).await);
+    assert_mismatch(mismatch.exec(Exec::new("/bin/true", [""; 0])).await);
     assert_mismatch(mismatch.write_bytes(&file, vec![], &FileOptions::default()).await);
     assert_mismatch(mismatch.read(&file).await);
     assert_mismatch(mismatch.forward("x").await);

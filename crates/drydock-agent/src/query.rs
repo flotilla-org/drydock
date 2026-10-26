@@ -77,6 +77,16 @@ impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for WithBlob<T> {
     }
 }
 
+/// Where a reattaching reader already is on each stream.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttachQuery {
+    #[serde(default)]
+    pub stdout: u64,
+    #[serde(default)]
+    pub stderr: u64,
+}
+
 /// A query string for `value`, with its leading `?` when nonempty.
 pub(crate) fn encode(value: &impl Serialize) -> std::io::Result<String> {
     let query = serde_urlencoded::to_string(value).map_err(crate::invalid)?;

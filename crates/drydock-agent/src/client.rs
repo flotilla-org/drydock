@@ -1,9 +1,10 @@
 use crate::{
-    query::{DirQuery, LinkQuery, RemoveQuery, WithBlob, encode as query},
+    frames::Frame,
+    query::{AttachQuery, DirQuery, LinkQuery, RemoveQuery, WithBlob, encode as query},
     rest::{encode_path, encode_segment},
     *,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use drydock_transport::{Opener, Purpose, Transport, http2};
 use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
 use std::{
@@ -382,10 +383,36 @@ impl Client {
         Ok(Tagged { value: decode(response, "GET", "/configuration").await?, etag })
     }
 
-    pub async fn exec(&self, request: Exec) -> io::Result<ExecOutput> {
-        let response = self.link.send("POST", "/exec", &[("content-type", "application/json".into())], json_body(&request)?).await?;
-        Ok(ExecOutput { body: response.into_body(), pending: BytesMut::new(), seen_exit: false })
+    /// Start a process and return its handle. Attach to read its output.
+    pub async fn spawn(&self, request: Exec) -> io::Result<Process> {
+        let info: ProcessInfo = self.link.json("POST", "/processes", json_body(&request)?).await?;
+        Ok(Process { link: self.link.clone(), info })
     }
+    /// Start a process and read its output from the beginning.
+    pub async fn exec(&self, request: Exec) -> io::Result<ExecOutput> {
+        self.spawn(request).await?.output().await
+    }
+    /// Run a process to completion, collecting at most `limit` bytes of each
+    /// stream, then forget its handle so the agent holds nothing for it.
+    pub async fn run(&self, request: Exec, limit: usize) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
+        let process = self.spawn(request).await?;
+        let collected = process.output().await?.collect(limit).await;
+        // Removing kills it when collection stopped early; an exited
+        // handle is only forgotten.
+        let removed = process.remove().await;
+        let collected = collected?;
+        removed?;
+        Ok(collected)
+    }
+    /// A process started earlier on this agent, by ID.
+    pub async fn process(&self, id: &str) -> io::Result<Process> {
+        let info = self.link.json("GET", &format!("/processes/{}", encode_segment(id)), empty()).await?;
+        Ok(Process { link: self.link.clone(), info })
+    }
+    pub async fn processes(&self) -> io::Result<Vec<ProcessInfo>> {
+        self.link.json("GET", "/processes", empty()).await
+    }
+
     /// Stream `content` to `path`, replacing it atomically.
     pub async fn write(&self, path: &Path, content: impl AsyncRead + Send + 'static, options: &FileOptions) -> io::Result<Written> {
         self.write_body(path, streamed(content), options, None).await
@@ -756,40 +783,126 @@ impl Download {
     }
 }
 
-/// Incremental NDJSON. Each output channel preserves its own byte order.
+/// A process on the agent. Dropping the handle leaves the process running.
+pub struct Process {
+    link: Control,
+    info: ProcessInfo,
+}
+impl Process {
+    pub fn id(&self) -> &str {
+        &self.info.id
+    }
+    pub fn pid(&self) -> u32 {
+        self.info.pid
+    }
+    fn uri(&self, tail: &str) -> String {
+        format!("/processes/{}{tail}", encode_segment(&self.info.id))
+    }
+    pub async fn info(&self) -> io::Result<ProcessInfo> {
+        self.link.json("GET", &self.uri(""), empty()).await
+    }
+    /// Read output from the beginning of what the agent still holds.
+    pub async fn output(&self) -> io::Result<ExecOutput> {
+        self.attach(0, 0).await
+    }
+    /// Become the process's reader, skipping bytes already received. A later
+    /// attach takes over; this reader then ends with UnexpectedEof.
+    pub async fn attach(&self, stdout: u64, stderr: u64) -> io::Result<ExecOutput> {
+        let response =
+            self.link.send("GET", &self.uri(&format!("/output{}", query(&AttachQuery { stdout, stderr })?)), &[], empty()).await?;
+        Ok(ExecOutput::new(self.info.id.clone(), response.into_body(), [stdout, stderr]))
+    }
+    /// Stream `input` to stdin and close it. The process must have been
+    /// started with `stdin: true`.
+    pub async fn write_stdin(&self, input: impl AsyncRead + Send + 'static) -> io::Result<()> {
+        self.link.send("PUT", &self.uri("/stdin"), &[("content-type", "application/octet-stream".into())], streamed(input)).await.map(drop)
+    }
+    pub async fn write_stdin_bytes(&self, input: impl Into<Bytes>) -> io::Result<()> {
+        self.link.send("PUT", &self.uri("/stdin"), &[("content-type", "application/octet-stream".into())], full(input)).await.map(drop)
+    }
+    /// Send a signal to the process group.
+    pub async fn signal(&self, signal: i32) -> io::Result<()> {
+        self.link.empty("POST", &self.uri("/signals"), json_body(&crate::server::Signal { signal })?).await.map(drop)
+    }
+    pub async fn kill(&self) -> io::Result<()> {
+        self.signal(libc::SIGKILL).await
+    }
+    /// Kill the process group if it is running and forget the handle.
+    pub async fn remove(self) -> io::Result<()> {
+        self.link.empty("DELETE", &self.uri(""), empty()).await.map(drop)
+    }
+}
+
+/// A process's framed output: stdout and stderr chunks in the order the agent
+/// read them, then the exit status.
 pub struct ExecOutput {
-    body: axum::body::Body,
-    pending: BytesMut,
+    id: String,
+    frames: tokio_util::codec::FramedRead<
+        tokio_util::io::StreamReader<futures_util::stream::BoxStream<'static, io::Result<Bytes>>, Bytes>,
+        tokio_util::codec::LengthDelimitedCodec,
+    >,
+    offsets: [u64; 2],
     seen_exit: bool,
 }
 impl ExecOutput {
+    fn new(id: String, body: axum::body::Body, offsets: [u64; 2]) -> Self {
+        use futures_util::{StreamExt, TryStreamExt};
+        let context = format!("process {id} output");
+        let bytes = TryStreamExt::map_err(body.into_data_stream(), move |e| link_error(context.clone(), e)).boxed();
+        let frames = tokio_util::codec::FramedRead::new(tokio_util::io::StreamReader::new(bytes), crate::frames::codec());
+        Self { id, frames, offsets, seen_exit: false }
+    }
+    pub fn process_id(&self) -> &str {
+        &self.id
+    }
+    /// Bytes received so far on stdout and stderr, including any the agent
+    /// reported skipping; pass them to [`Process::attach`] to resume.
+    pub fn offsets(&self) -> (u64, u64) {
+        (self.offsets[0], self.offsets[1])
+    }
     pub async fn next(&mut self) -> io::Result<Option<ExecEvent>> {
         if self.seen_exit {
             return Ok(None);
         }
-        loop {
-            if let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-                let line = self.pending.split_to(end + 1);
-                let event = serde_json::from_slice(&line).map_err(invalid)?;
-                self.seen_exit = matches!(event, ExecEvent::Exit { .. });
-                return Ok(Some(event));
+        use futures_util::StreamExt;
+        let frame = match self.frames.next().await {
+            Some(Ok(frame)) => Frame::decode(frame.freeze())?,
+            // The codec's report of a stream that ended inside a frame; the
+            // truncation test (`exec_requires_exit_at_truncation_boundaries`)
+            // fails if tokio-util ever words it differently.
+            Some(Err(error)) if error.kind() == io::ErrorKind::Other && error.to_string() == "bytes remaining on stream" => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("process {} output ended mid-frame", self.id)));
             }
-            match self.body.frame().await {
-                Some(Ok(frame)) => {
-                    if let Ok(bytes) = frame.into_data() {
-                        self.pending.extend_from_slice(&bytes);
-                    }
-                }
-                Some(Err(error)) => return Err(link_error("exec output", error)),
-                None if self.pending.is_empty() => {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "exec stream ended without Exit"));
-                }
-                None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated exec event")),
+            Some(Err(error)) => return Err(error),
+            None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("process {} output ended without an exit", self.id))),
+        };
+        Ok(Some(match frame {
+            Frame::Output { stderr, offset, bytes } => {
+                self.offsets[stderr as usize] = offset + bytes.len() as u64;
+                if stderr { ExecEvent::Stderr(bytes) } else { ExecEvent::Stdout(bytes) }
             }
-            if self.pending.len() > 1024 * 1024 {
-                return Err(invalid("oversized exec event"));
+            Frame::Exit(status) => {
+                self.seen_exit = true;
+                ExecEvent::Exit(status)
             }
+        }))
+    }
+    /// Collect everything to the exit status, refusing more than `limit`
+    /// bytes on either stream.
+    pub async fn collect(mut self, limit: usize) -> io::Result<(Vec<u8>, Vec<u8>, ExitStatus)> {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        while let Some(event) = self.next().await? {
+            let (buffer, bytes) = match event {
+                ExecEvent::Stdout(bytes) => (&mut stdout, bytes),
+                ExecEvent::Stderr(bytes) => (&mut stderr, bytes),
+                ExecEvent::Exit(status) => return Ok((stdout, stderr, status)),
+            };
+            if buffer.len() + bytes.len() > limit {
+                return Err(io::Error::new(io::ErrorKind::FileTooLarge, format!("process {} output exceeds {limit} bytes", self.id)));
+            }
+            buffer.extend_from_slice(&bytes);
         }
+        unreachable!("next returns the exit before None")
     }
 }
 
@@ -797,23 +910,33 @@ impl ExecOutput {
 mod tests {
     use super::*;
     // HTTP-body boundary fake: truncate a valid stream at every drawn byte.
-    // Only a stream containing a complete Exit event may end successfully.
+    // Only a stream containing a complete exit frame may end successfully.
     #[hegel::test]
     fn exec_requires_exit_at_truncation_boundaries(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        let events = [ExecEvent::Stdout(vec![0, 128, 255]), ExecEvent::Stderr(b"err".to_vec()), ExecEvent::Exit { code: Some(0) }];
-        let bytes: Vec<u8> = events
-            .iter()
-            .flat_map(|event| {
-                let mut bytes = serde_json::to_vec(event).unwrap();
-                bytes.push(b'\n');
-                bytes
-            })
-            .collect();
+        let frames = [
+            Frame::Output { stderr: false, offset: 0, bytes: Bytes::from_static(&[0, 128, 255]) },
+            Frame::Output { stderr: true, offset: 0, bytes: Bytes::from_static(b"err") },
+            Frame::Exit(ExitStatus { code: Some(0), signal: None, timed_out: false }),
+        ];
+        let events = [
+            ExecEvent::Stdout(Bytes::from_static(&[0, 128, 255])),
+            ExecEvent::Stderr(Bytes::from_static(b"err")),
+            ExecEvent::Exit(ExitStatus { code: Some(0), signal: None, timed_out: false }),
+        ];
+        let encoded: Vec<Vec<u8>> = frames.iter().map(|f| f.encode().to_vec()).collect();
+        let bytes: Vec<u8> = encoded.concat();
         let cut = tc.draw(gs::integers::<usize>().min_value(0).max_value(bytes.len()));
-        let expected_events = bytes[..cut].iter().filter(|byte| **byte == b'\n').count();
+        let mut ends = 0;
+        let expected_events = encoded
+            .iter()
+            .take_while(|frame| {
+                ends += frame.len();
+                ends <= cut
+            })
+            .count();
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let mut output = ExecOutput { body: axum::body::Body::from(bytes[..cut].to_vec()), pending: BytesMut::new(), seen_exit: false };
+            let mut output = ExecOutput::new("1".into(), axum::body::Body::from(bytes[..cut].to_vec()), [0, 0]);
             let mut received = Vec::new();
             let failed = loop {
                 match output.next().await {

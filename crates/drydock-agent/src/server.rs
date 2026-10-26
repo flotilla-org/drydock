@@ -1,11 +1,12 @@
 use crate::{
+    query::AttachQuery,
     rest::{header_value, sf_boolean, sf_integer, structured},
     *,
 };
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, head, post, put},
@@ -17,7 +18,6 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinSet,
 };
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 type Refusal<T> = Result<T, AgentError>;
 
@@ -89,6 +89,7 @@ pub(crate) struct Shared {
     staged: Mutex<Option<PathBuf>>,
     restart: mpsc::Sender<PathBuf>,
     pub(crate) store: crate::store::Store,
+    processes: crate::process::Processes,
 }
 /// Owns one host-facing transport. Never expose this router on guest TCP.
 pub struct Agent {
@@ -96,6 +97,8 @@ pub struct Agent {
     shared: Arc<Shared>,
     restart: mpsc::Receiver<PathBuf>,
 }
+/// Output bytes held per process before the process blocks on its pipe.
+const PROCESS_BUFFER: usize = 1024 * 1024;
 /// 128 random bits, drawn once per agent process. Without the kernel's
 /// source, time and PID still differ between boots: the ID only has to tell
 /// restarts apart, not be unpredictable.
@@ -113,6 +116,10 @@ impl Agent {
     /// `executable` is the installed agent path; the upgrade sidecars and the
     /// digest store (`<executable>.store`) live beside it.
     pub fn new(transport: Transport, fingerprint: String, executable: PathBuf) -> Self {
+        Self::with_process_buffer(transport, fingerprint, executable, PROCESS_BUFFER)
+    }
+    /// As [`Agent::new`], holding at most `buffer` output bytes per process.
+    pub fn with_process_buffer(transport: Transport, fingerprint: String, executable: PathBuf, buffer: usize) -> Self {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
             hello: Hello {
@@ -128,6 +135,7 @@ impl Agent {
             executable,
             staged: Mutex::new(None),
             restart: tx,
+            processes: crate::process::Processes::new(buffer),
         });
         Self { transports: vec![transport], shared, restart }
     }
@@ -142,7 +150,11 @@ impl Agent {
             // Executables arrive whole, so they keep a larger cap.
             .route("/upgrade", put(stage_upgrade).post(activate_upgrade).layer(DefaultBodyLimit::max(128 * 1024 * 1024)))
             .route("/configuration", get(configuration).put(configure))
-            .route("/exec", post(exec))
+            .route("/processes", get(list_processes).post(spawn))
+            .route("/processes/{id}", get(process).delete(remove_process))
+            .route("/processes/{id}/output", get(attach))
+            .route("/processes/{id}/stdin", put(write_stdin))
+            .route("/processes/{id}/signals", post(signal))
             .route("/files/{*path}", get(get_file).head(head_file).put(put_file))
             .route("/entries/", get(get_entry).delete(delete_entry).patch(patch_entry))
             .route("/entries/{*path}", get(get_entry).delete(delete_entry).patch(patch_entry))
@@ -553,17 +565,41 @@ async fn remove_target(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> 
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Refusal<Body> {
+async fn spawn(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Refusal<Response> {
     let environment = s.settings.lock().await.config.environment.clone();
-    let program = request.program.clone();
-    let rx = crate::exec::launch(request, environment).map_err(|e| AgentError::io("exec.launch", &program, e))?;
-    let stream = ReceiverStream::new(rx).map(|event| {
-        let mut bytes = serde_json::to_vec(&event).expect("exec event serialization");
-        bytes.push(b'\n');
-        Ok::<_, io::Error>(bytes)
-    });
-    Ok(Body::from_stream(stream))
+    let handle = s.processes.spawn(request, environment)?;
+    let info = handle.info();
+    Ok((StatusCode::CREATED, [(header::LOCATION, header_value(format!("/processes/{}", info.id)))], Json(info)).into_response())
 }
+async fn list_processes(State(s): State<Arc<Shared>>) -> Json<Vec<ProcessInfo>> {
+    Json(s.processes.list())
+}
+async fn process(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<ProcessInfo>> {
+    Ok(Json(s.processes.get(&id)?.info()))
+}
+async fn remove_process(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
+    s.processes.remove(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn attach(State(s): State<Arc<Shared>>, Path(id): Path<String>, Query(query): Query<AttachQuery>) -> Refusal<Response> {
+    let stream = s.processes.get(&id)?.attach([query.stdout, query.stderr])?;
+    Ok(([(header::CONTENT_TYPE, crate::frames::CONTENT_TYPE)], Body::from_stream(stream)).into_response())
+}
+async fn write_stdin(State(s): State<Arc<Shared>>, Path(id): Path<String>, headers: HeaderMap, body: Body) -> Refusal<StatusCode> {
+    crate::files::require_octet_stream("process.stdin", std::path::Path::new(&id), &headers, &["application/octet-stream"])?;
+    s.processes.get(&id)?.write_stdin(body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Signal {
+    pub signal: i32,
+}
+async fn signal(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(request): Json<Signal>) -> Refusal<StatusCode> {
+    s.processes.get(&id)?.signal(request.signal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Refusal<StatusCode> {
     let path = crate::upgrade::sidecar(&s.executable, "upgrade");
     if bytes.is_empty() {

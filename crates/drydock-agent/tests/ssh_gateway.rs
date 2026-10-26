@@ -39,10 +39,7 @@ async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
     .await
     .unwrap();
     assert!(client.is_compatible());
-    let mut output = client
-        .exec(drydock_agent::Exec { program: "/bin/sh".into(), args: vec!["-c".into(), "printf ready".into()], cwd: None })
-        .await
-        .unwrap();
+    let mut output = client.exec(drydock_agent::Exec::new("/bin/sh", ["-c", "printf ready"])).await.unwrap();
     let mut stdout = Vec::new();
     while let Some(event) = output.next().await.unwrap() {
         if let drydock_agent::ExecEvent::Stdout(bytes) = event {

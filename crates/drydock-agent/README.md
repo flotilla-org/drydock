@@ -69,7 +69,11 @@ any Unix path can be named; relative paths and `.`/`..` components are refused.
 | GET / PUT | `/configuration` | Read / replace `Configuration`, with an `ETag`; PUT honours `If-Match` |
 | GET / PUT / DELETE | `/forwards/guest/{id}` | Read / upsert / remove one `GuestForward`; GET `/forwards/guest` lists them |
 | GET / PUT / DELETE | `/forwards/host/{id}` | Read / upsert / remove one `HostForward`; GET `/forwards/host` lists them |
-| POST | `/exec` | `Exec { program, args, cwd }`; NDJSON `ExecEvent` stream |
+| POST / GET | `/processes` | Start an `Exec` (201, `ProcessInfo`) / list processes |
+| GET / DELETE | `/processes/{id}` | `ProcessInfo` / kill the group if running and forget the handle |
+| GET | `/processes/{id}/output?stdout=N&stderr=M` | Become the reader; framed output from those offsets, then the exit |
+| PUT | `/processes/{id}/stdin` | Stream the body to stdin, then close it |
+| POST | `/processes/{id}/signals` | `{ "signal": N }` to the process group |
 | GET / HEAD / PUT | `/files/{path}` | Stream a file (Range, `ETag`, `If-Match`) / its size / an atomic streamed write |
 | GET / PATCH / DELETE | `/entries/{path}` | Stat without following links / change mode and owner / remove (`?recursive=true`) |
 | GET / PUT | `/dirs/{path}` | List a directory / create one |
@@ -187,6 +191,46 @@ install from a completed blob. The store is content-addressed so that a
 later fetch-by-digest, where the agent itself downloads a pinned package or
 OCI layer (flotilla#3839), can fill the same `blobs/` slots for the same
 consumers.
+
+### Processes
+
+A process is a handle. `POST /processes` starts it leading its own process
+group, with no terminal; stdin is `/dev/null` unless `stdin: true` gives it a pipe for
+`PUT /processes/{id}/stdin`, written once and then closed (a second write, or
+a retry after the body broke off, is a 409). `timeout_ms` kills the process
+group when it
+expires. Every process inherits the configured environment, then fixed
+pipeline defaults (`CI=1`, `TERM=dumb`, pagers set to `cat`, no Git terminal
+prompt), then the request's own `environment`.
+
+Output is read from pipes into a bounded buffer per process (1 MiB by
+default). When it is full the agent stops reading, so the process blocks on
+its pipe: a process whose client went away never spools output without
+limit. `GET /processes/{id}/output` streams frames
+(`application/vnd.drydock.process-frames`): a kind byte, a big-endian u32
+length and the payload. Stdout and stderr frames carry raw bytes after a u64
+offset into their stream; the exit frame carries JSON `ExitStatus { code,
+signal, timed_out }` after all drained output. A later attach takes over from
+an earlier reader, and the offsets in the query skip bytes the caller already
+has. Sent bytes stay in the buffer for a reattach until new output needs the
+room, so only bytes pushed out that way are lost, and the offsets show it.
+After the process exits, its pipes are drained until EOF, waiting at most
+250 ms without new bytes for a descendant still holding one. Signals go to the
+process group; only named signals are sent, so a realtime signal number is
+refused (400). A process is reaped only after its exit is recorded, so a
+signal never reaches a reused PID. Exited handles are kept for their status until removed, at
+most 256 of them; running handles are not capped, since the host that starts
+them is trusted with the vessel. Where pidfds are unavailable (before Linux
+5.3, or off Linux), each running process holds a blocking thread. EOF without an exit frame is `UnexpectedEof` in the client.
+`Client::run` starts a process, collects its output and removes the handle,
+so callers that only need whole outputs leave nothing held on the agent.
+
+An agent restart or re-exec ends its process handles. A child that survives
+it has lost its output reader: it can keep running and is reaped after it
+exits, but writing to stdout or stderr then raises SIGPIPE. On Linux, startup
+reaps children inherited across re-exec after they exit. Discovery is best
+effort when procfs child lists are unavailable. The provider's init reaps
+children orphaned by an agent crash.
 
 ### Configuration, forwards and restarts
 
@@ -325,24 +369,6 @@ installation and the agent socket exemption. It requires `sudo`, `nft`, `ip`,
 Python 3 and mount/network namespace support, and changes only disposable
 namespaces. The live Docker `--network none` operator check remains #3487.
 
-Exec uses null stdin, no tty, a detached session, and fixed pipeline defaults
-(`CI=1`, `TERM=dumb`, pagers set to `cat`, no Git terminal prompt). Every process
-inherits the pushed environment, including proxy, CA variables and placeholder
-tokens. Output is streamed incrementally and ordered independently per stdout
-and stderr; `Exit` follows their drained output, with `None` for a signal exit.
-EOF without a complete `Exit` is an `UnexpectedEof` error in the host client.
-Output spools into unlinked temporary files so agent exit/re-exec cannot deliver
-SIGPIPE to the child. Idle polling backs off, reuses a buffer, and stops tailing
-when the client disconnects (the child is still reaped). The provider may set
-the agent’s standard `TMPDIR` to place spools on disk instead of tmpfs. Disk use
-grows with a command's output until it exits, including after disconnection.
-This unbounded spool is an accepted tradeoff in this slice; callers must manage
-long-running service logs. Dropping a stream does not kill
-the process. On Linux, startup reaps children inherited across re-exec after they
-exit. Discovery is best effort when procfs child lists are unavailable; exited
-but unreaped children remain in those lists and are included in the startup scan.
-The provider's init reaps children orphaned by an agent crash.
-
 Upgrade uses only `/hello` and `/upgrade`: stage with PUT, activate with POST,
 reconnect with a fresh provider transport, then verify the new fingerprint.
 A failed activation retains its staged image and existing rollback until a new
@@ -408,7 +434,9 @@ and Unix connections: tagged configuration, forward resources and generated
 upsert/removal sequences, every refusal as a structured error, file
 operations, ranges, modes, digests, resumable uploads and tree unpacks
 (`tests/files.rs`), a streamed transfer
-larger than 512 MiB in bounded memory (`tests/large_files.rs`), streamed exec, byte-transparent HTTP/1.1, WebSocket upgrade frames,
+larger than 512 MiB in bounded memory (`tests/large_files.rs`), processes with
+stdin, separate streams, exit codes, signals, kill, timeout, reattach and
+bounded output (`tests/processes.rs`), byte-transparent HTTP/1.1, WebSocket upgrade frames,
 chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
 A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,
 forward socket cleanup, fingerprint gating and survival/reaping of a child.

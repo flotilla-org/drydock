@@ -1,5 +1,5 @@
 mod support;
-use drydock_agent::{Agent, Client, Configuration, Endpoint, ErrorKind, Exec, ExecEvent, GuestForward, HostForward, Platform};
+use drydock_agent::{Agent, Client, Configuration, Endpoint, ErrorKind, GuestForward, HostForward, Platform};
 use drydock_transport::{ByteStream, Purpose, Transport};
 use std::{path::Path, sync::Arc, time::Duration};
 use support::*;
@@ -27,7 +27,7 @@ async fn hello_and_tagged_configuration_on_both_transports() {
         let hello = h.client.hello().clone();
         assert_eq!(hello.fingerprint, "test-build");
         assert_eq!(hello.platform, Some(Platform::current()));
-        assert!(hello.features.contains(&"forwards".into()) && hello.features.contains(&"configuration".into()));
+        assert!(hello.features.contains(&"forwards".into()) && hello.features.contains(&"processes".into()));
         assert!(hello.boot_id.len() == 32 && hello.boot_id.bytes().all(|b| b.is_ascii_hexdigit()), "{}", hello.boot_id);
         let initial = h.client.configuration().await.unwrap();
         assert_eq!(initial.value, Configuration::default());
@@ -602,94 +602,6 @@ async fn refusals_are_structured() {
     assert!(error.message.to_lowercase().contains("utf-8") || error.message.contains("decode"), "{error}");
     // Nothing above changed the configuration.
     assert_eq!(h.client.configuration().await.unwrap().value, Configuration::default());
-}
-
-// Exec is a pipeline with null stdin and no tty, with independently streamed
-// stdout/stderr, on both in-memory and Unix-socket transports.
-#[tokio::test]
-async fn exec_on_both_transports() {
-    for unix in [false, true] {
-        let h = harness(unix, "test-build").await;
-        let environment = [("HTTPS_PROXY", "proxy"), ("SSL_CERT_FILE", "/tmp/ca"), ("TOKEN", "placeholder")];
-        let config = Configuration { environment: environment.map(|(k, v)| (k.into(), v.into())).into(), ..Configuration::default() };
-        h.client.configure(config).await.unwrap();
-        let (out,err,status) = output(h.client.exec(shell("test ! -t 0 && test ! -t 1; read line && exit 9; printf '%s|%s|%s|%s|%s' \"$HTTPS_PROXY\" \"$SSL_CERT_FILE\" \"$TOKEN\" \"$PAGER\" \"$CI\"; printf err >&2")).await.unwrap()).await;
-        assert_eq!(out, b"proxy|/tmp/ca|placeholder|cat|1");
-        assert_eq!(err, b"err");
-        assert_eq!(status, Some(0));
-        let gate = h.dir.path().join("gate");
-        let mut stream = h
-            .client
-            .exec(shell(&format!("printf first; while test ! -f '{}'; do sleep 0.01; done; printf second", gate.display())))
-            .await
-            .unwrap();
-        let first = tokio::time::timeout(Duration::from_secs(2), stream.next()).await.unwrap().unwrap().unwrap();
-        assert_eq!(first, ExecEvent::Stdout(b"first".to_vec()));
-        std::fs::write(gate, []).unwrap();
-        assert_eq!(output(stream).await.0, b"second");
-    }
-}
-
-// Detached exec output remains writable after its consumer disconnects. The
-// agent still waits for the child, so a completed command cannot leave a zombie.
-#[tokio::test]
-async fn disconnected_exec_drains_to_spool_and_is_reaped() {
-    let h = harness(false, "test-build").await;
-    let gate = h.dir.path().join("release");
-    let done = h.dir.path().join("done");
-    let pidfile = h.dir.path().join("pid");
-    let mut stream = h
-        .client
-        .exec(shell(&format!(
-            "echo $$ > '{}'; printf ready; while test ! -f '{}'; do sleep 0.01; done; head -c 131072 /dev/zero; printf complete > '{}'",
-            pidfile.display(),
-            gate.display(),
-            done.display()
-        )))
-        .await
-        .unwrap();
-    assert_eq!(stream.next().await.unwrap(), Some(ExecEvent::Stdout(b"ready".to_vec())));
-    let pid = std::fs::read_to_string(pidfile).unwrap();
-    drop(stream);
-    std::fs::write(gate, []).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let completed = std::fs::read(&done).ok().as_deref() == Some(b"complete");
-            #[cfg(target_os = "linux")]
-            let reaped = !std::path::Path::new(&format!("/proc/{}", pid.trim())).exists();
-            #[cfg(not(target_os = "linux"))]
-            let reaped = true;
-            if completed && reaped {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-}
-
-// Exec errors cross both real control transports with the original kind and
-// enough context to distinguish missing programs and working directories.
-#[tokio::test]
-async fn exec_errors_name_the_failed_operation_and_subject() {
-    use std::io::ErrorKind;
-    for unix in [false, true] {
-        let h = harness(unix, "test-build").await;
-        let path = h.dir.path().join("absent");
-        assert_error(
-            h.client.exec(Exec { program: "/missing-program".into(), args: vec![], cwd: None }).await.err().unwrap(),
-            ErrorKind::NotFound,
-            "exec.spawn",
-            "/missing-program",
-        );
-        assert_error(
-            h.client.exec(Exec { program: "/bin/true".into(), args: vec![], cwd: Some(path.clone()) }).await.err().unwrap(),
-            ErrorKind::NotFound,
-            "exec.cwd",
-            "absent",
-        );
-    }
 }
 
 // Guest stand-in at the HTTP boundary: serves a fixed hello body and records
