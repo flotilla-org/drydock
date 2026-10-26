@@ -13,6 +13,19 @@ use std::{io, time::Duration};
 
 pub type Client<B = Full<Bytes>> = http2::SendRequest<B>;
 
+// Flow-control windows sized for large transfers over slow links. hyper's
+// defaults (1 MiB server, 2 MiB client stream windows) cap a transfer at one
+// window per round trip. Measured with the agent's link_throughput example
+// over a shaped yamux link, uploads went from 51% to 79% of a 100 Mbit/s
+// link at 100 ms RTT and from 27% to 66% at 200 ms; hyper's adaptive window
+// reached 74% and 53%. A window bounds what a peer may send before the
+// reader drains it, so it also bounds per-stream receive buffering. The
+// connection window is shared: two streams whose readers stall can hold all
+// of it until they drain or are dropped. yamux tunes its own stream windows
+// under a 1 GiB connection limit, so it is not the cap here.
+const STREAM_WINDOW: u32 = 16 << 20;
+const CONNECTION_WINDOW: u32 = 32 << 20;
+
 /// Caller owns the returned connection task and should abort it on shutdown.
 pub async fn connect(opener: &Opener, purpose: Purpose) -> io::Result<(Client, tokio::task::JoinHandle<Result<(), hyper::Error>>)> {
     connect_with_body::<Full<Bytes>>(opener, purpose).await
@@ -31,6 +44,8 @@ where
     require_link(&purpose)?;
     let stream = opener.open(purpose).await?;
     let (sender, connection) = http2::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
         .timer(TokioTimer::new())
         .keep_alive_interval(Duration::from_secs(15))
         .keep_alive_timeout(Duration::from_secs(30))
@@ -48,6 +63,8 @@ pub async fn serve(incoming: Incoming, router: Router) -> io::Result<()> {
 }
 async fn serve_stream(stream: ByteStream, router: Router) -> io::Result<()> {
     server::Builder::new(TokioExecutor::new())
+        .initial_stream_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
         .timer(TokioTimer::new())
         .keep_alive_interval(Duration::from_secs(15))
         .keep_alive_timeout(Duration::from_secs(30))

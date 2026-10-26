@@ -87,6 +87,13 @@ pub(crate) struct AttachQuery {
     pub stderr: u64,
 }
 
+/// The digest an upgrade image must have.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DigestQuery {
+    pub sha256: String,
+}
+
 /// A query string for `value`, with its leading `?` when nonempty.
 pub(crate) fn encode(value: &impl Serialize) -> std::io::Result<String> {
     let query = serde_urlencoded::to_string(value).map_err(crate::invalid)?;

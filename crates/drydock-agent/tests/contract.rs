@@ -29,6 +29,7 @@ async fn hello_and_tagged_configuration_on_both_transports() {
         assert_eq!(hello.platform, Some(Platform::current()));
         assert!(hello.features.contains(&"forwards".into()) && hello.features.contains(&"processes".into()));
         assert!(hello.boot_id.len() == 32 && hello.boot_id.bytes().all(|b| b.is_ascii_hexdigit()), "{}", hello.boot_id);
+        assert!(!hello.probation);
         let initial = h.client.configuration().await.unwrap();
         assert_eq!(initial.value, Configuration::default());
         assert!(initial.etag.starts_with(&format!("\"{}-", hello.boot_id)), "{}", initial.etag);
@@ -605,19 +606,29 @@ async fn refusals_are_structured() {
 }
 
 // Guest stand-in at the HTTP boundary: serves a fixed hello body and records
-// upgrade bodies, so a test observes exactly what the host pushed.
+// upgrade bodies and confirmations, so a test observes exactly what the host
+// sent.
 async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
-    use axum::routing::{get, put};
+    use axum::routing::{get, post, put};
     let (host, mut guest) = pair(false, Path::new("")).await;
     let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let recorded = pushes.clone();
-    let router = axum::Router::new().route("/hello", get(move || std::future::ready(axum::Json(hello.clone())))).route(
-        "/upgrade",
-        put(move |body: bytes::Bytes| {
-            recorded.lock().unwrap().push(body.to_vec());
-            std::future::ready(())
-        }),
-    );
+    let (recorded, confirmed) = (pushes.clone(), pushes.clone());
+    let router = axum::Router::new()
+        .route("/hello", get(move || std::future::ready(axum::Json(hello.clone()))))
+        .route(
+            "/upgrade",
+            put(move |body: bytes::Bytes| {
+                recorded.lock().unwrap().push(body.to_vec());
+                std::future::ready(())
+            }),
+        )
+        .route(
+            "/upgrade/confirm",
+            post(move || {
+                confirmed.lock().unwrap().push(b"confirm".to_vec());
+                std::future::ready(())
+            }),
+        );
     tokio::spawn(async move {
         while let Ok(Some(incoming)) = guest.accept().await {
             tokio::spawn(drydock_transport::http2::serve(incoming, router.clone()));
@@ -629,10 +640,11 @@ async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync
 // An agent that predates platform reporting sends no platform. The host
 // already knows the vessel's platform from its prepared form, so it pushes
 // that platform's build; it never needs to ask the guest. The push uses the
-// same stable upgrade route older agents serve.
+// same stable upgrade route older agents serve. A candidate on probation that
+// is not the wanted build is replaced, never confirmed.
 #[tokio::test]
 async fn hello_without_platform_gets_the_prepared_platforms_build() {
-    let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"]})).await;
+    let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "probation": true})).await;
     let mut host = Some(host);
     // The fake guest never re-executes, so the reconnect after the push times out.
     let error = Client::connect_current(
