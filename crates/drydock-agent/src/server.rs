@@ -1,5 +1,5 @@
 use crate::{
-    rest::{header_value, structured},
+    rest::{header_value, sf_boolean, sf_integer, structured},
     *,
 };
 use axum::{
@@ -8,7 +8,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, head, post, put},
 };
 use drydock_transport::{Opener, Purpose, Transport, http2};
 use std::{collections::BTreeMap, sync::Arc};
@@ -88,6 +88,7 @@ pub(crate) struct Shared {
     executable: PathBuf,
     staged: Mutex<Option<PathBuf>>,
     restart: mpsc::Sender<PathBuf>,
+    pub(crate) store: crate::store::Store,
 }
 /// Owns one host-facing transport. Never expose this router on guest TCP.
 pub struct Agent {
@@ -109,6 +110,8 @@ fn boot_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 impl Agent {
+    /// `executable` is the installed agent path; the upgrade sidecars and the
+    /// digest store (`<executable>.store`) live beside it.
     pub fn new(transport: Transport, fingerprint: String, executable: PathBuf) -> Self {
         let (tx, restart) = mpsc::channel(1);
         let shared = Arc::new(Shared {
@@ -121,6 +124,7 @@ impl Agent {
             egress_system: crate::egress::System::default(),
             opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),
+            store: crate::store::Store::new(crate::upgrade::sidecar(&executable, "store")),
             executable,
             staged: Mutex::new(None),
             restart: tx,
@@ -145,7 +149,10 @@ impl Agent {
             .route("/dirs/", get(get_dir))
             .route("/dirs/{*path}", get(get_dir).put(put_dir))
             .route("/links/{*path}", put(put_link))
+            .route("/trees/{*path}", put(put_tree))
             .route("/renames", post(post_rename))
+            .route("/uploads/{sha256}", head(upload_offset).patch(append_upload).delete(remove_upload))
+            .route("/blobs/{sha256}", head(blob_size).put(create_upload).delete(remove_blob))
             .route("/forwards/guest", get(guest_forwards))
             .route("/forwards/guest/{id}", get(guest_forward).put(put_guest).delete(remove_guest))
             .route("/forwards/host", get(host_forwards))
@@ -161,6 +168,11 @@ impl Agent {
     pub async fn run(mut self) -> io::Result<PathBuf> {
         if let Err(error) = self.shared.egress_system.clear().await {
             tracing::warn!(%error, "could not clear guest egress redirects left by an earlier agent");
+        }
+        match self.shared.store.sweep(crate::store::ABANDONED) {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "removed abandoned partial uploads"),
+            Err(error) => tracing::warn!(%error, "could not sweep abandoned partial uploads"),
         }
         let router = self.router();
         let mut controller_bound = false;
@@ -559,7 +571,7 @@ async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Refusal<St
     }
     let mut staged = s.staged.lock().await;
     let options = FileOptions { mode: Some(0o755), ..FileOptions::default() };
-    crate::files::write("upgrade.stage", &path, Body::from(bytes), &options).await?;
+    crate::files::write("upgrade.stage", &path, crate::files::Source::Body(Body::from(bytes)), &options).await?;
     *staged = Some(path);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -589,6 +601,91 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _ = tx.send(path).await;
     });
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn sha256_header(digest: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
+    [(header::ETAG, header_value(format!("\"{digest}\"")))]
+}
+/// An upload's state as draft-ietf-httpbis-resumable-upload-12 headers.
+fn upload_headers(response: &mut Response, progress: &crate::store::Progress) {
+    let headers = response.headers_mut();
+    headers.insert("upload-offset", header_value(progress.offset));
+    headers.insert("upload-complete", header_value(if progress.complete { "?1" } else { "?0" }));
+    if let Some(length) = progress.length {
+        headers.insert("upload-length", header_value(length));
+    }
+    // The agent applies no size limit of its own; an incomplete upload is
+    // kept for as long as it is not left untouched.
+    let limit = progress.max_age.map_or("min-size=0".to_owned(), |age| format!("max-age={}", age.as_secs()));
+    headers.insert("upload-limit", header_value(limit));
+}
+/// The reply to an upload creation or append. Completing it answers as the
+/// blob resource does; otherwise it reports the upload's state. A refusal
+/// carries the upload's current state too, with `Upload-Complete: ?1` only
+/// when it came from processing the completed upload (a digest mismatch).
+async fn upload_reply(s: &Shared, digest: &str, status: StatusCode, result: Refusal<crate::store::Progress>) -> Response {
+    let (mut response, progress) = match result {
+        Ok(progress) if progress.complete => {
+            let written = Written { sha256: digest.to_owned(), size: progress.offset };
+            ((StatusCode::CREATED, [(header::LOCATION, header_value(format!("/blobs/{digest}")))], Json(written)).into_response(), progress)
+        }
+        Ok(progress) => ((status, [(header::LOCATION, header_value(format!("/uploads/{digest}")))]).into_response(), progress),
+        Err(error) => {
+            let processed = error.kind == ErrorKind::DigestMismatch;
+            let state = s.store.state(digest).await.ok().flatten().unwrap_or_default();
+            (error.into_response(), crate::store::Progress { complete: processed, ..state })
+        }
+    };
+    upload_headers(&mut response, &progress);
+    response
+}
+/// Offset retrieval (draft section 4.3).
+async fn upload_offset(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<Response> {
+    let missing = || AgentError::new("upload.stat", &digest, ErrorKind::NotFound, "no upload of this digest");
+    let progress = s.store.offset(&digest).await?.ok_or_else(missing)?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    upload_headers(&mut response, &progress);
+    response.headers_mut().insert(header::CACHE_CONTROL, header_value("no-store"));
+    Ok(response)
+}
+/// Upload creation (draft section 4.2), targeting the blob the bytes become.
+/// Without `Upload-Complete` it is a conventional upload of the whole blob.
+async fn create_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>, headers: HeaderMap, body: Body) -> Refusal<Response> {
+    const OP: &str = "upload.create";
+    crate::files::require_octet_stream(OP, std::path::Path::new(&digest), &headers, &["application/octet-stream"])?;
+    let complete = sf_boolean(&headers, "upload-complete").unwrap_or(true);
+    let append =
+        crate::store::Append { digest: digest.clone(), create: true, offset: 0, complete, length: sf_integer(&headers, "upload-length") };
+    let result = s.store.append(append, body).await;
+    Ok(upload_reply(&s, &digest, StatusCode::CREATED, result).await)
+}
+/// Upload append (draft section 4.4).
+async fn append_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>, headers: HeaderMap, body: Body) -> Refusal<Response> {
+    const OP: &str = "upload.append";
+    crate::files::require_octet_stream(OP, std::path::Path::new(&digest), &headers, &["application/partial-upload"])?;
+    let required = |name| AgentError::new(OP, &digest, ErrorKind::InvalidInput, format!("{name} is required"));
+    let offset = sf_integer(&headers, "upload-offset").ok_or_else(|| required("Upload-Offset"))?;
+    let complete = sf_boolean(&headers, "upload-complete").ok_or_else(|| required("Upload-Complete"))?;
+    let append =
+        crate::store::Append { digest: digest.clone(), create: false, offset, complete, length: sf_integer(&headers, "upload-length") };
+    let result = s.store.append(append, body).await;
+    Ok(upload_reply(&s, &digest, StatusCode::NO_CONTENT, result).await)
+}
+/// Upload cancellation (draft section 4.5).
+async fn remove_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<StatusCode> {
+    s.store.cancel(&digest).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn blob_size(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<Response> {
+    let size =
+        s.store.blob_size(&digest).await?.ok_or_else(|| AgentError::new("blob.stat", &digest, ErrorKind::NotFound, "no such blob"))?;
+    let mut response = (StatusCode::OK, sha256_header(&digest)).into_response();
+    response.headers_mut().insert(header::CONTENT_LENGTH, header_value(size));
+    Ok(response)
+}
+async fn remove_blob(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<StatusCode> {
+    s.store.remove_blob(&digest).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -13,6 +13,7 @@ mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
 pub mod socket;
+mod store;
 pub mod upgrade;
 pub use client::{Client, Download, ExecOutput};
 use drydock_transport::ByteStream;
@@ -20,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configuration", "exec", "files", "forwards", "egress", "upgrade"];
+pub const FEATURES: &[&str] = &["configuration", "exec", "files", "uploads", "trees", "forwards", "egress", "upgrade"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -114,7 +115,7 @@ pub enum ExecEvent {
     Stderr(Vec<u8>),
     Exit { code: Option<i32> },
 }
-/// Options for creating a file, directory or link.
+/// Options for creating a file, directory, link or unpacked tree.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileOptions {
@@ -193,6 +194,37 @@ pub struct Rename {
 #[serde(deny_unknown_fields)]
 pub struct Link {
     pub target: PathBuf,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Compression {
+    #[default]
+    None,
+    Gzip,
+}
+/// Unpack a tar archive into a new directory. The archive's digest is
+/// checked before the directory appears; a refusal leaves the target as it was.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TreeOptions {
+    /// Lowercase hex sha256 of the archive bytes as sent.
+    pub sha256: String,
+    #[serde(default)]
+    pub compression: Compression,
+    /// Owner of every unpacked entry. Without one, entries belong to the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+    /// Mode of the target directory itself; default 0755.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parents: bool,
+    /// Replace an existing target directory atomically. Without it, an
+    /// existing target is a 409.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace: bool,
 }
 pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
