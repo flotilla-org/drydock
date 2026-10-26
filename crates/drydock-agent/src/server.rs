@@ -11,9 +11,8 @@ use axum::{
     routing::{get, post, put},
 };
 use drydock_transport::{Opener, Purpose, Transport, http2};
-use std::{collections::BTreeMap, os::unix::fs::PermissionsExt, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
-    io::AsyncWriteExt,
     net::{TcpListener, UnixListener},
     sync::{Mutex, mpsc},
     task::JoinSet,
@@ -133,16 +132,20 @@ impl Agent {
         self.transports.push(transport);
     }
     fn router(&self) -> Router {
-        // Executables and JSON file writes arrive whole, so they keep a larger cap.
-        let buffered = || DefaultBodyLimit::max(128 * 1024 * 1024);
+        use crate::files::*;
         Router::new()
             .route("/hello", get(hello))
-            .route("/upgrade", put(stage_upgrade).post(activate_upgrade).layer(buffered()))
+            // Executables arrive whole, so they keep a larger cap.
+            .route("/upgrade", put(stage_upgrade).post(activate_upgrade).layer(DefaultBodyLimit::max(128 * 1024 * 1024)))
             .route("/configuration", get(configuration).put(configure))
             .route("/exec", post(exec))
-            .route("/files/write", post(write_file).layer(buffered()))
-            .route("/files/read", post(read_file))
-            .route("/files/flush", post(flush_file))
+            .route("/files/{*path}", get(get_file).head(head_file).put(put_file))
+            .route("/entries/", get(get_entry).delete(delete_entry).patch(patch_entry))
+            .route("/entries/{*path}", get(get_entry).delete(delete_entry).patch(patch_entry))
+            .route("/dirs/", get(get_dir))
+            .route("/dirs/{*path}", get(get_dir).put(put_dir))
+            .route("/links/{*path}", put(put_link))
+            .route("/renames", post(post_rename))
             .route("/forwards/guest", get(guest_forwards))
             .route("/forwards/guest/{id}", get(guest_forward).put(put_guest).delete(remove_guest))
             .route("/forwards/host", get(host_forwards))
@@ -549,86 +552,14 @@ async fn exec(State(s): State<Arc<Shared>>, Json(request): Json<Exec>) -> Refusa
     });
     Ok(Body::from_stream(stream))
 }
-fn absolute(operation: &str, path: &std::path::Path) -> Refusal<()> {
-    if !path.is_absolute() {
-        return Err(AgentError::new(operation, path.display(), ErrorKind::InvalidInput, "file path must be absolute"));
-    }
-    Ok(())
-}
-/// Write a sibling, fsync it, rename atomically, then fsync the parent directory.
-/// Readers always observe either the complete old file or the complete new file.
-pub(crate) async fn atomic_write(path: &std::path::Path, bytes: &[u8], executable: bool) -> io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-    let temporary = tempfile::NamedTempFile::new_in(parent)?;
-    let mut file = tokio::fs::File::from_std(temporary.reopen()?);
-    file.write_all(bytes).await?;
-    file.flush().await?;
-    let existing = std::fs::symlink_metadata(path).ok().filter(|m| !m.file_type().is_symlink());
-    if let Some(metadata) = &existing {
-        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
-        // SAFETY: the temporary file owns this open descriptor. Preserve the
-        // destination's owner before chmod (chown may clear permission bits).
-        let temporary_owner = temporary.as_file().metadata()?;
-        if (metadata.uid(), metadata.gid()) != (temporary_owner.uid(), temporary_owner.gid()) {
-            let result = if unsafe { libc::fchown(temporary.as_file().as_raw_fd(), metadata.uid(), metadata.gid()) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            };
-            // SAFETY: geteuid has no arguments or memory effects.
-            ownership_result(result, unsafe { libc::geteuid() })?;
-        }
-    }
-    let mode = if executable { 0o755 } else { existing.map_or(0o644, |m| m.permissions().mode()) };
-    file.set_permissions(std::fs::Permissions::from_mode(mode)).await?;
-    file.sync_all().await?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    crate::durable::sync_directory(parent)
-}
-// Unprivileged replacement may be allowed by directory permissions even when
-// preserving another user's owner is not. Preserve it when permitted; root and
-// non-permission failures remain strict.
-fn ownership_result(result: io::Result<()>, uid: u32) -> io::Result<()> {
-    match result {
-        Err(error) if uid != 0 && error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        other => other,
-    }
-}
-async fn write_file(Json(file): Json<FileWrite>) -> Refusal<StatusCode> {
-    absolute("file.write", &file.path)?;
-    atomic_write(&file.path, &file.bytes, file.executable).await.map_err(|e| AgentError::io("file.write", file.path.display(), e))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn read_file(Json(file): Json<FilePath>) -> Refusal<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    const LIMIT: u64 = 128 * 1024 * 1024;
-    let at = |e| AgentError::io("file.read", file.path.display(), e);
-    absolute("file.read", &file.path)?;
-    let too_large = || AgentError::new("file.read", file.path.display(), ErrorKind::PayloadTooLarge, "read exceeds 128 MiB");
-    let input = tokio::fs::File::open(&file.path).await.map_err(at)?;
-    if input.metadata().await.map_err(at)?.len() > LIMIT {
-        return Err(too_large());
-    }
-    let mut bytes = Vec::new();
-    input.take(LIMIT + 1).read_to_end(&mut bytes).await.map_err(at)?;
-    if bytes.len() as u64 > LIMIT {
-        return Err(too_large());
-    }
-    Ok(bytes)
-}
-async fn flush_file(Json(file): Json<FilePath>) -> Refusal<StatusCode> {
-    let at = |e| AgentError::io("file.flush", file.path.display(), e);
-    absolute("file.flush", &file.path)?;
-    tokio::fs::File::open(&file.path).await.map_err(at)?.sync_all().await.map_err(at)?;
-    Ok(StatusCode::NO_CONTENT)
-}
 async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Refusal<StatusCode> {
     let path = crate::upgrade::sidecar(&s.executable, "upgrade");
     if bytes.is_empty() {
         return Err(AgentError::new("upgrade.stage", path.display(), ErrorKind::InvalidInput, "empty agent executable"));
     }
     let mut staged = s.staged.lock().await;
-    atomic_write(&path, &bytes, true).await.map_err(|e| AgentError::io("upgrade.stage", path.display(), e))?;
+    let options = FileOptions { mode: Some(0o755), ..FileOptions::default() };
+    crate::files::write("upgrade.stage", &path, Body::from(bytes), &options).await?;
     *staged = Some(path);
     Ok(StatusCode::NO_CONTENT)
 }

@@ -29,3 +29,14 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# Large-transfer tests hash and frame hundreds of MiB; unoptimized hashing and
+# framing would dominate their runtime without changing what they show.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.h2]
+opt-level = 3
+[profile.dev.package.hyper]
+opt-level = 3
+[profile.dev.package.yamux]
+opt-level = 3

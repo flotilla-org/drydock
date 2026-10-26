@@ -6,13 +6,15 @@ mod egress;
 mod error;
 pub use egress::{CA_PATH, Egress, PROXY_PORT};
 mod exec;
+mod files;
 mod forward;
+mod query;
 mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
 pub mod socket;
 pub mod upgrade;
-pub use client::{Client, ExecOutput};
+pub use client::{Client, Download, ExecOutput};
 use drydock_transport::ByteStream;
 use serde::{Deserialize, Serialize};
 pub use server::Agent;
@@ -112,15 +114,85 @@ pub enum ExecEvent {
     Stderr(Vec<u8>),
     Exit { code: Option<i32> },
 }
-#[derive(Serialize, Deserialize)]
-pub(crate) struct FilePath {
-    pub path: PathBuf,
+/// Options for creating a file, directory or link.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileOptions {
+    /// Permission bits. A new file defaults to 0600 and a new directory to
+    /// 0700; a replaced file keeps its existing mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Owner for the new entry and any parents it creates. A replaced file
+    /// keeps its existing owner when permitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gid: Option<u32>,
+    /// Create missing parent directories (mode 0755, the given owner).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parents: bool,
+    /// Refuse with 409 when the destination already exists.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive: bool,
+    /// Lowercase hex sha256 the content must have. The agent hashes while
+    /// writing and refuses, leaving nothing behind, on a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
-#[derive(Serialize, Deserialize)]
-pub(crate) struct FileWrite {
-    pub path: PathBuf,
-    pub bytes: Vec<u8>,
-    pub executable: bool,
+/// The digest and size of what the agent wrote.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Written {
+    pub sha256: String,
+    pub size: u64,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+/// One directory entry or stat result. Symlinks are not followed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub kind: EntryKind,
+    pub size: u64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub modified_ns: i128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<PathBuf>,
+}
+/// Changes to an existing entry's mode and owner.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Attributes {
+    #[serde(default)]
+    pub mode: Option<u32>,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Rename {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// Refuse with 409 when `to` exists, instead of replacing it.
+    #[serde(default)]
+    pub exclusive: bool,
+    #[serde(default)]
+    pub parents: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Link {
+    pub target: PathBuf,
 }
 pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
@@ -128,6 +200,12 @@ pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
 pub(crate) fn check_id(id: &str) -> io::Result<()> {
     if id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) {
         return Err(invalid("forward ID must be 1..=1024 bytes without controls"));
+    }
+    Ok(())
+}
+pub(crate) fn check_sha256(digest: &str) -> io::Result<()> {
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(invalid(format!("sha256 must be 64 lowercase hex digits, not {digest:?}")));
     }
     Ok(())
 }

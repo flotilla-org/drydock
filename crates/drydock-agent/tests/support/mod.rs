@@ -3,7 +3,7 @@
 //! real agent executable as a subprocess, for restarts and re-execs.
 #![allow(dead_code)]
 use bytes::Bytes;
-use drydock_agent::{Agent, AgentError, Client, Exec, ExecEvent};
+use drydock_agent::{Agent, AgentError, Client, ErrorKind, Exec, ExecEvent};
 use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};
 use http_body_util::{BodyExt, Full};
 use std::{
@@ -29,6 +29,14 @@ pub struct Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         self.agent.abort();
+    }
+}
+impl Harness {
+    /// A directory inside the harness for a test's files.
+    pub fn vessel(&self) -> PathBuf {
+        let root = self.dir.path().join("vessel");
+        std::fs::create_dir_all(&root).unwrap();
+        root
     }
 }
 /// A connected host and guest transport: yamux over memory, or native Unix sockets.
@@ -59,6 +67,11 @@ pub async fn harness(unix: bool, expected: &str) -> Harness {
     drop(driver);
     let client = Client::connect(host, expected).await.unwrap();
     Harness { client, guest_opener, raw, agent, dir }
+}
+
+/// A multi-threaded runtime for a hegel test body.
+pub fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
 }
 
 /// Send a request the typed client would not, and return status, headers and body.
@@ -93,6 +106,17 @@ pub async fn refused(h: &Harness, method: &str, uri: &str, headers: &[(&str, &st
 /// The structured error behind a typed client failure.
 pub fn agent_error(error: &std::io::Error) -> &AgentError {
     AgentError::of(error).unwrap_or_else(|| panic!("not a structured agent error: {error}"))
+}
+/// The agent's kind for a typed client failure.
+pub fn kind(error: &std::io::Error) -> ErrorKind {
+    agent_error(error).kind
+}
+/// The error of a call that must fail, for results whose value has no Debug.
+pub fn failed<T>(result: std::io::Result<T>) -> std::io::Error {
+    match result {
+        Ok(_) => panic!("the call succeeded"),
+        Err(error) => error,
+    }
 }
 pub fn assert_error(error: std::io::Error, kind: std::io::ErrorKind, operation: &str, subject: &str) -> AgentError {
     assert_eq!(error.kind(), kind, "{error}");
@@ -139,6 +163,28 @@ pub fn sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
+/// Cheap deterministic pseudo-random bytes (xorshift64), so generated
+/// content is reproducible from its seed without storing it.
+pub fn pattern(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+/// Names in `dir` that start with `prefix`: leftover staging entries.
+pub fn leftovers(dir: &Path, prefix: &str) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
 /// The agent executable this package builds.
 pub fn agent_binary() -> Vec<u8> {
     std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap()

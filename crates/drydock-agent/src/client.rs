@@ -1,12 +1,17 @@
-use crate::{rest::encode_segment, *};
+use crate::{
+    query::{DirQuery, LinkQuery, RemoveQuery, encode as query},
+    rest::{encode_path, encode_segment},
+    *,
+};
 use bytes::{Bytes, BytesMut};
 use drydock_transport::{Opener, Purpose, Transport, http2};
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::{Arc, Mutex, OnceLock},
 };
-use tokio::task::JoinSet;
+use tokio::{io::AsyncRead, task::JoinSet};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum EndpointKey {
@@ -103,6 +108,19 @@ fn full(bytes: impl Into<Bytes>) -> RequestBody {
 fn json_body(value: &impl Serialize) -> io::Result<RequestBody> {
     Ok(full(serde_json::to_vec(value).map_err(invalid)?))
 }
+/// Stream a reader as a request body, 256 KiB at a time.
+fn streamed(reader: impl AsyncRead + Send + 'static) -> RequestBody {
+    use futures_util::TryStreamExt;
+    let stream = tokio_util::io::ReaderStream::with_capacity(reader, 256 * 1024).map_ok(http_body::Frame::data);
+    BodyExt::boxed_unsync(StreamBody::new(stream))
+}
+fn route(prefix: &str, path: &Path) -> io::Result<String> {
+    if !path.is_absolute() {
+        return Err(crate::error::context("request", path.display(), invalid("path must be absolute")));
+    }
+    Ok(format!("{prefix}{}", encode_path(path)))
+}
+
 /// The HTTP/2 control link, shared by a client and its process handles.
 #[derive(Clone)]
 struct Control {
@@ -349,16 +367,108 @@ impl Client {
         let response = self.link.send("POST", "/exec", &[("content-type", "application/json".into())], json_body(&request)?).await?;
         Ok(ExecOutput { body: response.into_body(), pending: BytesMut::new(), seen_exit: false })
     }
-    pub async fn write(&self, path: PathBuf, bytes: Vec<u8>, executable: bool) -> io::Result<()> {
-        self.link.empty("POST", "/files/write", json_body(&FileWrite { path, bytes, executable })?).await.map(drop)
+    /// Stream `content` to `path`, replacing it atomically.
+    pub async fn write(&self, path: &Path, content: impl AsyncRead + Send + 'static, options: &FileOptions) -> io::Result<Written> {
+        self.write_body(path, streamed(content), options, None).await
     }
-    pub async fn read(&self, path: PathBuf) -> io::Result<Vec<u8>> {
-        let response =
-            self.link.send("POST", "/files/read", &[("content-type", "application/json".into())], json_body(&FilePath { path })?).await?;
-        Ok(axum::body::to_bytes(response.into_body(), 128 * 1024 * 1024).await.map_err(|e| link_error("POST /files/read", e))?.to_vec())
+    pub async fn write_bytes(&self, path: &Path, content: impl Into<Bytes>, options: &FileOptions) -> io::Result<Written> {
+        self.write_body(path, full(content), options, None).await
     }
-    pub async fn flush(&self, path: PathBuf) -> io::Result<()> {
-        self.link.empty("POST", "/files/flush", json_body(&FilePath { path })?).await.map(drop)
+    /// Stream `content` to `path` only if the file still has `etag` (412
+    /// otherwise, also when it is absent); `*` requires only that it exists.
+    pub async fn write_if(
+        &self,
+        path: &Path,
+        content: impl AsyncRead + Send + 'static,
+        options: &FileOptions,
+        etag: &str,
+    ) -> io::Result<Written> {
+        self.write_body(path, streamed(content), options, Some(etag)).await
+    }
+    async fn write_body(&self, path: &Path, body: RequestBody, options: &FileOptions, etag: Option<&str>) -> io::Result<Written> {
+        let uri = format!("{}{}", route("/files", path)?, query(options)?);
+        let mut headers = vec![("content-type", "application/octet-stream".to_owned())];
+        headers.extend(etag.map(|etag| ("if-match", etag.to_owned())));
+        decode(self.link.send("PUT", &uri, &headers, body).await?, "PUT", &uri).await
+    }
+    /// Stream a whole file.
+    pub async fn read(&self, path: &Path) -> io::Result<Download> {
+        self.download(path, None, None).await
+    }
+    /// Stream `length` bytes from `start`, or to the end without a length.
+    /// With `etag`, the read is refused (412) if the file has changed since.
+    pub async fn read_range(&self, path: &Path, start: u64, length: Option<u64>, etag: Option<&str>) -> io::Result<Download> {
+        let range = match length {
+            Some(0) => return Err(invalid("a range must select at least one byte")),
+            Some(length) => headers::Range::bytes(start..start + length),
+            None => headers::Range::bytes(start..),
+        };
+        self.download(path, Some(range.map_err(invalid)?), etag).await
+    }
+    async fn download(&self, path: &Path, range: Option<headers::Range>, etag: Option<&str>) -> io::Result<Download> {
+        use headers::HeaderMapExt;
+        let uri = route("/files", path)?;
+        let mut headers = Vec::new();
+        if let Some(range) = range {
+            let mut map = http::HeaderMap::new();
+            map.typed_insert(range);
+            headers.extend(map.get(http::header::RANGE).and_then(|v| v.to_str().ok()).map(|v| ("range", v.to_owned())));
+        }
+        if let Some(etag) = etag {
+            headers.push(("if-match", etag.to_owned()));
+        }
+        let response = self.link.send("GET", &uri, &headers, empty()).await?;
+        let length = header(&response, "content-length").and_then(|v| v.parse().ok()).unwrap_or_default();
+        let etag = header(&response, "etag").unwrap_or_default();
+        let range = response.headers().typed_get::<headers::ContentRange>().and_then(|r| Some((r.bytes_range()?, r.bytes_len()?)));
+        let range = range.map(|((start, end), size)| (start, end, size));
+        Ok(Download { length, etag, range, body: response.into_body(), received: 0 })
+    }
+    /// A whole file in memory, refused if it is longer than `limit`.
+    pub async fn read_bytes(&self, path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+        let download = self.read(path).await?;
+        if download.length > limit {
+            return Err(crate::error::context(
+                "file.read",
+                path.display(),
+                io::Error::new(io::ErrorKind::FileTooLarge, format!("file has {} bytes, more than {limit}", download.length)),
+            ));
+        }
+        download.bytes().await
+    }
+    /// A file's size and entity tag, without its bytes.
+    pub async fn head(&self, path: &Path) -> io::Result<(u64, String)> {
+        let uri = route("/files", path)?;
+        let response = self.link.send("HEAD", &uri, &[], empty()).await.map_err(|e| head_error(e, "file.read", path))?;
+        let length = header(&response, "content-length").and_then(|v| v.parse().ok()).unwrap_or_default();
+        Ok((length, header(&response, "etag").unwrap_or_default()))
+    }
+    pub async fn stat(&self, path: &Path) -> io::Result<Entry> {
+        self.link.json("GET", &route("/entries", path)?, empty()).await
+    }
+    pub async fn list(&self, path: &Path) -> io::Result<Vec<Entry>> {
+        self.link.json("GET", &route("/dirs", path)?, empty()).await
+    }
+    /// Remove a file, link or empty directory; `recursive` removes a tree.
+    pub async fn remove(&self, path: &Path, recursive: bool) -> io::Result<()> {
+        let uri = format!("{}{}", route("/entries", path)?, query(&RemoveQuery { recursive })?);
+        self.link.empty("DELETE", &uri, empty()).await.map(drop)
+    }
+    pub async fn set_attributes(&self, path: &Path, attributes: &Attributes) -> io::Result<Entry> {
+        self.link.json("PATCH", &route("/entries", path)?, json_body(attributes)?).await
+    }
+    /// Create a directory. An existing one is accepted unless `exclusive`.
+    pub async fn create_dir(&self, path: &Path, options: &FileOptions) -> io::Result<Entry> {
+        self.link.json("PUT", &format!("{}{}", route("/dirs", path)?, query(&DirQuery::from(options))?), empty()).await
+    }
+    /// Create a symlink at `path` pointing at `target`, atomically replacing
+    /// any non-directory there unless `exclusive`.
+    pub async fn symlink(&self, path: &Path, target: &Path, options: &FileOptions) -> io::Result<()> {
+        let uri = format!("{}{}", route("/links", path)?, query(&LinkQuery::from(options))?);
+        self.link.empty("PUT", &uri, json_body(&Link { target: target.into() })?).await.map(drop)
+    }
+    pub async fn rename(&self, rename: &Rename) -> io::Result<()> {
+        self.link.empty("POST", "/renames", json_body(rename)?).await.map(drop)
     }
 
     /// Stage then activate via the stable route. Reconnect afterwards and verify
@@ -460,6 +570,72 @@ impl Client {
         Ok(stream)
     }
 }
+/// HEAD replies carry no body, so a refusal has only its status.
+fn head_error(error: io::Error, operation: &str, subject: &Path) -> io::Error {
+    match AgentError::of(&error) {
+        Some(agent) if agent.operation == "request" => {
+            let mut agent = agent.clone();
+            agent.operation = operation.into();
+            agent.subject = subject.display().to_string();
+            agent.into_io()
+        }
+        _ => error,
+    }
+}
+
+/// A streamed file read.
+pub struct Download {
+    /// Bytes in this reply: the whole file, or the requested range.
+    pub length: u64,
+    pub etag: String,
+    /// For a ranged read: first and last byte, and the file's size.
+    pub range: Option<(u64, u64, u64)>,
+    body: axum::body::Body,
+    received: u64,
+}
+impl Download {
+    /// The next chunk, or None at the end. A reply shorter than its length is
+    /// an UnexpectedEof error.
+    pub async fn chunk(&mut self) -> io::Result<Option<Bytes>> {
+        loop {
+            match self.body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        self.received += data.len() as u64;
+                        return Ok(Some(data));
+                    }
+                }
+                Some(Err(error)) => return Err(link_error("file download", error)),
+                None if self.received < self.length => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("download ended after {} of {} bytes", self.received, self.length),
+                    ));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+    pub async fn bytes(mut self) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.length.min(64 * 1024 * 1024) as usize);
+        while let Some(chunk) = self.chunk().await? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+    /// Copy the download to a writer, holding one chunk at a time.
+    pub async fn copy_to(mut self, writer: &mut (impl tokio::io::AsyncWrite + Unpin)) -> io::Result<u64> {
+        use tokio::io::AsyncWriteExt;
+        let mut total = 0;
+        while let Some(chunk) = self.chunk().await? {
+            writer.write_all(&chunk).await?;
+            total += chunk.len() as u64;
+        }
+        writer.flush().await?;
+        Ok(total)
+    }
+}
+
 /// Incremental NDJSON. Each output channel preserves its own byte order.
 pub struct ExecOutput {
     body: axum::body::Body,

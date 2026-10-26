@@ -1,13 +1,18 @@
-//! Server-side HTTP plumbing: the one layer that turns every refusal the
-//! framework makes (an unknown route, a wrong method, a body or path its
-//! extractors reject) into the structured error. Handlers use axum's own
-//! extractors; their rejections pass through here.
+//! Server-side HTTP plumbing: path decoding for file routes, and the one
+//! layer that turns every refusal the framework makes (an unknown route, a
+//! wrong method, a body or query its extractors reject) into the structured
+//! error. Handlers use axum's own extractors; their rejections pass through here.
 use crate::{AgentError, ErrorKind};
 use axum::{
     extract::Request,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
+};
+use std::{
+    ffi::OsString,
+    os::unix::ffi::OsStringExt,
+    path::{Component, Path, PathBuf},
 };
 
 fn rejected(operation: &str, subject: impl std::fmt::Display, status: StatusCode, text: String) -> AgentError {
@@ -68,6 +73,37 @@ pub(crate) fn panicked(payload: Box<dyn std::any::Any + Send>) -> Response {
     let message = payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str));
     tracing::error!(panic = message.unwrap_or("(not a string)"), "request handler panicked");
     AgentError::new("request", "handler", ErrorKind::Other, "the agent failed while handling this request").into_response()
+}
+/// The absolute vessel path named by a route's tail, such as `/files/etc/x`
+/// naming `/etc/x`. Each byte may be percent-encoded, so any Unix path can be
+/// named. Relative paths, `..` components and NUL are refused; `.` components
+/// are dropped, as `Path::components` does.
+pub(crate) fn tail_path(operation: &str, uri: &axum::http::Uri, prefix: &str) -> Result<PathBuf, AgentError> {
+    let raw = uri.path();
+    let rest = raw.strip_prefix(prefix).unwrap_or_default();
+    let bytes: Vec<u8> = percent_encoding::percent_decode_str(rest).collect();
+    let path = PathBuf::from(OsString::from_vec(bytes));
+    check_path(operation, &path)?;
+    Ok(path)
+}
+pub(crate) fn check_path(operation: &str, path: &Path) -> Result<(), AgentError> {
+    let refuse = |message: &str| Err(AgentError::new(operation, path.display(), ErrorKind::InvalidInput, message));
+    if !path.is_absolute() {
+        return refuse("path must be absolute");
+    }
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return refuse("path must not contain NUL");
+    }
+    if path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+        return refuse("path must not contain .. components");
+    }
+    Ok(())
+}
+/// Percent-encode a path for a route tail. Unreserved bytes and `/` stay.
+pub(crate) fn encode_path(path: &Path) -> String {
+    const SET: &percent_encoding::AsciiSet =
+        &percent_encoding::NON_ALPHANUMERIC.remove(b'/').remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+    percent_encoding::percent_encode(path.as_os_str().as_encoded_bytes(), SET).to_string()
 }
 
 /// Any refusal that is not already an AgentError, from the framework or
