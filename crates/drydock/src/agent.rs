@@ -179,9 +179,9 @@ impl AgentReach {
             };
             masker.lock().unwrap().remember(user.expose());
             let chosen = self.preferred.under(reverse_forwards);
-            // Reported without any userinfo a provider might put in the endpoint.
-            let reached = endpoint.rsplit_once('@').map_or(endpoint.as_str(), |(_, host)| host).to_owned();
             let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into(), chosen)?;
+            // The endpoint dialled, which is the one reported: host and port only.
+            let reached = format!("{}:{}", config.host, config.port);
             config.agent_socket = socket.into();
             let transport = self.dialer.dial(config).await?;
             // The link of the last dial that succeeded, which carries the agent returned.
@@ -209,8 +209,10 @@ impl AgentReach {
     }
 }
 
-/// The SSH link for one reach recipe and the chosen agent link.
+/// The SSH link for one reach recipe and the chosen agent link. Any userinfo a
+/// provider puts in the endpoint is dropped: the user is the reach's own.
 pub(crate) fn ssh_config(endpoint: &str, user: &str, host_key: String, identity: PathBuf, link: AgentLink) -> io::Result<SshConfig> {
+    let endpoint = endpoint.rsplit_once('@').map_or(endpoint, |(_, host)| host);
     let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| io::Error::other("invalid SSH endpoint"))?;
     Ok(SshConfig {
         connect_timeout: Duration::from_secs(10),

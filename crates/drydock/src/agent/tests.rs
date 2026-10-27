@@ -70,7 +70,9 @@ fn the_link_follows_the_preference_where_the_server_allows_it() {
     ] {
         let chosen = preferred.under(reverse_forwards);
         assert_eq!(chosen, link, "{preferred} with reverse forwards {reverse_forwards}");
-        assert_eq!(ssh_config("gw.example:22", "u", "ssh-ed25519 AAAA".into(), "/k".into(), chosen).unwrap().guest_streams, streams);
+        let config = ssh_config("secret@gw.example:22", "u", "ssh-ed25519 AAAA".into(), "/k".into(), chosen).unwrap();
+        assert_eq!(config.guest_streams, streams);
+        assert_eq!((config.host.as_str(), config.port, config.user.as_str()), ("gw.example", 22, "u"), "userinfo is never dialled");
     }
 }
 
@@ -82,7 +84,7 @@ fn the_link_follows_the_preference_where_the_server_allows_it() {
 // forward. Either way the guest reaches the host through a guest forward.
 #[tokio::test]
 async fn connects_through_the_link_the_reach_and_preference_allow() {
-    // The last row's endpoint carries userinfo, which the report never shows.
+    // The last row's endpoint carries userinfo, which is neither dialled nor reported.
     for (reverse_forwards, preferred, link, endpoint) in [
         (false, AgentLink::ReverseForward, AgentLink::LocalForward, "gateway.test:22"),
         (true, AgentLink::ReverseForward, AgentLink::ReverseForward, "gateway.test:22"),
