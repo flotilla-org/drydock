@@ -1,12 +1,13 @@
 use crate::{
     frames::Frame,
-    query::{AttachQuery, DirQuery, LinkQuery, RemoveQuery, WithBlob, encode as query},
+    query::{AttachQuery, DigestQuery, DirQuery, LinkQuery, RemoveQuery, WithBlob, encode as query},
     rest::{encode_path, encode_segment},
     *,
 };
 use bytes::Bytes;
 use drydock_transport::{Opener, Purpose, Transport, http2};
 use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -136,7 +137,12 @@ impl Control {
         headers: &[(&str, String)],
         body: RequestBody,
     ) -> io::Result<http::Response<axum::body::Body>> {
-        if !self.compatible && !(uri == "/hello" || uri.starts_with("/upgrade")) {
+        // Hello, upgrade and the upload protocol that carries an upgrade image
+        // are the routes every generation keeps.
+        let path = uri.split('?').next().unwrap_or(uri);
+        let stable =
+            matches!(path, "/hello" | "/upgrade" | "/upgrade/confirm") || path.starts_with("/blobs/") || path.starts_with("/uploads/");
+        if !self.compatible && !stable {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "agent fingerprint mismatch: only hello and upgrade are permitted"));
         }
         let mut request = http::Request::builder().method(method).uri(uri);
@@ -226,8 +232,8 @@ impl Client {
     /// The factory must open a new provider transport on every invocation.
     /// `platform` is the platform the vessel was prepared for and `executable`
     /// the current agent build for it; the caller chose both from the prepared
-    /// form, never from the guest. Returns only a compatible client; callers
-    /// push configuration afterwards. Initial transport/hello errors
+    /// form, never from the guest. Returns only a compatible, confirmed client;
+    /// callers push configuration afterwards. Initial transport/hello errors
     /// return immediately; only post-upgrade reconnects retry. The caller must
     /// arrange initial provider readiness.
     ///
@@ -260,21 +266,31 @@ impl Client {
                     format!("vessel was prepared for {platform} but its agent reports {reported}"),
                 ));
             }
-            use sha2::{Digest, Sha256};
             let expected = format!("{:x}", Sha256::digest(executable));
             client.set_expected(expected.clone());
+            // Only the build this host wants is confirmed. Another candidate
+            // on probation is replaced below by activating the wanted one,
+            // and was never installed.
             if client.is_compatible() {
+                if client.hello.probation {
+                    client.confirm_upgrade().await?;
+                }
                 return Ok(client);
             }
-            client.stage_upgrade(executable.to_vec()).await?;
+            let digest = client.put_upgrade(Bytes::copy_from_slice(executable)).await?;
             // Activation acknowledgement is advisory: re-exec can close the
             // stream before the response arrives. Only the next hello decides.
-            let _ = client.activate_upgrade().await;
+            let _ = client.activate_upgrade(&digest).await;
             drop(client);
             loop {
                 match open().await {
                     Ok(transport) => match Self::connect(transport, &expected).await {
-                        Ok(client) if client.is_compatible() => return Ok(client),
+                        Ok(client) if client.is_compatible() => {
+                            if client.hello.probation {
+                                client.confirm_upgrade().await?;
+                            }
+                            return Ok(client);
+                        }
                         Ok(client) => observation = format!("last hello fingerprint {}", client.hello.fingerprint),
                         Err(error) => observation = format!("last hello error: {error}"),
                     },
@@ -324,7 +340,7 @@ impl Client {
         let mut client = Self {
             link: Control { sender, compatible: false },
             opener,
-            hello: Hello { fingerprint: String::new(), features: vec![], platform: None, boot_id: String::new() },
+            hello: Hello { fingerprint: String::new(), features: vec![], platform: None, boot_id: String::new(), probation: false },
             expected: String::new(),
             targets,
             tasks: vec![driver.abort_handle(), task.abort_handle()],
@@ -516,7 +532,6 @@ impl Client {
     pub async fn rename(&self, rename: &Rename) -> io::Result<()> {
         self.link.empty("POST", "/renames", json_body(rename)?).await.map(drop)
     }
-
     /// Stream a tar archive into a new directory at `path`.
     pub async fn unpack(&self, path: &Path, archive: impl AsyncRead + Send + 'static, options: &TreeOptions) -> io::Result<Written> {
         digest(&options.sha256)?;
@@ -618,21 +633,38 @@ impl Client {
         self.link.empty("DELETE", &format!("/blobs/{}", digest(sha256)?), empty()).await.map(drop)
     }
 
-    /// Stage then activate via the stable route. Reconnect afterwards and verify
-    /// the new hello fingerprint before using any generation-specific routes.
-    pub async fn upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
-        self.stage_upgrade(executable).await?;
-        self.activate_upgrade().await
+    /// Upload then activate. Reconnect afterwards and verify the new hello
+    /// fingerprint, then confirm, before using any generation-specific routes.
+    pub async fn upgrade(&self, executable: impl Into<Bytes>) -> io::Result<()> {
+        let digest = self.put_upgrade(executable.into()).await?;
+        self.activate_upgrade(&digest).await
     }
-    /// Retain a staged image across activation failures without retransmission.
-    pub async fn stage_upgrade(&self, executable: Vec<u8>) -> io::Result<()> {
-        let response = self.link.send("PUT", "/upgrade", &[("content-type", "application/octet-stream".into())], full(executable)).await?;
-        response.into_body().collect().await.map_err(|e| link_error("PUT /upgrade", e))?;
-        Ok(())
+    /// Put the image where activation finds it: a blob, uploaded resumably
+    /// and digest-checked, unless the agent already holds it. Agents from
+    /// before the blob store (hello without `uploads`, such as those baked
+    /// into published tools images) take it whole through `PUT /upgrade`.
+    /// That legacy path can go once no published tools image bakes such an
+    /// agent.
+    async fn put_upgrade(&self, executable: Bytes) -> io::Result<String> {
+        let digest = format!("{:x}", Sha256::digest(&executable));
+        if !self.hello.features.iter().any(|feature| feature == "uploads") {
+            let response =
+                self.link.send("PUT", "/upgrade", &[("content-type", "application/octet-stream".into())], full(executable)).await?;
+            response.into_body().collect().await.map_err(|e| link_error("PUT /upgrade", e))?;
+        } else if self.blob_size(&digest).await?.is_none() {
+            self.upload(&digest, executable.len() as u64, std::io::Cursor::new(executable)).await?;
+        }
+        Ok(digest)
     }
-    /// Retry activation of an already staged image after a filesystem failure.
-    pub async fn activate_upgrade(&self) -> io::Result<()> {
-        self.link.empty("POST", "/upgrade", empty()).await.map(drop)
+    /// Activate the completed upload named by `sha256` as the next agent.
+    pub async fn activate_upgrade(&self, sha256: &str) -> io::Result<()> {
+        let uri = format!("/upgrade{}", query(&DigestQuery { sha256: digest(sha256)?.to_owned() })?);
+        self.link.empty("POST", &uri, empty()).await.map(drop)
+    }
+    /// Make the running candidate the installed agent. Until then, the next
+    /// ordinary start rolls back to the previous executable.
+    pub async fn confirm_upgrade(&self) -> io::Result<()> {
+        self.link.empty("POST", "/upgrade/confirm", empty()).await.map(drop)
     }
 
     /// Reserve a host endpoint for guest connections arriving under `id`.

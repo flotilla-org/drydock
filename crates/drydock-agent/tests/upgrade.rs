@@ -1,5 +1,5 @@
 mod support;
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, FileOptions, GuestForward, HostForward, Platform};
+use drydock_agent::{Client, Configuration, Endpoint, ErrorKind, Exec, ExecEvent, FileOptions, GuestForward, HostForward, Platform};
 use std::{os::unix::fs::PermissionsExt, time::Duration};
 use support::*;
 use tokio::process::Command;
@@ -99,6 +99,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     assert_eq!(child.id(), Some(pid));
     assert!(child.try_wait().unwrap().is_none());
     assert_eq!(upgraded.hello().fingerprint, new);
+    upgraded.confirm_upgrade().await.unwrap();
     assert_eq!(std::fs::read(executable.with_extension("prev")).unwrap(), binary);
     assert!(!guest_socket.exists(), "old forward paths must be removed before re-exec");
     assert_eq!(upgraded.configuration().await.unwrap().value, Configuration::default());
@@ -190,19 +191,18 @@ async fn failed_file_write_never_publishes_a_partial_file_or_upgrade() {
     assert_eq!(detail.operation, "file.write");
     assert_eq!(detail.subject, path.display().to_string());
     assert_eq!(std::fs::read(&path).unwrap(), b"original");
-    let error = client.stage_upgrade(vec![7; 8192]).await.unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
-    assert!(error.to_string().contains("upgrade.stage"));
-    assert!(error.to_string().contains(&executable.with_extension("upgrade").display().to_string()));
+    let error = client.upgrade(vec![7; 8192]).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge, "{error}");
+    assert!(error.to_string().contains("upload.append"), "{error}");
     assert!(!executable.with_extension("upgrade").exists());
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }
 
-// A candidate whose exec succeeds but exits before hello must not strand the
-// provider's fixed entry point. The next ordinary start restores the old image.
+// A candidate whose exec succeeds but exits before confirmation must not strand
+// the provider's fixed entry point. The next ordinary start restores the old image.
 #[tokio::test]
-async fn candidate_that_dies_before_hello_rolls_back_on_next_start() {
+async fn candidate_that_dies_before_confirmation_rolls_back_on_next_start() {
     let dir = tempfile::tempdir().unwrap();
     let binary = agent_binary();
     let fingerprint = sha256(&binary);
@@ -378,6 +378,84 @@ async fn prepared_platform_mismatch_pushes_nothing() {
     }
     assert_eq!(connect(&socket, &fingerprint).await.hello().fingerprint, fingerprint);
     assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
+
+// Reading hello never confirms a candidate: one that runs and answers any
+// number of hellos, but that nobody confirms, is still on probation, and when
+// it dies the provider's next ordinary start restores the previous executable.
+#[tokio::test]
+async fn unconfirmed_candidate_rolls_back_even_after_serving_hello() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = agent_binary();
+    let executable = install(&dir.path().join("drydock-agent"), &binary);
+    let old = sha256(&binary);
+    let socket = dir.path().join("agent.sock");
+    let mut child = start_agent(&executable, &socket);
+    let client = connect(&socket, &old).await;
+    let mut candidate = binary.clone();
+    candidate.extend_from_slice(b"unconfirmed candidate");
+    let new = sha256(&candidate);
+    client.upgrade(candidate).await.unwrap();
+    drop(client);
+    let probe = connect_compatible(&socket, &new).await;
+    for _ in 0..5 {
+        assert!(probe.hello().probation);
+        drop(connect(&socket, &new).await);
+    }
+    drop(probe);
+    assert_eq!(std::fs::read(&executable).unwrap(), binary);
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let mut restarted = start_agent(&executable, &socket);
+    let recovered = connect(&socket, &old).await;
+    assert!(recovered.is_compatible(), "the previous executable must be back");
+    assert!(!recovered.hello().probation);
+    for suffix in ["probation", "upgrade", "prev"] {
+        assert!(!executable.with_extension(suffix).exists(), "{suffix} must be gone after rollback");
+    }
+    restarted.kill().await.unwrap();
+    restarted.wait().await.unwrap();
+}
+
+// The upgrade image is a blob: uploaded resumably and digest-checked, kept
+// across an agent restart, and activated only by naming its digest. Without
+// a completed upload of that digest activation is NotFound; an upload that
+// does not match its digest never becomes one. A confirmed candidate
+// confirms only once.
+#[tokio::test]
+async fn upgrades_activate_a_durable_verified_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = agent_binary();
+    let executable = install(&dir.path().join("drydock-agent"), &binary);
+    let old = sha256(&binary);
+    let socket = dir.path().join("agent.sock");
+    let mut child = start_agent(&executable, &socket);
+    let client = connect(&socket, &old).await;
+    let mut candidate = binary.clone();
+    candidate.extend_from_slice(b"durable upload");
+    let new = sha256(&candidate);
+    let length = candidate.len() as u64;
+    assert_eq!(kind(&client.activate_upgrade(&new).await.unwrap_err()), ErrorKind::NotFound);
+    let error = client.upload(&new, 5, std::io::Cursor::new(b"other".to_vec())).await.unwrap_err();
+    assert_eq!(kind(&error), ErrorKind::DigestMismatch);
+    assert_eq!(kind(&client.activate_upgrade(&new).await.unwrap_err()), ErrorKind::NotFound);
+    client.upload(&new, length, std::io::Cursor::new(candidate.clone())).await.unwrap();
+    drop(client);
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let mut child = start_agent(&executable, &socket);
+    let client = connect(&socket, &old).await;
+    assert_eq!(client.blob_size(&new).await.unwrap(), Some(length), "the upload survives a restart");
+    assert_eq!(kind(&client.activate_upgrade(&old).await.unwrap_err()), ErrorKind::NotFound);
+    client.activate_upgrade(&new).await.unwrap();
+    drop(client);
+    let candidate_client = connect_compatible(&socket, &new).await;
+    assert!(candidate_client.hello().probation);
+    candidate_client.confirm_upgrade().await.unwrap();
+    assert_eq!(std::fs::read(&executable).unwrap(), candidate);
+    assert_eq!(kind(&candidate_client.confirm_upgrade().await.unwrap_err()), ErrorKind::Conflict);
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }

@@ -1,11 +1,11 @@
 use crate::{
-    query::AttachQuery,
+    query::{AttachQuery, DigestQuery},
     rest::{header_value, sf_boolean, sf_integer, structured},
     *,
 };
 use axum::{
     Json, Router,
-    body::{Body, Bytes},
+    body::Body,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -86,7 +86,7 @@ pub(crate) struct Shared {
     opener: Arc<Mutex<Opener>>,
     settings: Mutex<Settings>,
     executable: PathBuf,
-    staged: Mutex<Option<PathBuf>>,
+    upgrade: Mutex<()>,
     restart: mpsc::Sender<PathBuf>,
     pub(crate) store: crate::store::Store,
     processes: crate::process::Processes,
@@ -127,13 +127,14 @@ impl Agent {
                 features: FEATURES.iter().map(|s| (*s).into()).collect(),
                 platform: Some(Platform::current()),
                 boot_id: boot_id(),
+                probation: false,
             },
             egress_system: crate::egress::System::default(),
             opener: Arc::new(Mutex::new(transport.opener.clone())),
             settings: Mutex::new(Settings::default()),
             store: crate::store::Store::new(crate::upgrade::sidecar(&executable, "store")),
             executable,
-            staged: Mutex::new(None),
+            upgrade: Mutex::new(()),
             restart: tx,
             processes: crate::process::Processes::new(buffer),
         });
@@ -147,8 +148,8 @@ impl Agent {
         use crate::files::*;
         Router::new()
             .route("/hello", get(hello))
-            // Executables arrive whole, so they keep a larger cap.
-            .route("/upgrade", put(stage_upgrade).post(activate_upgrade).layer(DefaultBodyLimit::max(128 * 1024 * 1024)))
+            .route("/upgrade", post(activate_upgrade))
+            .route("/upgrade/confirm", post(confirm_upgrade))
             .route("/configuration", get(configuration).put(configure))
             .route("/processes", get(list_processes).post(spawn))
             .route("/processes/{id}", get(process).delete(remove_process))
@@ -266,10 +267,9 @@ impl Agent {
     }
 }
 
-async fn hello(State(s): State<Arc<Shared>>) -> Refusal<Json<Hello>> {
-    let _guard = s.staged.lock().await;
-    crate::upgrade::confirm(&s.executable).await.map_err(|e| AgentError::io("upgrade.confirm", s.executable.display(), e))?;
-    Ok(Json(s.hello.clone()))
+async fn hello(State(s): State<Arc<Shared>>) -> Json<Hello> {
+    // Reading hello never changes anything; confirmation is its own call.
+    Json(Hello { probation: crate::upgrade::on_probation(&s.executable), ..s.hello.clone() })
 }
 
 fn configuration_tag(s: &Shared, config: &Configuration) -> String {
@@ -600,46 +600,6 @@ async fn signal(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(reque
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn stage_upgrade(State(s): State<Arc<Shared>>, bytes: Bytes) -> Refusal<StatusCode> {
-    let path = crate::upgrade::sidecar(&s.executable, "upgrade");
-    if bytes.is_empty() {
-        return Err(AgentError::new("upgrade.stage", path.display(), ErrorKind::InvalidInput, "empty agent executable"));
-    }
-    let mut staged = s.staged.lock().await;
-    let options = FileOptions { mode: Some(0o755), ..FileOptions::default() };
-    crate::files::write("upgrade.stage", &path, crate::files::Source::Body(Body::from(bytes)), &options).await?;
-    *staged = Some(path);
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn activate_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
-    let mut staged = s.staged.lock().await;
-    let at = |operation: &'static str, subject: &std::path::Path| {
-        let subject = subject.display().to_string();
-        move |e| AgentError::io(operation, subject, e)
-    };
-    let path = staged
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| AgentError::new("upgrade.activate", s.executable.display(), ErrorKind::Conflict, "no staged agent"))?;
-    // Keep the installed path stable over successive upgrades.
-    let previous = crate::upgrade::sidecar(&s.executable, "prev");
-    let parent = s.executable.parent().unwrap_or(std::path::Path::new("."));
-    let backup_dir = tempfile::tempdir_in(parent).map_err(at("upgrade.backup", parent))?;
-    let backup = backup_dir.path().join("previous");
-    tokio::fs::hard_link(&s.executable, &backup).await.map_err(at("upgrade.backup", &s.executable))?;
-    tokio::fs::rename(&backup, &previous).await.map_err(at("upgrade.backup", &previous))?;
-    crate::upgrade::prepare(&s.executable, &path).await.map_err(at("upgrade.prepare", &s.executable))?;
-    *staged = None;
-    crate::durable::sync_directory(parent).map_err(at("upgrade.flush", parent))?;
-    let tx = s.restart.clone();
-    tokio::spawn(async move {
-        // Activation acknowledgement is advisory: clients reconnect and verify hello.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = tx.send(path).await;
-    });
-    Ok(StatusCode::NO_CONTENT)
-}
-
 fn sha256_header(digest: &str) -> [(header::HeaderName, header::HeaderValue); 1] {
     [(header::ETAG, header_value(format!("\"{digest}\"")))]
 }
@@ -725,6 +685,23 @@ async fn remove_blob(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn activate_upgrade(State(s): State<Arc<Shared>>, Query(query): Query<DigestQuery>) -> Refusal<StatusCode> {
+    let _guard = s.upgrade.lock().await;
+    let path = crate::upgrade::activate(&s.executable, &s.store, &query.sha256).await?;
+    let tx = s.restart.clone();
+    tokio::spawn(async move {
+        // Activation acknowledgement is advisory: clients reconnect and verify hello.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = tx.send(path).await;
+    });
+    Ok(StatusCode::ACCEPTED)
+}
+async fn confirm_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
+    let _guard = s.upgrade.lock().await;
+    crate::upgrade::confirm(&s.executable).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,24 +739,30 @@ mod tests {
         assert_eq!(incoming.purpose, Purpose::Forward { id: "recover".into() });
     }
     // Real filesystem boundary: if backup linking fails, activation must retain
-    // both the staged image and previous rollback, and POST alone must retry.
+    // both the uploaded image and previous rollback, and activation alone retries.
     #[tokio::test]
-    async fn partial_activation_failure_retains_stage_and_previous() {
+    async fn partial_activation_failure_retains_upload_and_previous() {
+        use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
         let (_host, agent) = agent(dir.path()).await;
         let executable = dir.path().join("agent");
         let previous = executable.with_extension("prev");
         std::fs::write(&previous, b"previous rollback").unwrap();
-        stage_upgrade(State(agent.shared.clone()), Bytes::from_static(b"new image")).await.unwrap();
-        assert!(activate_upgrade(State(agent.shared.clone())).await.is_err());
-        let staged = agent.shared.staged.lock().await.clone().expect("stage must survive failed linking");
-        assert_eq!(std::fs::read(&staged).unwrap(), b"new image");
+        let digest = format!("{:x}", Sha256::digest(b"new image"));
+        let blob = agent.shared.store.blob(&digest).unwrap();
+        std::fs::write(&blob, b"new image").unwrap();
+        let query = || Query(DigestQuery { sha256: digest.clone() });
+        let refused = activate_upgrade(State(agent.shared.clone()), query()).await.unwrap_err();
+        assert_eq!(refused.operation, "upgrade.activate");
+        assert_eq!(refused.kind, ErrorKind::NotFound);
+        assert!(refused.subject.ends_with("agent"), "{refused}");
+        let upgrade = executable.with_extension("upgrade");
+        assert_eq!(std::fs::read(&blob).unwrap(), b"new image", "the upload must survive failed linking");
         assert_eq!(std::fs::read(&previous).unwrap(), b"previous rollback");
         std::fs::write(&executable, b"current image").unwrap();
-        activate_upgrade(State(agent.shared.clone())).await.unwrap();
-        assert!(agent.shared.staged.lock().await.is_none());
+        activate_upgrade(State(agent.shared.clone()), query()).await.unwrap();
         assert_eq!(std::fs::read(&executable).unwrap(), b"current image");
-        assert_eq!(std::fs::read(&staged).unwrap(), b"new image");
+        assert_eq!(std::fs::read(&upgrade).unwrap(), b"new image");
         assert_eq!(std::fs::read(previous).unwrap(), b"current image");
     }
 
@@ -804,6 +787,27 @@ mod tests {
         }
         running.abort();
     }
+    // Activation rehashes the upload as it copies it out of the store, so
+    // bytes changed on disk since the upload are refused (422) and discarded
+    // rather than executed.
+    #[tokio::test]
+    async fn activation_refuses_an_upload_corrupted_on_disk() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let (_host, agent) = agent(dir.path()).await;
+        let executable = dir.path().join("agent");
+        std::fs::write(&executable, b"current image").unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"new image"));
+        std::fs::write(agent.shared.store.blob(&digest).unwrap(), b"bad image").unwrap();
+        let refused = activate_upgrade(State(agent.shared.clone()), Query(DigestQuery { sha256: digest.clone() })).await.unwrap_err();
+        assert_eq!((refused.operation.as_str(), refused.kind, refused.status), ("upgrade.activate", ErrorKind::DigestMismatch, 422));
+        assert!(refused.message.contains(&digest), "{refused}");
+        assert_eq!(agent.shared.store.blob_size(&digest).await.unwrap(), None, "the corrupted upload is discarded");
+        assert!(!executable.with_extension("upgrade").exists());
+        assert!(!executable.with_extension("probation").exists());
+        assert_eq!(std::fs::read(&executable).unwrap(), b"current image");
+    }
+
     // A process-boundary nft stand-in records the last committed transaction.
     // Fail once after real capture preparation and once after nft installation;
     // both refusals must free every port and preserve configuration/nft state.

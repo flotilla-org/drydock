@@ -33,7 +33,8 @@ form and the agent build for it. The tools image pin is a bootstrap reference
 and may contain an older agent. This handshake reads hello, hashes the build,
 and pushes the binary plus re-execs when fingerprints differ. It reconnects through the supplied provider transport
 factory and returns only after verifying the current fingerprint. A matching
-hello avoids an unnecessary upgrade. Push configuration after this handshake.
+hello avoids an unnecessary upgrade. It confirms a candidate on probation once
+its fingerprint matches. Push configuration after this handshake.
 
 Hello's `platform` uses OCI names (`{"os": "linux", "architecture": "arm64"}`).
 The agent reports the platform its running executable was built for, not the
@@ -65,7 +66,7 @@ any Unix path can be named; relative paths and `.`/`..` components are refused.
 
 | Method | Route | Body / result |
 | --- | --- | --- |
-| GET | `/hello` | `Hello { fingerprint, features, platform, boot_id }` |
+| GET | `/hello` | `Hello { fingerprint, features, platform, boot_id, probation }`; changes nothing |
 | GET / PUT | `/configuration` | Read / replace `Configuration`, with an `ETag`; PUT honours `If-Match` |
 | GET / PUT / DELETE | `/forwards/guest/{id}` | Read / upsert / remove one `GuestForward`; GET `/forwards/guest` lists them |
 | GET / PUT / DELETE | `/forwards/host/{id}` | Read / upsert / remove one `HostForward`; GET `/forwards/host` lists them |
@@ -82,8 +83,8 @@ any Unix path can be named; relative paths and `.`/`..` components are refused.
 | POST | `/renames` | `Rename { from, to, exclusive, parents }` |
 | HEAD / PATCH / DELETE | `/uploads/{sha256}` | Resumable upload: offset retrieval / append / cancellation |
 | HEAD / PUT / DELETE | `/blobs/{sha256}` | A blob's size / upload creation / remove it |
-| PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
-| POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
+| POST | `/upgrade?sha256=...` | Activate the completed upload of that digest and re-exec with the original flags |
+| POST | `/upgrade/confirm` | Confirm the running candidate |
 
 ### One error layer
 
@@ -104,9 +105,8 @@ replies have no body, so a HEAD refusal carries only its status.
 ### Files
 
 File bytes travel as `application/octet-stream` bodies, streamed to and from
-disk; neither side holds a file whole. File bodies have no limit; JSON
-control bodies are capped at 16 MiB and upgrade images, which arrive whole,
-at 128 MiB.
+disk; neither side holds a file whole. There is no global body limit: JSON
+control bodies are capped at 16 MiB, and nothing else is.
 
 - `PUT /files/{path}` writes a sibling temporary, hashes it while writing,
   fsyncs, renames atomically and fsyncs the parent. Readers see the complete
@@ -138,7 +138,6 @@ at 128 MiB.
   concerns the entry that was checked; on Linux it is an `O_PATH` descriptor,
   so an owner can change an entry nobody can read. Rename replaces by
   default (`rename(2)`); `exclusive` refuses an existing target atomically.
-
 - `PUT /trees/{path}` unpacks a tar stream (`compression=gzip` for tar.gz)
   into a staging directory beside the target, hashing every archive byte.
   Only if the digest matches, and once its bytes are durable, does the tree
@@ -268,6 +267,43 @@ endpoint (`register_host_endpoint`); the agent opens it directly and needs no
 a guest TCP forward reinstalls the capture table with the new exemptions in
 the same call.
 
+### Upgrade
+
+The upgrade image travels as a blob: the host uploads it with the
+resumable upload protocol above, so it is digest-checked and an interrupted
+push resumes, and the completed upload survives an agent restart.
+`POST /upgrade?sha256=` activates the completed upload of that digest (404
+without one), copying it out of the store beside the
+installed binary and hashing it again as it goes, so a blob changed on disk
+is refused (422) and discarded rather than executed. It then re-execs with
+the original flags; the host reconnects with a fresh provider transport and
+verifies the new fingerprint. `/hello`, `/upgrade` and the upload routes are
+the routes every generation keeps. Agents from before the blob store (their
+hello lacks `uploads`, as in published tools images) still take the image
+whole through `PUT /upgrade`, and ignore the digest query on activation, so
+the same client upgrades them.
+
+The candidate runs on probation: a durable `.probation` marker records it,
+and it runs from `.upgrade` while the installed entry point stays the previous
+executable. `GET /hello` reports `probation: true` and changes nothing, so a
+health probe can never promote a candidate. The host confirms with
+`POST /upgrade/confirm`, which moves the candidate to the entry point and
+clears the marker; `connect_current` does this once the fingerprint matches.
+An unconfirmed candidate can be replaced by activating another; only a
+confirmed one ever becomes the entry point. If exec fails immediately,
+rollback happens in-process. If the candidate dies unconfirmed (including a
+loader failure after a successful exec), the next ordinary provider start
+restores `.prev` and clears probation. The previous executable is kept as
+`.prev`, and the binary path stays stable across upgrades. A failed
+activation keeps its upload and the existing rollback until a new backup is
+ready. The activation acknowledgement is advisory: a lost response means
+reconnecting and checking hello.
+
+Re-exec drops control and forward streams, removes owned guest sockets,
+clears the capture table and resets configuration. Stale socket inodes from a
+crash are reclaimed only when they refuse a connection; live listeners and
+ordinary files are preserved.
+
 ## Egress and guest requirements
 
 The agent binds dual-stack TCP capture on port 15001, fake DNS over UDP/TCP on
@@ -369,28 +405,6 @@ installation and the agent socket exemption. It requires `sudo`, `nft`, `ip`,
 Python 3 and mount/network namespace support, and changes only disposable
 namespaces. The live Docker `--network none` operator check remains #3487.
 
-Upgrade uses only `/hello` and `/upgrade`: stage with PUT, activate with POST,
-reconnect with a fresh provider transport, then verify the new fingerprint.
-A failed activation retains its staged image and existing rollback until a new
-backup is ready. `stage_upgrade` and `activate_upgrade` allow activation retries
-without uploading again. The activation acknowledgement is advisory: a lost
-response requires reconnecting and checking hello. A short acknowledgement grace period precedes shutdown;
-the binary path remains stable across repeated upgrades. The previous executable
-is retained as `.prev`. A durable `.probation` marker records the candidate
-image, which runs from `.upgrade` while the installed entry point remains
-runnable. The candidate promotes itself to that entry point on its first hello,
-then clears the marker. If exec fails immediately, rollback happens in-process.
-If the candidate dies before hello (including a loader failure after successful
-exec), the next ordinary provider start restores `.prev` and clears probation.
-Crashes after hello belong to provider supervision (#54).
-Re-exec drops control and forward streams, removes owned guest sockets,
-clears the capture table and resets configuration.
-Stale socket inodes from a crash are reclaimed only when they refuse a connection;
-live listeners and ordinary files are preserved.
-The host pushes it again after hello. Children continue running with their
-original environment. Embedders update their own files with `PUT /files`
-without agent re-exec.
-
 ## Byte forwards and endpoint ownership
 
 `Purpose::Forward { id }` begins with an opening result: a big-endian u32
@@ -431,16 +445,19 @@ the agent inspects no forwarded bytes and holds no token.
 
 `cargo test -p drydock-agent` covers the control contract over in-memory yamux
 and Unix connections: tagged configuration, forward resources and generated
-upsert/removal sequences, every refusal as a structured error, file
-operations, ranges, modes, digests, resumable uploads and tree unpacks
-(`tests/files.rs`), a streamed transfer
-larger than 512 MiB in bounded memory (`tests/large_files.rs`), processes with
-stdin, separate streams, exit codes, signals, kill, timeout, reattach and
-bounded output (`tests/processes.rs`), byte-transparent HTTP/1.1, WebSocket upgrade frames,
-chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
-A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,
-forward socket cleanup, fingerprint gating and survival/reaping of a child.
-No cloud provider or cleat installation is required.
+upsert/removal sequences, byte-transparent HTTP/1.1, WebSocket upgrade frames,
+chunked bodies, TCP and Unix endpoints, and isolation (`tests/contract.rs`);
+processes with stdin, separate streams, exit codes, signals, kill, timeout,
+reattach and bounded output (`tests/processes.rs`); file operations, ranges,
+modes, digests, resumable uploads and tree unpacks (`tests/files.rs`); a
+streamed transfer larger than 512 MiB in bounded memory (`tests/large_files.rs`);
+and every refusal as a structured error. Subprocess tests push a distinct ELF
+and verify real re-exec, the new hello and boot ID, explicit confirmation,
+rollback of an unconfirmed candidate, a durable upgrade upload, forward socket cleanup,
+fingerprint gating and survival/reaping of a child. No cloud provider or cleat
+installation is required. `examples/link_throughput.rs` measures transfers over
+a shaped high-latency link; the HTTP/2 windows in `drydock-transport` were sized
+with it.
 
 The first host-facing Control link supplies the reverse opener for the agent
 lifetime. Later connections cannot retarget it.

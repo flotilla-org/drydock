@@ -43,6 +43,11 @@ pub struct Hello {
     /// Empty from agents that predate boot IDs.
     #[serde(default)]
     pub boot_id: String,
+    /// This process is an upgrade candidate that nobody has confirmed yet.
+    /// Confirm it with [`Client::confirm_upgrade`]; until then the next
+    /// ordinary start rolls back to the previous executable.
+    #[serde(default)]
+    pub probation: bool,
 }
 /// The OCI platform type shared with the provider API; an agent reports the
 /// platform its own executable was built for.
