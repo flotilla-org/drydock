@@ -46,13 +46,15 @@ struct Record {
 }
 
 /// The directory holding entries. Guest processes reach entries through
-/// links, so it and the store root are searchable by everyone; uploads,
+/// links, so it is readable and searchable by everyone, and the store root
+/// gains search permission only (its listing stays as it was); uploads,
 /// blobs, the index and the use records stay private.
 fn entries(store: &Store) -> io::Result<PathBuf> {
     let path = store.directory("artifacts")?;
-    for directory in [store.root(), &path] {
-        if std::fs::metadata(directory)?.permissions().mode() & 0o055 != 0o055 {
-            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755))?;
+    for (directory, bits) in [(store.root(), 0o011), (path.as_path(), 0o055)] {
+        let mode = std::fs::metadata(directory)?.permissions().mode();
+        if mode & bits != bits {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode((mode | bits) & 0o7777))?;
         }
     }
     Ok(path)
@@ -139,8 +141,9 @@ pub(crate) fn inside(path: &Path) -> Option<PathBuf> {
     Some(result)
 }
 /// Whether a symlink at `link` (inside the tree) pointing at `target`
-/// resolves inside the tree, by its own path alone. Every symlink an
-/// archive creates is checked, so a chain of them stays inside too.
+/// resolves inside the tree by its own path alone. This is the early check
+/// with the clearer message; [`contained`] is the one that decides, since
+/// a target can pass through other symlinks.
 pub(crate) fn resolves_inside(link: &Path, target: &Path) -> bool {
     if target.as_os_str().is_empty() {
         return false;
@@ -157,13 +160,78 @@ pub(crate) fn resolves_inside(link: &Path, target: &Path) -> bool {
     true
 }
 
+/// Whether the symlink at `link` (relative to `root`) resolves inside the
+/// tree as the kernel resolves it: following every symlink met on the way,
+/// so a target such as `s/../x` with `s -> .` is seen to climb out. A
+/// resolution that would leave the tree, or loops, is refused; one that
+/// reaches a missing name inside it is a dangling link, and inside.
+fn contained(root: &Path, link: &Path) -> io::Result<bool> {
+    enum Part {
+        Up,
+        Name(std::ffi::OsString),
+        Root,
+    }
+    // Parts still to resolve, the next one last.
+    fn push(pending: &mut Vec<Part>, target: &Path) {
+        let parts = target.components().filter_map(|c| match c {
+            Component::Normal(name) => Some(Part::Name(name.to_owned())),
+            Component::ParentDir => Some(Part::Up),
+            Component::CurDir => None,
+            Component::RootDir | Component::Prefix(_) => Some(Part::Root),
+        });
+        pending.extend(parts.collect::<Vec<_>>().into_iter().rev());
+    }
+    let mut position: Vec<std::ffi::OsString> =
+        link.parent().unwrap_or(Path::new("")).components().map(|c| c.as_os_str().to_owned()).collect();
+    let mut pending = Vec::new();
+    push(&mut pending, &std::fs::read_link(root.join(link))?);
+    let mut hops = 0;
+    while let Some(part) = pending.pop() {
+        match part {
+            Part::Up => {
+                if position.pop().is_none() {
+                    return Ok(false);
+                }
+            }
+            Part::Name(name) => {
+                position.push(name);
+                let here: PathBuf = position.iter().fold(root.to_path_buf(), |path, part| path.join(part));
+                if std::fs::symlink_metadata(&here).is_ok_and(|m| m.file_type().is_symlink()) {
+                    hops += 1;
+                    if hops > 40 {
+                        return Ok(false);
+                    }
+                    position.pop();
+                    push(&mut pending, &std::fs::read_link(&here)?);
+                }
+            }
+            Part::Root => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+/// Every symlink under `into`, relative to it.
+fn symlinks(into: &Path, at: &Path, found: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in std::fs::read_dir(at)? {
+        let path = entry?.path();
+        let kind = std::fs::symlink_metadata(&path)?.file_type();
+        if kind.is_symlink() {
+            found.push(path.strip_prefix(into).unwrap().to_path_buf());
+        } else if kind.is_dir() {
+            symlinks(into, &path, found)?;
+        }
+    }
+    Ok(())
+}
 /// A refusal of the archive's content, as opposed to a filesystem error.
 fn refuse(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 /// Unpack a tar archive into `into`, refusing any entry that would leave
 /// the tree: a path with `..` or a root, a symlink pointing outside it, a
-/// hard link to outside it, and device files and FIFOs. Entries keep their
+/// hard link to outside it, and device files and FIFOs. An entry under a
+/// symlink the archive made is refused too, wherever the symlink points:
+/// the entry's path would no longer say where it lands. Entries keep their
 /// modes without setuid and setgid, and belong to the agent.
 pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> io::Result<()> {
     let reader: Box<dyn io::Read> = if gzip { Box::new(flate2::read::GzDecoder::new(reader)) } else { Box::new(reader) };
@@ -176,12 +244,17 @@ pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> 
     // Directories come last, as tar's own unpack does, so a directory
     // archived without write permission still receives its entries.
     let mut directories = Vec::new();
+    let mut links = std::collections::HashSet::new();
+    let under_link = |links: &std::collections::HashSet<PathBuf>, path: &Path| path.ancestors().skip(1).any(|a| links.contains(a));
     for entry in archive.entries()? {
         let mut entry = entry?;
         let kind = entry.header().entry_type();
         let named = entry.path()?.into_owned();
         let shown = named.display().to_string();
         let path = inside(&named).ok_or_else(|| refuse(format!("{shown}: the path leaves the tree")))?;
+        if under_link(&links, &path) {
+            return Err(refuse(format!("{shown}: the path passes through a symlink in the archive")));
+        }
         use tar::EntryType::*;
         match kind {
             Directory => {
@@ -194,10 +267,12 @@ pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> 
                 if !resolves_inside(&path, &target) {
                     return Err(refuse(format!("{shown}: the symlink to {} points outside the tree", target.display())));
                 }
+                links.insert(path.clone());
             }
             Link => {
                 let target = entry.link_name()?.ok_or_else(|| refuse(format!("{shown}: a hard link without a target")))?;
-                if inside(&target).is_none_or(|target| target.as_os_str().is_empty()) {
+                let within = inside(&target).filter(|target| !target.as_os_str().is_empty());
+                if within.is_none_or(|target| under_link(&links, &target.join("x"))) {
                     return Err(refuse(format!("{shown}: the hard link to {} points outside the tree", target.display())));
                 }
             }
@@ -215,6 +290,13 @@ pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> 
     }
     for mut directory in directories {
         directory.unpack_in(into)?;
+    }
+    let mut found = Vec::new();
+    symlinks(into, into, &mut found)?;
+    for link in found {
+        if !contained(into, &link)? {
+            return Err(refuse(format!("{}: the symlink resolves outside the tree", link.display())));
+        }
     }
     Ok(())
 }
@@ -428,8 +510,12 @@ pub(crate) async fn list_artifacts(State(shared): State<Arc<Shared>>) -> Refusal
         .collect();
     digests.sort();
     let mut listed = Vec::new();
+    // One unreadable record is skipped, not a reason to list nothing.
     for digest in digests {
-        listed.extend(indexed(&shared.store, OP, &digest)?);
+        match indexed(&shared.store, OP, &digest) {
+            Ok(artifact) => listed.extend(artifact),
+            Err(error) => tracing::warn!(%error, "skipping an unreadable artifact record"),
+        }
     }
     Ok(Json(listed))
 }
@@ -525,24 +611,47 @@ mod tests {
     // climbs, a symlink with an absolute target, a hard link whose target
     // climbs or is absolute, and any device file or FIFO are refused.
     // Generated: up to four benign entries (files, directories and symlinks
-    // to `a` and `b`) around one hazard of a drawn shape: none, a hostile
-    // path, a symlink or hard link with a hostile target, or a special
-    // file. Hostile paths and targets have up to three parts of {a, b, ..,
-    // .}, absolute or relative. The tree sits three levels below the
-    // sandbox, so any climb that got through would land where it is seen.
+    // to `a`, `b` and `.`) around one hazard of a drawn shape: none, a
+    // hostile path, a symlink or hard link with a hostile target, a chain
+    // (a symlink to the root, then a path or target through it), or a
+    // special file. Hostile paths and targets have up to three parts of {a,
+    // b, .., .}, absolute or relative. The tree sits three levels below
+    // the sandbox, beside bait files named `a` and `b` at every level, so a
+    // link that got out resolves to bait and is seen.
     #[hegel::test]
     fn unpacking_never_leaves_the_tree(tc: hegel::TestCase) {
         use tar::EntryType;
         let sandbox = tempfile::tempdir().unwrap();
         let into = sandbox.path().join("l1/l2/into");
         std::fs::create_dir_all(&into).unwrap();
+        let leading = [sandbox.path().to_path_buf(), sandbox.path().join("l1"), sandbox.path().join("l1/l2")];
+        let mut outside = leading.to_vec();
+        for level in &leading {
+            for bait in ["a", "b"] {
+                std::fs::write(level.join(bait), b"bait").unwrap();
+                outside.push(level.join(bait));
+            }
+        }
+        outside.sort();
         let benign = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let at = tc.draw(gs::integers::<usize>().min_value(0).max_value(benign));
         let mut archive = Vec::new();
         let mut refused = false;
         for index in 0..=benign {
             if index == at {
-                let hazard = tc.draw(gs::sampled_from(vec!["none", "path", "symlink", "hard link", "char", "block", "fifo"]));
+                let hazard = tc.draw(gs::sampled_from(vec!["none", "path", "symlink", "chain", "hard link", "char", "block", "fifo"]));
+                if hazard == "chain" {
+                    // A symlink to the tree's root, then one whose target
+                    // or path goes through it.
+                    let name = tc.draw(gs::sampled_from(vec!["a", "b"]));
+                    archive.extend(header(EntryType::Symlink, name, ".", b""));
+                    let through = tc.draw(gs::booleans());
+                    let path = if through { format!("{name}/{}", raw_path(&tc, false)) } else { raw_path(&tc, false) };
+                    let target = if through { raw_path(&tc, true) } else { format!("{name}/{}", raw_path(&tc, true)) };
+                    refused = through || target.starts_with('/');
+                    archive.extend(header(EntryType::Symlink, &path, &target, b""));
+                    continue;
+                }
                 let (kind, path, target) = match hazard {
                     "none" => (EntryType::Regular, raw_path(&tc, false), String::new()),
                     "path" => (
@@ -564,7 +673,8 @@ mod tests {
                 archive.extend(header(kind, &path, &target, content));
             } else {
                 let kind = tc.draw(gs::sampled_from(vec![EntryType::Regular, EntryType::Directory, EntryType::Symlink]).print_as_debug());
-                let target = if kind == EntryType::Symlink { tc.draw(gs::sampled_from(vec!["a", "b"])).to_owned() } else { String::new() };
+                let target =
+                    if kind == EntryType::Symlink { tc.draw(gs::sampled_from(vec!["a", "b", "."])).to_owned() } else { String::new() };
                 let content: &[u8] = if kind == EntryType::Regular { b"bytes" } else { b"" };
                 archive.extend(header(kind, &raw_path(&tc, false), &target, content));
             }
@@ -574,22 +684,44 @@ mod tests {
         // A benign entry may fail first for an ordinary reason, such as a
         // file where a directory must go; either way nothing is accepted.
         assert!(!refused || result.is_err(), "an escaping or special entry is refused");
-        // Nothing beside the tree: only the directories leading to it.
-        let outside: Vec<PathBuf> = walk(sandbox.path()).into_iter().filter(|path| !path.starts_with(&into)).collect();
-        let leading = [sandbox.path().to_path_buf(), sandbox.path().join("l1"), sandbox.path().join("l1/l2")];
-        assert_eq!(outside, leading, "created outside the tree");
+        // Nothing beside the tree but the directories leading to it and the bait.
+        let found: Vec<PathBuf> = walk(sandbox.path()).into_iter().filter(|path| !path.starts_with(&into)).collect();
+        assert_eq!(found, outside, "created outside the tree");
+        // Every link that resolves at all resolves inside, as the kernel sees it.
+        let root = into.canonicalize().unwrap();
         for path in walk(&into) {
-            if let Ok(target) = std::fs::read_link(&path) {
-                let mut resolved = path.parent().unwrap().to_path_buf();
-                for component in target.components() {
-                    match component {
-                        Component::ParentDir => assert!(resolved.pop()),
-                        Component::Normal(part) => resolved.push(part),
-                        Component::RootDir => resolved = PathBuf::from("/"),
-                        _ => {}
-                    }
-                }
-                assert!(resolved.starts_with(&into), "{} -> {} leaves the tree", path.display(), target.display());
+            if std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink()
+                && let Ok(real) = path.canonicalize()
+            {
+                assert!(real.starts_with(&root), "{} resolves to {}", path.display(), real.display());
+            }
+        }
+    }
+
+    // A symlink is judged where it physically lands and by what its target
+    // resolves through: an entry under a symlink the archive made is
+    // refused, and so is a target that climbs out through one, while a
+    // target through an in-tree symlink that stays inside is kept.
+    #[test]
+    fn symlink_chains_are_resolved_as_the_kernel_resolves_them() {
+        use tar::EntryType::{Directory, Regular, Symlink};
+        type Entries<'a> = &'a [(tar::EntryType, &'a str, &'a str)];
+        let cases: [(Entries, bool); 4] = [
+            (&[(Symlink, "s", "."), (Symlink, "s/t", "../x")], false),
+            (&[(Symlink, "s", "."), (Regular, "s/f", "")], false),
+            (&[(Symlink, "s", "."), (Symlink, "t", "s/../x")], false),
+            (&[(Directory, "d", ""), (Regular, "d/f", ""), (Symlink, "s", "d"), (Symlink, "t", "s/f"), (Symlink, "u", "s/../d")], true),
+        ];
+        for (entries, accepted) in cases {
+            let sandbox = tempfile::tempdir().unwrap();
+            let into = sandbox.path().join("into");
+            std::fs::create_dir(&into).unwrap();
+            let mut archive: Vec<u8> = entries.iter().flat_map(|(kind, path, target)| header(*kind, path, target, b"")).collect();
+            archive.resize(archive.len() + 1024, 0);
+            let result = unpack_archive(archive.as_slice(), false, &into);
+            assert_eq!(result.is_ok(), accepted, "{entries:?}: {result:?}");
+            if let Err(error) = result {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
             }
         }
     }

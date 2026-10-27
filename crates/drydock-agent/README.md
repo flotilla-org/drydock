@@ -211,7 +211,10 @@ tried in the caller's order, which is its policy:
   challenge with a token from its realm (anonymous, or with a `basic`
   credential), a Basic one with the `basic` credential. A `bearer`
   credential is sent as is. Credentials go only to HTTPS, never to a host a
-  redirect names, and are never stored or logged.
+  redirect names, and are never stored or logged. As Docker's client does,
+  a `basic` credential goes to the token realm the registry's challenge
+  names, which may be another HTTPS host (Docker Hub's realm is
+  `auth.docker.io`).
 - `{"kind": "push"}`: the caller pushes the bytes with the resumable upload
   protocol above. Reaching it without a completed upload is refused as
   `artifact.push` (404), naming how many bytes are staged; the caller
@@ -231,13 +234,19 @@ them. A completed upload of the digest is used without asking any source.
 ...}` the file itself (default 0555), or `{"kind": "tar"}` / `{"kind":
 "tar.gz"}` a directory unpacked from the archive (OCI `tar+gzip` layers are
 `tar.gz`). An archive entry whose path is absolute or has `..`, a symlink
-resolving outside the tree, a hard link to outside it, a device file or a
-FIFO is refused (422) before the entry appears; the verified bytes are then
+resolving outside the tree (as the kernel resolves it, through the tree's
+other symlinks), an entry under a symlink the archive made, a hard link to
+outside it, a device file or a FIFO is refused (422) before the entry
+appears; the verified bytes are then
 kept, so asking again reads them instead of downloading. Entries are
 read-only: every write, setuid and setgid bit is cleared. A file entry is
-the verified blob itself; an archive's blob goes once it is unpacked. The
-store root and `artifacts/` are searchable by every user, so guest processes
-can follow links into entries; the rest of the store stays private.
+the verified blob itself; an archive's blob goes once it is unpacked.
+`artifacts/` is readable and searchable by every user, and the store root
+gains search permission for group and others (nothing more), so guest
+processes can follow links into entries; the rest of the store stays
+private. An archive is unpacked without a size limit of its own: it stops
+at the filesystem's limit (507), so a pinned archive that expands beyond
+the free space fails without an entry, and its partial unpack is removed.
 
 Once an entry is complete, a record in `index/<sha256>` makes a repeat fetch
 a lookup that reads and hashes nothing (200, `origin: "index"`); a stored
