@@ -291,7 +291,9 @@ impl Fetcher {
         }
         Err(Failure::new("http", ErrorKind::InvalidData, format!("more than {REDIRECTS} redirects from {}", redact(url))))
     }
-    /// A GET of the source, answering one registry challenge.
+    /// A GET of the source, answering one registry challenge. The loop runs
+    /// at most twice: once answered, a challenge is no longer answerable, so
+    /// a second 401 is returned as it is.
     async fn authorized(&mut self, remote: &mut Remote, headers: &[(&'static str, String)]) -> Result<http::Response<Incoming>, Failure> {
         loop {
             let response = self.follow(&remote.url, headers, remote.authorization()).await?;
@@ -424,7 +426,7 @@ impl Fetcher {
                     restart(staging, hasher, offset).await?;
                     continue;
                 }
-                if let Some(free) = free_space(staging.parent().unwrap())
+                if let Some(free) = staging.parent().and_then(free_space)
                     && total - *offset > free
                 {
                     let message = format!("{} more bytes do not fit in the {free} free on the store's filesystem", total - *offset);

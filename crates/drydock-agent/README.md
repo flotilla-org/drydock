@@ -204,7 +204,9 @@ artifact with that digest a store entry, fetching it if need be. Sources are
 tried in the caller's order, which is its policy:
 
 - `{"kind": "upstream", "url": ...}`: an `http` or `https` URL, such as a
-  release download, following redirects.
+  release download, following redirects, including from `https` to `http`.
+  Integrity comes from the sha256, not from transport security; TLS only
+  keeps the transfer private.
 - `{"kind": "oci", "registry": ..., "repository": ..., "credential": ...}`:
   the blob `sha256:<digest>` through the OCI distribution API. `registry` is
   a host (HTTPS) or a base URL. A 401 challenge is answered once: a Bearer
