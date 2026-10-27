@@ -1,4 +1,5 @@
 //! Local daemon startup and private directories shared by CLI and daemon.
+use crate::api::ProviderApi;
 use crate::client::Client;
 use drydock_protocol::Platform;
 use rigging_process::EnvVars;

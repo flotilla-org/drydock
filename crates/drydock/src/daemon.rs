@@ -1,19 +1,19 @@
 //! Long-lived provider routing shared by drydockd and an embedding daemon.
 use crate::{
     HostConnection, HostHandle, HostSpec, Supervisor,
-    client::{Client, Error, StatusCache, WireResponse},
+    api::{ApiError, ApiJson, ApiPath},
+    client::{Client, Error, StatusCache},
     config::{Config, Egress},
     credentials::BuiltinCredentials,
     launch::{self, ImageResolver, LaunchOptions, RegistryResolver},
 };
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, Query, Request, State},
-    http::{Method, StatusCode},
+    extract::{Request, State},
+    http::StatusCode,
     middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{any, get, post},
+    response::IntoResponse,
+    routing::{get, post},
 };
 use drydock_protocol::*;
 use serde::Deserialize;
@@ -70,7 +70,7 @@ impl HostOption {
 }
 struct ManagedHost {
     handle: HostHandle,
-    cache: Mutex<(u64, Arc<StatusCache>)>,
+    cache: Mutex<(u64, Arc<StatusCache<crate::runtime::Runtime>>)>,
 }
 struct Placement {
     host: usize,
@@ -216,15 +216,27 @@ impl Daemon {
         })?;
         Ok(&self.hosts[placement.host])
     }
+    /// Host readiness gates here. Each provider's own readiness, including a
+    /// stored credential rejection, is the host Runtime's admission policy.
     fn ready_host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let host = self.host(provider)?;
-        match host.handle.instances().remove(provider) {
-            Some(Readiness::Ready) => Ok(host),
-            Some(readiness) => Err(Error::NotReady(readiness)),
-            None => Err(Error::Transport),
+        match host.handle.status.borrow().readiness.clone() {
+            Readiness::Ready => Ok(host),
+            readiness => Err(Error::NotReady(readiness)),
         }
     }
-    async fn cache(&self, provider: &str) -> Result<Arc<StatusCache>, Error> {
+    fn runtime(&self, provider: &str) -> Result<&crate::runtime::Runtime, Error> {
+        Ok(&self.ready_host(provider)?.handle.client)
+    }
+    /// Mutations discard cached status reads, whatever their outcome.
+    async fn invalidating<T>(&self, provider: &str, result: Result<T, Error>) -> Result<T, Error> {
+        if let Ok(host) = self.host(provider) {
+            let cache = host.cache.lock().await.1.clone();
+            cache.invalidate(provider).await;
+        }
+        result
+    }
+    async fn cache(&self, provider: &str) -> Result<Arc<StatusCache<crate::runtime::Runtime>>, Error> {
         let host = self.ready_host(provider)?;
         let status = host.handle.status.borrow().clone();
         let mut cache = host.cache.lock().await;
@@ -300,22 +312,16 @@ impl Daemon {
                 .collect(),
         )
     }
+    /// Daemon routes first; every provider operation falls through to the shared router.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/hello", get(|State(d): State<Arc<Daemon>>| async move { Json(d.hello()) }))
-            .route("/v1/events", get(events_route))
             .route("/v1/providers", get(|State(d): State<Arc<Daemon>>| async move { Json(d.providers()) }))
             .route("/v1/providers/{provider}/launch", post(launch_route))
             .route("/v1/providers/{provider}/prepare", post(prepare_route))
-            .route("/v1/providers/{provider}/environments/{id}/relay", get(relay_route))
-            .route("/v1/providers/{provider}/environments/{id}/exec", post(exec_route))
             .route("/v1/providers/{provider}/environments/{id}/shell", post(shell_route))
-            .route("/v1/providers/{provider}/{*rest}", any(forward))
-            .fallback(|| async { ApiError(Error::Protocol(ProtocolError::NotFound { reason: "unknown route".into() })) })
-            .method_not_allowed_fallback(|| async {
-                ApiError(Error::Protocol(ProtocolError::MethodNotAllowed { reason: "unsupported method".into() }))
-            })
+            .method_not_allowed_fallback(crate::api::method_not_allowed)
             .with_state(self.clone())
+            .fallback_service(crate::api::router(self.clone(), self.stopping.subscribe()))
     }
     pub async fn serve(
         self: &Arc<Self>,
@@ -343,15 +349,11 @@ impl Daemon {
     }
     pub async fn prepare(&self, provider: &str, options: &LaunchOptions) -> Result<(Prepared, Size), Error> {
         let host = self.ready_host(provider)?;
-        launch::prepare(
-            &host.handle.client,
-            provider,
-            &self.config.provider[provider],
-            &self.placements[provider].minimum,
-            options,
-            self.resolver.as_ref(),
-        )
-        .await
+        let request =
+            launch::prepare_request(&self.config.provider[provider], &self.placements[provider].minimum, options, self.resolver.as_ref())
+                .await?;
+        let prepared = host.handle.client.prepare(provider, &request).await?;
+        Ok((prepared, request.size))
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
         let (prepared, size) = self.prepare(provider, options).await?;
@@ -368,9 +370,9 @@ impl Daemon {
         };
         // Retain key and the resolved digests even on an ambiguous provision error.
         // This is launch evidence and key ownership, never desired-state reconciliation.
-        tokio::fs::write(dir.join("request.json"), serde_json::to_vec(&request).map_err(|_| Error::InvalidRequest)?)
+        tokio::fs::write(dir.join("request.json"), serde_json::to_vec(&request).expect("provision request serializes"))
             .await
-            .map_err(|_| Error::Transport)?;
+            .map_err(|e| Error::Transport(format!("record launch request: {e}")))?;
         // Preparation can outlast a host generation or credential change. Use
         // this fresh readiness check and its host for the actual provision call.
         let host = self.ready_host(provider)?;
@@ -378,10 +380,7 @@ impl Daemon {
         let agent = host.handle.status.borrow().providers.iter().any(|d| d.provider == provider && d.capabilities.agent);
         // Find the agent build for the prepared platform before creating anything.
         let agent_build = if agent { Some(agent_build(&platform).await?) } else { None };
-        let result = host.handle.client.clone().with_request_timeout(Duration::from_secs(600)).provision(provider, &request).await;
-        let cache = host.cache.lock().await.1.clone();
-        cache.invalidate(provider).await;
-        let environment = result?;
+        let environment = self.invalidating(provider, host.handle.client.provision(provider, &request).await).await?.into_inner();
         if let Some(build) = agent_build {
             self.agent_ready(provider, &environment, &platform, &build).await?;
         }
@@ -422,10 +421,12 @@ impl Daemon {
             .as_deref()
             .ok_or_else(|| Error::Protocol(ProtocolError::Refused { reason: "environment has no drydock-managed SSH key".into() }))?;
         // Never use an arbitrary client label as a filesystem path.
-        uuid::Uuid::parse_str(label).map_err(|_| Error::InvalidRequest)?;
+        uuid::Uuid::parse_str(label).map_err(|e| Error::InvalidRequest(format!("environment label is not a drydock key: {e}")))?;
         Ok(self.keys.join(label).join("id_ed25519"))
     }
 }
+// Routing between per-host runtimes. Policy stays in each host's Runtime;
+// the Daemon adds only placement and its existing status-read cache.
 #[async_trait::async_trait]
 impl ProviderApi for Daemon {
     async fn hello(&self) -> Result<Hello, Error> {
@@ -434,50 +435,44 @@ impl ProviderApi for Daemon {
     async fn observe(&self, since: Option<&str>) -> Result<crate::api::ObservationStream, Error> {
         Ok(self.observation_stream(since))
     }
-
-    async fn relay(&self, provider: &str, id: &str) -> Result<rigging_stream::ByteStream, Error> {
-        self.ready_host(provider)?.handle.client.relay(provider, id).await
+    async fn prepare(&self, p: &str, request: &PrepareRequest) -> Result<Prepared, Error> {
+        self.runtime(p)?.prepare(p, request).await
     }
-    async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
-        self.ready_host(provider)?.handle.client.exec(provider, id, command).await
+    async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
+        self.invalidating(p, self.runtime(p)?.provision(p, request).await).await
     }
-
-    async fn request(
-        &self,
-        method: Method,
-        segments: &[&str],
-        query: &[(&str, &str)],
-        body: Option<&serde_json::Value>,
-    ) -> Result<WireResponse, Error> {
-        let provider = *segments.get(2).ok_or(Error::InvalidRequest)?;
-        if segments.get(..2) != Some(&["v1", "providers"]) || segments.get(3) == Some(&"credential") {
-            return Err(Error::InvalidRequest);
-        }
-        let host = self.ready_host(provider)?;
-        if method == Method::GET && segments.get(3) == Some(&"environments") {
-            let value = match segments.len() {
-                4 => Some(serde_json::to_value(self.cache(provider).await?.list(provider).await?).map_err(|_| Error::InvalidResponse)?),
-                5 => Some(
-                    serde_json::to_value(self.cache(provider).await?.inspect(provider, segments[4]).await?)
-                        .map_err(|_| Error::InvalidResponse)?,
-                ),
-                _ => None,
-            };
-            if let Some(body) = value {
-                return Ok(WireResponse { status: 200, headers: Default::default(), body });
-            }
-        }
-        let client = if method == Method::POST {
-            host.handle.client.clone().with_request_timeout(Duration::from_secs(600))
-        } else {
-            host.handle.client.clone()
-        };
-        let result = client.wire_response(method.clone(), segments, query, body).await;
-        if method != Method::GET {
-            let cache = host.cache.lock().await.1.clone();
-            cache.invalidate(provider).await;
-        }
-        result
+    async fn list(&self, p: &str) -> Result<Vec<Environment>, Error> {
+        self.cache(p).await?.list(p).await
+    }
+    async fn inspect(&self, p: &str, id: &str) -> Result<Environment, Error> {
+        self.cache(p).await?.inspect(p, id).await
+    }
+    async fn destroy(&self, p: &str, id: &str) -> Result<(), Error> {
+        self.invalidating(p, self.runtime(p)?.destroy(p, id).await).await
+    }
+    async fn reach(&self, p: &str, id: &str) -> Result<Reach, Error> {
+        self.runtime(p)?.reach(p, id).await
+    }
+    async fn suspend(&self, p: &str, id: &str) -> Result<ResumeToken, Error> {
+        self.invalidating(p, self.runtime(p)?.suspend(p, id).await).await
+    }
+    async fn resume(&self, p: &str, id: &str, token: &ResumeToken) -> Result<(), Error> {
+        self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await
+    }
+    async fn export(&self, p: &str, id: &str) -> Result<Export, Error> {
+        self.invalidating(p, self.runtime(p)?.export(p, id).await).await
+    }
+    async fn quota(&self, p: &str) -> Result<Quota, Error> {
+        self.runtime(p)?.quota(p).await
+    }
+    async fn usage(&self, p: &str, period: &Period) -> Result<Usage, Error> {
+        self.runtime(p)?.usage(p, period).await
+    }
+    async fn relay(&self, p: &str, id: &str) -> Result<rigging_stream::ByteStream, Error> {
+        self.runtime(p)?.relay(p, id).await
+    }
+    async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
+        self.runtime(p)?.exec(p, id, command).await
     }
 }
 async fn discover(option: &HostOption, run: &FsPath) -> Result<Hello, String> {
@@ -532,29 +527,6 @@ async fn discover(option: &HostOption, run: &FsPath) -> Result<Hello, String> {
     }
     result
 }
-struct ApiError(Error);
-impl From<Error> for ApiError {
-    fn from(e: Error) -> Self {
-        Self(e)
-    }
-}
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let error = match self.0 {
-            Error::Protocol(e) => e,
-            Error::InvalidRequest => ProtocolError::Refused { reason: "invalid provider request".into() },
-            Error::RateLimited => ProtocolError::RateLimited { reason: "status budget exhausted".into(), retry_after: None },
-            Error::NotReady(r) => ProtocolError::unavailable(format!("provider is not ready: {r:?}"), None),
-            _ => ProtocolError::unavailable("provider transport failed", None),
-        };
-        let retry = error.retry_after();
-        let mut response = (StatusCode::from_u16(error.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(error)).into_response();
-        if let Some(seconds) = retry {
-            response.headers_mut().insert("retry-after", seconds.to_string().parse().expect("numeric header"));
-        }
-        response
-    }
-}
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum PrepareInput {
@@ -563,94 +535,26 @@ enum PrepareInput {
 }
 async fn prepare_route(
     State(d): State<Arc<Daemon>>,
-    Path(p): Path<String>,
-    input: Result<Json<PrepareInput>, axum::extract::rejection::JsonRejection>,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(input): ApiJson<PrepareInput>,
 ) -> Result<Json<Prepared>, ApiError> {
-    let Json(input) = input.map_err(|_| Error::InvalidRequest)?;
     Ok(Json(match input {
-        PrepareInput::Exact(r) => {
-            d.ready_host(&p)?.handle.client.clone().with_request_timeout(Duration::from_secs(600)).prepare(&p, &r).await?
-        }
+        PrepareInput::Exact(r) => ProviderApi::prepare(&*d, &p, &r).await?,
         PrepareInput::Defaults(o) => d.prepare(&p, &o).await?.0,
     }))
 }
 async fn launch_route(
     State(d): State<Arc<Daemon>>,
-    Path(p): Path<String>,
-    input: Result<Json<LaunchOptions>, axum::extract::rejection::JsonRejection>,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(o): ApiJson<LaunchOptions>,
 ) -> Result<Json<Environment>, ApiError> {
-    let Json(o) = input.map_err(|_| Error::InvalidRequest)?;
     Ok(Json(d.launch(&p, &o).await?))
 }
-async fn forward(
+async fn shell_route(
     State(d): State<Arc<Daemon>>,
-    Path((provider, rest)): Path<(String, String)>,
-    Query(query): Query<BTreeMap<String, String>>,
-    req: Request,
-) -> Result<Response, ApiError> {
-    let method = req.method().clone();
-    // Decode each path component separately: encoded slashes in opaque IDs must
-    // remain one ID. Axum's wildcard has already decoded the rest, so use URI.
-    let raw: Vec<_> = req
-        .uri()
-        .path()
-        .split('/')
-        .skip(4)
-        .map(|s| percent_encoding::percent_decode_str(s).decode_utf8().map(|s| s.into_owned()))
-        .collect::<Result<_, _>>()
-        .map_err(|_| Error::InvalidRequest)?;
-    let _ = rest;
-    if !matches!(raw.first().map(String::as_str), Some("environments" | "usage" | "quota")) {
-        return Err(Error::Protocol(ProtocolError::NotFound { reason: "unknown provider route".into() }).into());
-    }
-    let mut segments = vec!["v1", "providers", &provider];
-    segments.extend(raw.iter().map(String::as_str));
-    let bytes = axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024).await.map_err(|_| Error::InvalidRequest)?;
-    let body = if bytes.is_empty() { None } else { Some(serde_json::from_slice(&bytes).map_err(|_| Error::InvalidRequest)?) };
-    let query: Vec<_> = query.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let result = d.request(method, &segments, &query, body.as_ref()).await?;
-    let mut response = if result.status == 204 {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::from_u16(result.status).map_err(|_| Error::InvalidResponse)?, Json(result.body)).into_response()
-    };
-    if let Some(value) = result.headers.get("retry-after") {
-        response.headers_mut().insert("retry-after", value.clone());
-    }
-    Ok(response)
-}
-async fn relay_route(State(d): State<Arc<Daemon>>, Path((p, id)): Path<(String, String)>, req: Request) -> Result<Response, ApiError> {
-    let stream = d.ready_host(&p)?.handle.client.relay(&p, &id).await?;
-    upgrade(req, stream, "drydock-relay", d.stopping.subscribe())
-}
-async fn exec_route(State(d): State<Arc<Daemon>>, Path((p, id)): Path<(String, String)>, req: Request) -> Result<Response, ApiError> {
-    let (parts, body) = req.into_parts();
-    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|_| Error::InvalidRequest)?;
-    let command = serde_json::from_slice(&bytes).map_err(|_| Error::InvalidRequest)?;
-    let stream = d.ready_host(&p)?.handle.client.exec(&p, &id, &command).await?;
-    upgrade(Request::from_parts(parts, Body::empty()), stream, "drydock-stream", d.stopping.subscribe())
-}
-fn upgrade(
-    mut req: Request,
-    mut stream: rigging_stream::ByteStream,
-    protocol: &'static str,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
-) -> Result<Response, ApiError> {
-    if req.headers().get("upgrade").and_then(|v| v.to_str().ok()) != Some(protocol) {
-        return Err(Error::InvalidRequest.into());
-    }
-    let upgraded = hyper::upgrade::on(&mut req);
-    tokio::spawn(async move {
-        if let Ok(io) = upgraded.await {
-            let mut io = hyper_util::rt::TokioIo::new(io);
-            tokio::select! { _ = tokio::io::copy_bidirectional(&mut io, &mut stream) => {}, _ = stopping.wait_for(|s| *s) => {} }
-        }
-    });
-    Ok((StatusCode::SWITCHING_PROTOCOLS, [("connection", "upgrade"), ("upgrade", protocol)]).into_response())
-}
-
-async fn shell_route(State(d): State<Arc<Daemon>>, Path((p, id)): Path<(String, String)>) -> Result<Json<crate::shell::Session>, ApiError> {
-    let client = &d.ready_host(&p)?.handle.client;
+    ApiPath((p, id)): ApiPath<(String, String)>,
+) -> Result<Json<crate::shell::Session>, ApiError> {
+    let client = d.runtime(&p)?;
     let reach = client.reach(&p, &id).await?;
     match reach {
         Reach::Ssh { .. } => {}
@@ -671,17 +575,6 @@ async fn shell_route(State(d): State<Arc<Daemon>>, Path((p, id)): Path<(String, 
     Ok(Json(crate::shell::Session { reach, identity_file: d.key_for(&environment)? }))
 }
 
-async fn events_route(State(d): State<Arc<Daemon>>, Query(query): Query<BTreeMap<String, String>>) -> Response {
-    use futures::StreamExt;
-    let body = d.observation_stream(query.get("since").map(String::as_str)).map(|record| {
-        record.map(|record| {
-            let mut line = serde_json::to_vec(&record).expect("record serializes");
-            line.push(b'\n');
-            line
-        })
-    });
-    ([("content-type", "application/x-ndjson")], Body::from_stream(body)).into_response()
-}
 impl Daemon {
     fn observation_stream(&self, since: Option<&str>) -> crate::api::ObservationStream {
         use futures::{StreamExt, stream::BoxStream};
@@ -696,9 +589,9 @@ impl Daemon {
                 Box::pin(async_stream::stream! {
                     match client.observe(since.as_deref()).await {
                         Ok(mut records) => loop { match records.next().await {
-                            Ok(Some(record)) => yield (index,Ok(record)),
-                            Ok(None) => break,
-                            Err(error) => {yield (index,Err(error));break;}
+                            Some(Ok(record)) => yield (index,Ok(record)),
+                            None => break,
+                            Some(Err(error)) => {yield (index,Err(error));break;}
                         }},
                         Err(error) => yield (index,Err(error)),
                     }

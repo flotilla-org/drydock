@@ -1,5 +1,6 @@
 //! Typed, single-attempt host calls. Observation reconnect policy is explicit and
 //! separate from calls. Neither API stores desired state or reconciles resources.
+pub mod api;
 use drydock_protocol::*;
 use futures::{StreamExt, stream::BoxStream};
 pub use reqwest::Method;
@@ -16,22 +17,43 @@ use tokio::{sync::Mutex, time::Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("host transport failed")]
-    Transport,
-    #[error("invalid host response")]
-    InvalidResponse,
-    #[error("invalid host endpoint or request")]
-    InvalidRequest,
+    /// Connection refused, missing socket, reset or failed upgrade, with its cause chain.
+    #[error("host transport failed: {0}")]
+    Transport(String),
+    #[error("host request timed out after {0:?}")]
+    Timeout(Duration),
+    /// A body that is not the declared JSON shape: the decoder's reason, never the body.
+    #[error("invalid host response: {0}")]
+    InvalidResponse(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("host protocol error: {0}")]
     Protocol(ProtocolError),
     #[error("host protocol version mismatch")]
     VersionMismatch,
     #[error("local status request budget exhausted")]
     RateLimited,
-    #[error("host is not ready: {0:?}")]
+    #[error("host is not ready: {0}")]
     NotReady(Readiness),
-    #[error("host readiness timed out: {0:?}")]
+    #[error("host readiness timed out: {0}")]
     ReadinessTimeout(Readiness),
+}
+impl From<ProtocolError> for Error {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+impl Error {
+    pub fn transport(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self::Transport(chain(error))
+    }
+    fn response(error: impl std::fmt::Display) -> Self {
+        Self::InvalidResponse(error.to_string())
+    }
+}
+/// An error and its sources, outermost first: "error sending request: ...: Connection refused".
+pub fn chain(error: &(dyn std::error::Error + 'static)) -> String {
+    std::iter::successors(Some(error), |error| error.source()).map(ToString::to_string).collect::<Vec<_>>().join(": ")
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -45,10 +67,10 @@ impl HttpClient for SocketHttp {
         request: reqwest::Request,
         _: &rigging_http_client::ChannelLabel,
     ) -> std::result::Result<http::Response<bytes::Bytes>, String> {
-        let response = self.0.execute(request).await.map_err(|_| "host transport".to_owned())?;
+        let response = self.0.execute(request).await.map_err(|error| chain(&error))?;
         let mut result = http::Response::builder().status(response.status());
         *result.headers_mut().expect("response builder") = response.headers().clone();
-        result.body(response.bytes().await.map_err(|_| "host body".to_owned())?).map_err(|_| "host response".to_owned())
+        result.body(response.bytes().await.map_err(|error| chain(&error))?).map_err(|error| chain(&error))
     }
 }
 
@@ -67,7 +89,7 @@ pub struct Client {
 }
 impl Client {
     pub fn unix(path: impl AsRef<Path>) -> Result<Self> {
-        let transport = Self::builder().unix_socket(path.as_ref().to_path_buf()).build().map_err(|_| Error::InvalidRequest)?;
+        let transport = Self::builder().unix_socket(path.as_ref().to_path_buf()).build().map_err(|e| Error::transport(&e))?;
         Ok(Self {
             base: Url::parse("http://localhost/").expect("constant URL"),
             bearer: None,
@@ -78,7 +100,7 @@ impl Client {
     }
     /// External TCP hosts are loopback-only and require an explicitly supplied token.
     pub fn external(url: &str, bearer: Secret) -> Result<Self> {
-        let base = Url::parse(url).map_err(|_| Error::InvalidRequest)?;
+        let base = Url::parse(url).map_err(|e| Error::InvalidRequest(format!("host URL: {e}")))?;
         let loopback = base
             .host_str()
             .and_then(|host| host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
@@ -91,13 +113,16 @@ impl Client {
             || base.fragment().is_some()
             || base.path() != "/"
         {
-            return Err(Error::InvalidRequest);
+            return Err(Error::InvalidRequest("host URL must be a plain http:// loopback origin".into()));
         }
-        let transport = Self::builder().build().map_err(|_| Error::InvalidRequest)?;
-        let http = rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(|_| Error::InvalidRequest)?;
+        let transport = Self::builder().build().map_err(|e| Error::transport(&e))?;
+        let http = rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(|e| Error::Transport(e.to_string()))?;
         Ok(Self { base, bearer: Some(bearer), transport, http: Arc::new(http), request_timeout: Duration::from_secs(30) })
     }
     /// Bound buffered calls and upgrade setup independently of stream lifetimes.
+    /// The 30-second default is shorter than the server's 600-second deadline
+    /// for prepare, provision, reach, suspend, resume and export. Callers of
+    /// those raise it, as the CLI does, or treat a `Timeout` as an unknown outcome.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
@@ -116,39 +141,30 @@ impl Client {
     }
     fn request(&self, method: Method, segments: &[&str]) -> Result<reqwest::RequestBuilder> {
         let mut url = self.base.clone();
-        url.path_segments_mut().map_err(|_| Error::InvalidRequest)?.clear().extend(segments);
+        url.path_segments_mut().map_err(|_| Error::InvalidRequest("host URL cannot carry a path".into()))?.clear().extend(segments);
         let mut request = self.transport.request(method, url);
         if let Some(token) = &self.bearer {
             request = request.bearer_auth(token.expose());
         }
         Ok(request)
     }
+    /// The one caller deadline for buffered calls and stream upgrades.
+    async fn bounded<T>(&self, call: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(self.request_timeout, call).await.map_err(|_| Error::Timeout(self.request_timeout))?
+    }
+    async fn execute_buffered(&self, request: reqwest::RequestBuilder) -> Result<http::Response<bytes::Bytes>> {
+        let request = request.build().map_err(|e| Error::InvalidRequest(chain(&e)))?;
+        http_execute!(self.http, request).map_err(Error::Transport)
+    }
     async fn call<T: DeserializeOwned, B: Serialize + ?Sized>(&self, method: Method, segments: &[&str], body: Option<&B>) -> Result<T> {
         let mut request = self.request(method, segments)?;
         if let Some(body) = body {
             request = request.json(body);
         }
-        self.execute(request).await
-    }
-    async fn execute_response<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<(u16, T)> {
-        let request = request.timeout(self.request_timeout).build().map_err(|_| Error::InvalidRequest)?;
-        let response = http_execute!(self.http, request).map_err(|_| Error::Transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            let error: ProtocolError = serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?;
-            if error.status() != status.as_u16() {
-                return Err(Error::InvalidResponse);
-            }
-            return Err(Error::Protocol(error));
-        }
-        let body = if status == http::StatusCode::NO_CONTENT { b"null".as_slice() } else { response.body().as_ref() };
-        Ok((status.as_u16(), serde_json::from_slice(body).map_err(|_| Error::InvalidResponse)?))
-    }
-    async fn execute<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
         Ok(self.execute_response(request).await?.1)
     }
-    async fn get<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T> {
-        self.call::<T, ()>(Method::GET, segments, None).await
+    async fn execute_response<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<(u16, T)> {
+        decode(self.bounded(self.execute_buffered(request)).await?)
     }
     /// Replace the bearer credential while preserving the endpoint and HTTP port.
     pub fn with_bearer(mut self, bearer: Option<Secret>) -> Self {
@@ -179,67 +195,89 @@ impl Client {
         query: &[(&str, &str)],
         body: Option<&serde_json::Value>,
     ) -> Result<WireResponse> {
-        let mut request = self.request(method, segments)?.query(query).timeout(self.request_timeout);
+        let mut request = self.request(method, segments)?.query(query);
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = http_execute!(self.http, request.build().map_err(|_| Error::InvalidRequest)?).map_err(|_| Error::Transport)?;
+        let response = self.bounded(self.execute_buffered(request)).await?;
         let value = if response.body().is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::from_slice(response.body()).map_err(|_| Error::InvalidResponse)?
+            serde_json::from_slice(response.body()).map_err(Error::response)?
         };
         Ok(WireResponse { status: response.status().as_u16(), headers: response.headers().clone(), body: value })
     }
-    pub async fn hello(&self) -> Result<Hello> {
-        let hello: Hello = self.get(&["v1", "hello"]).await?;
-        if !hello.is_compatible() {
+    pub async fn provider_hello(&self) -> Result<drydock_provider::BridgeHello> {
+        let hello: drydock_provider::BridgeHello = self.call::<_, ()>(Method::GET, &["v1", "hello"], None).await?;
+        if !hello.hello.is_compatible() {
             return Err(Error::VersionMismatch);
         }
         Ok(hello)
+    }
+    pub async fn configure_provider(
+        &self,
+        module: &str,
+        configuration: &ProviderConfiguration,
+    ) -> Result<drydock_provider::ConfiguredProvider> {
+        self.call(Method::POST, &["private", "modules", module, "configure"], Some(configuration)).await
+    }
+    pub async fn release_provider(&self, instance: &str) -> Result<()> {
+        self.call::<_, ()>(Method::DELETE, &["private", "providers", instance], None).await
+    }
+    /// Private trait adapter. Each request carries its own credential snapshot.
+    pub async fn provider_call<T: DeserializeOwned, A: Serialize>(
+        &self,
+        provider: &str,
+        operation: &str,
+        argument: A,
+        credentials: &drydock_provider::Credentials,
+    ) -> Result<T> {
+        let request = self
+            .request(Method::POST, &["private", "providers", provider, operation])?
+            .json(&drydock_provider::Call { credentials: credentials.clone(), argument });
+        // The server's policy owns this operation's deadline. Do not add a
+        // second, shorter private-transport deadline for long mutating calls.
+        Ok(decode(self.execute_buffered(request).await?)?.1)
+    }
+    pub async fn provider_stream<A: Serialize>(
+        &self,
+        provider: &str,
+        operation: &str,
+        argument: A,
+        credentials: &drydock_provider::Credentials,
+        protocol: &str,
+    ) -> Result<rigging_stream::ByteStream> {
+        let request = self
+            .request(Method::POST, &["private", "providers", provider, operation])?
+            .json(&drydock_provider::Call { credentials: credentials.clone(), argument });
+        upgraded(request, protocol).await
+    }
+    pub async fn provider_updates(
+        &self,
+        provider: &str,
+        credentials: &drydock_provider::Credentials,
+        sink: drydock_provider::EventSink,
+    ) -> Result<()> {
+        let response = self
+            .request(Method::POST, &["private", "providers", provider, "subscribe"])?
+            .json(&drydock_provider::Call { credentials: credentials.clone(), argument: () })
+            .send()
+            .await
+            .map_err(|e| Error::transport(&e))?;
+        let mut records = Records::new(success(response).await?);
+        while let Some(record) = records.next_line::<drydock_provider::SubscriptionRecord>().await? {
+            match record {
+                drydock_provider::SubscriptionRecord::Update(update) => sink.publish(update)?,
+                drydock_provider::SubscriptionRecord::Failed(error) => return Err(Error::Protocol(error)),
+            }
+        }
+        Ok(())
     }
     pub async fn configure(&self, configuration: &HostConfiguration) -> Result<()> {
         self.call(Method::PUT, &["v1", "config"], Some(configuration)).await
     }
     pub async fn credential(&self, provider: &str, value: Secret) -> Result<()> {
         self.call(Method::PUT, &["v1", "providers", provider, "credential"], Some(&CredentialRefresh { value })).await
-    }
-    pub async fn prepare(&self, provider: &str, request: &PrepareRequest) -> Result<Prepared> {
-        self.call(Method::POST, &["v1", "providers", provider, "prepare"], Some(request)).await
-    }
-    pub async fn list(&self, provider: &str) -> Result<Vec<Environment>> {
-        self.get(&["v1", "providers", provider, "environments"]).await
-    }
-    pub async fn inspect(&self, provider: &str, id: &str) -> Result<Environment> {
-        self.get(&["v1", "providers", provider, "environments", id]).await
-    }
-    pub async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Environment> {
-        Ok(self.provision_with_status(provider, request).await?.1)
-    }
-    /// Preserve creation versus re-adoption status through the common typed decoder.
-    pub async fn provision_with_status(&self, provider: &str, request: &ProvisionRequest) -> Result<(u16, Environment)> {
-        self.execute_response(self.request(Method::POST, &["v1", "providers", provider, "environments"])?.json(request)).await
-    }
-    pub async fn destroy(&self, provider: &str, id: &str) -> Result<()> {
-        self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider, "environments", id], None).await
-    }
-    pub async fn reach(&self, provider: &str, id: &str) -> Result<Reach> {
-        self.call::<_, ()>(Method::POST, &["v1", "providers", provider, "environments", id, "reach"], None).await
-    }
-    pub async fn suspend(&self, provider: &str, id: &str) -> Result<ResumeToken> {
-        self.call::<_, ()>(Method::POST, &["v1", "providers", provider, "environments", id, "suspend"], None).await
-    }
-    pub async fn resume(&self, provider: &str, id: &str, token: &ResumeToken) -> Result<()> {
-        self.call(Method::POST, &["v1", "providers", provider, "environments", id, "resume"], Some(token)).await
-    }
-    pub async fn export(&self, provider: &str, id: &str) -> Result<Export> {
-        self.call::<_, ()>(Method::POST, &["v1", "providers", provider, "environments", id, "export"], None).await
-    }
-    pub async fn quota(&self, provider: &str) -> Result<Quota> {
-        self.get(&["v1", "providers", provider, "quota"]).await
-    }
-    pub async fn usage(&self, provider: &str, period: &Period) -> Result<Usage> {
-        self.execute(self.request(Method::GET, &["v1", "providers", provider, "usage"])?.query(period)).await
     }
     async fn upgrade<B: Serialize + ?Sized>(
         &self,
@@ -250,94 +288,111 @@ impl Client {
         body: Option<&B>,
     ) -> Result<rigging_stream::ByteStream> {
         let mut request = self
-            .request(if body.is_some() { Method::POST } else { Method::GET }, &["v1", "providers", provider, "environments", id, route])?
-            .header("connection", "upgrade")
-            .header("upgrade", protocol)
-            .timeout(self.request_timeout);
+            .request(if body.is_some() { Method::POST } else { Method::GET }, &["v1", "providers", provider, "environments", id, route])?;
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().await.map_err(|_| Error::Transport)?;
-        if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
-            return Err(Error::Protocol(response.json().await.map_err(|_| Error::InvalidResponse)?));
-        }
-        if response.headers().get("upgrade").and_then(|h| h.to_str().ok()) != Some(protocol)
-            || !response
-                .headers()
-                .get("connection")
-                .and_then(|h| h.to_str().ok())
-                .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
-        {
-            return Err(Error::InvalidResponse);
-        }
-        Ok(Box::new(response.upgrade().await.map_err(|_| Error::Transport)?))
-    }
-    pub async fn relay(&self, provider: &str, id: &str) -> Result<rigging_stream::ByteStream> {
-        self.upgrade::<()>(provider, id, "relay", "drydock-relay", None).await
-    }
-    pub async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream> {
-        self.upgrade(provider, id, "exec", "drydock-stream", Some(command)).await
+        self.bounded(upgraded(request, protocol)).await
     }
     pub async fn observe(&self, since: Option<&str>) -> Result<Records> {
         let mut request = self.request(Method::GET, &["v1", "events"])?;
         if let Some(since) = since {
             request = request.query(&[("since", since)]);
         }
-        let response = request.send().await.map_err(|_| Error::Transport)?;
-        if !response.status().is_success() {
-            return Err(Error::Protocol(response.json().await.map_err(|_| Error::InvalidResponse)?));
-        }
-        Ok(Records { stream: response.bytes_stream().boxed(), buffer: Vec::new() })
+        let response = request.send().await.map_err(|e| Error::transport(&e))?;
+        Ok(Records::new(success(response).await?))
     }
+}
+/// A refusal must be the protocol error its status declares.
+fn protocol_error(status: http::StatusCode, body: &[u8]) -> Error {
+    match serde_json::from_slice::<ProtocolError>(body) {
+        Ok(error) if error.status() == status.as_u16() => Error::Protocol(error),
+        Ok(error) => Error::InvalidResponse(format!("HTTP {status} carried a {} error", error.class())),
+        Err(error) => Error::InvalidResponse(format!("HTTP {status} without a protocol error body: {error}")),
+    }
+}
+fn decode<T: DeserializeOwned>(response: http::Response<bytes::Bytes>) -> Result<(u16, T)> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(protocol_error(status, response.body()));
+    }
+    let body = if status == http::StatusCode::NO_CONTENT { b"null".as_slice() } else { response.body().as_ref() };
+    Ok((status.as_u16(), serde_json::from_slice(body).map_err(Error::response)?))
+}
+async fn success(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() || status == http::StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(response);
+    }
+    Err(protocol_error(status, &response.bytes().await.map_err(|e| Error::transport(&e))?))
+}
+async fn upgraded(request: reqwest::RequestBuilder, protocol: &str) -> Result<rigging_stream::ByteStream> {
+    let response = request.header("connection", "upgrade").header("upgrade", protocol).send().await.map_err(|e| Error::transport(&e))?;
+    let response = success(response).await?;
+    if response.status() != http::StatusCode::SWITCHING_PROTOCOLS
+        || response.headers().get("upgrade").and_then(|h| h.to_str().ok()) != Some(protocol)
+        || !response
+            .headers()
+            .get("connection")
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("upgrade")))
+    {
+        return Err(Error::InvalidResponse(format!("HTTP {} did not switch to {protocol}", response.status())));
+    }
+    Ok(Box::new(response.upgrade().await.map_err(|e| Error::transport(&e))?))
 }
 
 pub struct Records {
     stream: BoxStream<'static, std::result::Result<bytes::Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
+    pending: bytes::Bytes,
 }
 impl Records {
-    /// A partial final record is a protocol failure, never silently discarded.
+    fn new(response: reqwest::Response) -> Self {
+        Self { stream: response.bytes_stream().boxed(), buffer: Vec::new(), pending: bytes::Bytes::new() }
+    }
     pub async fn next(&mut self) -> Result<Option<ObserveRecord>> {
+        self.next_line().await
+    }
+    /// A partial final record is a protocol failure, never silently discarded.
+    async fn next_line<T: DeserializeOwned>(&mut self) -> Result<Option<T>> {
         const MAX_RECORD: usize = 8 * 1024 * 1024;
         loop {
-            if let Some(end) = self.buffer.iter().position(|b| *b == b'\n') {
-                if end > MAX_RECORD {
-                    return Err(Error::InvalidResponse);
+            if self.pending.is_empty() {
+                match self.stream.next().await {
+                    Some(Ok(bytes)) => self.pending = bytes,
+                    Some(Err(error)) => return Err(Error::transport(&error)),
+                    None if self.buffer.is_empty() => return Ok(None),
+                    None => return Err(Error::InvalidResponse("stream ended inside a record".into())),
                 }
-                let record = serde_json::from_slice(&self.buffer[..end]).map_err(|_| Error::InvalidResponse)?;
-                self.buffer.drain(..=end);
-                return Ok(Some(record));
+                continue;
             }
-            if self.buffer.len() > MAX_RECORD {
-                return Err(Error::InvalidResponse);
+            // Copy one newline-delimited segment at a time: a chunk of many bounded
+            // records is accepted, and an oversized record is refused before copying.
+            let end = self.pending.iter().position(|b| *b == b'\n').map_or(self.pending.len(), |n| n + 1);
+            if self.buffer.len().saturating_add(end) > MAX_RECORD + 1 {
+                return Err(Error::InvalidResponse("record exceeds 8 MiB".into()));
             }
-            match self.stream.next().await {
-                Some(Ok(bytes)) => {
-                    // Check before copying a chunk so malformed streams cannot
-                    // grow the retained buffer beyond the framing limit.
-                    if self.buffer.len().saturating_add(bytes.len()) > MAX_RECORD + 1 {
-                        return Err(Error::InvalidResponse);
-                    }
-                    self.buffer.extend(bytes);
-                }
-                Some(Err(_)) => return Err(Error::Transport),
-                None if self.buffer.is_empty() => return Ok(None),
-                None => return Err(Error::InvalidResponse),
+            self.buffer.extend_from_slice(&self.pending.split_to(end));
+            if self.buffer.last() == Some(&b'\n') {
+                let record = serde_json::from_slice(&self.buffer[..self.buffer.len() - 1]).map_err(Error::response);
+                self.buffer.clear();
+                return record.map(Some);
             }
         }
     }
 }
 /// Cursor survives reconnects. A snapshot is surfaced intact: it explicitly marks
 /// a metering gap, rather than synthesizing transitions across missing history.
-pub struct Observer {
-    client: Client,
+pub struct Observer<C = Client> {
+    client: C,
     cursor: Option<String>,
-    records: Option<Records>,
+    records: Option<api::ObservationStream>,
     reconnect_delay: Duration,
     retry_at: Option<Instant>,
 }
-impl Observer {
-    pub fn new(client: Client, since: Option<String>) -> Self {
+impl<C: api::ProviderApi> Observer<C> {
+    pub fn new(client: C, since: Option<String>) -> Self {
         Self { client, cursor: since, records: None, reconnect_delay: Duration::from_millis(100), retry_at: None }
     }
     fn disconnected(&mut self) {
@@ -363,7 +418,7 @@ impl Observer {
             }
         }
         match self.records.as_mut().expect("connected stream").next().await {
-            Ok(Some(record)) => {
+            Some(Ok(record)) => {
                 self.reconnect_delay = Duration::from_millis(100);
                 self.cursor = Some(
                     match &record {
@@ -376,7 +431,7 @@ impl Observer {
             }
             result => {
                 self.disconnected();
-                Err(result.err().unwrap_or(Error::Transport))
+                Err(result.and_then(std::result::Result::err).unwrap_or_else(|| Error::Transport("observation stream ended".into())))
             }
         }
     }
@@ -385,8 +440,8 @@ impl Observer {
 /// Cache + per-provider rolling budgets. Each provider's mutex coalesces reads,
 /// including reads for different IDs sharing an inspect rate limit.
 /// No limits means no caching. Zero requests is a refusal, never a division panic.
-pub struct StatusCache {
-    client: Client,
+pub struct StatusCache<C = Client> {
+    client: C,
     states: BTreeMap<String, Mutex<CacheState>>,
 }
 struct CacheState {
@@ -394,8 +449,8 @@ struct CacheState {
     values: BTreeMap<Vec<String>, (Instant, serde_json::Value)>,
     calls: BTreeMap<(String, String), VecDeque<Instant>>,
 }
-impl StatusCache {
-    pub fn new(client: Client, declarations: &[ProviderDeclaration]) -> Self {
+impl<C: api::ProviderApi> StatusCache<C> {
+    pub fn new(client: C, declarations: &[ProviderDeclaration]) -> Self {
         Self {
             client,
             states: declarations
@@ -418,8 +473,8 @@ impl StatusCache {
                 Some(id) => serde_json::to_value(self.client.inspect(provider, id).await?),
                 None => serde_json::to_value(self.client.list(provider).await?),
             }
-            .map_err(|_| Error::InvalidResponse)?;
-            return serde_json::from_value(value).map_err(|_| Error::InvalidResponse);
+            .map_err(Error::response)?;
+            return serde_json::from_value(value).map_err(Error::response);
         };
         let mut state = state.lock().await;
         let now = Instant::now();
@@ -431,7 +486,7 @@ impl StatusCache {
         if let Some((at, value)) = state.values.get(&key)
             && now.duration_since(*at) < ttl
         {
-            return serde_json::from_value(value.clone()).map_err(|_| Error::InvalidResponse);
+            return serde_json::from_value(value.clone()).map_err(Error::response);
         }
         // Wildcard budgets are shared by list and inspect, not independently spent.
         for limit in &limits {
@@ -457,13 +512,13 @@ impl StatusCache {
             Some(id) => serde_json::to_value(self.client.inspect(provider, id).await?),
             None => serde_json::to_value(self.client.list(provider).await?),
         }
-        .map_err(|_| Error::InvalidResponse)?;
+        .map_err(Error::response)?;
         // Bound memory per declared provider independently of caller-supplied IDs.
         if state.values.len() >= 1024 {
             state.values.clear();
         }
         state.values.insert(key, (now, value.clone()));
-        serde_json::from_value(value).map_err(|_| Error::InvalidResponse)
+        serde_json::from_value(value).map_err(Error::response)
     }
     /// Mutations discard cached observations but retain their spent budget.
     pub async fn invalidate(&self, provider: &str) {
@@ -490,20 +545,41 @@ mod tests {
         let body = record.repeat(2);
         for split in 0..=body.len() {
             let chunks = vec![Ok(bytes::Bytes::copy_from_slice(&body[..split])), Ok(bytes::Bytes::copy_from_slice(&body[split..]))];
-            let mut records = Records { stream: futures::stream::iter(chunks).boxed(), buffer: vec![] };
+            let mut records = Records { stream: futures::stream::iter(chunks).boxed(), buffer: vec![], pending: bytes::Bytes::new() };
             for _ in 0..2 {
                 assert!(matches!(records.next().await.unwrap(), Some(ObserveRecord::Snapshot { cursor, .. }) if cursor == "c"));
             }
             assert!(records.next().await.unwrap().is_none());
         }
     }
+    // A missing socket names its cause, and a host that never answers is a
+    // timeout rather than a transport failure.
+    #[tokio::test]
+    async fn errors_keep_their_causes() {
+        use api::ProviderApi;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = Client::unix(dir.path().join("missing.sock")).unwrap().hello().await.unwrap_err();
+        assert!(matches!(&missing, Error::Transport(cause) if cause.contains("No such file or directory")), "{missing}");
+        let path = dir.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let _held = tokio::spawn(async move {
+            let _connection = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+        let silent = Client::unix(&path).unwrap().with_request_timeout(Duration::from_millis(50)).hello().await.unwrap_err();
+        assert!(matches!(silent, Error::Timeout(_)), "{silent}");
+    }
     // Malformed streams cannot retain more than the framing bound, and a
     // truncated final record is an error rather than a silent disconnect.
     #[tokio::test]
     async fn framing_rejects_oversized_and_partial_input() {
         for body in [b"{\"type\":\"snapshot\"".to_vec(), vec![b'x'; 8 * 1024 * 1024 + 2]] {
-            let mut records = Records { stream: futures::stream::iter(vec![Ok(bytes::Bytes::from(body))]).boxed(), buffer: vec![] };
-            assert!(matches!(records.next().await, Err(Error::InvalidResponse)));
+            let mut records = Records {
+                stream: futures::stream::iter(vec![Ok(bytes::Bytes::from(body))]).boxed(),
+                buffer: vec![],
+                pending: bytes::Bytes::new(),
+            };
+            assert!(matches!(records.next().await, Err(Error::InvalidResponse(_))));
             assert!(records.buffer.len() <= 8 * 1024 * 1024 + 1);
         }
     }

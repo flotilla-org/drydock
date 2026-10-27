@@ -71,7 +71,7 @@ pub(super) async fn host_fixtures(
             async {
                 let mut request = options.request.clone();
                 request.label = ids.label(ProbeLabel::Auxiliary(format!("loss-{name}")));
-                let row = client.provision(provider, &request).await.map_err(SafeError::category)?;
+                let row = client.provision(provider, &request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
                 ids.insert(row.id.clone());
                 let mut records = observe(client, None, &options.timeouts).await?;
                 next(&mut records, &options.timeouts).await?;
@@ -282,7 +282,7 @@ pub async fn optional_contract(
     peer_resources.register(&cross);
     cleanup(client, peer, &peer_resources).await?;
     require(refused, "cross-provider prepared form was accepted")?;
-    let row = client.provision(provider, request).await.map_err(SafeError::category)?;
+    let row = client.provision(provider, request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
     let token = client.suspend(provider, &row.id).await.map_err(SafeError::category)?;
     require(client.suspend(provider, &row.id).await.map_err(SafeError::category)? == token, "repeated suspend changed token")?;
     require(
@@ -322,7 +322,9 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
     let timestamp = "2026-01-01T00:00:00Z";
     let mut request = options.request.clone();
     request.label = ids.label(ProbeLabel::Auxiliary("poll".into()));
-    let Some(row) = report.capture("poll_provision", client.provision(provider, &request).await.map_err(SafeError::category)) else {
+    let Some(row) = report
+        .capture("poll_provision", client.provision(provider, &request).await.map(Provisioned::into_inner).map_err(SafeError::category))
+    else {
         return;
     };
     ids.insert(row.id.clone());
@@ -408,7 +410,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                 let mut request = options.request.clone();
                 request.label = ids.label(ProbeLabel::Auxiliary(format!("billing-{name}")));
                 request.size.cpus = cpus;
-                let row = client.provision(provider, &request).await.map_err(SafeError::category)?;
+                let row = client.provision(provider, &request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
                 ids.insert(row.id.clone());
                 let mut events = observe(client, None, &options.timeouts).await?;
                 next(&mut events, &options.timeouts).await?;
@@ -501,9 +503,11 @@ pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &st
                     egress: EgressRequest::default(),
                     ssh_public_key: None,
                 };
-                let (status, row) = client.provision_with_status(name, &request).await.map_err(SafeError::category)?;
+                let row = client.provision(name, &request).await.map_err(SafeError::category)?;
+                let created = matches!(row, Provisioned::Created(_));
+                let row = row.into_inner();
                 resources[index].insert(row.id.clone());
-                require(status == if model.contains_key(&key) { 200 } else { 201 }, "sequence creation/retry status changed")?;
+                require(created != model.contains_key(&key), "sequence creation/retry status changed")?;
                 if let Some(old) = model.get(&key) {
                     require(old == &row, "sequence retry created another environment")?;
                 }
@@ -557,7 +561,7 @@ async fn provider_isolation(client: &Client, providers: [&str; 2], main: &Enviro
         request.label = resources.label(ProbeLabel::Auxiliary("isolation".into()));
         let mut live = observe(client, None, &options.timeouts).await?;
         next(&mut live, &options.timeouts).await?;
-        let other = client.provision(providers[1], &request).await.map_err(SafeError::category)?;
+        let other = client.provision(providers[1], &request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
         transition(&mut live, providers[1], &other.id, |kind| matches!(kind, EventKind::Running { .. }), &options.timeouts).await?;
         resources.insert(other.id.clone());
         let mut gap = observe(client, Some("isolation-unknown-cursor"), &options.timeouts).await?;

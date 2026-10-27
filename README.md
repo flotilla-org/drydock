@@ -13,7 +13,7 @@ Project contents and roadmap:
 - the protocol crate: Rust types, the generated OpenAPI document and a drift test;
 - the Rust reference host and in-memory module; TypeScript and Python hosts follow, each with its own provider interface;
 - provider modules, Daytona first in Rust, and Namespace through the TypeScript SDK;
-- a conformance suite runnable against any language host or built-in provider.
+- a conformance suite runnable against the main server with a provider bridge.
 
 Licensed under either of Apache License 2.0 or MIT, at your option.
 
@@ -171,7 +171,7 @@ Clients and hosts must upgrade together.
 
 Protocol version 4 adds transitional observations and scoped resource measurements
 with UCUM units, exact decimal money plus currency, and structured quota keys.
-The host retains the last stable billing state across known progress samples;
+The main server retains the last stable billing state across known progress samples;
 Unknown breaks that baseline. Resource vocabulary additions require a version bump.
 
 Protocol version 3 adds returned `CommandFailed` errors (HTTP 424, typed exit
@@ -188,7 +188,7 @@ billing transitions. Upgrade snapshot reconciliation before accepting version 2.
 The HTTP route namespace remains `/v1`; the hello version is the compatibility gate.
 Snapshot errors retain the same typed details as route errors, including vendor
 reasons and raw `Internal` error text. They are visible to authenticated host clients;
-modules must exclude credentials from error text. The host does not sanitize it.
+modules must exclude credentials from error text. The main server sanitizes public diagnostics.
 
 Wire conventions chosen for this first protocol version:
 
@@ -230,7 +230,9 @@ suspend/resume/exec/export (POST) append their operation after `/{id}`.
 Provider-level prepare, credential, usage and quota stay directly under
 `/v1/providers/{provider}`. IDs such as `usage` and `quota` therefore remain opaque
 without colliding with provider-level operations. There are no route aliases.
-Host configuration is `PUT /v1/config`; the host-wide stream is `GET /v1/events`.
+The server runtime accepts configuration at `PUT /v1/config` and publishes
+`GET /v1/events`. The private host uses one module factory endpoint and raw
+per-provider subscriptions; it does not implement public policy endpoints.
 
 Optional fields serialize as explicit `null`; absent optional fields are accepted
 as `None`. Unknown object fields are ignored for additive compatibility. Unknown
@@ -270,7 +272,7 @@ short placeholders; a short or common value can therefore obscure unrelated
 words in a diagnostic. Use distinctive placeholders for readable diagnostics.
 Registering a unique value shorter than four bytes emits a debug-level note with
 its byte length, never its content.
-The host masks currently configured credentials plus the 32 most recent distinct
+The main server masks currently configured credentials plus the 32 most recent distinct
 replaced values across providers. Older historical values are evicted and their
 cached patterns removed; they are no longer covered by that recent window.
 An in-flight call also masks the credential it used even if that value has been
@@ -278,8 +280,8 @@ evicted. Provider removal requires a host restart. Successful response bodies,
 reach recipes and guest/probe output are omitted from validation diagnostics.
 
 Rust API compatibility: `provider_error` is now `String` (or `Option<String>`),
-and its Debug output is visible. Modules return complete diagnostics to the host;
-they should not log raw errors themselves. The host performs credential masking
+and its Debug output is visible. Modules return complete diagnostics to the main server;
+they should not log raw errors themselves. The main server performs credential masking
 before returning or logging them. Credential and recipe Debug output stays redacted.
 `provider_state_unknown` means the vendor returned an unrecognized state; it is
 an Unknown observation, not evidence that the environment stopped or disappeared.
@@ -311,15 +313,15 @@ must use a transport that preserves the upgrade rather than changing the method.
 `drydock conformance --provider NAME --options probe.json` runs destructive
 ADR 0070 scenarios against exactly one provider in the daemon
 provider configuration. Unix sockets, managed host binaries and authenticated loopback
-TCP hosts all use the same client and scenario list. A built-in provider can
-expose that same endpoint without a special test interface. The Rust reference
-binary and a small independent Python socket fixture run this list in CI; the
+TCP bridges are exercised through the main server runtime. A built-in provider can
+use the same server runtime. The server through the Rust reference binary
+and a small independent Python public-protocol fixture run these scenarios in CI; the
 fixture also deliberately violates each reported check. The checked-in
 [`broken-matrix.json`](crates/drydock-host/tests/fixtures/broken-matrix.json)
 must exactly match the healthy full report: removing a verdict fails CI too.
 Endpoint scenarios own deterministic polling, lifecycle sequences, provider
 isolation, typed errors, optional operations and stream upgrades. Unix admission
-and TCP bearer scenarios use the same endpoint client; host-internal poll races
+and TCP bearer scenarios use the same endpoint client; server-owned poll races
 remain implementation tests.
 
 For example, choose the image and tools digests in the request:
@@ -492,3 +494,15 @@ Daytona API key permissions for this module (see [Daytona API keys](https://www.
 
 Organization membership must also match the key. Permission failures
 report the exact upstream operation and message; they do not invalidate the key.
+
+## Rust/server policy ownership
+
+The main server owns common admission, credential state, budgets, polling,
+inventory/lifecycle reconciliation, billing, snapshots, replay and public diagnostic
+sanitisation. Embedded `Daemon` and standalone `drydockd` use the same
+[`runtime`](crates/drydock/src/runtime) implementation. The
+[Rust host](crates/drydock-host/README.md) is a compiled module loader and private
+REST/stream adapter to [`drydock-provider`](crates/drydock-provider).
+Earlier language-host policy ownership descriptions are superseded by this split.
+The public API is unchanged. Other language bridges require separate migration;
+this Rust change does not complete their adapters or Flotilla rollout.

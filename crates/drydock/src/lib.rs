@@ -7,7 +7,9 @@ pub mod credentials;
 pub mod daemon;
 pub mod launch;
 pub mod local;
+pub mod runtime;
 pub mod shell;
+use api::ProviderApi;
 use client::Client;
 use credentials::*;
 pub use drydock_client as client;
@@ -84,7 +86,7 @@ impl HostStatus {
     }
 }
 pub struct HostHandle {
-    pub client: Client,
+    pub client: runtime::Runtime,
     pub status: watch::Receiver<HostStatus>,
     instances: Vec<String>,
     task: JoinHandle<()>,
@@ -92,6 +94,7 @@ pub struct HostHandle {
 impl Drop for HostHandle {
     fn drop(&mut self) {
         self.task.abort();
+        self.client.stop();
     }
 }
 impl HostHandle {
@@ -126,7 +129,7 @@ impl HostHandle {
                     Readiness::MissingCredential { .. } => return Err(client::Error::NotReady(status.readiness)),
                     _ => {}
                 }
-                self.status.changed().await.map_err(|_| client::Error::Transport)?;
+                self.status.changed().await.map_err(|_| client::Error::Transport("host supervision stopped".into()))?;
             }
         })
         .await
@@ -157,28 +160,33 @@ impl Supervisor {
     }
     pub async fn start(&self, spec: HostSpec) -> Result<HostHandle, client::Error> {
         if spec.name.is_empty() || !spec.name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
-            return Err(client::Error::InvalidRequest);
+            return Err(client::Error::InvalidRequest(format!("host name {:?} must be ASCII letters, digits, - or _", spec.name)));
         }
-        let runtime_directory = std::path::absolute(&self.runtime_directory).map_err(|_| client::Error::InvalidRequest)?;
+        let runtime_directory = std::path::absolute(&self.runtime_directory)
+            .map_err(|e| client::Error::InvalidRequest(format!("host runtime directory: {e}")))?;
         // Own a private directory; never chmod an existing directory or follow a symlink.
         let socket = runtime_directory.join(format!("{}.sock", spec.name));
         let mut lease = None;
         let client = match &spec.connection {
             HostConnection::Managed { command, .. } => {
                 if command.is_empty() {
-                    return Err(client::Error::InvalidRequest);
+                    return Err(client::Error::InvalidRequest("managed host command is empty".into()));
                 }
                 match tokio::fs::create_dir(&self.runtime_directory).await {
                     Ok(()) => tokio::fs::set_permissions(&self.runtime_directory, std::fs::Permissions::from_mode(0o700))
                         .await
-                        .map_err(|_| client::Error::Transport)?,
+                        .map_err(|e| client::Error::Transport(format!("host runtime directory: {e}")))?,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(_) => return Err(client::Error::Transport),
+                    Err(e) => return Err(client::Error::Transport(format!("host runtime directory: {e}"))),
                 }
-                let metadata = tokio::fs::symlink_metadata(&self.runtime_directory).await.map_err(|_| client::Error::Transport)?;
+                let metadata = tokio::fs::symlink_metadata(&self.runtime_directory)
+                    .await
+                    .map_err(|e| client::Error::Transport(format!("host runtime directory: {e}")))?;
                 if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != rustix::process::geteuid().as_raw()
                 {
-                    return Err(client::Error::InvalidRequest);
+                    return Err(client::Error::InvalidRequest(
+                        "host runtime directory must be a private directory owned by this user".into(),
+                    ));
                 }
                 use std::os::unix::fs::OpenOptionsExt;
                 let lock = std::fs::OpenOptions::new()
@@ -189,12 +197,12 @@ impl Supervisor {
                     .mode(0o600)
                     .custom_flags(libc::O_NOFOLLOW)
                     .open(self.runtime_directory.join(format!("{}.lock", spec.name)))
-                    .map_err(|_| client::Error::InvalidRequest)?;
-                lock.try_lock().map_err(|_| client::Error::InvalidRequest)?;
+                    .map_err(|e| client::Error::InvalidRequest(format!("host lease: {e}")))?;
+                lock.try_lock().map_err(|_| client::Error::InvalidRequest(format!("host {} is supervised elsewhere", spec.name)))?;
                 lease = Some(lock);
                 // A live socket belongs to another supervisor. Never steal its pathname.
                 if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-                    return Err(client::Error::InvalidRequest);
+                    return Err(client::Error::InvalidRequest(format!("host socket {} is already served", socket.display())));
                 }
                 Client::unix(&socket)?
             }
@@ -206,17 +214,19 @@ impl Supervisor {
         let mut supervisor = self.clone();
         supervisor.runtime_directory = runtime_directory;
         let host_client = client.clone();
+        let public_client = runtime::Runtime::new(Default::default()).with_request_timeout(self.request_timeout);
+        let policy = public_client.clone();
         let instances = spec.configuration.providers.iter().map(|p| p.name.clone()).collect();
         let task = tokio::spawn(async move {
             let _lease = lease;
-            supervisor.run(spec, socket, host_client, status).await;
+            supervisor.run(spec, socket, host_client, policy, status).await;
         });
-        Ok(HostHandle { client, status: receiver, instances, task })
+        Ok(HostHandle { client: public_client, status: receiver, instances, task })
     }
     async fn refresh(
         &self,
         spec: &HostSpec,
-        client: &Client,
+        client: &runtime::Runtime,
         previous: &mut BTreeMap<String, Secret>,
         masker: &mut DiagnosticMasker,
     ) -> Result<BTreeMap<String, Readiness>, client::Error> {
@@ -231,7 +241,7 @@ impl Supervisor {
                 }
                 masker.remember(credential.value.expose());
                 if previous.get(&provider.name) != Some(&credential.value) {
-                    client.credential(&provider.name, credential.value.clone()).await?;
+                    client.credential(&provider.name, credential.value.clone()).await.map_err(client::Error::Protocol)?;
                     previous.insert(provider.name.clone(), credential.value);
                 }
                 Ok(())
@@ -248,7 +258,7 @@ impl Supervisor {
         }
         Ok(unavailable)
     }
-    async fn run(&self, spec: HostSpec, socket: PathBuf, client: Client, status: watch::Sender<HostStatus>) {
+    async fn run(&self, spec: HostSpec, socket: PathBuf, raw_client: Client, client: runtime::Runtime, status: watch::Sender<HostStatus>) {
         let mut masker = DiagnosticMasker::default();
         // Settings are not diagnostics. Mask string values even if a host
         // mistakenly includes them in its readiness reason.
@@ -313,6 +323,7 @@ impl Supervisor {
                 }
             }
             let mut initialized = false;
+            let mut incarnation = None;
             let mut previous = BTreeMap::new();
             let mut changes = self.credentials.changes();
             loop {
@@ -322,11 +333,23 @@ impl Supervisor {
                     break;
                 }
                 let result = async {
-                    let hello = client.hello().await?;
-                    // External hosts can restart without a local process handle.
-                    if spec.configuration.providers.iter().any(|p| !hello.providers.iter().any(|d| d.provider == p.name)) {
+                    let discovered = raw_client.provider_hello().await?;
+                    if initialized && incarnation != discovered.incarnation {
                         initialized = false;
                     }
+                    incarnation = discovered.incarnation;
+                    let raw_hello = discovered.hello;
+                    // The independent host owns loader instances. Missing bindings
+                    // after restart invalidate the server's remote trait handles.
+                    if initialized && spec.configuration.providers.iter().any(|p| !raw_hello.providers.iter().any(|d| d.provider == p.name))
+                    {
+                        initialized = false;
+                    }
+                    if !initialized {
+                        client.reconnect(runtime::remote::registry(raw_client.clone(), &raw_hello)).await;
+                    }
+                    // Runtime calls carry their own deadlines; remote factories use the host client's.
+                    let hello = client.hello().await?;
                     for provider in &hello.providers {
                         if matches!(provider.readiness, Readiness::MissingCredential { .. }) {
                             previous.remove(&provider.provider);
@@ -340,7 +363,16 @@ impl Supervisor {
                     }
                     let mut unavailable = self.refresh(&spec, &client, &mut previous, &mut masker).await?;
                     let mut hello = client.hello().await?;
+                    // The host reports its live module versions and host-level readiness.
+                    let raw_hello = raw_client.hello().await?;
+                    hello.modules = raw_hello.modules;
+                    hello.loadable_modules = raw_hello.loadable_modules;
                     for provider in &mut hello.providers {
+                        if let Some(raw) = raw_hello.providers.iter().find(|raw| raw.provider == provider.provider)
+                            && !matches!(raw.readiness, Readiness::Ready | Readiness::MissingCredential { .. })
+                        {
+                            provider.readiness = raw.readiness.clone();
+                        }
                         match &mut provider.readiness {
                             Readiness::Ready => {}
                             Readiness::MissingTool { reason }
@@ -404,24 +436,24 @@ async fn read_bearer_token(path: &Path) -> Result<Secret, client::Error> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .await
-        .map_err(|_| client::Error::InvalidRequest)?;
-    let metadata = file.metadata().await.map_err(|_| client::Error::InvalidRequest)?;
+        .map_err(|e| client::Error::InvalidRequest(format!("bearer token file: {e}")))?;
+    let metadata = file.metadata().await.map_err(|e| client::Error::InvalidRequest(format!("bearer token file: {e}")))?;
     // Validate the descriptor we will read, rather than a pathname that could
     // be replaced between metadata and open.
     if !metadata.is_file()
         || !matches!(metadata.permissions().mode() & 0o7777, 0o400 | 0o600)
         || metadata.uid() != rustix::process::geteuid().as_raw()
     {
-        return Err(client::Error::InvalidRequest);
+        return Err(client::Error::InvalidRequest("bearer token file must be a 0400 or 0600 file owned by this user".into()));
     }
     let mut token = String::new();
-    file.take(65537).read_to_string(&mut token).await.map_err(|_| client::Error::InvalidRequest)?;
+    file.take(65537).read_to_string(&mut token).await.map_err(|e| client::Error::InvalidRequest(format!("bearer token file: {e}")))?;
     if token.len() > 65536 {
-        return Err(client::Error::InvalidRequest);
+        return Err(client::Error::InvalidRequest("bearer token exceeds 64 KiB".into()));
     }
     let token = token.trim_end_matches(['\r', '\n']);
     if token.is_empty() || token.bytes().any(|c| c.is_ascii_whitespace() || c.is_ascii_control()) {
-        return Err(client::Error::InvalidRequest);
+        return Err(client::Error::InvalidRequest("bearer token is empty or contains whitespace".into()));
     }
     Ok(Secret::new(token))
 }
@@ -440,7 +472,7 @@ mod tests {
         ] {
             let (_sender, status) = watch::channel(HostStatus::new(readiness.clone(), 0));
             let mut handle = HostHandle {
-                client: Client::unix("/unused").unwrap(),
+                client: runtime::Runtime::new(Default::default()),
                 status,
                 instances: vec![],
                 task: tokio::spawn(std::future::pending()),

@@ -130,6 +130,17 @@ pub enum Readiness {
     VersionMismatch { reason: String },
     Unknown { reason: String },
 }
+impl std::fmt::Display for Readiness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => write!(f, "ready"),
+            Self::MissingTool { reason } => write!(f, "missing tool: {reason}"),
+            Self::MissingCredential { reason } => write!(f, "missing credential: {reason}"),
+            Self::VersionMismatch { reason } => write!(f, "version mismatch: {reason}"),
+            Self::Unknown { reason } => write!(f, "unknown: {reason}"),
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Capabilities {
     pub material_modes: Vec<MaterialMode>,

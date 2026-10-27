@@ -19,7 +19,7 @@ async fn main() -> std::io::Result<()> {
         tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
     };
     match args.as_slice() {
-        [flag, path] if flag == "--unix" => host.serve_unix(path, rustix::process::geteuid().as_raw(), shutdown).await,
+        [flag, path] if flag == "--unix" => host.serve_unix(path, shutdown).await,
         [flag, address, token_flag, path] if flag == "--tcp" && token_flag == "--token-file" => {
             host.serve_tcp(address.parse().map_err(std::io::Error::other)?, path, shutdown).await
         }

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drydock-provider = { path = "../drydock-provider" }
 drydock-agent = { path = "../drydock-agent" }
 drydock-transport = { path = "../drydock-transport" }
 rigging-paths.workspace = true
@@ -16,12 +17,9 @@ reqwest = { workspace = true, features = ["json", "stream", "query"] }
 sha2.workspace = true
 http.workspace = true
 bytes = "1"
-percent-encoding = "2"
 axum = "0.8"
 toml = "1.0"
 tempfile = "3"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
 async-stream = "0.3"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
@@ -37,8 +35,11 @@ thiserror = "2"
 chrono = "0.4"
 libc = "0.2"
 rustix = { version = "1", features = ["process"] }
+url = "2"
+tracing = "0.1"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 drydock-host = { path = "../drydock-host" }
 tempfile = "3"
 tokio = { version = "1", features = ["process", "io-util", "test-util"] }

@@ -8,10 +8,12 @@ buffered port cannot carry a long-lived stream or an HTTP upgrade.
 
 `Client::unix` connects over an authenticated local socket. `Client::external`
 accepts a loopback HTTP URL and redacting bearer token. Calls make one attempt,
-with no redirects, retries or ambient proxies. Buffered calls have a 30-second
-deadline; event streams intentionally remain open. Errors distinguish transport,
-invalid response, version mismatch, readiness/timeout causes, local rate budget
-and typed `ProtocolError`.
+with no redirects, retries or ambient proxies. Buffered calls and upgrade setup
+share one 30-second deadline, set by `with_request_timeout`; event streams
+intentionally remain open. Errors keep their causes: transport failures carry
+their source chain (connection refused, missing socket), an expired deadline is
+`Timeout`, an invalid response carries the decoder's reason, and protocol
+refusals are typed `ProtocolError`s. `Client` implements `api::ProviderApi`.
 Error displays never include vendor raw text, secrets or response documents.
 Provider names and IDs are escaped as individual URL path segments.
 
