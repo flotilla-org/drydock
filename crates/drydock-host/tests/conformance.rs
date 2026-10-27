@@ -19,6 +19,8 @@ async fn reference_binary_passes_conformance() {
             &PrepareRequest {
                 size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
                 platform: None,
+                route: None,
+                image_pull: None,
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),
             },

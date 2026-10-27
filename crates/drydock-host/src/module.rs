@@ -20,11 +20,33 @@ pub fn prepare_platform(request: &PrepareRequest) -> Result<Platform> {
 /// A requested platform, or the first declared one, provided it is declared.
 pub fn resolve_platform(requested: Option<Platform>, declared: &[Platform]) -> Result<Platform> {
     let offered = || declared.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+    let unsupported = |platform: Platform, reason: String| ProtocolError::ImageRefused {
+        reason,
+        refusal: ImageRefusal::UnsupportedPlatform { platform },
+    };
     match requested {
         None => declared.first().cloned().ok_or_else(|| refused("provider declares no platforms it can run")),
         Some(platform) if declared.contains(&platform) => Ok(platform),
-        Some(platform) if declared.is_empty() => Err(refused(format!("provider cannot run {platform}: it declares no platforms"))),
-        Some(platform) => Err(refused(format!("provider cannot run {platform}; it offers {}", offered()))),
+        Some(platform) if declared.is_empty() => {
+            Err(unsupported(platform.clone(), format!("provider cannot run {platform}: it declares no platforms")))
+        }
+        Some(platform) => Err(unsupported(platform.clone(), format!("provider cannot run {platform}; it offers {}", offered()))),
+    }
+}
+/// The image route a module prepares by. The host resolves it from the request
+/// and the module's declared routes before calling `prepare`.
+pub fn prepare_route(request: &PrepareRequest) -> Result<ImageRouteKind> {
+    request.route.ok_or_else(|| refused("prepare reached the module without a resolved image route"))
+}
+/// A requested image route, or the first declared one, provided it is declared.
+pub fn resolve_route(requested: Option<ImageRouteKind>, declared: &[ImageRoute]) -> Result<ImageRouteKind> {
+    match requested {
+        None => declared.first().map(ImageRoute::kind).ok_or_else(|| refused("provider declares no image routes")),
+        Some(route) if declared.iter().any(|d| d.kind() == route) => Ok(route),
+        Some(route) => Err(refused(format!(
+            "provider has no {route} image route; it offers {}",
+            declared.iter().map(|d| d.kind().to_string()).collect::<Vec<_>>().join(", ")
+        ))),
     }
 }
 
@@ -193,8 +215,8 @@ pub trait QuotaOperation: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Omitted means the first declared platform; anything undeclared is refused
-    // naming what the provider offers.
+    // Omitted means the first declared platform; an undeclared one is refused
+    // with the typed unsupported-platform code, naming what the provider offers.
     #[test]
     fn platform_resolution() {
         let amd = Platform::new("linux", "amd64");
@@ -202,24 +224,48 @@ mod tests {
         let declared = [arm.clone(), amd.clone()];
         assert_eq!(resolve_platform(None, &declared).unwrap(), arm);
         assert_eq!(resolve_platform(Some(amd.clone()), &declared).unwrap(), amd);
-        let reason = |e: ProtocolError| match e {
-            ProtocolError::Refused { reason } => reason,
+        let unsupported = |e: ProtocolError| match e {
+            ProtocolError::ImageRefused { refusal: ImageRefusal::UnsupportedPlatform { platform }, reason } => (platform, reason),
             other => panic!("{other:?}"),
         };
-        assert_eq!(
-            reason(resolve_platform(Some(Platform::new("linux", "s390x")), &declared).unwrap_err()),
-            "provider cannot run linux/s390x; it offers linux/arm64, linux/amd64"
-        );
-        assert_eq!(reason(resolve_platform(None, &[]).unwrap_err()), "provider declares no platforms it can run");
-        assert_eq!(reason(resolve_platform(Some(amd), &[]).unwrap_err()), "provider cannot run linux/amd64: it declares no platforms");
-        assert!(
-            prepare_platform(&PrepareRequest {
-                platform: None,
-                size: Size { cpus: 1.0, memory_bytes: 1, disk_bytes: 1 },
-                image_digest: "i".into(),
-                tools_digest: "t".into()
-            })
-            .is_err()
-        );
+        let s390x = Platform::new("linux", "s390x");
+        let (platform, reason) = unsupported(resolve_platform(Some(s390x.clone()), &declared).unwrap_err());
+        assert_eq!(platform, s390x);
+        assert!(reason.contains("linux/arm64, linux/amd64"), "{reason}");
+        assert!(matches!(resolve_platform(None, &[]), Err(ProtocolError::Refused { .. })));
+        assert_eq!(unsupported(resolve_platform(Some(amd.clone()), &[]).unwrap_err()).0, amd);
+        assert!(prepare_platform(&request(None, None)).is_err());
+    }
+    // Image routes resolve like platforms: omitted means the first declared
+    // route, any declared route is honoured, and an undeclared one is refused.
+    #[test]
+    fn route_resolution() {
+        let push = ImageRoute::ProviderPush {
+            protocol: PushProtocol::OciDistribution,
+            credential_lifetime_seconds: None,
+            tools_layer: ToolsLayer::Host,
+        };
+        let pull = ImageRoute::RegistryPull {
+            auth: RegistryAuthKind::Basic,
+            registration: CredentialRegistration::ProviderApi,
+            digest_references: true,
+            tools_layer: ToolsLayer::Provider,
+        };
+        let declared = [push, pull];
+        assert_eq!(resolve_route(None, &declared).unwrap(), ImageRouteKind::ProviderPush);
+        assert_eq!(resolve_route(Some(ImageRouteKind::RegistryPull), &declared).unwrap(), ImageRouteKind::RegistryPull);
+        assert!(matches!(resolve_route(Some(ImageRouteKind::RemoteBuild), &declared), Err(ProtocolError::Refused { .. })));
+        assert!(matches!(resolve_route(None, &[]), Err(ProtocolError::Refused { .. })));
+        assert!(prepare_route(&request(Some(Platform::new("linux", "amd64")), None)).is_err());
+    }
+    fn request(platform: Option<Platform>, route: Option<ImageRouteKind>) -> PrepareRequest {
+        PrepareRequest {
+            platform,
+            route,
+            image_pull: None,
+            size: Size { cpus: 1.0, memory_bytes: 1, disk_bytes: 1 },
+            image_digest: "i".into(),
+            tools_digest: "t".into(),
+        }
     }
 }

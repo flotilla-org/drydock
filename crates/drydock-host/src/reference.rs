@@ -116,6 +116,13 @@ impl Provider for Reference {
             bootstrap: BootstrapRoute::Bake,
             agent: self.settings.agent,
             platforms: self.settings.platforms.clone(),
+            // Modelled as a runtime that pulls public images and bakes the tools itself.
+            image_routes: vec![ImageRoute::RegistryPull {
+                auth: RegistryAuthKind::Anonymous,
+                registration: CredentialRegistration::NotRequired,
+                digest_references: true,
+                tools_layer: ToolsLayer::Provider,
+            }],
             usage: true,
             quota: true,
         }

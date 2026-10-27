@@ -69,8 +69,9 @@ fn secret_debug_redacts_without_changing_wire() {
     let refresh = CredentialRefresh { value: secret.clone() };
     let credential = CredentialMode::Proxied { placeholder_token: secret.clone(), proxy_url: "http://localhost".into() };
     let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), expires_at: "2026-10-19T00:00:00Z".parse().unwrap() };
+    let pull = RegistryCredential { username: "u".into(), secret: secret.clone() };
     let resume = ResumeToken { token: secret };
-    for debug in [format!("{refresh:?}"), format!("{credential:?}"), format!("{reach:?}"), format!("{resume:?}")] {
+    for debug in [format!("{refresh:?}"), format!("{credential:?}"), format!("{reach:?}"), format!("{resume:?}"), format!("{pull:?}")] {
         assert!(!debug.contains(value));
         assert!(debug.contains("[REDACTED]"));
     }
@@ -128,7 +129,7 @@ fn hello_requires_exact_protocol_version() {
     let old =
         Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], loadable_modules: vec![], providers: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6", "6.0.0", "6 "] {
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6", "7", "8.0.0", "8 "] {
         let hello = Hello {
             protocol_version: version.into(),
             host_version: "test".into(),
@@ -170,11 +171,11 @@ fn exact_cost_roundtrips(tc: hegel::TestCase) {
     assert!(ResourceKind::Memory.accepts_unit("By.s"));
 }
 
-// Protocol 7 records the platform in every prepared form; protocol-6 peers
-// return prepared forms without one and must not pass the exact handshake.
+// Protocol 8 adds the typed image refusal, which a protocol-7 peer cannot
+// decode, so the exact handshake must keep the two apart.
 #[test]
-fn prepared_platform_requires_protocol_seven() {
-    for (version, compatible) in [("6", false), ("7", true)] {
+fn image_refusals_require_protocol_eight() {
+    for (version, compatible) in [("7", false), ("8", true)] {
         let hello = Hello {
             protocol_version: version.into(),
             host_version: "test".into(),
@@ -184,6 +185,37 @@ fn prepared_platform_requires_protocol_seven() {
         };
         assert_eq!(hello.is_compatible(), compatible);
     }
+}
+
+// Every image route and refusal variant has one pinned wire shape; a request
+// may name a route and carry pull access, and omits both by default.
+#[test]
+fn image_route_wire_shapes() {
+    for value in [
+        json!({"route":"provider_push","protocol":"oci_distribution","credential_lifetime_seconds":3600,"tools_layer":"host"}),
+        json!({"route":"provider_push","protocol":"oci_distribution","tools_layer":"host"}),
+        json!({"route":"registry_pull","auth":"basic","registration":"provider_api","digest_references":true,"tools_layer":"provider"}),
+        json!({"route":"registry_pull","auth":"anonymous","registration":"not_required","digest_references":false,"tools_layer":"provider"}),
+        json!({"route":"registry_pull","auth":"basic","registration":"per_request","digest_references":true,"tools_layer":"host"}),
+        json!({"route":"remote_build","input":"dockerfile","multi_stage":false,"tools_layer":"provider"}),
+    ] {
+        fixture::<ImageRoute>(value);
+    }
+    for value in [
+        json!({"kind":"image_refused","reason":"r","refusal":{"cause":"unsupported_platform","platform":{"os":"linux","architecture":"arm64"}}}),
+        json!({"kind":"image_refused","reason":"r","refusal":{"cause":"too_large","bytes":2,"limit_bytes":1}}),
+        json!({"kind":"image_refused","reason":"r","refusal":{"cause":"push_credential_expired"}}),
+    ] {
+        fixture::<ProtocolError>(value);
+    }
+    let size = json!({"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0});
+    fixture::<PrepareRequest>(json!({"size": size, "route": "registry_pull", "image_pull": {"username": "u", "secret": "s"},
+        "image_digest": "image", "tools_digest": "tools"}));
+    for route in [ImageRouteKind::ProviderPush, ImageRouteKind::RegistryPull, ImageRouteKind::RemoteBuild] {
+        assert_eq!(route.to_string().parse::<ImageRouteKind>().unwrap(), route);
+        assert_eq!(serde_json::to_value(route).unwrap(), json!(route.to_string()));
+    }
+    assert!("push".parse::<ImageRouteKind>().is_err());
 }
 
 // The platform is recorded at prepare: prepared forms require it, requests and

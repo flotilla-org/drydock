@@ -60,7 +60,17 @@ error-class conformance, `platforms` (`{"os", "architecture"}` objects; default 
 first preferred), and rejects unknown settings. The host resolves each prepare
 request's platform against the declared list before the module sees it; modules
 read it with `prepare_platform` and must record that platform in the prepared
-form, or the host returns `Internal`. Exact repeated documents
+form, or the host returns `Internal`. Capabilities also list `image_routes`, the
+ways a vessel image reaches the provider, preferred first: `provider_push`
+(protocol and credential lifetime), `registry_pull` (auth kind, how the
+credential is registered, whether digest references work) and `remote_build`
+(input kind, multi-stage support). Each route states whether the tools layer is
+added by the provider or by the host. Clients choose by these properties and
+their own policy, never by provider name. The host resolves each request's
+`route` like its platform (omitted means the first declared route; an
+undeclared one is refused), and modules read it with `prepare_route`. A
+platform, image size or push credential a provider cannot take is the typed
+`image_refused` error, whose `refusal` carries a stable cause. Exact repeated documents
 preserve providers and credentials; additions commit atomically. Replacement or
 removal currently requires restart, protecting in-memory resources. Stateless
 settings replacement is tracked in #22.
@@ -283,14 +293,43 @@ The key needs sandbox creation/modification/deletion, snapshot creation and bill
 read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
 
-Prepare builds a Daytona snapshot with `buildInfo.dockerfileContent`: the pinned
-base plus `COPY --from` the pinned tools image's `/opt/drydock/`. It never sets
-entrypoint, command or init. The build selects the tools reference through
-`crates/drydock/tools-image.txt` (or `DRYDOCK_TOOLS_IMAGE` at build time); the
-`unpublished` pin refuses preparation until the first publish. Both references
-must be immutable SHA-256 image references.
+Daytona declares two image routes. The default is `provider_push` with the
+tools layer added by the host, for images in registries Daytona cannot reach.
+The host reads the base and tools manifests for `linux/amd64` (with
+`PrepareRequest.image_pull`, sent only to the base's registry, for a private
+base), appends the tools image's layer to the base manifest (a manifest and
+blob operation: no container build, no local Docker), mints push access with
+`GET /docker-registry/registry-push-access`, copies the blobs into Daytona's
+registry in `push_chunk_bytes` requests (default 16 MiB), pushes the manifest,
+waits until a pull by digest succeeds, and creates the snapshot from
+`imageName: <registry>/<project>/drydock-vessel@sha256:…` with no `buildInfo`.
+Images above `max_image_gib` (default 20, Daytona's default snapshot maximum;
+compressed size is the lower bound checked), platforms other than amd64 and
+push access that expires mid-upload are typed refusals.
 
-The snapshot name includes the digest pair and size. Prepare reuses it and waits
+On this route the host itself contacts the registries the request names, and
+their token realms, over HTTPS. It applies no registry allowlist or address
+policy, because lab registries usually sit on private networks. Prepare callers
+are authenticated host clients and are trusted to name registries. A pull
+credential goes only to its registry's origin, or to Docker Hub's
+`auth.docker.io` token service for `docker.io`. In proxied mode, registry
+traffic uses the same egress proxy as every other provider call.
+
+The fallback, `registry_pull` with the tools layer added by the provider, builds
+the snapshot with `buildInfo.dockerfileContent`: the pinned base plus
+`COPY --from` the pinned tools image's `/opt/drydock/`. Daytona's builder pulls
+both references itself, so a private registry must first be registered for the
+organisation through `POST /docker-registry` (`name`, `url`, `username`,
+`password`; needs `write:registries`). Request it with `--image-route
+registry_pull` or `route` on the prepare request.
+
+Neither route sets entrypoint, command or init. The build selects the tools
+reference through `crates/drydock/tools-image.txt` (or `DRYDOCK_TOOLS_IMAGE` at
+build time); the `unpublished` pin refuses preparation until the first publish.
+Both references must be immutable SHA-256 image references.
+
+The snapshot name includes the digest pair, platform and size, not the route:
+both routes produce the same filesystem. Prepare reuses it and waits
 for `active`, for up to four minutes per call. Provision inherits the snapshot's
 resources and refuses a size that differs from the prepared key. Requests must
 use whole vCPU and GiB within the default 4 vCPU, 8 GiB RAM and 10 GiB disk cap.
@@ -308,9 +347,10 @@ Toolbox bootstrap has a 25-second execution budget; ordinary exec/probes get
 handshake over the SSH gateway before returning launch success. It upgrades an
 older tools agent to the build for the platform recorded in the prepared form,
 then verifies the current hello. Daytona declares only `linux/amd64`: its
-sandboxes run on x86_64, and its snapshot API takes no platform, so both `FROM`
-lines of the snapshot Dockerfile carry `--platform=linux/amd64` and the snapshot
-name includes the platform. Lookup order for platform `<os>/<arch>`:
+sandboxes run on x86_64, and its snapshot API takes no platform, so the push
+route composes the amd64 manifests, both `FROM` lines of the fallback's
+Dockerfile carry `--platform=linux/amd64`, and the snapshot name includes the
+platform. Lookup order for platform `<os>/<arch>`:
 
 1. `DRYDOCK_AGENT_BIN_<OS>_<ARCH>` (for example `DRYDOCK_AGENT_BIN_LINUX_ARM64`);
 2. `DRYDOCK_AGENT_BIN`, only when the guest's platform is the host's own;

@@ -125,6 +125,7 @@ impl DiagnosticMasker {
             ProtocolError::NotFound { reason }
             | ProtocolError::MethodNotAllowed { reason }
             | ProtocolError::Refused { reason }
+            | ProtocolError::ImageRefused { reason, .. }
             | ProtocolError::Unavailable { reason, .. }
             | ProtocolError::RateLimited { reason, .. }
             | ProtocolError::QuotaExhausted { reason }
