@@ -392,7 +392,13 @@ impl Daemon {
         let identity = self.key_for(environment)?;
         let client = &self.ready_host(provider)?.handle.client;
         let vessel = crate::agent::Vessel { provider, environment: &environment.id, identity: &identity, platform, build };
-        crate::agent::AgentReach::new(self.config.provider[provider].agent_link).connect(client, &vessel).await.map(drop)
+        let link = self
+            .config
+            .provider
+            .get(provider)
+            .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))?
+            .agent_link;
+        crate::agent::AgentReach::new(link).connect(client, &vessel).await.map(drop)
     }
 
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {

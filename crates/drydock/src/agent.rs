@@ -126,12 +126,14 @@ impl AgentReach {
 
     /// Wait for the vessel agent's current hello. A provider that declares no
     /// agent, or a reach this client cannot follow, is refused at once; other
-    /// failures retry until the timeout and report the last one, with any
-    /// credential in the reach masked.
+    /// failures retry until the timeout and report the last one, with the
+    /// reach's minted gateway username masked.
     pub async fn connect(&self, api: &dyn ProviderApi, vessel: &Vessel<'_>) -> Result<ConnectedAgent, Error> {
         self.connect_at(api, vessel, Path::new(AGENT_SOCKET)).await
     }
 
+    /// [`Self::connect`] to an agent listening at `socket` rather than the
+    /// fixed [`AGENT_SOCKET`], for tests whose vessel is the test host.
     pub(crate) async fn connect_at(&self, api: &dyn ProviderApi, vessel: &Vessel<'_>, socket: &Path) -> Result<ConnectedAgent, Error> {
         let refused = |reason: String| Error::Protocol(ProtocolError::Refused { reason });
         let hello = api.hello().await?;
@@ -155,8 +157,10 @@ impl AgentReach {
             let chosen = self.preferred.under(reverse_forwards);
             let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into(), chosen)?;
             config.agent_socket = socket.into();
+            let transport = self.dialer.dial(config).await?;
+            // The link of the last dial that succeeded, which carries the agent returned.
             *link.lock().unwrap() = Some(chosen);
-            self.dialer.dial(config).await
+            Ok(transport)
         };
         let client = wait_for_agent(open, vessel.platform, vessel.build, self.timeout, |text| masker.lock().unwrap().text(text))
             .await
@@ -222,7 +226,8 @@ where
                 let error = mask(&error.to_string());
                 // Log a reason once, not on every 250ms retry.
                 if last.as_deref() != Some(error.as_str()) {
-                    tracing::info!(attempt, %error, "agent hello attempt failed");
+                    // The daemon logs through stderr into drydock.log.
+                    eprintln!("agent hello attempt {attempt} failed: {error}");
                 }
                 // An attempt cut short by the deadline says less than the one before it.
                 if !interrupted || last.is_none() {

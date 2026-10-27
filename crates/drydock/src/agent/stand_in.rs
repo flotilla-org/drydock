@@ -2,7 +2,8 @@
 //! serves a real agent, and dials it under an SSH server's forwarding rules: a
 //! gateway that refuses remote forwards fails a reverse-forward link the way
 //! OpenSSH does (`ExitOnForwardFailure`), as Daytona's gateway does. Guest paths
-//! in the agent's requests are this host's own paths.
+//! in the agent's requests are this host's own paths. It is test support for
+//! drydock and its embedding clients, never a production dialer.
 use super::{AgentLink, SshDialer};
 use async_trait::async_trait;
 use drydock_transport::{

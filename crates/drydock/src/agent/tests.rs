@@ -86,6 +86,7 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
         (true, AgentLink::ReverseForward, AgentLink::ReverseForward),
         (true, AgentLink::LocalForward, AgentLink::LocalForward),
     ] {
+        // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(true, ssh_reach(reverse_forwards)).await;
         let gateway = Gateway::start(directory.path(), reverse_forwards, BUILD).unwrap();
@@ -99,17 +100,25 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
     }
 }
 
-// A provider whose declaration has no agent is refused before any reach.
+// What the client cannot follow is refused at once, without dialling: a
+// provider whose declaration has no agent, and a reach that is not SSH.
 #[tokio::test]
-async fn a_provider_without_an_agent_is_refused() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let (api, environment) = provider(false, ssh_reach(true)).await;
-    let gateway = Gateway::start(directory.path(), true, BUILD).unwrap();
-    let identity = directory.path().join("id_ed25519");
-    let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
-    let error = AgentReach::new(AgentLink::default()).with_dialer(gateway.clone()).connect(&api, &vessel).await.err().unwrap();
-    assert!(matches!(&error, Error::Protocol(ProtocolError::Refused { reason }) if reason.contains("declares no vessel agent")), "{error}");
-    assert!(gateway.links().is_empty());
+async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
+    let dial =
+        Reach::Dial { url: "wss://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+    for (agent, reach, refusal) in [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "agent hello requires an SSH reach")]
+    {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (api, environment) = provider(agent, reach).await;
+        let gateway = Gateway::start(directory.path(), true, BUILD).unwrap();
+        let identity = directory.path().join("id_ed25519");
+        let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+        let started = tokio::time::Instant::now();
+        let error = AgentReach::new(AgentLink::default()).with_dialer(gateway.clone()).connect(&api, &vessel).await.err().unwrap();
+        assert!(matches!(&error, Error::Protocol(ProtocolError::Refused { reason }) if reason.contains(refusal)), "{error}");
+        assert!(gateway.links().is_empty());
+        assert!(started.elapsed() < Duration::from_secs(30), "refused without waiting for the readiness deadline");
+    }
 }
 
 // A transport connection alone is not readiness. Fail initial opens, then
@@ -226,7 +235,8 @@ async fn timeout_reports_the_last_masked_error() {
 // guest-to-host forward stream must both work over the host's link.
 #[tokio::test]
 async fn agent_reach_works_through_a_gateway_without_reverse_forwards() {
-    let directory = tempfile::tempdir().unwrap();
+    // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
     let agent_socket = directory.path().join("agent.sock");
     let listener = tokio::net::UnixListener::bind(&agent_socket).unwrap();
     let connections = drydock_transport::native::UnixConnections::new(listener, directory.path().join("host.sock"));

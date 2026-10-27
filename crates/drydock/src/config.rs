@@ -222,6 +222,16 @@ settings = {{
             Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 9 }
         );
     }
+    // A provider's agent link preference defaults to reverse forwards, names
+    // either link, and refuses anything else.
+    #[test]
+    fn agent_link_parses_with_a_default() {
+        let parse = |line: &str| Config::parse(&format!("[provider.demo]\nmodule = \"m\"\ncredential = {{env=\"PATH\"}}\n{line}\n"));
+        assert_eq!(parse("").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
+        assert_eq!(parse("agent_link = \"reverse_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
+        assert_eq!(parse("agent_link = \"local_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::LocalForward);
+        assert!(parse("agent_link = \"over_the_rainbow\"").is_err());
+    }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]
     fn quantities_preserve_bytes_and_reject_overflow(tc: hegel::TestCase) {
