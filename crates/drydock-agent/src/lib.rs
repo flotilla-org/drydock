@@ -14,6 +14,7 @@ mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
 pub mod socket;
+pub mod stand_in;
 mod store;
 pub mod upgrade;
 pub use client::{Client, Download, ExecOutput, Process};
