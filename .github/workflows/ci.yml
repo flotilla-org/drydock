@@ -31,6 +31,21 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - if: steps.workspace.outputs.present == 'true'
         run: cargo test --workspace --locked
+      - name: Install TypeScript companion runtime
+        if: steps.workspace.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.18.0'
+      - name: Check TypeScript companion
+        if: steps.workspace.outputs.present == 'true'
+        env:
+          COREPACK_HOME: ${{ runner.temp }}/drydock-corepack
+        run: |
+          mkdir -p "$COREPACK_HOME"
+          chmod 700 "$COREPACK_HOME"
+          corepack pnpm --dir hosts/typescript install --frozen-lockfile
+          corepack pnpm --dir hosts/typescript check
+          corepack pnpm --dir hosts/typescript pack:companion
       - name: Test compile-time tools selection with fixture metadata
         if: steps.workspace.outputs.present == 'true'
         env:
