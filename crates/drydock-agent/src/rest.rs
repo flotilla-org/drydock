@@ -149,3 +149,17 @@ pub(crate) fn header_value(value: impl std::fmt::Display) -> HeaderValue {
         HeaderValue::from_str(&encoded).unwrap_or_else(|_| HeaderValue::from_static("invalid"))
     })
 }
+/// A Structured Field Integer header (RFC 9651) as a byte count. Any other
+/// value is ignored, as draft-ietf-httpbis-resumable-upload-12 requires.
+pub(crate) fn sf_integer(headers: &HeaderMap, name: &str) -> Option<u64> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    (!value.is_empty() && value.len() <= 15 && value.bytes().all(|b| b.is_ascii_digit())).then(|| value.parse().ok()).flatten()
+}
+/// A Structured Field Boolean header (RFC 9651); any other value is ignored.
+pub(crate) fn sf_boolean(headers: &HeaderMap, name: &str) -> Option<bool> {
+    match headers.get(name)?.to_str().ok()?.trim() {
+        "?1" => Some(true),
+        "?0" => Some(false),
+        _ => None,
+    }
+}

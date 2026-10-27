@@ -74,7 +74,10 @@ any Unix path can be named; relative paths and `.`/`..` components are refused.
 | GET / PATCH / DELETE | `/entries/{path}` | Stat without following links / change mode and owner / remove (`?recursive=true`) |
 | GET / PUT | `/dirs/{path}` | List a directory / create one |
 | PUT | `/links/{path}` | `{ "target": ... }`; create or atomically replace a symlink |
+| PUT | `/trees/{path}?sha256=...` | Unpack a streamed tar (optionally gzip) into a new directory |
 | POST | `/renames` | `Rename { from, to, exclusive, parents }` |
+| HEAD / PATCH / DELETE | `/uploads/{sha256}` | Resumable upload: offset retrieval / append / cancellation |
+| HEAD / PUT / DELETE | `/blobs/{sha256}` | A blob's size / upload creation / remove it |
 | PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
 | POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
 
@@ -131,6 +134,59 @@ at 128 MiB.
   concerns the entry that was checked; on Linux it is an `O_PATH` descriptor,
   so an owner can change an entry nobody can read. Rename replaces by
   default (`rename(2)`); `exclusive` refuses an existing target atomically.
+
+- `PUT /trees/{path}` unpacks a tar stream (`compression=gzip` for tar.gz)
+  into a staging directory beside the target, hashing every archive byte.
+  Only if the digest matches, and once its bytes are durable, does the tree
+  appear, by rename, or with
+  `replace` by an atomic exchange with the existing directory. On a mismatch
+  or a malformed archive the target is unchanged. Entries keep their modes,
+  masked of setuid and setgid, but not their archived owners; `uid`/`gid` set
+  the owner of every entry.
+
+### Resumable uploads and the digest store
+
+Uploads follow [draft-ietf-httpbis-resumable-upload-12][resumable]
+(interop version 9). The blob resource is the upload's target and the
+upload resource is named after the digest the finished bytes must have:
+
+- **Creation:** `PUT /blobs/{sha256}` with `Upload-Complete`, and
+  `Upload-Length` when known. With `?1` the body is the whole blob. With
+  `?0` the reply is 201 with `Location: /uploads/{sha256}`, the offset
+  reached and `Upload-Limit`. Without `Upload-Complete` it is a conventional,
+  still digest-checked upload. A second creation for an existing upload is a
+  409: resume it instead.
+- **Offset retrieval:** `HEAD /uploads/{sha256}` returns 204 with
+  `Upload-Offset`, `Upload-Complete`, `Upload-Length` once declared,
+  `Upload-Limit` (`max-age`, the time left before an untouched upload is
+  removed) and `Cache-Control: no-store`; 404 for an unknown upload.
+- **Append:** `PATCH /uploads/{sha256}` with `Content-Type:
+  application/partial-upload`, `Upload-Offset` and `Upload-Complete`
+  continues from exactly that offset. Another offset is a 409 carrying the
+  right `Upload-Offset`.
+- **Cancellation:** `DELETE /uploads/{sha256}`.
+
+Bytes received before a disconnect stay. A request that arrives while another
+is still using the upload ends that one first (draft section 4.6), so the
+offset a retrieval reports is the one the next append needs. When the client
+completes the upload the agent checks the digest once: a match moves it to
+`blobs/<sha256>`, and the reply is the blob's (201 with `Written`); a
+mismatch discards it (422 with `Upload-Complete: ?1`). There are no per-piece
+hashes. Completing short of the declared length is refused (400); a body that
+runs past it discards the upload (413). A declared length beyond the store's
+free space is refused up front (507), and partial uploads untouched for seven
+days are removed at agent startup. Completed blobs are kept until
+`DELETE /blobs/{sha256}`: they are content-addressed, so a later install of
+the same digest needs no new upload. The agent sends no 104 interim
+responses.
+
+[resumable]: https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-resumable-upload-12
+
+`PUT /files/{path}?blob=<sha256>` and `PUT /trees/{path}?blob=<sha256>`
+install from a completed blob. The store is content-addressed so that a
+later fetch-by-digest, where the agent itself downloads a pinned package or
+OCI layer (flotilla#3839), can fill the same `blobs/` slots for the same
+consumers.
 
 ### Configuration, forwards and restarts
 
@@ -350,7 +406,8 @@ the agent inspects no forwarded bytes and holds no token.
 `cargo test -p drydock-agent` covers the control contract over in-memory yamux
 and Unix connections: tagged configuration, forward resources and generated
 upsert/removal sequences, every refusal as a structured error, file
-operations, ranges, modes and digests (`tests/files.rs`), a streamed transfer
+operations, ranges, modes, digests, resumable uploads and tree unpacks
+(`tests/files.rs`), a streamed transfer
 larger than 512 MiB in bounded memory (`tests/large_files.rs`), streamed exec, byte-transparent HTTP/1.1, WebSocket upgrade frames,
 chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
 A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,

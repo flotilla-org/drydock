@@ -1,5 +1,5 @@
 //! Durable filesystem steps shared by every writer: replace a small file
-//! atomically, make a directory's entries durable, and the atomic renames
+//! atomically, make a directory's entries durable, and the two atomic renames
 //! rename(2) alone cannot express.
 use std::{io, path::Path};
 
@@ -24,4 +24,9 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
 pub(crate) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     Ok(renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE)?)
+}
+/// Swap two existing entries atomically.
+pub(crate) fn exchange(a: &Path, b: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    Ok(renameat_with(CWD, a, CWD, b, RenameFlags::EXCHANGE)?)
 }

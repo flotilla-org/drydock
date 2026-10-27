@@ -1,15 +1,16 @@
 //! File operations. Bytes travel as `application/octet-stream` request and
 //! response bodies, streamed straight to and from disk.
 use crate::{
-    AgentError, Attributes, Entry, EntryKind, ErrorKind, FileOptions, Link, Rename, Written,
-    durable::{rename_noreplace, sync_directory},
-    query::{DirQuery, LinkQuery, RemoveQuery},
+    AgentError, Attributes, Compression, Entry, EntryKind, ErrorKind, FileOptions, Link, Rename, TreeOptions, Written,
+    durable::{exchange, rename_noreplace, sync_directory},
+    query::{DirQuery, LinkQuery, RemoveQuery, WithBlob},
     rest::{check_path, header_value, if_match, tail_path},
+    server::Shared,
 };
 use axum::{
     Json,
     body::Body,
-    extract::Query,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
@@ -18,6 +19,7 @@ use std::{
     io,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -218,10 +220,22 @@ pub(crate) fn ownership_result(result: io::Result<()>, uid: u32) -> io::Result<(
     }
 }
 
+/// Where a write's bytes come from.
+pub(crate) enum Source {
+    Body(Body),
+    File(PathBuf),
+}
+/// A completed upload to install at `path`, refused if the store lacks it.
+async fn blob_source(shared: &Shared, operation: &str, path: &Path, blob: &str) -> Refusal<Source> {
+    if shared.store.blob_size(blob).await?.is_none() {
+        return Err(AgentError::new(operation, path.display(), ErrorKind::NotFound, format!("no completed upload {blob}")));
+    }
+    Ok(Source::File(shared.store.blob(blob).map_err(|e| AgentError::io(operation, blob, e))?))
+}
 /// Write a sibling, hash while writing, fsync, rename atomically, then fsync
 /// the parent. Readers observe either the complete old file or the complete
 /// new one; a refused write leaves nothing behind.
-pub(crate) async fn write(operation: &str, path: &Path, body: Body, options: &FileOptions) -> Refusal<(Written, bool)> {
+pub(crate) async fn write(operation: &str, path: &Path, source: Source, options: &FileOptions) -> Refusal<(Written, bool)> {
     check_path(operation, path)?;
     check_mode(operation, path, options.mode)?;
     check_digest(operation, &options.sha256)?;
@@ -240,7 +254,24 @@ pub(crate) async fn write(operation: &str, path: &Path, body: Body, options: &Fi
     let temporary = tempfile::Builder::new().prefix(".drydock-").tempfile_in(&parent).map_err(at)?;
     let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(at)?);
     let mut hasher = Sha256::new();
-    let size = copy_body(body, &mut file, Some(&mut hasher), None).await.map_err(|e| e.refusal(operation, path.display()))?;
+    let size = match source {
+        Source::Body(body) => {
+            copy_body(body, &mut file, Some(&mut hasher), None, None).await.map_err(|e| e.refusal(operation, path.display()))?
+        }
+        Source::File(from) => {
+            let input = tokio::fs::File::open(&from).await.map_err(|e| AgentError::io(operation, from.display(), e))?;
+            copy_body(
+                Body::from_stream(tokio_util::io::ReaderStream::with_capacity(input, 256 * 1024)),
+                &mut file,
+                Some(&mut hasher),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| e.refusal(operation, from.display()))?
+        }
+    };
+
     let sha256 = format!("{:x}", hasher.finalize());
     if let Some(expected) = &options.sha256
         && *expected != sha256
@@ -281,10 +312,28 @@ pub(crate) async fn write(operation: &str, path: &Path, body: Body, options: &Fi
     Ok((Written { sha256, size }, existing.is_none()))
 }
 
-pub(crate) async fn put_file(uri: Uri, Query(options): Query<FileOptions>, headers: HeaderMap, body: Body) -> Refusal<Response> {
+pub(crate) async fn put_file(
+    State(shared): State<Arc<Shared>>,
+    uri: Uri,
+    Query(WithBlob { mut options, blob }): Query<WithBlob<FileOptions>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Refusal<Response> {
     const OP: &str = "file.write";
     let path = tail_path(OP, &uri, "/files")?;
-    require_octet_stream(OP, &path, &headers, &["application/octet-stream"])?;
+    let source = match &blob {
+        Some(blob) => {
+            crate::check_sha256(blob).map_err(|e| AgentError::io(OP, blob, e))?;
+            // An installed blob is checked against its own digest unless the
+            // caller named one.
+            options.sha256.get_or_insert_with(|| blob.clone());
+            blob_source(&shared, OP, &path, blob).await?
+        }
+        None => {
+            require_octet_stream(OP, &path, &headers, &["application/octet-stream"])?;
+            Source::Body(body)
+        }
+    };
     // The precondition is checked before writing; a concurrent writer can
     // still replace the file between the check and the rename.
     // The tag is the entry the write replaces: a symlink is replaced, not
@@ -294,7 +343,7 @@ pub(crate) async fn put_file(uri: Uri, Query(options): Query<FileOptions>, heade
         let now = current.as_deref().unwrap_or("absent");
         return Err(AgentError::new(OP, path.display(), ErrorKind::PreconditionFailed, format!("file is now {now}")));
     }
-    let (written, created) = write(OP, &path, body, &options).await?;
+    let (written, created) = write(OP, &path, source, &options).await?;
     let metadata = std::fs::metadata(&path).map_err(|e| AgentError::io(OP, path.display(), e))?;
     let status = if created { StatusCode::CREATED } else { StatusCode::OK };
     Ok((status, [(header::ETAG, header_value(etag(&metadata)))], Json(written)).into_response())
@@ -306,6 +355,8 @@ pub(crate) enum Copy {
     Body(axum::Error),
     Write(io::Error),
     TooLong,
+    /// A later request for the same upload took it over.
+    Superseded,
 }
 impl Copy {
     pub(crate) fn refusal(self, operation: &str, subject: impl std::fmt::Display) -> AgentError {
@@ -315,22 +366,43 @@ impl Copy {
             }
             Copy::Write(error) => AgentError::io(operation, subject, error),
             Copy::TooLong => AgentError::new(operation, subject, ErrorKind::PayloadTooLarge, "request body is longer than allowed"),
+            Copy::Superseded => AgentError::new(operation, subject, ErrorKind::Conflict, "a later request for this upload took it over"),
         }
     }
 }
 /// Stream a body to a file as it arrives, holding at most one frame and the
-/// write buffer in memory. Stops before writing past `limit`.
+/// write buffer in memory. Stops before writing past `limit`, and when
+/// `superseded` fires, keeping what was written.
 pub(crate) async fn copy_body(
     body: Body,
     file: &mut (impl tokio::io::AsyncWrite + Unpin),
     mut hasher: Option<&mut Sha256>,
     limit: Option<u64>,
+    superseded: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<u64, Copy> {
     let mut writer = tokio::io::BufWriter::with_capacity(256 * 1024, file);
     let mut body = body.into_data_stream();
     let mut total = 0u64;
     use futures_util::StreamExt;
-    while let Some(chunk) = body.next().await {
+    let ended = async {
+        match superseded {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(ended);
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            () = &mut ended => {
+                writer.flush().await.map_err(Copy::Write)?;
+                return Err(Copy::Superseded);
+            }
+            chunk = body.next() => match chunk {
+                Some(chunk) => chunk,
+                None => break,
+            },
+        };
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(error) => {
@@ -350,6 +422,16 @@ pub(crate) async fn copy_body(
     }
     writer.flush().await.map_err(Copy::Write)?;
     Ok(total)
+}
+/// The sha256 of a file's bytes, hashed off the async runtime.
+pub(crate) async fn hash_file(path: &Path) -> io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    tokio::task::spawn_blocking(move || {
+        let mut hasher = Sha256::new();
+        io::copy(&mut file, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await?
 }
 /// The one byte range, first and last byte, that a `Range` header selects
 /// in a file of `size` bytes. `Ok(None)` serves the whole file: there is no
@@ -560,6 +642,227 @@ pub(crate) async fn post_rename(Json(rename): Json<Rename>) -> Refusal<StatusCod
         sync_directory(source).map_err(|e| AgentError::io(OP, &subject, e))?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A staging directory, removed with whatever it holds when dropped, even
+/// directories an archive left without write permission.
+struct Staging(Option<PathBuf>);
+impl Staging {
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a staging directory still held")
+    }
+    /// Keep the directory: it was renamed into place.
+    fn release(mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = open_up(&path);
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(%error, path = %path.display(), "could not remove a staging directory");
+            }
+        }
+    }
+}
+/// Give the owner write and search permission on every directory under
+/// `root`, so the tree can be removed.
+fn open_up(root: &Path) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(root)?;
+    if metadata.is_dir() {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(metadata.mode() | 0o700))?;
+        for entry in std::fs::read_dir(root)? {
+            let _ = open_up(&entry?.path());
+        }
+    }
+    Ok(())
+}
+/// Make everything written on the filesystem holding `path` durable.
+fn sync_filesystem(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        Ok(rustix::fs::syncfs(directory)?)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        rustix::fs::sync();
+        Ok(())
+    }
+}
+/// Hashes every byte read through it, including bytes the unpacker skips.
+struct Hashing<R> {
+    inner: R,
+    hasher: Sha256,
+    count: u64,
+}
+impl<R: std::io::Read> std::io::Read for Hashing<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+fn unpack_into(reader: &mut impl std::io::Read, compression: Compression, into: &Path) -> io::Result<()> {
+    let mut archive = match compression {
+        Compression::None => tar::Archive::new(Box::new(reader) as Box<dyn std::io::Read>),
+        Compression::Gzip => tar::Archive::new(Box::new(flate2::read::GzDecoder::new(reader)) as Box<dyn std::io::Read>),
+    };
+    archive.set_preserve_permissions(true);
+    // An archive cannot install privileged executables through an agent
+    // that runs as root: setuid and setgid are masked from every entry.
+    archive.set_mask(0o6000);
+    archive.set_preserve_ownerships(false);
+    archive.set_unpack_xattrs(false);
+    archive.set_overwrite(true);
+    archive.unpack(into)
+}
+fn unpack(reader: impl std::io::Read, compression: Compression, into: &Path) -> (io::Result<()>, String, u64) {
+    let mut hashing = Hashing { inner: reader, hasher: Sha256::new(), count: 0 };
+    let result = unpack_into(&mut hashing, compression, into);
+    // The digest covers the whole archive, including any trailing padding
+    // the unpacker did not need to read.
+    let drained = std::io::copy(&mut hashing, &mut std::io::sink());
+    let result = result.and(drained.map(drop));
+    (result, format!("{:x}", hashing.hasher.finalize()), hashing.count)
+}
+/// Why the bytes, whose digest matched, did not unpack. Format errors from
+/// the tar and gzip readers are faults in the archive (422); filesystem
+/// errors such as a full disk keep their own kind.
+fn unpack_refusal(operation: &str, path: &Path, error: io::Error) -> AgentError {
+    let format = matches!(
+        error.kind(),
+        io::ErrorKind::Other | io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput | io::ErrorKind::UnexpectedEof
+    );
+    let mut refusal = AgentError::io(operation, path.display(), error);
+    if format {
+        refusal.kind = ErrorKind::InvalidData;
+        refusal.status = ErrorKind::InvalidData.status();
+    }
+    refusal.message = format!("the archive could not be unpacked; the target is unchanged: {}", refusal.message);
+    refusal
+}
+fn chown_tree(root: &Path, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    std::os::unix::fs::lchown(root, uid, gid)?;
+    if std::fs::symlink_metadata(root)?.is_dir() {
+        for entry in std::fs::read_dir(root)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+/// Unpack a tar archive into a new directory. It is unpacked beside the
+/// target and appears there, whole, only after the archive's digest matched.
+pub(crate) async fn put_tree(
+    State(shared): State<Arc<Shared>>,
+    uri: Uri,
+    Query(WithBlob { options, blob }): Query<WithBlob<TreeOptions>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Refusal<Response> {
+    const OP: &str = "tree.unpack";
+    let path = tail_path(OP, &uri, "/trees")?;
+    crate::check_sha256(&options.sha256).map_err(|e| AgentError::io(OP, path.display(), e))?;
+    check_mode(OP, &path, options.mode)?;
+    let source = match &blob {
+        Some(blob) => {
+            if *blob != options.sha256 {
+                return Err(AgentError::new(OP, path.display(), ErrorKind::InvalidInput, "blob and sha256 must name the same digest"));
+            }
+            blob_source(&shared, OP, &path, blob).await?
+        }
+        None => {
+            require_octet_stream(OP, &path, &headers, &["application/x-tar", "application/gzip", "application/octet-stream"])?;
+            Source::Body(body)
+        }
+    };
+    let parent = prepare_parent(OP, &path, options.parents, options.uid, options.gid)?;
+    let existed = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(AgentError::new(OP, path.display(), ErrorKind::AlreadyExists, "exists and is not a directory"));
+        }
+        Ok(_) if !options.replace => {
+            return Err(AgentError::new(OP, path.display(), ErrorKind::AlreadyExists, "directory exists; ask to replace it"));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(AgentError::io(OP, path.display(), error)),
+    };
+    let at = |e| AgentError::io(OP, path.display(), e);
+    let staging = Staging(Some(tempfile::Builder::new().prefix(".drydock-tree-").tempdir_in(&parent).map_err(at)?.keep()));
+    let compression = options.compression;
+    // The unpacking task owns the staging directory and hands it back. If the
+    // client resets the stream, this handler is cancelled but the blocking
+    // unpack runs on until its body fails; only then may the staging
+    // directory be removed, or entries it creates afterwards would stay.
+    let (unpacked, sha256, size, staging) = match source {
+        Source::Body(body) => {
+            let stream = futures_util::TryStreamExt::map_err(body.into_data_stream(), io::Error::other);
+            let reader = tokio_util::io::SyncIoBridge::new(tokio_util::io::StreamReader::new(stream));
+            tokio::task::spawn_blocking(move || {
+                let (unpacked, sha256, size) = unpack(reader, compression, staging.path());
+                (unpacked, sha256, size, staging)
+            })
+            .await
+        }
+        Source::File(file) => {
+            tokio::task::spawn_blocking(move || {
+                let (unpacked, sha256, size) = match std::fs::File::open(&file) {
+                    Ok(reader) => unpack(std::io::BufReader::new(reader), compression, staging.path()),
+                    Err(error) => (Err(error), String::new(), 0),
+                };
+                (unpacked, sha256, size, staging)
+            })
+            .await
+        }
+    }
+    .map_err(|e| AgentError::new(OP, path.display(), ErrorKind::Other, "unpack task failed").with_cause(e))?;
+    // A blob that could not even be opened (removed meanwhile) reports that,
+    // not a digest of no bytes.
+    if sha256.is_empty() {
+        return Err(AgentError::io(OP, path.display(), unpacked.err().unwrap_or_else(|| io::Error::other("blob unreadable"))));
+    }
+    if sha256 != options.sha256 {
+        let mut refusal = AgentError::new(
+            OP,
+            path.display(),
+            ErrorKind::DigestMismatch,
+            format!("expected sha256 {}, received {size} bytes with sha256 {sha256}; the target is unchanged", options.sha256),
+        );
+        if let Err(error) = unpacked {
+            refusal = refusal.with_cause(error);
+        }
+        return Err(refusal);
+    }
+    unpacked.map_err(|e| unpack_refusal(OP, &path, e))?;
+    if options.uid.is_some() || options.gid.is_some() {
+        chown_tree(staging.path(), options.uid, options.gid).map_err(at)?;
+    }
+    std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(options.mode.unwrap_or(0o755))).map_err(at)?;
+    // Every unpacked byte is durable before the tree appears.
+    let synced = staging.path().to_path_buf();
+    tokio::task::spawn_blocking(move || sync_filesystem(&synced))
+        .await
+        .map_err(|e| AgentError::new(OP, path.display(), ErrorKind::Other, "sync task failed").with_cause(e))?
+        .map_err(at)?;
+    // The target was checked above; one created or removed meanwhile makes
+    // the rename or exchange fail with its own error.
+    if existed {
+        exchange(staging.path(), &path).map_err(at)?;
+        // The staging name now holds the previous tree; dropping removes it.
+    } else {
+        rename_noreplace(staging.path(), &path).map_err(at)?;
+        staging.release();
+    }
+    sync_directory(&parent).map_err(at)?;
+    Ok((StatusCode::CREATED, Json(Written { sha256, size })).into_response())
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 use crate::{
-    query::{DirQuery, LinkQuery, RemoveQuery, encode as query},
+    query::{DirQuery, LinkQuery, RemoveQuery, WithBlob, encode as query},
     rest::{encode_path, encode_segment},
     *,
 };
@@ -177,6 +177,25 @@ impl Control {
 async fn decode<T: serde::de::DeserializeOwned>(response: http::Response<axum::body::Body>, method: &str, uri: &str) -> io::Result<T> {
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024 * 1024).await.map_err(|e| link_error(format!("{method} {uri}"), e))?;
     serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{method} {uri}: malformed reply: {e}")))
+}
+/// A sha256 checked before it goes into a URL.
+fn digest(sha256: &str) -> io::Result<&str> {
+    check_sha256(sha256).map_err(|e| crate::error::context("request", sha256, e))?;
+    Ok(sha256)
+}
+/// The draft version this client implements, and the upload request headers.
+const INTEROP_VERSION: &str = "9";
+fn upload_headers(complete: bool, content_type: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("upload-draft-interop-version", INTEROP_VERSION.to_owned()),
+        ("upload-complete", if complete { "?1" } else { "?0" }.to_owned()),
+        ("content-type", content_type.to_owned()),
+    ]
+}
+/// An upload's offset and completeness from its headers.
+fn progress(response: &http::Response<axum::body::Body>) -> (u64, bool) {
+    let offset = header(response, "upload-offset").and_then(|v| v.parse().ok()).unwrap_or_default();
+    (offset, header(response, "upload-complete").as_deref() == Some("?1"))
 }
 fn header(response: &http::Response<axum::body::Body>, name: &str) -> Option<String> {
     response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
@@ -386,7 +405,7 @@ impl Client {
         self.write_body(path, streamed(content), options, Some(etag)).await
     }
     async fn write_body(&self, path: &Path, body: RequestBody, options: &FileOptions, etag: Option<&str>) -> io::Result<Written> {
-        let uri = format!("{}{}", route("/files", path)?, query(options)?);
+        let uri = format!("{}{}", route("/files", path)?, WithBlob { options, blob: None }.encode()?);
         let mut headers = vec![("content-type", "application/octet-stream".to_owned())];
         headers.extend(etag.map(|etag| ("if-match", etag.to_owned())));
         decode(self.link.send("PUT", &uri, &headers, body).await?, "PUT", &uri).await
@@ -469,6 +488,107 @@ impl Client {
     }
     pub async fn rename(&self, rename: &Rename) -> io::Result<()> {
         self.link.empty("POST", "/renames", json_body(rename)?).await.map(drop)
+    }
+
+    /// Stream a tar archive into a new directory at `path`.
+    pub async fn unpack(&self, path: &Path, archive: impl AsyncRead + Send + 'static, options: &TreeOptions) -> io::Result<Written> {
+        digest(&options.sha256)?;
+        let uri = format!("{}{}", route("/trees", path)?, WithBlob { options, blob: None }.encode()?);
+        let response = self.link.send("PUT", &uri, &[("content-type", "application/x-tar".into())], streamed(archive)).await?;
+        decode(response, "PUT", &uri).await
+    }
+    /// Unpack a completed upload, named by `options.sha256`, into `path`.
+    pub async fn unpack_blob(&self, path: &Path, options: &TreeOptions) -> io::Result<Written> {
+        digest(&options.sha256)?;
+        let uri = format!("{}{}", route("/trees", path)?, WithBlob { options, blob: Some(options.sha256.clone()) }.encode()?);
+        self.link.json("PUT", &uri, empty()).await
+    }
+
+    /// Upload `content`, all `length` bytes of the blob named by `sha256`, in
+    /// one request. If it is interrupted, [`Client::resume_upload`] continues
+    /// from what the agent kept.
+    pub async fn upload(&self, sha256: &str, length: u64, content: impl AsyncRead + Send + 'static) -> io::Result<Written> {
+        let (size, _) = self.create_upload(sha256, Some(length), content, true).await?;
+        Ok(Written { sha256: sha256.into(), size })
+    }
+    /// Upload creation: start the upload of the blob named by `sha256` with
+    /// `content`, declaring its `length` if known. With `complete`, `content`
+    /// is the whole blob. Returns the offset reached and whether the upload
+    /// is complete (its digest then checked).
+    pub async fn create_upload(
+        &self,
+        sha256: &str,
+        length: Option<u64>,
+        content: impl AsyncRead + Send + 'static,
+        complete: bool,
+    ) -> io::Result<(u64, bool)> {
+        let uri = format!("/blobs/{}", digest(sha256)?);
+        let mut headers = upload_headers(complete, "application/octet-stream");
+        headers.extend(length.map(|length| ("upload-length", length.to_string())));
+        Ok(progress(&self.link.send("PUT", &uri, &headers, streamed(content)).await?))
+    }
+    /// Upload append: continue the upload at exactly `offset` with `content`,
+    /// which with `complete` is the rest of the blob.
+    pub async fn append_upload(
+        &self,
+        sha256: &str,
+        offset: u64,
+        content: impl AsyncRead + Send + 'static,
+        complete: bool,
+    ) -> io::Result<(u64, bool)> {
+        let uri = format!("/uploads/{}", digest(sha256)?);
+        let mut headers = upload_headers(complete, "application/partial-upload");
+        headers.push(("upload-offset", offset.to_string()));
+        Ok(progress(&self.link.send("PATCH", &uri, &headers, streamed(content)).await?))
+    }
+    /// How many bytes of the upload named by `sha256` the agent holds, and
+    /// whether it is complete; (0, false) when there is no such upload.
+    /// Asking ends any request still appending to it.
+    pub async fn upload_offset(&self, sha256: &str) -> io::Result<(u64, bool)> {
+        Ok(self.upload_state(sha256).await?.unwrap_or_default())
+    }
+    async fn upload_state(&self, sha256: &str) -> io::Result<Option<(u64, bool)>> {
+        let uri = format!("/uploads/{}", digest(sha256)?);
+        match self.link.send("HEAD", &uri, &upload_headers(false, "")[..1], empty()).await {
+            Ok(response) => Ok(Some(progress(&response))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(head_error(error, "upload.stat", Path::new(sha256))),
+        }
+    }
+    /// Upload or resume the blob named by `sha256` from a seekable source of
+    /// `length` bytes: ask how far the agent got, then send the rest.
+    pub async fn resume_upload<R>(&self, sha256: &str, length: u64, mut source: R) -> io::Result<(u64, bool)>
+    where
+        R: AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static,
+    {
+        use tokio::io::AsyncSeekExt;
+        match self.upload_state(sha256).await? {
+            Some((offset, true)) => Ok((offset, true)),
+            None => self.create_upload(sha256, Some(length), source, true).await,
+            Some((offset, false)) => {
+                source.seek(io::SeekFrom::Start(offset)).await?;
+                self.append_upload(sha256, offset, source, true).await
+            }
+        }
+    }
+    /// Upload cancellation: discard an incomplete upload.
+    pub async fn remove_upload(&self, sha256: &str) -> io::Result<()> {
+        self.link.empty("DELETE", &format!("/uploads/{}", digest(sha256)?), empty()).await.map(drop)
+    }
+    /// Install a completed upload at `path`, as a write of its bytes would.
+    pub async fn install_blob(&self, path: &Path, sha256: &str, options: &FileOptions) -> io::Result<Written> {
+        let uri = format!("{}{}", route("/files", path)?, WithBlob { options, blob: Some(digest(sha256)?.to_owned()) }.encode()?);
+        self.link.json("PUT", &uri, empty()).await
+    }
+    pub async fn blob_size(&self, sha256: &str) -> io::Result<Option<u64>> {
+        match self.link.send("HEAD", &format!("/blobs/{}", digest(sha256)?), &[], empty()).await {
+            Ok(response) => Ok(header(&response, "content-length").and_then(|v| v.parse().ok())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(head_error(error, "blob.stat", Path::new(sha256))),
+        }
+    }
+    pub async fn remove_blob(&self, sha256: &str) -> io::Result<()> {
+        self.link.empty("DELETE", &format!("/blobs/{}", digest(sha256)?), empty()).await.map(drop)
     }
 
     /// Stage then activate via the stable route. Reconnect afterwards and verify
