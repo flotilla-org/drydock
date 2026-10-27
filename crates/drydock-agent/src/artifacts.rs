@@ -231,7 +231,8 @@ fn refuse(message: String) -> io::Error {
 /// the tree: a path with `..` or a root, a symlink pointing outside it, a
 /// hard link to outside it, and device files and FIFOs. An entry under a
 /// symlink the archive made is refused too, wherever the symlink points:
-/// the entry's path would no longer say where it lands. Entries keep their
+/// the entry's path would no longer say where it lands. So is a second
+/// entry at a symlink's own path. Entries keep their
 /// modes without setuid and setgid, and belong to the agent.
 pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> io::Result<()> {
     let reader: Box<dyn io::Read> = if gzip { Box::new(flate2::read::GzDecoder::new(reader)) } else { Box::new(reader) };
@@ -254,6 +255,11 @@ pub(crate) fn unpack_archive(reader: impl io::Read, gzip: bool, into: &Path) -> 
         let path = inside(&named).ok_or_else(|| refuse(format!("{shown}: the path leaves the tree")))?;
         if under_link(&links, &path) {
             return Err(refuse(format!("{shown}: the path passes through a symlink in the archive")));
+        }
+        // A second entry at a symlink's own path would act through it (a
+        // directory entry sets its mode on the link's target).
+        if links.contains(&path) {
+            return Err(refuse(format!("{shown}: the archive already made this path a symlink")));
         }
         use tar::EntryType::*;
         match kind {
@@ -700,16 +706,18 @@ mod tests {
 
     // A symlink is judged where it physically lands and by what its target
     // resolves through: an entry under a symlink the archive made is
-    // refused, and so is a target that climbs out through one, while a
-    // target through an in-tree symlink that stays inside is kept.
+    // refused, as is a second entry at its own path, and so is a target that
+    // climbs out through one, while a target through an in-tree symlink that
+    // stays inside is kept.
     #[test]
     fn symlink_chains_are_resolved_as_the_kernel_resolves_them() {
         use tar::EntryType::{Directory, Regular, Symlink};
         type Entries<'a> = &'a [(tar::EntryType, &'a str, &'a str)];
-        let cases: [(Entries, bool); 4] = [
+        let cases: [(Entries, bool); 5] = [
             (&[(Symlink, "s", "."), (Symlink, "s/t", "../x")], false),
             (&[(Symlink, "s", "."), (Regular, "s/f", "")], false),
             (&[(Symlink, "s", "."), (Symlink, "t", "s/../x")], false),
+            (&[(Directory, "a", ""), (Symlink, "s", "a"), (Directory, "s", "")], false),
             (&[(Directory, "d", ""), (Regular, "d/f", ""), (Symlink, "s", "d"), (Symlink, "t", "s/f"), (Symlink, "u", "s/../d")], true),
         ];
         for (entries, accepted) in cases {
