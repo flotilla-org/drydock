@@ -1,252 +1,99 @@
-# Rust reference host
+# Rust provider bridge
 
-`drydock-host` serves protocol version 6 directly from `drydock-protocol`. Its binary
-registers the in-memory `reference` module. Embedders register additional compiled
-Rust factories in `module::Registry` and use the same router/listeners. The crate
-requires Unix and is tested on Linux.
+`drydock-host` loads the compiled-in reference and Daytona modules and adapts the
+policy-free traits in `drydock-provider` to private REST. Common provider policy
+lives in `drydock::runtime`, owned by the main server's supervisor in both
+`drydockd` and an embedded `Daemon`. TypeScript and Python must implement this
+private bridge before they can use the new server path; their migration is separate.
+
+```text
+public API → Daemon / server Runtime → Provider traits → private REST → Rust host → vendor
+```
+
+The host decodes requests, resolves modules/providers, invokes their shared-reference
+methods and serializes results. Module settings remain opaque and are validated
+by the module. The host has no provider operation lock, credential store,
+credential rejection state, rate budget, poller, inventory reconciliation, billing
+transitions, public snapshots or event history. It never retries provider calls.
+Optional ports are reported separately from capabilities so server registration
+can validate their agreement.
+
+## Private contract
+
+`GET /v1/hello` discovers loadable/loaded modules and configured instances.
+Its private `incarnation` field identifies the loader process, so supervision can
+rebind stale handles even if another server has already configured the same
+logical names after a host restart. The public server Hello remains unchanged.
+`POST /private/modules/{module}/configure` maps `Module::configure` and returns
+an opaque configured-provider handle and its raw facts. The server releases that
+handle when its trait object drops, including rejected configuration transactions;
+release never destroys vendor resources. Logical bindings reuse identical configurations
+to preserve independently owned external-host state across server disconnects;
+they retain no ordinary-call credential snapshots or observation tasks. Independent handles permit a corrected
+configuration to reuse its logical provider name. Logical bindings and opaque
+handles have separate key spaces; reuse includes the actual selected entrypoint.
+Each configure returns a fresh handle, released when the server drops its trait
+object. A release lost while the host is unreachable leaves that handle until the
+host exits; logical bindings, and so their loaded modules, last for the host's
+lifetime. Concurrent loader calls are serialized, without locking ordinary operations.
+This is the only private loader endpoint; bulk configuration/admission belongs
+to the main server. Bridge hello reports module readiness without a delivered
+credential; per-call facts report readiness with that call's snapshot.
+Every `POST /private/providers/{provider}/{operation}` carries a JSON `Call<T>`:
+`{ "credentials": { "mode": ..., "value": ... }, "argument": ... }`.
+The credential value is an immutable snapshot for that ordinary call. Configuration
+contains only credential mode/reference metadata, never a retained vendor secret.
+
+Operations map directly to the existing traits:
+
+| Operation | Argument | Result |
+| --- | --- | --- |
+| facts | null | capabilities, optional ports, observation mode, rate limits, provider readiness |
+| prepare / provision | typed request | Prepared / Provisioned (Created or Existing) |
+| list | null | raw ObservedEnvironment array |
+| inspect / inspect-after-lifecycle | environment ID | raw ObservedEnvironment |
+| destroy | environment ID | null |
+| reach | environment ID | raw Connection |
+| suspend / resume | ID / [ID, token] | token / null |
+| export / usage / quota | ID / Period / null | Export / Usage / Quota |
+| relay / exec | ID / [ID, command] | upgraded byte stream |
+| subscribe | null | SubscriptionRecord NDJSON (raw Update or typed failure) |
+
+ObservedEnvironment preserves the provider timestamp, egress_measured and
+opaque egress_policy identity alongside Environment. Lifecycle inspection calls
+`inspect_after_lifecycle`, never ordinary inspect. Provision serialization retains
+Created versus Existing rather than inferring it from an Environment response.
+Subscriptions forward observed rows and explicit removals; the host never assigns
+public cursors or emits derived billing events. Each subscription holds one
+credential snapshot; the server cancels/reopens it on rotation.
+
+Disconnect drops provider futures and subscriptions. Cancellation does not prove
+vendor rollback: a mutating call may have taken effect before cancellation.
+Relay and exec forward stream bytes until disconnection or shutdown. Ctrl-C and
+SIGTERM close streams and unlink the managed socket.
+
+## Transport
 
 ```sh
 mkdir -m 700 /tmp/drydock-example
 cargo run -p drydock-host -- --unix /tmp/drydock-example/host.sock
-# Or: --tcp 127.0.0.1:9280 --token-file /tmp/drydock-example/token
+# Existing loopback TCP: --tcp 127.0.0.1:9280 --token-file /tmp/drydock-example/token
 ```
 
-The runtime directory must exist, belong to the host user, and have mode 0700.
-Rigging owns socket binding, peer credentials, token-file creation, constant-time
-comparison, and Host/Origin enforcement. TCP is loopback only and uses the numeric
-bound authority in Host. The host selects bearer-only TCP and the supervisor UID
-through small caller-policy layers pending shared Rigging policy options (#20).
-Ctrl-C and SIGTERM signal and await observers, close event bodies and upgraded streams, and unlink the
-owned Unix socket. Restart rotates the TCP token.
+The supervisor/server owns the 0700 directory; the socket is 0600. There is no
+peer UID/SO_PEERCRED admission check on this managed private transport. Existing
+loopback TCP bearer authentication and Host/Origin restrictions are unchanged.
+Main-server public network admission is unchanged.
 
-## Configuration and module interface
+## Validation ownership
 
-Send this to `PUT /v1/config` over the authenticated connection:
-
-```json
-{
-  "modules": [{"name": "memory", "entrypoint": "reference"}],
-  "providers": [{
-    "name": "test",
-    "module": "memory",
-    "settings": {},
-    "credential": {"mode": "direct", "credential_reference": "example"}
-  }]
-}
-```
-
-`entrypoint` selects a compiled factory, not a shared-library path. Each factory
-creates an `Arc<dyn Provider>`. **Every provider method takes `&self`; the host
-holds no provider operation lock.** Concurrent prepare, inspect, list, snapshot
-and credential refresh calls remain independent. Stateful modules synchronize
-only their own data; the reference uses a short internal Mutex with no await.
-
-`Provider` contains the core lifecycle and inventory operations. Optional operations
-are borrowed ports returned by `operations()`: `Exec`, `SuspendResume`,
-`ExportOperation`, `UsageOperation`, and `QuotaOperation`. The default is an empty
-`Operations`, so a basic provider implements no optional methods. Implement only
-the supported traits, returning `Some(self)` (or a separate adapter) for those ports.
-Registration refuses a mismatch between ports and capability flags. Both declarations
-must stay stable for the configured lifetime. If a module violates this contract by
-withdrawing a port, the request returns a typed Refused error instead of panicking.
-The host remains the single capability
-gate; ports contain no unsupported defaults. All ports are object-safe, `Send + Sync`,
-and use `&self`. Push providers retain the post-commit `run(PushContext)` hook.
-
-Factories validate settings before commit and must not publish or start detached
-work while configuring. The reference parses a typed settings struct, accepts an
-optional `poll_interval_ms` (positive, default 10) and `fault: <ProtocolError>` for
-error-class conformance, `platforms` (`{"os", "architecture"}` objects; default linux/amd64 then linux/arm64, the
-first preferred), and rejects unknown settings. The host resolves each prepare
-request's platform against the declared list before the module sees it; modules
-read it with `prepare_platform` and must record that platform in the prepared
-form, or the host returns `Internal`. Capabilities also list `image_routes`, the
-ways a vessel image reaches the provider, preferred first: `provider_push`
-(protocol and credential lifetime), `registry_pull` (auth kind, how the
-credential is registered, whether digest references work) and `remote_build`
-(input kind, multi-stage support). Each route states whether the tools layer is
-added by the provider or by the host. Clients choose by these properties and
-their own policy, never by provider name. The host resolves each request's
-`route` like its platform (omitted means the first declared route; an
-undeclared one is refused), and modules read it with `prepare_route`. A
-platform, image size or push credential a provider cannot take is the typed
-`image_refused` error, whose `refusal` carries a stable cause. Exact repeated documents
-preserve providers and credentials; additions commit atomically. Replacement or
-removal currently requires restart, protecting in-memory resources. Stateless
-settings replacement is tracked in #22.
-
-One shared call helper resolves a provider, checks readiness and cached capability,
-reserves the declared operation/global rate budget, invokes it and records the
-outcome. Optional methods have no duplicate unsupported defaults. A missing
-credential means Unavailable (503), without a vendor call. CredentialRejected
-(502) means a vendor actually rejected a delivered value; readiness then becomes
-MissingCredential until refresh. A stale rejection cannot undo a newer credential
-generation. Hello reads cached declarations without waiting on vendor I/O.
-
-Provision returns a typed Created/Existing result; the host chooses 201/200.
-The same label with a valid changed body returns the existing environment, not an
-update. Reach returns a module connection recipe; Relay is a marker and the host
-builds its escaped route. Streams reuse `rigging_stream::ByteStream`.
-
-## Credentials and HTTP transport
-
-Send `{"value":"example-secret"}` to
-`PUT /v1/providers/test/credential`, again whenever it rotates. Direct values
-exist only in memory. `Credentials::new` has no initial secret; empty refreshes
-are refused. The host does not resolve credential references. Tool/version/unknown
-readiness is separate from credential refresh.
-
-Factories receive `Arc<dyn rigging_http_client::HttpClient>` separately from
-credential mode and values. Modules build requests, add the current credential,
-and execute through that port, allowing Rigging stand-in/replay clients in tests.
-The production client comes from Rigging's `ReqwestHttpClient::restricted`:
-no ambient proxy, retries or redirects, a 30-second timeout, an explicit proxy
-when configured and additional supervisor CA roots. No client construction is
-copied into Drydock. `DRYDOCK_PROXY_CA` names a PEM file for the binary;
-embedders use `Host::with_proxy_ca`. The file is PEM with one or more
-`-----BEGIN CERTIFICATE-----` / `-----END CERTIFICATE-----` CA blocks, not a private
-key or PKCS#12 file. Never log serialized credentials, request
-bodies, or raw vendor errors. Proxied providers refuse Direct refreshes.
-
-## Host-owned observation
-
-A provider declares `ObservationMode::Poll { interval }` or Push. For Poll the
-host owns one list loop, last-seen state and diffing. It stretches the interval
-within declared list/global limits and skips missed ticks. Observation gets at
-most half the long-run list/global rate and max(1, requests/2) slots per window;
-route calls share the total budget and can use the remaining slots. An indivisible
-one-request window is polled at most every two windows: a route immediately after
-that single poll can still receive 429 until the shared window expires. If route
-traffic consumes a single-slot window before a due poll, the host reserves the next
-free slot for that pending observation. Routes may receive 429 until the next poll
-attempt takes the slot; this prevents steady route traffic from starving observation.
-The first
-poll is eligible immediately; Direct credential delivery wakes observation, so a
-large steady-state interval does not delay the first snapshot. Failed or unready lists preserve prior state and never report
-resources gone. Successful complete lists emit Created/Running, Stopped/Paused,
-Resumed/Running, size changes, and Gone transitions. Confirmed requested deletions
-use DestroyedByRequest; unexplained absence uses MissingOnList. If a list observes
-absence while destroy is pending, the host defers the billing cause until the call
-confirms or fails. Failure/cancellation is never promoted to confirmed deletion.
-
-The default `inspect_after_lifecycle` reads the complete inventory to avoid guest
-probes on a completed lifecycle. This costs O(inventory); providers with a cheap
-per-environment read can override it, as Daytona does, retaining that observation
-if optional enrichment fails. Explicit inspect remains strict.
-
-Modules return `ObservedEnvironment` from list/inspect: the environment plus an optional
-typed provider timestamp. Polling uses that time, including matching inspect
-metadata when list has none; otherwise the host stamps first observation with
-TimestampSource::Adaptor. Push modules publish through EventSink with an optional
-typed timestamp. Some means Provider provenance; None asks the host to stamp
-Adaptor time. Modules never format event times. The reference declares Poll and
-publishes no events itself, so its lifecycle tests exercise the host poller.
-
-The host retains `EVENT_HISTORY_CAPACITY` host-wide events in memory (1024).
-`GET /v1/events` starts with a snapshot; `?since=` resumes exclusively at
-retained cursors. Unknown, expired and previous-process cursors produce a
-gap snapshot. Poll snapshots use the last successful host-owned inventory, never
-another vendor list request. A poll commits its inventory and transition events
-under the same log lock, so a poll-only snapshot cursor identifies that exact cut.
-Before a provider's first successful poll, a snapshot waits for observation or
-marks that provider's typed failure. With neither cache nor a failure, it waits for
-an observation, an error, or host shutdown. Later transient poll failures retain the inventory.
-Push snapshot cursors precede provider listing to replay overlapping events.
-Independent push lists run concurrently under one shared five-second deadline
-(`PUSH_SNAPSHOT_TIMEOUT`), once per snapshot. This is a fixed host policy rather than
-provider configuration. A timed-out list is cancelled and its provider is marked
-Unavailable; healthy providers still publish inventory. Lists return complete vectors:
-no captured or unfinished response is published as authoritative. Host shutdown
-cancels the whole batch immediately. Waiting for an initial poll inventory does not
-restart the push lists or their deadline. If enough events arrive during that wait
-to evict the pre-list cursor from the 1024-event history, the next stream iteration
-emits a fresh gap snapshot instead of replaying the lost events. Clients apply that
-replacement snapshot normally, preserving inventory for unavailable providers;
-individual evicted billing transitions cannot be recovered from this in-memory log.
-Snapshot rows mark a metering gap and do not create extra billing transitions.
-
-Snapshots omit inventory for unready providers and failed push lists, reporting
-those providers in an optional `unavailable_providers` map of name to typed error.
-Cached poll rows are also withheld when that provider is unready; a ready provider's
-cached inventory remains available through transient polling failures.
-The map is absent for a complete snapshot. Consumers must preserve previous inventory
-for marked providers: missing rows are not evidence of deletion or a billing transition.
-Healthy providers continue streaming. Events from a marked provider can still follow
-the snapshot cursor. Each such event is authoritative only for its own environment
-row; it does not make that provider's omitted inventory complete or remove its marker.
-Push lists use the normal call gate, so a
-successful list repairs a proxied rejection without requiring a separate route call.
-Direct credentials still require refresh. Poll providers repair through normal polling.
-Retained-cursor replay does not list. Host stopping still returns an initial typed
-HTTP error or ends an existing stream. The protocol defines no terminal NDJSON error record.
-Polling cannot report transitions hidden entirely between samples; modules with
-event streams declare Push.
-
-Push observers receive `Provider::run(PushContext)` only after configuration commits.
-The context carries a provider-scoped sink, a credential watch, and a stop watch.
-On shutdown the host signals and cancels pending configuration, then awaits observer
-cleanup against one shared five-second deadline. It aborts remaining observers without
-awaiting cooperative cancellation and releases instances. Once the shared deadline
-expires, remaining observers receive no additional grace; already-completed tasks
-are still collected. Module factories must be
-cancellation safe; configuration remains transactional until commit. Poll factories
-receive no sink and do not start background work. Upgraded streams close on shutdown; they
-are not drained to completion.
-
-## Diagnostics and readiness
-
-The library emits structured tracing events with route/provider/environment identity,
-static error classes and readiness statuses; it never installs a subscriber or logs
-request bodies, credentials or vendor error text. The binary installs a plain-text
-stderr subscriber using `RUST_LOG`, defaulting to `info`. Embedders choose a subscriber.
-
-One policy derives readiness and call admission from module readiness plus host
-credential state. Direct rejection is sticky until a new refresh. A rejection also
-invalidates older calls, so a stale success cannot repair it. Proxied rejection
-reports Unknown while allowing subsequent probes; a successful post-rejection
-probe restores readiness after the supervisor repairs the proxy. Direct credential
-refresh is still refused for Proxied providers.
-
-## Routes and validation
-
-All routes in `openapi.json` are implemented. Typed JSON/path extraction returns
-sanitized Refused errors without echoing diagnostics; no status-rewriting layer
-is used. `ProtocolError::status` and every OpenAPI route carry the shared status
-contract. Destination host/IP/CIDR parsing and ordered RFC3339 periods are validated
-by protocol deserialization, and their patterns/formats/invariants appear in the
-schema for other language hosts. Positive CPU counts, nonempty labels/digests/credential values and executable
-commands are also protocol/schema constraints. Times are typed instants throughout
-module and wire types. Unknown routes/providers/environments use NotFound (404);
-wrong HTTP methods use MethodNotAllowed (405). Other statuses have shared,
-status-specific OpenAPI responses, including Retry-After. Host checks retain
-prepared-provider ownership and capability gates.
-
-Relay requests send `Connection: Upgrade` and `Upgrade: drydock-relay`. Exec uses
-POST, typed JSON `ExecRequest`, and `Upgrade: drydock-stream`; its upgrade extractor
-preserves metadata while using the same JSON body path as other routes. Successful
-101 responses echo the headers and bridge raw streams with half-close propagation.
-Shared all-route body deadlines and auth policy options are tracked in #20 and
-Rigging #18. Generic provider call lifetime/cancellation policy is tracked in #19.
-
-The reference echoes relay and `exec ["cat"]`; `exec ["echo", ...]` writes a line
-without OS processes. It reports advisory egress, refuses direct destinations,
-returns no vendor usage measurements and counts running resources for quota.
-Usage/quota numeric output assertions belong in conformance (#21), not routing.
-
-```sh
-cargo test -p drydock-host -p drydock-protocol --locked
-```
-
-Tests drive real Unix/TCP endpoints, a generated label lifecycle, host polling,
-provider/inspect timestamp provenance, replay/eviction, concurrent same-provider
-calls, credential rotation, Rigging replay injection, raw upgrades, rate limits,
-auth and shutdown. Shared protocol properties compare decoding with schema rules.
-Endpoint-driven reuse across language hosts and remaining forwarding/fixture-helper
-consolidation are tracked in #21.
-
-Unix UID admission failures return a bare 403 before protocol handling, just as
-Rigging's TCP authentication failures return transport-level statuses. These are
-not module or `/v1` ProtocolError outcomes.
+Server unit tests and `drydock/tests/runtime.rs` exercise admission, credential
+state, budgets, polling, raw evidence retention, billing and public event replay.
+Host bridge tests exercise module/provider routing, raw serialization, per-call
+credentials, stream forwarding and cancellation. Managed daemon and conformance
+tests run the server policy through the real Rust binary. Daytona tests retain
+the replay/stand-in boundary and run policy assertions against the server Runtime.
+No live paid-provider provisioning is part of these checks.
 
 ## Tools prepare and startup contract
 
@@ -256,6 +103,19 @@ provider-owned prepared keys, preservation of base configuration, agent startup
 and upgrade layout, and the `drydock::conformance::vessel_tools` probe. The
 reference module supplies explicitly simulated guest evidence; stock-Ubuntu OCI
 acceptance runs separately in CI.
+
+Capabilities list `platforms` and `image_routes`, the ways a vessel image
+reaches the provider, preferred first: `provider_push` (protocol and credential
+lifetime), `registry_pull` (auth kind, how the credential is registered, whether
+digest references work) and `remote_build` (input kind, multi-stage support).
+Each route states whether the tools layer is added by the provider or by the
+host. Clients choose by these properties and their own policy, never by
+provider name. The server resolves each prepare request's platform and `route`
+before the module sees them (omitted means the first declared; an undeclared one
+is refused). Modules read them with `prepare_platform` and `prepare_route`, and
+must record the platform in the prepared form, or the server returns `Internal`.
+A platform, image size or push credential a provider cannot take is the typed
+`image_refused` error, whose `refusal` carries a stable cause.
 
 Every host build uses drydock's checked-in bootstrap tools pin unless a build-time
 override is supplied. The pin can be older than the host: use the agent client's
@@ -409,9 +269,9 @@ when the policy has listed destinations:
 For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
 is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
 real externally verified reachable services; never print constants as evidence.
-Provision, host resume completion and explicit inspect measure the claim. Cheap
+Provision, server resume completion and explicit inspect measure the claim. Cheap
 list/poll calls do not exec. Every Daytona observation carries an opaque effective
-policy fingerprint; the host retains measured evidence while running with the
+policy fingerprint; the server retains measured evidence while running with the
 same fingerprint, and invalidates it on policy change, stopped/gone/unknown state
 or disappearance. A changed-back policy requires another measurement. Providers
 without policy fingerprints retain the conservative 60-second fallback TTL.
@@ -421,18 +281,18 @@ typed error class; explicit inspect still returns the typed error. Open/nonrunni
 rows are Advisory. Transport outages return Unavailable, not adaptor-bug Internal.
 
 Observation polls every 30 seconds, with complete cursor pagination, provider
-`updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The host
+`updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The main server
 owns all state diffs and event emission. Error reasons map OOM/eviction to loss
 causes, unreachable to host-unreachable, and other provider errors to API-error;
 known progress maps to `Transitioning` phases; unestablished states alone are
-Unknown. The host keeps stable billing state across progress samples. No webhooks.
+Unknown. The main server keeps stable billing state across progress samples. No webhooks.
 
 The module declares per-organization Tier 1–4 general/create/lifecycle limits
 (10k/300/10k through 50k/600/50k per minute). Optional `rate_limits` overrides
-accept explicit host `RateLimit` rows for Enterprise contracts. A 429 reads
+accept explicit provider `RateLimit` rows for Enterprise contracts. A 429 reads
 `Retry-After-{throttler}`, falling back to the exhausted bucket's
 `X-RateLimit-Reset-{throttler}` remaining seconds (or plain Retry-After). It never retries.
-Unused cached rate-window state was removed: the host does not yet dynamically
+Unused cached rate-window state was removed: the server does not yet dynamically
 adjust its admission budget using successful responses' observed limit/remaining
 counters. That is an explicit gap, not global quota coordination. Completion
 waits, pagination, toolbox routing lookups and probes consume additional calls
@@ -494,12 +354,19 @@ This is a diagnostic runner, not an interactive terminal. Empty output is valid.
 Snapshot activation is submitted once and then observed by paced reads. Terminal
 sandbox start failures are returned immediately. A provider-reported `destroyed`
 without eviction metadata is `DestroyedAtProvider`, rather than claiming that the
-guest powered itself off; confirmed Drydock deletion still uses the host's
+guest powered itself off; confirmed Drydock deletion still uses the server's
 `DestroyedByRequest` event cause.
 
-The module's bounded completion waits are distinct from the host's observation
+The module's bounded completion waits are distinct from the server's observation
 poller: prepare permits up to 120 successful state reads at two-second intervals,
 and start/stop permit up to 60. A failed GET exits immediately; the caller owns
-failure retries. These internal reads do not currently consume separate host
+failure retries. These internal reads do not currently consume separate server
 route-budget slots. That is a known limitation under the required rate-window
 review work, not an additional module observation/reconciliation loop.
+
+Raw subscription overflow terminates the stream with a typed failure, including
+when a provider ignores sink errors. The server records that failure; consistent
+with existing subscription lifetime policy, it does not introduce a same-snapshot
+retry loop. Rotation can reopen the subscription. Transport loss during mutation
+reports unavailability with an uncertain-outcome reason and never proves rollback;
+malformed host responses are internal adapter errors rather than transient outages.

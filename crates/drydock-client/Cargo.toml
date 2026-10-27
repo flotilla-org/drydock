@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drydock-provider = { path = "../drydock-provider" }
 drydock-protocol = { path = "../drydock-protocol" }
 rigging-http-client.workspace = true
 rigging-stream.workspace = true
@@ -12,6 +13,7 @@ rigging-tls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait = "0.1"
+async-stream = "0.3"
 reqwest = { workspace = true, features = ["json", "stream", "query"] }
 http.workspace = true
 bytes = "1"
@@ -20,4 +22,5 @@ tokio = { version = "1", features = ["sync", "time", "io-util"] }
 thiserror = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "net"] }
+tempfile = "3"

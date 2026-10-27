@@ -1,6 +1,9 @@
 //! Endpoint-driven ADR 0070 scenarios. No reference-host implementation is used.
 //! The caller configures/authenticates the client and owns the host's lifetime.
-use drydock_client::{Client, Error, Method, Records};
+use drydock_client::{
+    Client, Error, Method, Records,
+    api::{ProviderApi, Provisioned},
+};
 use drydock_protocol::*;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -169,13 +172,14 @@ impl SafeError for Error {
     fn category(self) -> String {
         match self {
             Error::Protocol(error) => format!("http {} {}", error.status(), error),
-            Error::InvalidResponse => "decode".into(),
-            Error::Transport => "transport".into(),
-            Error::InvalidRequest => "invalid request".into(),
+            Error::InvalidResponse(_) => "decode".into(),
+            Error::Transport(_) => "transport".into(),
+            Error::Timeout(_) => "timeout".into(),
+            Error::InvalidRequest(_) => "invalid request".into(),
             Error::VersionMismatch => "version mismatch".into(),
             Error::RateLimited => "rate limited".into(),
-            Error::NotReady(readiness) => format!("not ready: {readiness:?}"),
-            Error::ReadinessTimeout(readiness) => format!("startup timeout: {readiness:?}"),
+            Error::NotReady(readiness) => format!("not ready: {readiness}"),
+            Error::ReadinessTimeout(readiness) => format!("startup timeout: {readiness}"),
         }
     }
 }
@@ -531,13 +535,10 @@ impl Target<'_> {
         let options = self.options;
 
         owned_ids.register(&options.request);
-        let (first, second) = tokio::join!(
-            client.provision_with_status(provider, &options.request),
-            client.provision_with_status(provider, &options.request)
-        );
-        let first_status = first.as_ref().ok().map(|(status, _)| *status);
+        let (first, second) = tokio::join!(client.provision(provider, &options.request), client.provision(provider, &options.request));
+        let first_created = first.as_ref().ok().map(|row| matches!(row, Provisioned::Created(_)));
         let environment = match first {
-            Ok((_, environment)) => environment,
+            Ok(row) => row.into_inner(),
             Err(error) => {
                 report.record("provision", Err(error.category()));
                 report.record("cleanup_after_failed_provision", cleanup(client, provider, owned_ids).await);
@@ -548,13 +549,12 @@ impl Target<'_> {
         report.record(
             "concurrent_label",
             async {
-                let (status, other) = second.map_err(SafeError::category)?;
+                let second = second.map_err(SafeError::category)?;
+                let created = matches!(second, Provisioned::Created(_));
+                let other = second.into_inner();
                 let same = other.id == environment.id;
                 owned_ids.insert(other.id.clone());
-                require(
-                    matches!((first_status, status), (Some(200), 201) | (Some(201), 200)) && same,
-                    "concurrent retries must return one creation and one existing resource",
-                )
+                require(first_created == Some(!created) && same, "concurrent retries must return one creation and one existing resource")
             }
             .await,
         );
@@ -580,7 +580,7 @@ impl Target<'_> {
         report.record(
             "idempotent_label",
             async {
-                let again = client.provision(provider, &options.request).await.map_err(SafeError::category)?;
+                let again = client.provision(provider, &options.request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
                 let same = again.id == environment.id && again.label == environment.label;
                 owned_ids.insert(again.id.clone());
                 require(same, "duplicate label created another environment")
@@ -862,7 +862,7 @@ impl Target<'_> {
                 let mut invalid = options.request.clone();
                 invalid.prepared.provider = format!("{provider}-other");
                 invalid.label = owned_ids.label(ProbeLabel::Refused);
-                match client.provision(provider, &invalid).await {
+                match client.provision(provider, &invalid).await.map(Provisioned::into_inner) {
                     Err(Error::Protocol(ProtocolError::Refused { .. })) => Ok(()),
                     Ok(unexpected) => {
                         owned_ids.insert(unexpected.id);
@@ -1204,14 +1204,14 @@ mod tests {
     fn diagnostic_categories_and_provider_messages() {
         let secret = "vendor explanation";
         let errors = [
-            (Error::InvalidResponse, "decode"),
-            (Error::Transport, "transport"),
+            (Error::InvalidResponse("expected value".into()), "decode"),
+            (Error::Transport("connection refused".into()), "transport"),
             (Error::Protocol(ProtocolError::Refused { reason: secret.into() }), "http 422 refused: vendor explanation"),
             (
                 Error::Protocol(ProtocolError::Internal { reason: secret.into(), provider_error: secret.into() }),
                 "http 500 internal: vendor explanation; vendor explanation",
             ),
-            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready: Unknown { reason: \"vendor explanation\" }"),
+            (Error::NotReady(Readiness::Unknown { reason: secret.into() }), "not ready: unknown: vendor explanation"),
         ];
         for (error, expected) in errors {
             assert_eq!(error.category(), expected);

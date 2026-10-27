@@ -1,18 +1,19 @@
 //! Compiled Rust provider interface. Shared methods permit independent concurrent calls.
-use crate::EventSink;
+pub mod rest;
 use async_trait::async_trait;
 use drydock_protocol::*;
 pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 /// Errors are serialized to authenticated host clients, including snapshot readers.
-/// The host masks configured credential values in reasons and provider diagnostics.
+/// The main server masks configured credential values in public diagnostics.
 /// Credentials, tokens and reach recipes still use Secret fields.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
 }
-/// The platform a module prepares for. The host resolves it from the request
+/// The platform a module prepares for. The server resolves it from the request
 /// and the module's declared platforms before calling `prepare`.
 pub fn prepare_platform(request: &PrepareRequest) -> Result<Platform> {
     request.platform.clone().ok_or_else(|| refused("prepare reached the module without a resolved platform"))
@@ -51,7 +52,7 @@ pub fn resolve_route(requested: Option<ImageRouteKind>, declared: &[ImageRoute])
 }
 
 /// Factories are transactional: do not spawn observers or publish before commit.
-/// Poll modules are stateless translators; the host owns observation. Push modules
+/// Poll modules are stateless translators; the server owns observation. Push modules
 /// receive a post-commit run hook with credentials and shutdown. No module retries.
 #[async_trait]
 pub trait Module: Send + Sync {
@@ -64,7 +65,7 @@ pub trait Module: Send + Sync {
     /// resources; factories must yield while waiting on external work.
     async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub mode: CredentialMode,
     pub value: Option<Secret>,
@@ -80,13 +81,13 @@ impl Credentials {
         }
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum ObservationMode {
     Poll { interval: Duration },
     Push,
 }
 /// Optional provider time travels separately from the environment wire representation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ObservedEnvironment {
     /// True only when this call measured the isolation claim; conversion from
     /// a bare Environment conservatively supplies no measurement evidence.
@@ -101,10 +102,25 @@ impl From<Environment> for ObservedEnvironment {
         Self { environment, timestamp: None, egress_measured: false, egress_policy: None }
     }
 }
-pub enum Provisioned {
-    Created(ObservedEnvironment),
-    Existing(ObservedEnvironment),
+/// Created versus Existing preserves the public 201/200 distinction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Provisioned<T = ObservedEnvironment> {
+    Created(T),
+    Existing(T),
 }
+impl<T> Provisioned<T> {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Provisioned<U> {
+        match self {
+            Self::Created(row) => Provisioned::Created(f(row)),
+            Self::Existing(row) => Provisioned::Existing(f(row)),
+        }
+    }
+    pub fn into_inner(self) -> T {
+        let (Self::Created(row) | Self::Existing(row)) = self;
+        row
+    }
+}
+#[derive(Serialize, Deserialize)]
 pub enum Connection {
     /// `reverse_forwards`: whether the SSH server accepts remote Unix-socket forwards.
     Ssh {
@@ -121,15 +137,31 @@ pub enum Connection {
     Relay,
 }
 
+/// Raw provider facts. No public events, billing transitions or cursors cross this seam.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Update {
+    Observed(ObservedEnvironment),
+    Removed { id: String, timestamp: Option<chrono::DateTime<chrono::Utc>> },
+}
+#[derive(Clone)]
+pub struct EventSink(Arc<dyn Fn(Update) -> Result<()> + Send + Sync>);
+impl EventSink {
+    pub fn new(deliver: impl Fn(Update) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(deliver))
+    }
+    pub fn publish(&self, update: Update) -> Result<()> {
+        (self.0)(update)
+    }
+}
 /// Context for a push observer, handed to run only after configuration commits.
-/// Observe credential changes in memory, and release resources before returning on stop.
+/// Credentials are immutable for this subscription; the server cancels and reopens on rotation.
 pub struct PushContext {
     pub events: EventSink,
-    pub credentials: tokio::sync::watch::Receiver<Credentials>,
+    pub credentials: Credentials,
     pub stopping: tokio::sync::watch::Receiver<bool>,
 }
 /// No host-side provider lock. Implementations own any internal synchronization.
-/// Capability declarations are stable. The host gates optional calls in one place;
+/// Capability declarations are stable. The server gates optional calls in one place;
 /// optional ports are stable for the configured lifetime. Omit unsupported ports.
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -148,6 +180,9 @@ pub trait Provider: Send + Sync {
     fn readiness(&self, c: &Credentials) -> Readiness {
         if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
     }
+    /// Refresh transport-backed readiness facts before server admission. Local
+    /// providers already expose current facts synchronously through readiness().
+    async fn refresh_readiness(&self, _c: &Credentials) {}
     fn rate_limits(&self) -> Vec<RateLimit> {
         vec![]
     }
@@ -268,4 +303,65 @@ mod tests {
             tools_digest: "t".into(),
         }
     }
+}
+
+/// Private adapter payload. Credentials are immutable for this call or subscription.
+#[derive(Serialize, Deserialize)]
+pub struct Call<T> {
+    pub credentials: Credentials,
+    pub argument: T,
+}
+#[derive(Serialize, Deserialize)]
+pub struct Facts {
+    pub ports: Ports,
+    pub capabilities: Capabilities,
+    pub observation: ObservationMode,
+    pub rate_limits: Vec<RateLimit>,
+    pub readiness: Readiness,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Ports {
+    pub exec: bool,
+    pub suspend_resume: bool,
+    pub export: bool,
+    pub usage: bool,
+    pub quota: bool,
+}
+impl From<Operations<'_>> for Ports {
+    fn from(p: Operations<'_>) -> Self {
+        Self {
+            exec: p.exec.is_some(),
+            suspend_resume: p.suspend_resume.is_some(),
+            export: p.export.is_some(),
+            usage: p.usage.is_some(),
+            quota: p.quota.is_some(),
+        }
+    }
+}
+
+/// Private loader identity. The public Hello payload remains unchanged.
+#[derive(Serialize, Deserialize)]
+pub struct BridgeHello {
+    #[serde(flatten)]
+    pub hello: Hello,
+    /// Absent on simple discovery stand-ins; real bridges supply a process identity.
+    #[serde(default)]
+    pub incarnation: Option<String>,
+}
+
+/// A configured provider is a loader-owned handle, released when the server
+/// drops its trait object (including a rejected configuration transaction).
+#[derive(Serialize, Deserialize)]
+pub struct ConfiguredProvider {
+    pub instance: String,
+    pub facts: Facts,
+}
+
+/// Subscription errors remain typed provider results on the private transport.
+/// These records are not public ObserveRecord events/history.
+#[derive(Serialize, Deserialize)]
+pub enum SubscriptionRecord {
+    Update(Update),
+    Failed(ProtocolError),
 }

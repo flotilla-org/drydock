@@ -1,0 +1,19 @@
+[package]
+name = "drydock-provider"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+drydock-protocol = { path = "../drydock-protocol" }
+async-trait = "0.1"
+rigging-http-client.workspace = true
+rigging-stream.workspace = true
+serde.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["sync", "rt", "io-util"] }
+axum = "0.8"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde_json.workspace = true
+serde_path_to_error = "0.1"
+tracing = "0.1"

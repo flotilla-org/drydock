@@ -1,6 +1,6 @@
 //! Standalone launch policy: defaults, immutable images and per-vessel SSH keys.
 use crate::{
-    client::{Client, Error},
+    client::Error,
     config::{Egress, Provider, Quantity, SizeDefaults},
 };
 use drydock_protocol::*;
@@ -73,19 +73,19 @@ impl RegistryResolver {
             .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|_| Error::Transport)?;
-        Ok(Self { http: Arc::new(rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(|_| Error::Transport)?), client })
+            .map_err(|e| Error::transport(&e))?;
+        Ok(Self { http: Arc::new(rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(Error::Transport)?), client })
     }
     pub fn with_http(mut self, http: Arc<dyn rigging_http_client::HttpClient>) -> Self {
         self.http = http;
         self
     }
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<http::Response<bytes::Bytes>, Error> {
-        let request = request.build().map_err(|_| Error::InvalidRequest)?;
+        let request = request.build().map_err(|e| Error::InvalidRequest(drydock_client::chain(&e)))?;
         self.http
             .execute(request, &rigging_http_client::ChannelLabel::Extra("drydock".into(), "image".into()))
             .await
-            .map_err(|_| Error::Transport)
+            .map_err(|e| Error::Transport(format!("image registry: {e}")))
     }
 }
 #[async_trait::async_trait]
@@ -108,9 +108,11 @@ impl ImageResolver for RegistryResolver {
             let challenge = challenge.strip_prefix("Bearer ").ok_or_else(|| refused("registry requires unsupported authentication"))?;
             let fields: std::collections::BTreeMap<_, _> =
                 challenge.split(',').filter_map(|s| s.trim().split_once('=')).map(|(k, v)| (k, v.trim_matches('"'))).collect();
-            let realm = reqwest::Url::parse(fields.get("realm").ok_or(Error::InvalidResponse)?).map_err(|_| Error::InvalidResponse)?;
+            let invalid = |reason: &str| Error::InvalidResponse(format!("registry authentication challenge {reason}"));
+            let realm = reqwest::Url::parse(fields.get("realm").ok_or_else(|| invalid("has no realm"))?)
+                .map_err(|_| invalid("realm is not a URL"))?;
             if realm.scheme() != "https" || !realm.username().is_empty() || realm.password().is_some() {
-                return Err(Error::InvalidResponse);
+                return Err(invalid("realm is not a plain https URL"));
             }
             let scope = format!("repository:{}:pull", reference.repository);
             let token = self
@@ -123,8 +125,13 @@ impl ImageResolver for RegistryResolver {
             if !token.status().is_success() {
                 return Err(refused("registry token request failed"));
             }
-            let token: serde_json::Value = serde_json::from_slice(token.body()).map_err(|_| Error::InvalidResponse)?;
-            let token = token.get("token").or_else(|| token.get("access_token")).and_then(|v| v.as_str()).ok_or(Error::InvalidResponse)?;
+            let token: serde_json::Value =
+                serde_json::from_slice(token.body()).map_err(|e| Error::InvalidResponse(format!("registry token: {e}")))?;
+            let token = token
+                .get("token")
+                .or_else(|| token.get("access_token"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::InvalidResponse("registry token response has no token".into()))?;
             response = self.send(request().bearer_auth(token)).await?;
         }
         if !response.status().is_success() {
@@ -134,7 +141,7 @@ impl ImageResolver for RegistryResolver {
         if let Some(header) = response.headers().get("docker-content-digest")
             && header.to_str().ok() != Some(&digest)
         {
-            return Err(Error::InvalidResponse);
+            return Err(Error::InvalidResponse(format!("registry manifest digest header does not match {digest}")));
         }
         Ok(format!("{}@{digest}", reference.name))
     }
@@ -192,38 +199,28 @@ impl ImageReference {
     }
 }
 
-pub async fn prepare(
-    client: &Client,
-    name: &str,
+pub(crate) async fn prepare_request(
     provider: &Provider,
     minimum: &Size,
     options: &LaunchOptions,
     resolver: &dyn ImageResolver,
-) -> Result<(Prepared, Size), Error> {
+) -> Result<PrepareRequest, Error> {
     let tools_digest = build_tools_digest()?;
     let size = options.size(provider, minimum).map_err(refused)?;
     let image =
         options.image.as_deref().or(provider.image.as_deref()).ok_or_else(|| refused("provider needs a default image or --image"))?;
     let image_digest = resolver.resolve(image).await?;
-    let prepared = client
-        .clone()
-        .with_request_timeout(Duration::from_secs(600))
-        .prepare(
-            name,
-            &PrepareRequest {
-                size: size.clone(),
-                platform: options.platform.clone(),
-                route: options.image_route,
-                image_pull: None,
-                image_digest,
-                tools_digest: tools_digest.into(),
-            },
-        )
-        .await?;
-    Ok((prepared, size))
+    Ok(PrepareRequest {
+        size,
+        platform: options.platform.clone(),
+        route: options.image_route,
+        image_pull: None,
+        image_digest,
+        tools_digest: tools_digest.into(),
+    })
 }
 pub async fn keypair(directory: &Path) -> Result<(PathBuf, String), Error> {
-    crate::local::private_dir(directory).map_err(|_| Error::Transport)?;
+    crate::local::private_dir(directory).map_err(|e| Error::InvalidRequest(format!("key directory: {e}")))?;
     let key = directory.join("id_ed25519");
     let status = tokio::process::Command::new("ssh-keygen")
         .args(["-q", "-t", "ed25519", "-N", "", "-f"])
@@ -237,7 +234,8 @@ pub async fn keypair(directory: &Path) -> Result<(PathBuf, String), Error> {
     if !status.success() {
         return Err(refused("could not generate vessel SSH key"));
     }
-    let public = tokio::fs::read_to_string(key.with_extension("pub")).await.map_err(|_| Error::Transport)?;
+    let public =
+        tokio::fs::read_to_string(key.with_extension("pub")).await.map_err(|e| refused(format!("read vessel SSH public key: {e}")))?;
     Ok((key, public))
 }
 
@@ -308,7 +306,7 @@ mod tests {
             let resolver = RegistryResolver::new().unwrap().with_http(registry.clone());
             let result = resolver.resolve("ubuntu:24.04").await;
             if corrupt {
-                assert!(matches!(result, Err(Error::InvalidResponse)));
+                assert!(matches!(result, Err(Error::InvalidResponse(_))));
             } else {
                 assert_eq!(result.unwrap(), format!("ubuntu@sha256:{:x}", Sha256::digest(br#"{"schemaVersion":2,"manifests":[]}"#)));
             }

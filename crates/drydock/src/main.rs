@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use drydock::{
+    api::ProviderApi,
     client::{Client, Method},
     config::resolve_paths,
     launch::LaunchOptions,

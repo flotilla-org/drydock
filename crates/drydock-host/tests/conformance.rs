@@ -1,3 +1,6 @@
+use drydock::api::ProviderApi;
+#[path = "support/public_server.rs"]
+mod public_server;
 use drydock::{
     HostConnection, HostSpec, Supervisor,
     conformance::{self, Options},
@@ -11,7 +14,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 #[tokio::test]
 async fn reference_binary_passes_conformance() {
     let configuration = fixture_configuration();
-    let (_dir, mut binary, host) = start_binary(configuration.clone()).await;
+    let (dir, mut binary, host) = start_binary(configuration.clone()).await;
+    let client = public_server::client(host.client.clone(), dir.path().join("public.sock")).await;
     let prepared = host
         .client
         .prepare(
@@ -42,9 +46,10 @@ async fn reference_binary_passes_conformance() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_inner();
     conformance::vessel_tools(
-        &host.client,
+        &client,
         "a",
         &tools_environment.id,
         &ExecRequest { command: vec!["drydock-fixture".into(), "tools".into()] },
@@ -63,7 +68,9 @@ async fn reference_binary_passes_conformance() {
             egress: EgressRequest::default(),
             ssh_public_key: None,
         },
-        scenarios: conformance::Scenario::ALL.to_vec(),
+        // Policy scenarios run on the server-owned endpoint; TCP adapter
+        // authentication is checked separately on the actual private listener.
+        scenarios: conformance::Scenario::ALL.iter().copied().filter(|s| *s != conformance::Scenario::Authentication).collect(),
         fixture_configuration: Some(configuration),
         billing_sample_millis: 25,
         billing_settle_millis: 0,
@@ -79,7 +86,7 @@ async fn reference_binary_passes_conformance() {
         reach_probe: None,
         egress_probe: None,
     };
-    let report = conformance::run(&host.client, "a", &options).await;
+    let report = conformance::run(&client, "a", &options).await;
     assert!(report.passed(), "{}", serde_json::to_string_pretty(&report).unwrap());
     assert!(host.client.list("a").await.unwrap().is_empty());
     binary.kill().await.unwrap();
@@ -106,6 +113,9 @@ async fn start_binary(configuration: HostConfiguration) -> (tempfile::TempDir, t
     })
     .await
     .unwrap();
+    let bearer = Secret::new(tokio::fs::read_to_string(&token_file).await.unwrap().trim());
+    let raw = drydock::client::Client::external(&format!("http://{address}"), bearer).unwrap();
+    conformance::authentication(&raw, Duration::from_secs(5)).await.unwrap();
     let spec = HostSpec {
         name: "rust".into(),
         connection: HostConnection::External { url: format!("http://{address}"), token_file },
@@ -329,7 +339,8 @@ async fn declared_reach_recipes_and_faults() {
             });
         }
     }
-    let (_runtime, mut binary, host) = start_binary(configuration).await;
+    let (runtime, mut binary, host) = start_binary(configuration).await;
+    let client = public_server::client(host.client.clone(), runtime.path().join("public.sock")).await;
     for kind in ["relay", "tcp", "ws", "ssh"] {
         for broken in [false, true] {
             let provider = format!("{kind}-{broken}");
@@ -338,7 +349,7 @@ async fn declared_reach_recipes_and_faults() {
                 "scenarios":["prepare","reach","destroy"],"echo_relay":kind=="relay",
                 "reach_probe":if kind=="relay" {serde_json::Value::Null} else {serde_json::json!(["python3",concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/recipe-probe.py"),"--identity",manifest["identity"]])}
             })).unwrap();
-            let report = conformance::run(&host.client, &provider, &options).await;
+            let report = conformance::run(&client, &provider, &options).await;
             let reach = report.checks.iter().find(|check| check.name == "reach_byte_stream").unwrap();
             assert_eq!(reach.passed, !broken, "{kind} broken={broken}: {report:?}");
             assert!(host.client.list(&provider).await.unwrap().is_empty());

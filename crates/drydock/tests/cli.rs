@@ -2,7 +2,7 @@
 //! is wrapped to point its external-host option at our real reference host.
 use drydock::{
     HostConnection,
-    client::{Client, Method},
+    client::Client,
     config::Config,
     daemon::{Daemon, HostOption, ProviderApi},
 };
@@ -32,15 +32,28 @@ settings = {{}}
         "a".repeat(64)
     )
 }
+async fn raw_provider(client: &Client, config: &Config, name: &str) -> String {
+    let provider = &config.provider[name];
+    client
+        .configure_provider(
+            &provider.module,
+            &ProviderConfiguration {
+                name: name.into(),
+                module: provider.module.clone(),
+                settings: provider.settings.clone(),
+                credential: CredentialMode::Direct { credential_reference: name.into() },
+            },
+        )
+        .await
+        .unwrap()
+        .instance
+}
 async fn reference(dir: &std::path::Path) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = dir.join("reference.sock");
     let socket = path.clone();
     let task = tokio::spawn(async move {
-        drydock_host::Host::new(drydock_host::reference::registry())
-            .serve_unix(socket, unsafe { libc::geteuid() }, std::future::pending())
-            .await
-            .unwrap();
+        drydock_host::Host::new(drydock_host::reference::registry()).serve_unix(socket, std::future::pending()).await.unwrap();
     });
     for _ in 0..200 {
         if Client::unix(&path).unwrap().hello().await.is_ok() {
@@ -159,9 +172,14 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     assert!(request.ssh_public_key.unwrap().starts_with("ssh-ed25519 "));
     assert_eq!(request.egress, EgressRequest::Open);
     // Change provider state directly while no CLI process is running. The host
-    // poller, rather than a CLI read, must emit the stopped transition.
+    // server poller, rather than a CLI read, must emit the stopped transition.
     let upstream = Client::unix(host).unwrap();
-    let resume = upstream.suspend("demo", &environment.id).await.unwrap();
+    let credentials = drydock_provider::Credentials {
+        mode: CredentialMode::Direct { credential_reference: "demo".into() },
+        value: Some(Secret::new("test-token")),
+    };
+    let handle = raw_provider(&upstream, &Config::parse(&config_text(&token)).unwrap(), "demo").await;
+    let resume: ResumeToken = upstream.provider_call(&handle, "suspend", &environment.id, &credentials).await.unwrap();
     let event = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(ObserveRecord::Event { event }) = records.next().await.unwrap()
@@ -175,7 +193,7 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     .await
     .unwrap();
     assert_eq!(event.provider, "demo");
-    upstream.resume("demo", &environment.id, &resume).await.unwrap();
+    upstream.provider_call::<(), _>(&handle, "resume", (&environment.id, resume), &credentials).await.unwrap();
     let inspected = json(cli(&config, &socket, &shim, &["inspect", "demo", &environment.id]).await);
     assert_eq!(inspected["id"], environment.id);
     let shell = cli(&config, &socket, &shim, &["shell", "demo", &environment.id]).await;
@@ -237,6 +255,7 @@ async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Envir
     )
     .await
     .unwrap()
+    .into_inner()
 }
 
 // Contract: the embedded and socket forms route the same provider API, isolate
@@ -281,12 +300,10 @@ async fn daemon_routes_provider_api_and_streams() {
     }
     let env = routing_environment(&daemon, &socket).await;
     assert_eq!(client.inspect("demo", &env.id).await.unwrap(), env);
-    let response =
-        ProviderApi::request(daemon.as_ref(), Method::GET, &["v1", "providers", "demo", "environments"], &[], None).await.unwrap();
-    assert_eq!(response.body, serde_json::to_value(client.list("demo").await.unwrap()).unwrap());
+    assert_eq!(ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), client.list("demo").await.unwrap());
     assert!(client.inspect("other", &env.id).await.is_err());
     assert!(
-        matches!(client.list("missing").await,Err(drydock::client::Error::Protocol(ProtocolError::Unavailable {reason,..})) if reason.contains("MissingTool"))
+        matches!(client.list("missing").await,Err(drydock::client::Error::Protocol(ProtocolError::Unavailable {reason,..})) if reason.contains("missing tool"))
     );
     assert!(client.credential("demo", Secret::new("bad")).await.is_err());
     let command: ExecRequest = serde_json::from_value(serde_json::json!({"command":["echo","hello"],"env":{},"cwd":null})).unwrap();
@@ -374,7 +391,7 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
                         egress: EgressRequest::default(),
                         ssh_public_key: None,
                     };
-                    let env = api.provision(provider, &request).await.unwrap();
+                    let env = api.provision(provider, &request).await.unwrap().into_inner();
                     if let Some(previous) = model.insert((p, label), env.clone()) {
                         assert_eq!(previous, env);
                     }
@@ -547,7 +564,13 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     // No build for the prepared platform: refused before anything is created.
     let error = daemon.launch("foreign", &drydock::launch::LaunchOptions::default()).await.err().unwrap().to_string();
     assert!(error.contains("no vessel agent build for linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");
-    assert!(host.list("foreign").await.unwrap().is_empty());
+    let credentials = drydock_provider::Credentials {
+        mode: CredentialMode::Direct { credential_reference: "foreign".into() },
+        value: Some(Secret::new("test-token")),
+    };
+    let handle = raw_provider(&host, &Config::parse(&text).unwrap(), "foreign").await;
+    let rows: Vec<drydock_provider::ObservedEnvironment> = host.provider_call(&handle, "list", (), &credentials).await.unwrap();
+    assert!(rows.is_empty());
     task.abort();
 }
 // The prepared platform defaults to the provider's first declared one, can be

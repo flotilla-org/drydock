@@ -1,3 +1,4 @@
+use drydock::api::ProviderApi;
 use drydock::{
     HostConnection, HostSpec, Supervisor, ToolDetector,
     client::{Client, Error, Observer, StatusCache},
@@ -23,7 +24,7 @@ fn spec() -> HostSpec {
     }
 }
 // Reference accepts byte-sized RAM and zero disk; vendor modules apply their own limits.
-async fn prepare(client: &Client) -> Prepared {
+async fn prepare(client: &(impl ProviderApi + ?Sized)) -> Prepared {
     client
         .prepare(
             "a",
@@ -63,8 +64,8 @@ async fn typed_lifecycle() {
     host.ready(Duration::from_secs(5)).await.unwrap();
     let c = &host.client;
     let prepared = prepare(c).await;
-    let environment = c.provision("a", &request(prepared.clone())).await.unwrap();
-    assert_eq!(c.provision("a", &request(prepared)).await.unwrap(), environment);
+    let environment = c.provision("a", &request(prepared.clone())).await.unwrap().into_inner();
+    assert_eq!(c.provision("a", &request(prepared)).await.unwrap().into_inner(), environment);
     assert_eq!(c.list("a").await.unwrap(), vec![environment.clone()]);
     assert_eq!(c.inspect("a", &environment.id).await.unwrap(), environment);
     assert!(matches!(c.reach("a", &environment.id).await.unwrap(), Reach::Relay { .. }));
@@ -222,7 +223,7 @@ async fn cache_honours_declared_limit() {
     let mut host = supervisor(dir.path()).start(spec).await.unwrap();
     let status = host.ready(Duration::from_secs(5)).await.unwrap();
     assert_eq!(status.providers[0].rate_limits[0].requests, 1);
-    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap();
+    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap().into_inner();
     let cache = Arc::new(StatusCache::new(host.client.clone(), &status.providers));
     assert!(matches!(cache.inspect("a", &environment.id).await.unwrap().state, Observation::Running));
     host.client.suspend("a", &environment.id).await.unwrap();
@@ -293,7 +294,7 @@ async fn credential_rotation_preserves_live_state() {
     s.credentials = source.clone();
     let mut host = s.start(spec()).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
-    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap();
+    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap().into_inner();
     *source.value.lock().unwrap() = Some(Credential { value: Secret::new("expired"), expires_at: Some(std::time::SystemTime::UNIX_EPOCH) });
     source.changes.send_replace(1);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -331,18 +332,24 @@ async fn external_host_is_not_supervised() {
     let socket = dir.path().join("external.sock");
     let server_socket = socket.clone();
     let server = tokio::spawn(async move {
-        drydock_host::Host::new(drydock_host::reference::registry())
-            .serve_unix(server_socket, unsafe { libc::geteuid() }, std::future::pending())
-            .await
-            .unwrap()
+        drydock_host::Host::new(drydock_host::reference::registry()).serve_unix(server_socket, std::future::pending()).await.unwrap()
     });
     let mut spec = spec();
     spec.connection = HostConnection::ExternalUnix { path: socket.clone() };
+    let config = spec.configuration.providers[0].clone();
     let mut host = supervisor(dir.path()).start(spec).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
-    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap();
+    let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap().into_inner();
     drop(host);
-    assert_eq!(Client::unix(socket).unwrap().inspect("a", &environment.id).await.unwrap(), environment);
+    let credentials = drydock_host::module::Credentials {
+        mode: CredentialMode::Direct { credential_reference: "test".into() },
+        value: Some(Secret::new("snapshot")),
+    };
+    let raw_client = Client::unix(socket).unwrap();
+    let handle = raw_client.configure_provider("reference", &config).await.unwrap().instance;
+    let raw: drydock_host::module::ObservedEnvironment =
+        raw_client.provider_call(&handle, "inspect", &environment.id, &credentials).await.unwrap();
+    assert_eq!(raw.environment, environment);
     assert!(!server.is_finished());
     server.abort();
 }
@@ -397,11 +404,11 @@ async fn managed_socket_has_one_owner() {
     let s = supervisor(dir.path());
     let mut host = s.start(spec()).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
-    assert!(matches!(s.start(spec()).await, Err(Error::InvalidRequest)));
+    assert!(matches!(s.start(spec()).await, Err(Error::InvalidRequest(_))));
     for name in ["", "../elsewhere", "a/b"] {
         let mut spec = spec();
         spec.name = name.into();
-        assert!(matches!(s.start(spec).await, Err(Error::InvalidRequest)));
+        assert!(matches!(s.start(spec).await, Err(Error::InvalidRequest(_))));
     }
     assert!(host.client.hello().await.is_ok());
 }
@@ -506,18 +513,18 @@ async fn external_token_file_validation() {
     }
     for mode in [0o000, 0o444, 0o644, 0o660, 0o1600] {
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(mode)).unwrap();
-        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest)));
+        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest(_))));
     }
     std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     for content in ["".to_owned(), " \n".into(), "token ".into(), "tok\nen".into(), "x".repeat(65537)] {
         std::fs::write(&token, content).unwrap();
-        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest)));
+        assert!(matches!(s.start(with_token(token.clone())).await, Err(Error::InvalidRequest(_))));
     }
     std::fs::write(&token, "valid").unwrap();
     let link = dir.path().join("link");
     symlink(&token, &link).unwrap();
-    assert!(matches!(s.start(with_token(link)).await, Err(Error::InvalidRequest)));
-    assert!(matches!(s.start(with_token(dir.path().to_path_buf())).await, Err(Error::InvalidRequest)));
+    assert!(matches!(s.start(with_token(link)).await, Err(Error::InvalidRequest(_))));
+    assert!(matches!(s.start(with_token(dir.path().to_path_buf())).await, Err(Error::InvalidRequest(_))));
     let fifo = dir.path().join("fifo");
     let raw = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
@@ -636,7 +643,7 @@ async fn reference_preparation_ignores_size() {
     assert_eq!(first, second);
     let mut provision = request(first);
     provision.size = preparation.size.clone();
-    let row = host.client.provision("a", &provision).await.unwrap();
+    let row = host.client.provision("a", &provision).await.unwrap().into_inner();
     assert_eq!(row.granted_size, Some(preparation.size));
 }
 

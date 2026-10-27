@@ -1,7 +1,13 @@
-use drydock_host::module::{Connection, HttpClient, ObservationMode, ObservedEnvironment, Provisioned};
-use drydock_host::{Host, reference};
+#[path = "../../drydock-host/tests/support/provider.rs"]
+mod provider;
+#[path = "../../drydock-host/tests/support/public_server.rs"]
+mod public_server;
+use drydock::{api::ProviderApi, runtime::Runtime as Host};
+use drydock_host::module::ObservedEnvironment;
+use drydock_host::reference;
 use drydock_protocol::*;
 use futures::{StreamExt, stream::BoxStream};
+use provider::{Control, ControlledModule};
 use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
 use std::{os::unix::fs::PermissionsExt, time::Duration};
@@ -16,19 +22,16 @@ struct Harness {
 }
 impl Harness {
     async fn start() -> Self {
-        Self::with_uid(unsafe { libc::geteuid() }).await
+        Self::with_host(Host::new(reference::registry())).await
     }
-    async fn with_uid(uid: u32) -> Self {
-        Self::with_host(Host::new(reference::registry()), uid).await
-    }
-    async fn with_host(host: Host, uid: u32) -> Self {
+    async fn with_host(host: Host) -> Self {
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("host.sock");
         let (stop, rx) = tokio::sync::oneshot::channel();
         let socket = path.clone();
         let task = tokio::spawn(async move {
-            host.serve_unix(socket, uid, async {
+            public_server::serve_unix(host, socket, async {
                 let _ = rx.await;
             })
             .await
@@ -230,13 +233,6 @@ async fn relay_and_exec_round_trip() {
     drydock::conformance::stream_contract(&client, "a", &environment.id, &Default::default()).await.unwrap();
 }
 
-// Kernel peer credentials gate even hello; a caller-supplied HTTP header cannot impersonate UID.
-#[tokio::test]
-async fn unix_peer_rejected() {
-    let h = Harness::with_uid(unsafe { libc::geteuid() } + 1).await;
-    drydock::conformance::unix_peer_admission(&drydock::client::Client::unix(&h.path).unwrap()).await.unwrap();
-}
-
 // Loopback hosts create a private token file, require bearer auth, and reject wrong tokens.
 #[tokio::test]
 async fn tcp_bearer_auth() {
@@ -245,7 +241,8 @@ async fn tcp_bearer_auth() {
     let token = dir.path().join("token");
     let server = rigging_http_serve::TcpServer::bind("127.0.0.1:0".parse().unwrap(), &token).await.unwrap();
     let addr = server.local_addr().unwrap();
-    let host = Host::new(reference::registry());
+    // The thin Rust host owns the loopback listener; the server is not served over TCP.
+    let host = drydock_host::Host::new(reference::registry());
     let task = tokio::spawn(async move {
         host.serve_bound_tcp(server, std::future::pending()).await.unwrap();
     });
@@ -279,7 +276,7 @@ async fn event_eviction_and_initial_error() {
     let prepared = h.prepared("a").await;
     let mut initial = h.stream(None).await;
     let start = initial.next().await;
-    let count = drydock_host::EVENT_HISTORY_CAPACITY / 2 + 1;
+    let count = drydock::runtime::EVENT_HISTORY_CAPACITY / 2 + 1;
     for n in 0..count {
         h.provision("a", &format!("item-{n}"), &prepared, 201).await;
         for _ in 0..2 {
@@ -363,13 +360,18 @@ async fn proxied_credentials_use_supervisor_proxy() {
 #[tokio::test]
 async fn transport_rejections_are_typed() {
     let h = Harness::start().await;
-    for (method, path, body) in
-        [(Method::PUT, "/config", "x".repeat(2 * 1024 * 1024 + 1)), (Method::GET, "/providers/%FF/environments", String::new())]
-    {
+    for (method, path, body) in [
+        (Method::POST, "/providers/a/prepare", "x".repeat(2 * 1024 * 1024 + 1)),
+        (Method::GET, "/providers/%FF/environments", String::new()),
+    ] {
         let response = h.client.request(method, format!("http://localhost/v1{path}")).body(body).send().await.unwrap();
         assert_eq!(response.status(), 422);
         assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { .. }));
     }
+    // A malformed field is named with the decoder's reason, never its value.
+    let body = json!({"image_digest":"i","tools_digest":"t","size":{"cpus":"secret-value","memory_bytes":1,"disk_bytes":0}});
+    let error: ProtocolError = h.ok(Method::POST, "/providers/a/prepare", body, 422).await.json().await.unwrap();
+    assert!(matches!(&error, ProtocolError::Refused { reason } if reason.contains("size.cpus") && !reason.contains("secret")), "{error}");
     let response = h.ok(Method::POST, "/hello", Value::Null, 405).await;
     assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::MethodNotAllowed { .. }));
 }
@@ -393,231 +395,13 @@ async fn shutdown_closes_event_stream() {
     assert!(!h.path.exists());
 }
 
-#[derive(Default)]
-struct Control {
-    poll: std::sync::atomic::AtomicBool,
-    execute_http: std::sync::atomic::AtomicBool,
-    disable_exec: std::sync::atomic::AtomicBool,
-    skip_list_timestamp: std::sync::atomic::AtomicBool,
-    skip_egress_measurement: std::sync::atomic::AtomicBool,
-    timestamp: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
-    global_limit: std::sync::atomic::AtomicBool,
-    list_limit: std::sync::atomic::AtomicU32,
-    list_period: std::sync::atomic::AtomicU64,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-
-    hold_list: std::sync::atomic::AtomicBool,
-    hold_list_result: std::sync::atomic::AtomicBool,
-    list_result_ready: tokio::sync::Notify,
-    list_result_release: tokio::sync::Notify,
-    list_entered: tokio::sync::Notify,
-    list_release: tokio::sync::Notify,
-    vendor: std::sync::Mutex<VendorState>,
-    list_held: tokio::sync::Notify,
-    http_url: std::sync::Mutex<Option<String>>,
-    reject_list: std::sync::atomic::AtomicBool,
-    missing_tool: std::sync::atomic::AtomicBool,
-    dropped: tokio::sync::Notify,
-    hold_destroy: std::sync::atomic::AtomicBool,
-    fail_destroy: std::sync::atomic::AtomicBool,
-    destroy_entered: tokio::sync::Notify,
-    destroy_release: tokio::sync::Notify,
-    hold_success: std::sync::atomic::AtomicBool,
-    success_entered: tokio::sync::Notify,
-    success_release: tokio::sync::Notify,
-    started: tokio::sync::Notify,
-    stopped: tokio::sync::Notify,
-    list_calls: std::sync::atomic::AtomicUsize,
-    sink: std::sync::Mutex<Option<drydock_host::EventSink>>,
-}
-#[derive(Default)]
-struct VendorState {
-    row: Option<Environment>,
-    error: bool,
-}
-struct ControlledModule(std::sync::Arc<Control>);
-struct ControlledProvider {
-    http: std::sync::Arc<dyn HttpClient>,
-    inner: std::sync::Arc<dyn drydock_host::module::Provider>,
-    control: std::sync::Arc<Control>,
-}
-impl Drop for ControlledProvider {
-    fn drop(&mut self) {
-        self.control.dropped.notify_one();
-    }
-}
-// The gate and error flag stand in for the vendor network boundary; all resource
-// behavior is delegated to the real reference provider, through real HTTP sockets.
-#[async_trait::async_trait]
-impl drydock_host::module::Module for ControlledModule {
-    fn version(&self) -> &str {
-        "test"
-    }
-    async fn configure(
-        &self,
-        c: &ProviderConfiguration,
-        http: std::sync::Arc<dyn HttpClient>,
-    ) -> drydock_host::module::Result<std::sync::Arc<dyn drydock_host::module::Provider>> {
-        let inner = drydock_host::module::Module::configure(&reference::ReferenceModule, c, http.clone()).await?;
-        Ok(std::sync::Arc::new(ControlledProvider { inner, http, control: self.0.clone() }))
-    }
-}
-#[async_trait::async_trait]
-impl drydock_host::module::Provider for ControlledProvider {
-    fn readiness(&self, c: &drydock_host::module::Credentials) -> Readiness {
-        if self.control.missing_tool.load(std::sync::atomic::Ordering::SeqCst) {
-            Readiness::MissingTool { reason: "test tool absent".into() }
-        } else {
-            self.inner.readiness(c)
-        }
-    }
-
-    async fn run(&self, mut context: drydock_host::module::PushContext) -> drydock_host::module::Result<()> {
-        *self.control.sink.lock().unwrap() = Some(context.events.clone());
-        self.control.started.notify_one();
-        if !*context.stopping.borrow() {
-            let _ = context.stopping.changed().await;
-        }
-        self.control.stopped.notify_one();
-        Ok(())
-    }
-
-    fn observation(&self) -> ObservationMode {
-        if self.control.poll.load(std::sync::atomic::Ordering::SeqCst) {
-            ObservationMode::Poll { interval: Duration::from_millis(10) }
-        } else {
-            ObservationMode::Push
-        }
-    }
-    fn rate_limits(&self) -> Vec<RateLimit> {
-        let requests = self.control.list_limit.load(std::sync::atomic::Ordering::SeqCst);
-        if requests == 0 {
-            vec![]
-        } else {
-            vec![RateLimit {
-                operation: if self.control.global_limit.load(std::sync::atomic::Ordering::SeqCst) { "*" } else { "list" }.into(),
-                requests,
-                period_seconds: self.control.list_period.load(std::sync::atomic::Ordering::SeqCst).max(1),
-            }]
-        }
-    }
-    fn operations(&self) -> drydock_host::module::Operations<'_> {
-        drydock_host::module::Operations {
-            exec: if self.control.disable_exec.load(std::sync::atomic::Ordering::SeqCst) { None } else { self.inner.operations().exec },
-            ..self.inner.operations()
-        }
-    }
-    fn capabilities(&self) -> Capabilities {
-        let mut capabilities = self.inner.capabilities();
-        capabilities.fallback_runner = !self.control.disable_exec.load(std::sync::atomic::Ordering::SeqCst);
-        capabilities
-    }
-    async fn prepare(&self, r: PrepareRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Prepared> {
-        if self.control.hold_success.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.control.success_entered.notify_one();
-            self.control.success_release.notified().await;
-        }
-        if c.token().is_some_and(|t| t.expose() == "old") {
-            self.control.entered.notify_one();
-            self.control.release.notified().await;
-            return Err(ProtocolError::CredentialRejected { reason: "old credential rejected".into() });
-        }
-        if self.control.execute_http.load(std::sync::atomic::Ordering::SeqCst) {
-            let url = self.control.http_url.lock().unwrap().clone().unwrap_or_else(|| "https://vendor.example/prepare".into());
-            let mut request = reqwest::Request::new(reqwest::Method::GET, url.parse().unwrap());
-            request.headers_mut().insert("Authorization", format!("Bearer {}", c.token().unwrap().expose()).parse().unwrap());
-            let response = self
-                .http
-                .execute(request, &rigging_http_client::http_channel_label("GET", &url))
-                .await
-                .map_err(|_| ProtocolError::unavailable("transport failure", None))?;
-            if response.status() == 401 {
-                return Err(ProtocolError::CredentialRejected { reason: "vendor rejected credential".into() });
-            }
-            assert!(response.status().is_success());
-        }
-        self.inner.prepare(r, c).await
-    }
-    async fn provision(&self, r: ProvisionRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Provisioned> {
-        self.inner.provision(r, c).await
-    }
-    async fn list(&self, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Vec<ObservedEnvironment>> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if self.control.hold_list.load(SeqCst) {
-            self.control.list_held.notify_one();
-            self.control.list_release.notified().await;
-        }
-        let mut rows = self.inner.list(c).await?;
-        // Capture the complete external response atomically: failure and inventory
-        // can never come from two different vendor revisions.
-        let vendor = {
-            let state = self.control.vendor.lock().unwrap();
-            (state.error, state.row.clone())
-        };
-        self.control.list_calls.fetch_add(1, SeqCst);
-        self.control.list_entered.notify_waiters();
-        if self.control.reject_list.load(SeqCst) {
-            return Err(ProtocolError::CredentialRejected { reason: "vendor credential rejected".into() });
-        }
-        if vendor.0 {
-            return Err(ProtocolError::unavailable("vendor unavailable", None));
-        }
-        if let Some(row) = vendor.1 {
-            rows.push(ObservedEnvironment {
-                egress_policy: None,
-                egress_measured: !self.control.skip_egress_measurement.load(SeqCst),
-                environment: row,
-                timestamp: if self.control.skip_list_timestamp.load(SeqCst) { None } else { *self.control.timestamp.lock().unwrap() },
-            });
-        }
-        if self.control.hold_list_result.swap(false, SeqCst) {
-            self.control.list_result_ready.notify_one();
-            self.control.list_result_release.notified().await;
-        }
-        Ok(rows)
-    }
-    async fn inspect(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<ObservedEnvironment> {
-        if let Some(row) = self.control.vendor.lock().unwrap().row.clone().filter(|row| row.id == id) {
-            return Ok(ObservedEnvironment {
-                egress_policy: None,
-                egress_measured: true,
-                environment: row,
-                timestamp: *self.control.timestamp.lock().unwrap(),
-            });
-        }
-        self.inner.inspect(id, c).await
-    }
-    async fn destroy(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<()> {
-        self.inner.destroy(id, c).await?;
-        if self.control.hold_destroy.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            self.control.destroy_entered.notify_one();
-            self.control.destroy_release.notified().await;
-        }
-        if self.control.fail_destroy.load(std::sync::atomic::Ordering::SeqCst) {
-            Err(ProtocolError::unavailable("ambiguous vendor failure", None))
-        } else {
-            Ok(())
-        }
-    }
-    async fn reach(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Connection> {
-        self.inner.reach(id, c).await
-    }
-    async fn relay(
-        &self,
-        id: &str,
-        c: &drydock_host::module::Credentials,
-    ) -> drydock_host::module::Result<drydock_host::module::ByteStream> {
-        self.inner.relay(id, c).await
-    }
-}
 async fn controlled() -> (Harness, std::sync::Arc<Control>) {
     let control = std::sync::Arc::new(Control::default());
     let registry = drydock_host::module::Registry::from([(
         "reference".into(),
         std::sync::Arc::new(ControlledModule(control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>,
     )]);
-    (Harness::with_host(Host::new(registry), unsafe { libc::geteuid() }).await, control)
+    (Harness::with_host(Host::new(registry)).await, control)
 }
 
 // A held vendor request on A must not block B, hello, or credential refresh for A.
@@ -734,7 +518,7 @@ async fn events_after_proxied_rejection_probe_and_repair() {
             std::sync::Arc::new(ControlledModule(healthy_control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>,
         ),
     ]);
-    let h = Harness::with_host(Host::new(registry), unsafe { libc::geteuid() }).await;
+    let h = Harness::with_host(Host::new(registry)).await;
     let mut proxied = provider("a", json!({}));
     proxied["credential"] = json!({"mode":"proxied", "proxy_url":"http://127.0.0.1:1", "placeholder_token":"placeholder"});
     let mut healthy = provider("b", json!({}));
@@ -760,7 +544,7 @@ async fn events_after_proxied_rejection_probe_and_repair() {
     assert!(record["unavailable_providers"]["a"].is_object());
     assert_eq!(record["environments"][0]["id"], environment.id);
     healthy_control.started.notified().await;
-    healthy_control.sink.lock().unwrap().as_ref().unwrap().publish("healthy-event".into(), None, None, EventKind::Created);
+    healthy_control.sink.lock().unwrap().as_ref().unwrap().publish(raw_created("healthy-event".into())).unwrap();
     assert!(matches!(records.next().await, ObserveRecord::Event { event } if event.provider == "b" && event.id == "healthy-event"));
     control.reject_list.store(false, SeqCst);
     let mut repaired = h.stream(None).await;
@@ -782,13 +566,13 @@ async fn recovery_snapshot_error_is_provider_local() {
     control.vendor.lock().unwrap().error = true;
     control.started.notified().await;
     let sink = control.sink.lock().unwrap().clone().unwrap();
-    for n in 0..drydock_host::EVENT_HISTORY_CAPACITY + 1 {
-        sink.publish(format!("id-{n}"), None, None, EventKind::Created);
+    for n in 0..drydock::runtime::EVENT_HISTORY_CAPACITY + 1 {
+        sink.publish(raw_created(format!("id-{n}"))).unwrap();
     }
     let record = serde_json::to_value(records.next().await).unwrap();
     assert_eq!(record["type"], "snapshot");
     assert_eq!(record["unavailable_providers"]["a"]["kind"], "unavailable");
-    sink.publish("after-gap".into(), None, None, EventKind::Created);
+    sink.publish(raw_created("after-gap".into())).unwrap();
     assert!(matches!(records.next().await, ObserveRecord::Event { event } if event.id == "after-gap"));
 }
 
@@ -813,69 +597,12 @@ async fn partial_factory_failure_preserves_configuration() {
 async fn tcp_refuses_nonloopback_bind() {
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("token");
-    let error = Host::new(reference::registry()).serve_tcp("0.0.0.0:0".parse().unwrap(), &token, std::future::pending()).await.unwrap_err();
+    let error = drydock_host::Host::new(reference::registry())
+        .serve_tcp("0.0.0.0:0".parse().unwrap(), &token, std::future::pending())
+        .await
+        .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(!token.exists());
-}
-
-// SIGTERM follows the same graceful path as Ctrl-C, ending an open event body and
-// unlinking the managed socket before the binary exits successfully.
-#[tokio::test]
-async fn binary_sigterm_drains_and_removes_socket() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    let path = dir.path().join("host.sock");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock-host"))
-        .arg("--unix")
-        .arg(&path)
-        .kill_on_drop(true)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let client = rigging_tls::client_builder().unix_socket(path.clone()).build().unwrap();
-    wait_hello(&client).await;
-    let mut records = client.get("http://localhost/v1/events").send().await.unwrap().bytes_stream();
-    assert!(records.next().await.unwrap().is_ok());
-    let config = json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[provider("fault",json!({"fault":{"kind":"unavailable","reason":"sensitive-vendor-reason","provider_error":"provider explanation sensitive-credential-value","retry_after":null}}))]});
-    assert_eq!(client.put("http://localhost/v1/config").json(&config).send().await.unwrap().status(), 204);
-    let before: Hello = client.get("http://localhost/v1/hello").send().await.unwrap().json().await.unwrap();
-    assert!(matches!(before.providers[0].readiness, Readiness::MissingCredential { .. }));
-    assert_eq!(
-        client
-            .put("http://localhost/v1/providers/fault/credential")
-            .json(&json!({"value":"sensitive-credential-value"}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        204
-    );
-    assert_eq!(client.get("http://localhost/v1/events?since=expired").send().await.unwrap().status(), 200);
-    let malformed = client
-        .put("http://localhost/v1/config")
-        .header("content-type", "application/json")
-        .body("sensitive-value-never-log")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(malformed.status(), 422);
-    // SAFETY: the child PID is live and owned by this test; SIGTERM is its shutdown signal.
-    assert_eq!(unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) }, 0);
-    assert!(tokio::time::timeout(Duration::from_secs(2), records.next()).await.unwrap().is_none());
-    assert!(tokio::time::timeout(Duration::from_secs(2), child.wait()).await.unwrap().unwrap().success());
-    assert!(!path.exists());
-    let mut logs = String::new();
-    child.stderr.take().unwrap().read_to_string(&mut logs).await.unwrap();
-    assert!(logs.contains("route=\"/v1/config\""));
-    assert!(logs.contains("error_class=\"refused\""));
-    assert!(!logs.contains("sensitive-value-never-log"));
-    assert!(logs.contains("sensitive-vendor-reason"));
-    assert!(logs.contains("provider explanation <REDACTED>"));
-    assert!(!logs.contains("provider is not ready"));
-    assert!(!logs.contains("sensitive-credential-value"));
-    assert!(logs.contains("route=\"poll\""));
-    assert!(logs.contains("error_class=\"unavailable\""));
-    assert!(logs.contains("readiness=\"ready\""));
 }
 
 // Wire sizes use unsigned integers: zero and u64::MAX are valid; negative sizes
@@ -1215,7 +942,7 @@ async fn poll_rejection_survives_stale_success_until_refresh() {
     assert_eq!(pending.await.unwrap().status(), 200);
     let hello: Hello = h.hello().await;
     assert!(matches!(hello.providers[0].readiness, Readiness::MissingCredential { .. }));
-    h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await;
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
     control.reject_list.store(false, SeqCst);
     h.credential("a", "refreshed").await;
     h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await;
@@ -1231,7 +958,7 @@ async fn push_observer_starts_after_commit_and_stops_with_host() {
     let hello: Hello = h.hello().await;
     assert_eq!(hello.providers[0].provider, "a");
     h.stop.take().unwrap().send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), control.stopped.notified()).await.unwrap();
+
     tokio::time::timeout(Duration::from_secs(2), &mut h.task).await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(2), control.dropped.notified()).await.unwrap();
 }
@@ -1256,14 +983,14 @@ async fn not_found_and_method_statuses() {
 // rejecting an invalid bundle proves host configuration does not discard it.
 #[tokio::test]
 async fn host_validates_supervisor_proxy_ca() {
-    let h = Harness::with_host(Host::new(reference::registry()).with_proxy_ca(b"not a CA".to_vec()), unsafe { libc::geteuid() }).await;
+    let h = Harness::with_host(Host::new(reference::registry()).with_proxy_ca(b"not a CA".to_vec())).await;
     let mut config = provider("proxy", json!({}));
     config["credential"] = json!({"mode":"proxied","placeholder_token":"placeholder","proxy_url":"http://127.0.0.1:1234"});
     let response =
         h.ok(Method::PUT, "/config", json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[config]}), 422).await;
     assert_eq!(
         response.json::<ProtocolError>().await.unwrap(),
-        ProtocolError::Refused { reason: "invalid HTTP transport configuration".into() }
+        ProtocolError::Refused { reason: "invalid HTTP transport configuration: CA contains no certificates".into() }
     );
 }
 
@@ -1351,8 +1078,8 @@ async fn shutdown_during_recovery_ends_with_clean_eof() {
     control.started.notified().await;
     control.hold_list.store(true, SeqCst);
     let sink = control.sink.lock().unwrap().clone().unwrap();
-    for n in 0..drydock_host::EVENT_HISTORY_CAPACITY + 1 {
-        sink.publish(format!("evict-{n}"), None, None, EventKind::Created);
+    for n in 0..drydock::runtime::EVENT_HISTORY_CAPACITY + 1 {
+        sink.publish(raw_created(format!("evict-{n}"))).unwrap();
     }
     tokio::time::timeout(Duration::from_secs(2), control.list_held.notified()).await.unwrap();
     h.stop.take().unwrap().send(()).unwrap();
@@ -1396,7 +1123,7 @@ async fn push_snapshot_lists_share_deadline_and_isolate_partial_results() {
             providers.push(p);
         }
         let host = Host::new(registry);
-        let h = Harness::with_host(host, unsafe { libc::geteuid() }).await;
+        let h = Harness::with_host(host).await;
         h.ok(Method::PUT, "/config", json!({"modules":modules,"providers":providers}), 204).await;
         h.credential("healthy", "token").await;
         let prepared = h.prepared("healthy").await;
@@ -1411,12 +1138,12 @@ async fn push_snapshot_lists_share_deadline_and_isolate_partial_results() {
             let entered = if n % 2 == 0 { &control.list_held } else { &control.list_result_ready };
             tokio::time::timeout(Duration::from_secs(1), entered.notified()).await.expect("all lists must start concurrently");
         }
-        healthy_control.sink.lock().unwrap().as_ref().unwrap().publish("overlap".into(), None, None, EventKind::Created);
+        healthy_control.sink.lock().unwrap().as_ref().unwrap().publish(raw_created("overlap".into())).unwrap();
         healthy_control.wait_lists(0).await;
         // Keep socket setup on real time; advance only once all vendor gates
         // have entered, then resume before waiting for the real HTTP response.
         tokio::time::pause();
-        tokio::time::advance(drydock_host::PUSH_SNAPSHOT_TIMEOUT).await;
+        tokio::time::advance(drydock::runtime::PUSH_SNAPSHOT_TIMEOUT).await;
         tokio::time::resume();
         let response = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap().unwrap();
         assert!(start.elapsed() < Duration::from_secs(6), "deadline must be shared, not per provider");
@@ -1442,7 +1169,7 @@ async fn shutdown_cancels_held_push_snapshot() {
         "reference".into(),
         std::sync::Arc::new(ControlledModule(control.clone())) as std::sync::Arc<dyn drydock_host::module::Module>,
     )]));
-    let mut h = Harness::with_host(host.clone(), unsafe { libc::geteuid() }).await;
+    let mut h = Harness::with_host(host.clone()).await;
     h.configure(vec![provider("a", json!({}))]).await;
     h.credential("a", "token").await;
     let client = h.client.clone();
@@ -1479,18 +1206,6 @@ async fn disappearing_operation_port_is_a_typed_refusal() {
         matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { reason } if reason.ends_with("operation port unavailable"))
     );
     assert!(h.hello().await.providers[0].capabilities.fallback_runner);
-}
-
-// Admission fault: a server allowing this UID must fail a scenario that requires
-// rejection of an unauthorized peer. The healthy counterpart uses another UID.
-#[tokio::test]
-async fn unix_peer_admission_fault_matrix() {
-    for admits_this_uid in [false, true] {
-        let uid = unsafe { libc::geteuid() } + u32::from(!admits_this_uid);
-        let h = Harness::with_uid(uid).await;
-        let result = drydock::conformance::unix_peer_admission(&drydock::client::Client::unix(&h.path).unwrap()).await;
-        assert_eq!(result.is_ok(), !admits_this_uid);
-    }
 }
 
 // Known progress samples preserve the last stable billing baseline, while
@@ -1631,67 +1346,128 @@ async fn rejected_credential_context_is_not_nested() {
     .await;
     h.credential("a", "fixture-token").await;
     h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
-    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 503).await.json().await.unwrap();
+    // A stored rejection stays CredentialRejected; it is never a retryable 503.
+    let error: ProtocolError = h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await.json().await.unwrap();
     assert_eq!(error.to_string().matches("provider a operation list").count(), 1);
 }
 
-// Provider-only TOML must reach readiness using the bundled managed binary's
-// loadable-module handshake, without declaring a host/module registry in config.
-#[tokio::test]
-async fn managed_daemon_discovers_reference_module() {
-    let dir = tempfile::tempdir().unwrap();
-    let run = dir.path().join("run");
-    let config = drydock::config::Config::parse(
-        r#"
-[provider.demo]
-module = "reference"
-credential = {env="PATH"}
-image = "image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-settings = {
-    poll_interval_ms = 10,
+fn raw_created(id: String) -> drydock_host::module::Update {
+    drydock_host::module::Update::Observed(ObservedEnvironment::from(Environment {
+        id,
+        provider: "a".into(),
+        label: None,
+        state: Observation::Transitioning { phase: TransitionPhase::Starting },
+        platform: None,
+        granted_size: None,
+        egress: Enforcement::Advisory,
+    }))
 }
-"#,
-    )
-    .unwrap();
-    let daemon = drydock::daemon::Daemon::start(
-        config,
-        &run,
-        run.join("keys"),
-        vec![drydock::daemon::HostOption {
-            optional: false,
-            name: "rust".into(),
-            connection: drydock::HostConnection::Managed {
-                command: vec![env!("CARGO_BIN_EXE_drydock-host").into()],
-                runtime: None,
-                proxy_environment: Default::default(),
-            },
-        }],
-    )
-    .await
-    .unwrap();
-    assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
-    // Discovery works before the first pin is published; only prepare/launch need the
-    // build's image pin. Stamped builds retain the complete launch assertion.
-    let launch = daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await;
-    if drydock::launch::build_tools_digest().is_ok() {
-        let environment = launch.unwrap();
-        assert_eq!(environment.provider, "demo");
-        assert_eq!(drydock::daemon::ProviderApi::list(daemon.as_ref(), "demo").await.unwrap(), vec![environment]);
-    } else {
-        assert!(launch.unwrap_err().to_string().contains("the tools image has not been published yet"));
-        assert!(drydock::daemon::ProviderApi::list(daemon.as_ref(), "demo").await.unwrap().is_empty());
-    }
-    drop(daemon);
-    // Supervisor cancellation releases the managed child and its socket lease.
-    let lock = drydock::local::lock(&run.join("hosts/rust.lock")).unwrap();
+
+// Rotation drops the previous provider subscription and reopens it with an
+// immutable snapshot of the new credential. A subscription rejection belongs to the
+// same credential generation as ordinary calls, so the next rotation clears it.
+#[tokio::test]
+async fn rotation_reopens_push_and_clears_subscription_rejection() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    control.started.notified().await;
+    control.reject_subscription.store(true, SeqCst);
+    h.credential("a", "rejected-generation").await;
+    tokio::time::timeout(Duration::from_secs(2), control.cancelled.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), control.started.notified()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if lock.try_lock().is_ok() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        while !matches!(h.hello().await.providers[0].readiness, Readiness::MissingCredential { .. }) {}
     })
     .await
     .unwrap();
+    h.ok(Method::GET, "/providers/a/environments", Value::Null, 502).await;
+    control.reject_subscription.store(false, SeqCst);
+    h.credential("a", "replacement-generation").await;
+    tokio::time::timeout(Duration::from_secs(2), control.started.notified()).await.unwrap();
+    assert!(matches!(h.hello().await.providers[0].readiness, Readiness::Ready));
+    assert_eq!(
+        *control.subscriptions.lock().unwrap(),
+        vec![None, Some("rejected-generation".into()), Some("replacement-generation".into())]
+    );
+}
+
+// Raw push removals retain provider time and use the server's lifecycle outcome.
+// A failed or cancelled deletion must never be promoted to confirmed deletion.
+#[tokio::test]
+async fn push_removal_preserves_time_and_ambiguous_lifecycle_cause() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for outcome in ["confirmed", "failed", "cancelled"] {
+        let (h, control) = controlled().await;
+        h.configure(vec![provider("a", json!({}))]).await;
+        h.credential("a", "snapshot").await;
+        let prepared = h.prepared("a").await;
+        let row = h.provision("a", outcome, &prepared, 201).await;
+        let mut records = h.stream(None).await;
+        records.next().await;
+        control.started.notified().await;
+        let sink = control.sink.lock().unwrap().clone().unwrap();
+        sink.publish(drydock_provider::Update::Observed(row.clone().into())).unwrap();
+        assert!(matches!(records.next().await,ObserveRecord::Event{event} if matches!(event.event,EventKind::Created)));
+        assert!(matches!(records.next().await,ObserveRecord::Event{event} if matches!(event.event,EventKind::Running{..})));
+        control.hold_destroy.store(true, SeqCst);
+        control.fail_destroy.store(outcome == "failed", SeqCst);
+        let client = h.client.clone();
+        let id = row.id.clone();
+        let deleting =
+            tokio::spawn(async move { client.delete(format!("http://localhost/v1/providers/a/environments/{id}")).send().await });
+        control.destroy_entered.notified().await;
+        let timestamp = chrono::DateTime::from_timestamp(123456, 0).unwrap();
+        sink.publish(drydock_provider::Update::Removed { id: row.id.clone(), timestamp: Some(timestamp) }).unwrap();
+        if outcome == "cancelled" {
+            deleting.abort();
+            let _ = deleting.await;
+        } else {
+            control.destroy_release.notify_one();
+            let response = deleting.await.unwrap().unwrap();
+            assert_eq!(response.status().as_u16(), if outcome == "confirmed" { 204 } else { 503 });
+        }
+        let event = tokio::time::timeout(Duration::from_secs(2), records.next()).await.unwrap();
+        let ObserveRecord::Event { event } = event else { panic!("removal event") };
+        assert_eq!(event.timestamp_source, TimestampSource::Provider);
+        assert_eq!(event.timestamp, Timestamp::from(timestamp));
+        let expected = if outcome == "confirmed" { GoneCause::DestroyedByRequest } else { GoneCause::MissingOnList };
+        assert_eq!(event.event, EventKind::Gone { cause: expected });
+    }
+}
+
+// An explicit removal before the first update is still authoritative, and a
+// duplicate removal cannot invent a Created event or a second Gone transition.
+#[tokio::test]
+async fn push_removal_before_first_update_is_not_creation() {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "snapshot").await;
+    let mut records = h.stream(None).await;
+    records.next().await;
+    control.started.notified().await;
+    let sink = control.sink.lock().unwrap().clone().unwrap();
+    let removal = drydock_provider::Update::Removed { id: "unseen".into(), timestamp: None };
+    sink.publish(removal.clone()).unwrap();
+    assert!(
+        matches!(records.next().await,ObserveRecord::Event{event} if event.id=="unseen" && matches!(event.event,EventKind::Gone{cause:GoneCause::MissingOnList}))
+    );
+    sink.publish(removal).unwrap();
+    sink.publish(raw_created("next".into())).unwrap();
+    assert!(matches!(records.next().await,ObserveRecord::Event{event} if event.id=="next" && matches!(event.event,EventKind::Created)));
+}
+
+// A vendor resume that succeeded is reported as success even when the cache
+// refresh after it fails; the observer reconciles the cache later.
+#[tokio::test]
+async fn resume_succeeds_when_the_refresh_after_it_fails() {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let prepared = h.prepared("a").await;
+    let environment = h.provision("a", "resume", &prepared, 201).await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let token = client.suspend("a", &environment.id).await.unwrap();
+    control.vendor.lock().unwrap().error = true;
+    client.resume("a", &environment.id, &token).await.unwrap();
 }

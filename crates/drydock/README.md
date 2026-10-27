@@ -32,7 +32,7 @@ re-resolution; periodic resolution (one second by default) also notices file
 replacement and expiry. Unchanged values are not resent. Missing, empty, rejected
 or expired credentials make that instance not ready without affecting its peers.
 Recovery refreshes the credential without replacing the live provider. Restarted
-hosts always receive configuration and fresh credentials again.
+hosts receive configuration again; the server selects fresh credential snapshots for each call.
 
 Proxied instances do not resolve Direct credentials. The embedder supplies the
 per-host `proxy_environment` (for example `HTTP_PROXY`, `HTTPS_PROXY` and
@@ -52,15 +52,23 @@ explains the unpublished sentinel, build-time override and post-hello agent upgr
 `Supervisor`, resolves credentials, discovers modules, assigns providers and
 serves their API through rigging's Unix server with peer-UID admission.
 
-`ProviderApi` is the object-safe provider seam implemented by the embedded
-`Daemon` and the socket `Client`. It exposes typed buffered calls and the relay
-and exec byte streams. `Daemon::router()` can be mounted by an embedding daemon;
-`Daemon::serve()` installs local peer authentication. Authentication must be
-installed by the embedder when mounting the router itself.
+`ProviderApi` is the object-safe provider seam: typed buffered calls plus the
+relay and exec byte streams. The server `Runtime` implements it once; that is the
+only implementation of provider policy. `api::router` is the one HTTP router: its
+handlers decode a request, call one `ProviderApi` method and encode the result.
+The socket `Client` implements the same trait over HTTP for remote callers, and
+`Daemon` implements it by routing each call to its provider's host runtime.
+`Daemon::router()` adds the daemon's launch, prepare-defaults, provider-list and
+shell routes in front of the shared router and can be mounted by an embedding
+daemon; `Daemon::serve()` installs local peer authentication. Authentication must
+be installed by the embedder when mounting the router itself.
 
 The daemon retains status caches across calls and discards stale cache values
-after mutations or a supervised host generation change. Host pollers remain the
-owners of observations; the daemon's `/v1/events` merges their NDJSON records
+after mutations or a supervised host generation change. The server Runtime owns polling, rate budgets, inventory reconciliation, credential
+rejection and generation state, lifecycle causes, egress evidence, billing, public
+snapshots, diagnostic masking and event history. `HostHandle.client` holds
+this server-owned runtime directly; every public request reaches it through the same typed methods. The private REST adapter implements the shared `drydock-provider`
+traits and preserves raw metadata. The daemon's `/v1/events` merges server runtime NDJSON records
 with a vector cursor. A snapshot from one host explicitly omits the other
 providers, preserving the protocol's no-false-deletion rule.
 
@@ -86,3 +94,39 @@ starts it with the new configuration. Startup rotates `drydock.log` to
 [#62](https://github.com/flotilla-org/drydock/issues/62) tracks within-run log caps. Keys/evidence currently remain
 after errors and destruction; [#61](https://github.com/flotilla-org/drydock/issues/61)
 tracks safe retention and garbage collection.
+
+Both `Daemon::router()` and embedded `ProviderApi` calls reach the same runtime
+in process. Supervision creates no policy socket or server-to-itself HTTP hop.
+Only the remote provider adapter crosses a private host transport. Changed private host incarnation or missing raw
+host bindings after restart invalidate remote handles and trigger configuration
+and credential delivery before publishing a fresh generation. No ordinary
+provider operation is automatically replayed. External host processes and their
+loader bindings remain independently owned across server disconnects.
+
+Provider subscriptions carry raw observations/removals with one immutable
+credential snapshot. Rotation drops the old subscription future before reopening
+it. The runtime owns provider call deadlines: ordinary calls end at the
+supervisor's request timeout (30 seconds by default), and prepare, provision,
+reach, suspend, resume and export at 600 seconds, the deadline the daemon gave
+its POST routes. An expired call reports Unavailable with an unknown outcome.
+Private adapter calls add no retry or second deadline. Cancelling a mutation
+releases its future without asserting that vendor side effects rolled back.
+
+Errors keep their causes. Client errors carry the transport's source chain, a
+timeout is its own `Timeout` error, and an invalid response carries the decoder's
+reason. A malformed request names the failing field and the reason without
+echoing its value. A stored credential rejection stays `CredentialRejected`
+(502) until a new credential arrives; it is never reported as a retryable 503.
+See the [Rust bridge contract](../drydock-host/README.md) for the private mapping.
+
+### Existing policy limitations retained
+
+This separation does not redesign policy. If credential resolution becomes
+unavailable or expires, supervision marks public readiness missing but retains the
+last delivered runtime snapshot until a replacement arrives; background polls can
+therefore still use that snapshot. A push observer that exits is logged and is not
+automatically retried. These are existing behaviours to evaluate separately.
+Diagnostic masking retains active credentials and 32 recent replaced values;
+older values remain covered only by the in-flight call that used them. This is
+bounded diagnostic retention, not proof that arbitrary vendor errors contain no
+other secrets. No new retry or configurable deadline policy is introduced here.

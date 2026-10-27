@@ -243,6 +243,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -410,14 +411,12 @@ dependencies = [
  "drydock-client",
  "drydock-host",
  "drydock-protocol",
+ "drydock-provider",
  "drydock-transport",
  "futures",
  "hegeltest",
  "http",
- "hyper",
- "hyper-util",
  "libc",
- "percent-encoding",
  "reqwest",
  "rigging-http-client",
  "rigging-http-serve",
@@ -434,6 +433,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -484,9 +486,11 @@ dependencies = [
 name = "drydock-client"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "bytes",
  "drydock-protocol",
+ "drydock-provider",
  "futures",
  "http",
  "reqwest",
@@ -495,6 +499,7 @@ dependencies = [
  "rigging-tls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -511,11 +516,10 @@ dependencies = [
  "chrono",
  "drydock",
  "drydock-protocol",
+ "drydock-provider",
  "futures",
  "hegeltest",
  "http",
- "hyper",
- "hyper-util",
  "libc",
  "reqwest",
  "rigging-http-client",
@@ -523,7 +527,6 @@ dependencies = [
  "rigging-replay-testkit",
  "rigging-stream",
  "rigging-tls",
- "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -547,6 +550,25 @@ dependencies = [
  "serde",
  "serde_json",
  "utoipa",
+]
+
+[[package]]
+name = "drydock-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "drydock-protocol",
+ "hyper",
+ "hyper-util",
+ "rigging-http-client",
+ "rigging-stream",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

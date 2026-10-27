@@ -1,7 +1,10 @@
 //! Stand-in at the vendor HTTP boundary: validates requests and stores real
 //! sandbox/snapshot state in memory. No live tokens or token-mint recordings.
+#[path = "support/public_server.rs"]
+mod public_server;
 use async_trait::async_trait;
 use bytes::Bytes;
+use drydock::api::ProviderApi;
 use drydock_host::{daytona::DaytonaModule, module::*};
 use drydock_protocol::*;
 use rigging_http_client::ChannelLabel;
@@ -1865,6 +1868,7 @@ impl Module for VendorModule {
     }
 }
 struct HostHarness {
+    _policy: drydock::HostHandle,
     client: drydock::client::Client,
     _dir: tempfile::TempDir,
     task: tokio::task::JoinHandle<()>,
@@ -1880,7 +1884,7 @@ impl HostHarness {
         let host = drydock_host::Host::new(BTreeMap::from([("daytona".into(), Arc::new(VendorModule(vendor)) as Arc<dyn Module>)]));
         let (stop, rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            host.serve_unix(socket, unsafe { libc::geteuid() }, async {
+            host.serve_unix(socket, async {
                 let _ = rx.await;
             })
             .await
@@ -1893,6 +1897,20 @@ impl HostHarness {
         })
         .await
         .unwrap();
+        // The stand-in remains the vendor HTTP boundary. Policy now runs in
+        // the main server through the real thin Rust host over a private UDS.
+        let supervisor = drydock::Supervisor::new(dir.path().join("policy"), Arc::new(drydock::credentials::BuiltinCredentials::default()));
+        let mut policy = supervisor
+            .start(drydock::HostSpec {
+                name: "daytona-test".into(),
+                connection: drydock::HostConnection::ExternalUnix { path: dir.path().join("host.sock") },
+                configuration: HostConfiguration { modules: vec![], providers: vec![] },
+                credentials: Default::default(),
+            })
+            .await
+            .unwrap();
+        policy.ready(std::time::Duration::from_secs(5)).await.unwrap();
+        let client = policy.client.clone();
         client
             .configure(
                 &serde_json::from_value(json!({
@@ -1907,7 +1925,8 @@ impl HostHarness {
             .await
             .unwrap();
         client.credential("daytona", Secret::new("key-a")).await.unwrap();
-        Self { client, _dir: dir, task, stop: Some(stop) }
+        let client = public_server::client(client, dir.path().join("public.sock")).await;
+        Self { _policy: policy, client, _dir: dir, task, stop: Some(stop) }
     }
     async fn finish(mut self) {
         self.stop.take().unwrap().send(()).unwrap();
@@ -1926,7 +1945,7 @@ async fn fast_restart_invalidates_host_egress_evidence() {
     let prep = prepared(p.as_ref(), &credentials(false)).await;
     let mut r = request(prep, "fast-restart");
     r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
-    let env = host.client.provision("daytona", &r).await.unwrap();
+    let env = host.client.provision("daytona", &r).await.unwrap().into_inner();
     for phase in ["starting", "creating"] {
         assert_eq!(host.client.inspect("daytona", &env.id).await.unwrap().egress, Enforcement::Enforced);
         assert_eq!(host.client.list("daytona").await.unwrap()[0].egress, Enforcement::Enforced);
