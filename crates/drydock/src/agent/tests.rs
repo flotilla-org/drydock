@@ -113,6 +113,22 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
     }
 }
 
+// A gateway started for a platform stands in for a guest of that platform on
+// any test host: a vessel prepared for it connects, and the agent reports it.
+#[tokio::test]
+async fn a_gateway_stands_in_for_the_platform_it_was_started_as() {
+    let current = Platform::current();
+    let prepared = Platform::new("linux", if current == Platform::new("linux", "amd64") { "arm64" } else { "amd64" });
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let (api, environment) = provider(true, ssh_reach(true)).await;
+    let gateway = Gateway::start_as(directory.path(), true, BUILD, prepared.clone()).unwrap();
+    let identity = directory.path().join("id_ed25519");
+    let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &prepared, build: BUILD };
+    let connected = AgentReach::new(AgentLink::default()).with_dialer(gateway).with_timeout(Duration::from_secs(10));
+    let connected = connected.connect(&api, &vessel).await.unwrap();
+    assert_eq!(connected.client.hello().platform, Some(prepared));
+}
+
 // What the client cannot follow is refused at once, without dialling: a
 // provider whose declaration has no agent, and a reach that is not SSH.
 #[tokio::test]

@@ -6,6 +6,7 @@
 //! drydock and its embedding clients, never a production dialer.
 use super::{AgentLink, SshDialer};
 use async_trait::async_trait;
+use drydock_protocol::Platform;
 use drydock_transport::{
     Limits, Transport,
     native::UnixConnections,
@@ -27,6 +28,7 @@ pub struct Gateway {
     host_socket: PathBuf,
     executable: PathBuf,
     fingerprint: String,
+    platform: Platform,
     reverse_forwards: bool,
     links: Mutex<Vec<AgentLink>>,
     agent: Mutex<Option<JoinHandle<()>>>,
@@ -42,11 +44,19 @@ impl Gateway {
     /// Serve an agent whose fingerprint is `build`'s, with its sockets in
     /// `directory`. `reverse_forwards` is whether this gateway accepts them.
     pub fn start(directory: &Path, reverse_forwards: bool, build: &[u8]) -> io::Result<Arc<Self>> {
+        Self::start_as(directory, reverse_forwards, build, Platform::current())
+    }
+
+    /// As [`Gateway::start`], with the agent reporting `platform`: the vessel
+    /// stands in for a guest of the platform it was prepared for, whatever
+    /// host the test runs on.
+    pub fn start_as(directory: &Path, reverse_forwards: bool, build: &[u8], platform: Platform) -> io::Result<Arc<Self>> {
         let gateway = Arc::new(Self {
             agent_socket: directory.join("agent.sock"),
             host_socket: directory.join("host.sock"),
             executable: directory.join("drydock-agent"),
             fingerprint: format!("{:x}", Sha256::digest(build)),
+            platform,
             reverse_forwards,
             links: Mutex::default(),
             agent: Mutex::default(),
@@ -72,7 +82,8 @@ impl Gateway {
         }
         let listener = UnixListener::bind(&self.agent_socket)?;
         let transport = Transport::native(Arc::new(UnixConnections::new(listener, self.host_socket.clone())), Limits::default())?;
-        let agent = drydock_agent::Agent::new(transport, self.fingerprint.clone(), self.executable.clone());
+        let agent =
+            drydock_agent::Agent::new(transport, self.fingerprint.clone(), self.executable.clone()).with_platform(self.platform.clone());
         *self.agent.lock().unwrap() = Some(tokio::spawn(async move {
             let _ = agent.run().await;
         }));
