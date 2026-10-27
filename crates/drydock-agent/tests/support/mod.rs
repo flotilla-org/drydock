@@ -2,6 +2,7 @@
 //! a raw HTTP/2 sender for requests the typed client would never make; or the
 //! real agent executable as a subprocess, for restarts and re-execs.
 #![allow(dead_code)]
+pub mod origin;
 use bytes::Bytes;
 use drydock_agent::{Agent, AgentError, Client, ErrorKind, ExecEvent, ExitStatus};
 use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};

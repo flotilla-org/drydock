@@ -1,10 +1,12 @@
 //! Drydock's vessel control API and host client. The transport is the trust boundary:
 //! only its host-facing side may serve control; guest forwards carry opaque IDs.
+mod artifacts;
 mod client;
 mod durable;
 mod egress;
 mod error;
 pub use egress::{CA_PATH, Egress, PROXY_PORT};
+mod fetch;
 mod files;
 mod forward;
 mod frames;
@@ -23,7 +25,7 @@ use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade"];
+pub const FEATURES: &[&str] = &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -287,6 +289,115 @@ pub struct TreeOptions {
     /// existing target is a 409.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replace: bool,
+}
+/// Fetch an artifact by digest into the agent's store, from the first of
+/// `sources` that yields bytes with that digest, and unpack it there.
+/// Without sources it is only a lookup of the index and of completed uploads.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Fetch {
+    /// Tried in order; the order is the caller's policy.
+    #[serde(default)]
+    pub sources: Vec<ArtifactSource>,
+    pub unpack: Unpack,
+}
+/// One place an artifact's bytes may come from. Every source meets the same
+/// final check: the bytes hash to the expected digest, or nothing is stored.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactSource {
+    /// An `http` or `https` URL, such as a release download.
+    Upstream { url: String },
+    /// A blob in an OCI registry, fetched through the distribution API by
+    /// the artifact's digest. `registry` is a host (HTTPS) or a base URL.
+    Oci {
+        registry: String,
+        repository: String,
+        /// Used for this call only; the agent never stores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<RegistryCredential>,
+    },
+    /// The caller pushes the bytes with the resumable upload protocol
+    /// (`/blobs/{sha256}`), then asks again. Reaching this source without a
+    /// completed upload is refused as `artifact.push`, naming the offset.
+    Push,
+}
+/// Registry authentication for one fetch.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RegistryCredential {
+    /// Answers a Basic challenge, or authenticates a Bearer token request.
+    Basic { username: String, password: String },
+    /// Sent as `Authorization: Bearer`.
+    Bearer { token: String },
+}
+impl std::fmt::Debug for RegistryCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => write!(f, "Basic({username}, <redacted>)"),
+            Self::Bearer { .. } => f.write_str("Bearer(<redacted>)"),
+        }
+    }
+}
+/// How fetched bytes become a store entry.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum Unpack {
+    /// The bytes are one file with these permission bits; write bits and
+    /// setuid/setgid are always cleared.
+    #[serde(rename = "file")]
+    File {
+        #[serde(default = "Unpack::default_mode")]
+        mode: u32,
+    },
+    /// A tar archive unpacked into a directory.
+    #[serde(rename = "tar")]
+    Tar,
+    /// A gzip-compressed tar archive, such as a release `.tar.gz` or an OCI
+    /// `tar+gzip` layer.
+    #[serde(rename = "tar.gz")]
+    TarGz,
+}
+impl Unpack {
+    fn default_mode() -> u32 {
+        0o555
+    }
+}
+/// A complete, verified store entry. It is read-only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Artifact {
+    pub sha256: String,
+    /// Bytes fetched, before any unpacking.
+    pub size: u64,
+    pub unpack: Unpack,
+    /// The entry: the file itself, or the unpacked directory.
+    pub path: PathBuf,
+    /// Links placed through the agent that still point into the entry.
+    #[serde(default)]
+    pub links: Vec<PathBuf>,
+}
+/// Where a fetch found an artifact's bytes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// The index already held the entry: nothing was read or hashed.
+    Index,
+    /// A completed upload of the digest, such as a push.
+    Blob,
+    /// The source at this position in the request.
+    Source(usize),
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Fetched {
+    pub artifact: Artifact,
+    pub origin: Origin,
+}
+/// A link to a store entry, or to `member` inside an unpacked one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactLink {
+    #[serde(default)]
+    pub member: PathBuf,
 }
 pub(crate) fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())

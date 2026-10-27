@@ -91,6 +91,18 @@ pub(crate) struct Shared {
     pub(crate) store: crate::store::Store,
     processes: crate::process::Processes,
 }
+impl Shared {
+    /// The way out for a fetch: the configured egress, as for guest traffic.
+    pub(crate) async fn network(&self) -> crate::fetch::Network {
+        let settings = self.settings.lock().await;
+        match &settings.config.egress {
+            Some(egress) => {
+                crate::fetch::Network::Upstream { opener: self.opener.clone(), id: egress.upstream.clone(), ca: settings.config.ca.clone() }
+            }
+            None => crate::fetch::Network::Direct,
+        }
+    }
+}
 /// Owns one host-facing transport. Never expose this router on guest TCP.
 pub struct Agent {
     transports: Vec<Transport>,
@@ -140,6 +152,13 @@ impl Agent {
         });
         Self { transports: vec![transport], shared, restart }
     }
+    /// Keep the digest store at `root` instead of beside the executable.
+    /// Agents on one host may share a store, so that an artifact one vessel
+    /// fetched is a lookup for the next.
+    pub fn with_store(mut self, root: PathBuf) -> Self {
+        Arc::get_mut(&mut self.shared).expect("the store is chosen before the agent runs").store = crate::store::Store::new(root);
+        self
+    }
     /// Add another host-facing native link (e.g. vsock). All links share state.
     pub fn add_transport(&mut self, transport: Transport) {
         self.transports.push(transport);
@@ -166,6 +185,12 @@ impl Agent {
             .route("/renames", post(post_rename))
             .route("/uploads/{sha256}", head(upload_offset).patch(append_upload).delete(remove_upload))
             .route("/blobs/{sha256}", head(blob_size).put(create_upload).delete(remove_blob))
+            .route("/artifacts", get(crate::artifacts::list_artifacts))
+            .route(
+                "/artifacts/{sha256}",
+                get(crate::artifacts::get_artifact).put(crate::artifacts::put_artifact).delete(crate::artifacts::delete_artifact),
+            )
+            .route("/artifacts/{sha256}/links/{*path}", put(crate::artifacts::put_artifact_link))
             .route("/forwards/guest", get(guest_forwards))
             .route("/forwards/guest/{id}", get(guest_forward).put(put_guest).delete(remove_guest))
             .route("/forwards/host", get(host_forwards))
@@ -186,6 +211,9 @@ impl Agent {
             Ok(0) => {}
             Ok(removed) => tracing::info!(removed, "removed abandoned partial uploads"),
             Err(error) => tracing::warn!(%error, "could not sweep abandoned partial uploads"),
+        }
+        if let Err(error) = self.shared.store.sweep_staging(crate::store::ABANDONED) {
+            tracing::warn!(%error, "could not sweep abandoned artifact staging");
         }
         let router = self.router();
         let mut controller_bound = false;

@@ -23,10 +23,12 @@ async fn main() -> io::Result<()> {
     }
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
+    let mut store = None;
     let mut options = args.iter();
     while let Some(flag) = options.next() {
         match flag.to_str() {
             Some("--socket") => socket = options.next().ok_or_else(|| io::Error::other("--socket requires a path"))?.into(),
+            Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other("--store requires a path"))?)),
             Some("--vsock-port") => {
                 vsock = Some(
                     options
@@ -36,7 +38,7 @@ async fn main() -> io::Result<()> {
                         .ok_or_else(|| io::Error::other("--vsock-port requires a port"))?,
                 )
             }
-            _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT]")),
+            _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT] [--store DIR]")),
         }
     }
     drydock_agent::socket::private_directory(
@@ -68,9 +70,10 @@ async fn main() -> io::Result<()> {
     let fingerprint = drydock_agent::fingerprint()?;
     let executable = drydock_agent::upgrade::startup(&current)
         .map_err(|e| io::Error::new(e.kind(), format!("recover agent {}: {e}", current.display())))?;
-    let agent = Agent::new(transport, fingerprint, executable.clone());
-    #[cfg(target_os = "linux")]
-    let mut agent = agent;
+    let mut agent = Agent::new(transport, fingerprint, executable.clone());
+    if let Some(store) = store {
+        agent = agent.with_store(store);
+    }
     #[cfg(target_os = "linux")]
     if let Some(port) = vsock {
         let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port))?;

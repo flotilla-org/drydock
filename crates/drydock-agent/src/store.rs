@@ -7,6 +7,11 @@
 //! discards them. Blobs are content-addressed, so any operation that produces
 //! verified bytes for a digest (an upload today, a fetch by digest later) can
 //! fill the same slot, and every consumer can install from it.
+//!
+//! Several agents may share one store (`--store`), as vessels on one host
+//! do. Each digest then also has a lock file under `locks/`, held by
+//! whichever agent is using that digest, so their uploads, fetches and
+//! artifact entries never interleave.
 use crate::{
     AgentError, ErrorKind, check_sha256,
     durable::sync_directory,
@@ -46,6 +51,7 @@ pub(crate) struct Held {
     generation: u64,
     superseded: CancellationToken,
     _guard: tokio::sync::OwnedMutexGuard<()>,
+    _shared: std::fs::File,
 }
 impl Drop for Held {
     fn drop(&mut self) {
@@ -77,12 +83,15 @@ pub(crate) struct Append {
     pub length: Option<u64>,
 }
 /// Bytes available to an unprivileged writer on the filesystem holding `path`.
-fn free_space(path: &Path) -> Option<u64> {
+pub(crate) fn free_space(path: &Path) -> Option<u64> {
     rustix::fs::statvfs(path).ok().map(|stat| stat.f_bavail * stat.f_frsize)
 }
 impl Store {
     pub(crate) fn new(root: PathBuf) -> Self {
         Self { root, slots: Arc::default() }
+    }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
     }
     /// Remove partial uploads not appended to for `age`, with their recorded
     /// lengths. Returns how many uploads went.
@@ -114,13 +123,34 @@ impl Store {
         }
         Ok(removed)
     }
-    fn directory(&self, name: &str) -> io::Result<PathBuf> {
+    /// Remove artifact staging directories left by a crash, untouched for
+    /// `age`. Staging in progress is younger: its unpack keeps writing.
+    pub(crate) fn sweep_staging(&self, age: Duration) -> io::Result<usize> {
+        let entries = match std::fs::read_dir(self.root.join("artifacts")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let stale = entry.metadata().and_then(|m| m.modified()).is_ok_and(|m| m.elapsed().is_ok_and(|e| e >= age));
+            if entry.file_name().to_string_lossy().starts_with('.') && stale {
+                let _ = crate::files::open_up(&entry.path());
+                match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(error) => tracing::warn!(%error, "could not sweep artifact staging"),
+                }
+            }
+        }
+        Ok(removed)
+    }
+    pub(crate) fn directory(&self, name: &str) -> io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         let path = self.root.join(name);
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path)?;
         Ok(path)
     }
-    fn partial(&self, digest: &str) -> io::Result<PathBuf> {
+    pub(crate) fn partial(&self, digest: &str) -> io::Result<PathBuf> {
         Ok(self.directory("partial")?.join(digest))
     }
     fn declared(&self, digest: &str) -> io::Result<PathBuf> {
@@ -131,6 +161,14 @@ impl Store {
     }
     /// Take the digest's upload, ending any request still using it.
     async fn take(&self, operation: &str, digest: &str) -> Result<Held, AgentError> {
+        self.hold(operation, digest, true).await
+    }
+    /// Use the digest after whatever is using it now has finished, without
+    /// ending it: a fetch neither ends nor is ended by another request.
+    pub(crate) async fn wait_for(&self, operation: &str, digest: &str) -> Result<Held, AgentError> {
+        self.hold(operation, digest, false).await
+    }
+    async fn hold(&self, operation: &str, digest: &str, supersede: bool) -> Result<Held, AgentError> {
         check_sha256(digest).map_err(|e| AgentError::io(operation, digest, e))?;
         let superseded = CancellationToken::new();
         let (lock, generation) = {
@@ -140,12 +178,27 @@ impl Store {
                 holder: CancellationToken::new(),
                 generation: 0,
             });
-            std::mem::replace(&mut slot.holder, superseded.clone()).cancel();
+            if supersede {
+                std::mem::replace(&mut slot.holder, superseded.clone()).cancel();
+            }
             slot.generation += 1;
             (slot.lock.clone(), slot.generation)
         };
         let guard = lock.lock_owned().await;
-        Ok(Held { slots: self.slots.clone(), digest: digest.to_owned(), generation, superseded, _guard: guard })
+        // Another agent sharing the store may hold the digest; this one
+        // waits for it off the runtime. A request cancelled meanwhile drops
+        // the lock as soon as the blocking wait ends.
+        let path = self.directory("locks").map(|locks| locks.join(digest)).map_err(|e| AgentError::io(operation, digest, e))?;
+        let shared = tokio::task::spawn_blocking(move || -> io::Result<std::fs::File> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path)?;
+            rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
+            Ok(file)
+        })
+        .await
+        .map_err(|e| AgentError::new(operation, digest, ErrorKind::Other, "lock task failed").with_cause(e))?
+        .map_err(|e| AgentError::io(operation, digest, e))?;
+        Ok(Held { slots: self.slots.clone(), digest: digest.to_owned(), generation, superseded, _guard: guard, _shared: shared })
     }
     /// A completed blob's size, if the store holds one.
     pub(crate) async fn blob_size(&self, digest: &str) -> Result<Option<u64>, AgentError> {
@@ -305,7 +358,15 @@ impl Store {
         sync_directory(blob.parent().unwrap()).map_err(|e| AgentError::io("upload.complete", blob.display(), e))?;
         Ok(Progress { offset: state.offset, complete: true, length: Some(state.offset), max_age: None })
     }
-    async fn discard(&self, digest: &str) {
+    /// Keep verified bytes staged under `partial/<sha256>` as the blob.
+    pub(crate) async fn keep(&self, digest: &str) -> io::Result<PathBuf> {
+        let blob = self.blob(digest)?;
+        tokio::fs::rename(self.partial(digest)?, &blob).await?;
+        forget(self.declared(digest)).await;
+        sync_directory(blob.parent().unwrap())?;
+        Ok(blob)
+    }
+    pub(crate) async fn discard(&self, digest: &str) {
         forget(self.partial(digest)).await;
         forget(self.declared(digest)).await;
     }

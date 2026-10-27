@@ -7,7 +7,7 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 ## Runtime and trust
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
-[--vsock-port PORT]` alongside the image's own processes. It must not be PID 1.
+[--vsock-port PORT] [--store DIR]` alongside the image's own processes. It must not be PID 1.
 Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`.
 This detaches a singleton supervisor alongside the provider's init; the supervisor
 holds an OS file lock and restarts the agent after a crash, without guest Python
@@ -83,6 +83,9 @@ any Unix path can be named; relative paths and `.`/`..` components are refused.
 | POST | `/renames` | `Rename { from, to, exclusive, parents }` |
 | HEAD / PATCH / DELETE | `/uploads/{sha256}` | Resumable upload: offset retrieval / append / cancellation |
 | HEAD / PUT / DELETE | `/blobs/{sha256}` | A blob's size / upload creation / remove it |
+| GET | `/artifacts` | Complete store entries, with the links that use them |
+| GET / PUT / DELETE | `/artifacts/{sha256}` | One entry / fetch it by digest (`Fetch`) / remove it unless in use |
+| PUT | `/artifacts/{sha256}/links/{path}` | `{ "member": ... }`; place a symlink to the entry atomically |
 | POST | `/upgrade?sha256=...` | Activate the completed upload of that digest and re-exec with the original flags |
 | POST | `/upgrade/confirm` | Confirm the running candidate |
 
@@ -186,10 +189,98 @@ responses.
 [resumable]: https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-resumable-upload-12
 
 `PUT /files/{path}?blob=<sha256>` and `PUT /trees/{path}?blob=<sha256>`
-install from a completed blob. The store is content-addressed so that a
-later fetch-by-digest, where the agent itself downloads a pinned package or
-OCI layer (flotilla#3839), can fill the same `blobs/` slots for the same
-consumers.
+install from a completed blob.
+
+The store lives beside the executable (`<executable>.store`) unless
+`--store DIR` names another. Agents may share one store, as vessels on one
+host do: each digest also has a lock file under `locks/`, so their uploads,
+fetches and entries never interleave, and what one agent fetched is a
+lookup for the next.
+
+### Artifacts: fetch by digest
+
+`PUT /artifacts/{sha256}` with a JSON `Fetch { sources, unpack }` makes the
+artifact with that digest a store entry, fetching it if need be. Sources are
+tried in the caller's order, which is its policy:
+
+- `{"kind": "upstream", "url": ...}`: an `http` or `https` URL, such as a
+  release download, following redirects, including from `https` to `http`.
+  Integrity comes from the sha256, not from transport security; TLS only
+  keeps the transfer private.
+- `{"kind": "oci", "registry": ..., "repository": ..., "credential": ...}`:
+  the blob `sha256:<digest>` through the OCI distribution API. `registry` is
+  a host (HTTPS) or a base URL. A 401 challenge is answered once: a Bearer
+  challenge with a token from its realm (anonymous, or with a `basic`
+  credential), a Basic one with the `basic` credential. A `bearer`
+  credential is sent as is. Credentials go only to HTTPS, never to a host a
+  redirect names, and are never stored or logged. As Docker's client does,
+  a `basic` credential goes to the token realm the registry's challenge
+  names, which may be another HTTPS host (Docker Hub's realm is
+  `auth.docker.io`).
+- `{"kind": "push"}`: the caller pushes the bytes with the resumable upload
+  protocol above. Reaching it without a completed upload is refused as
+  `artifact.push` (404), naming how many bytes are staged; the caller
+  uploads to `/blobs/{sha256}`, continuing from them, and asks again.
+  `Client::fetch_artifact_or_push` does both.
+
+Every source meets the same final check: the bytes stream into the upload
+staging (`partial/<sha256>`), hashed as they arrive, and only bytes that
+hash to the digest are kept; otherwise nothing is stored. Nothing is held
+whole in memory. A body that breaks off or stalls for 60 seconds leaves its
+bytes staged: the agent asks again with `Range: bytes=N-`, and restarts from
+nothing when the source ignores it, up to five requests per source. Staged
+bytes also survive a failed fetch, so the next fetch or push continues
+them. A completed upload of the digest is used without asking any source.
+
+`unpack` makes the entry `artifacts/<sha256>`: `{"kind": "file", "mode":
+...}` the file itself (default 0555), or `{"kind": "tar"}` / `{"kind":
+"tar.gz"}` a directory unpacked from the archive (OCI `tar+gzip` layers are
+`tar.gz`). An archive entry whose path is absolute or has `..`, a symlink
+resolving outside the tree (as the kernel resolves it, through the tree's
+other symlinks), an entry under a symlink the archive made, a hard link to
+outside it, a device file or a FIFO is refused (422) before the entry
+appears; the verified bytes are then
+kept, so asking again reads them instead of downloading. Entries are
+read-only: every write, setuid and setgid bit is cleared. A file entry is
+the verified blob itself; an archive's blob goes once it is unpacked.
+`artifacts/` is readable and searchable by every user, and the store root
+gains search permission for group and others (nothing more), so guest
+processes can follow links into entries; the rest of the store stays
+private. An archive is unpacked without a size limit of its own: it stops
+at the filesystem's limit (507), so a pinned archive that expands beyond
+the free space fails without an entry, and its partial unpack is removed.
+
+Once an entry is complete, a record in `index/<sha256>` makes a repeat fetch
+a lookup that reads and hashes nothing (200, `origin: "index"`); a stored
+fetch is 201 with `origin` `blob` or `{"source": N}`. A fetch asking for an
+entry already stored another way is a 409. Concurrent fetches of one digest
+wait for each other rather than downloading twice. The fetch runs to the
+end even if its caller goes away.
+
+Fetches leave through the agent's configured egress like any other guest
+traffic. With egress configured, every connection is a `CONNECT host:port`
+on a fresh stream of the upstream forward, by name, and TLS is verified
+against the configured `ca` bundle; without it, the agent connects directly
+and trusts the system's roots (or bundled Mozilla roots when the guest has
+none). A destination the upstream refuses fails at the `egress` step (403),
+quoting the refusal and its `Proxy-Status` (RFC 9209) when given.
+
+A failure names the digest and, for each source, its position, kind and
+URL (without user information or query), the step that failed (`request`,
+`egress`, `connect`, `tls`, `http`, `auth`, `download`, `verify`, `unpack`,
+`disk`, `push`) and why. With several sources the message says all failed
+and `causes` holds one line per source; the last failure gives the kind and
+status. A full disk (507) or an unpack refusal stops the fetch, since no
+other source can help.
+
+`PUT /artifacts/{sha256}/links/{path}` with `{"member": "bin/codex"}` (empty
+for the entry itself) and the link query of `/links` places a symlink to
+the entry, or to a member inside it, by renaming a new link over the path,
+so the path never goes missing. The link is recorded as a use of the entry.
+`DELETE /artifacts/{sha256}` refuses an entry while any recorded link still
+points into it (409, naming the links); links since removed or pointed
+elsewhere no longer count. `GET /artifacts` lists complete entries with
+their live links. Links made through plain `/links` are not recorded.
 
 ### Processes
 
@@ -449,8 +540,11 @@ upsert/removal sequences, byte-transparent HTTP/1.1, WebSocket upgrade frames,
 chunked bodies, TCP and Unix endpoints, and isolation (`tests/contract.rs`);
 processes with stdin, separate streams, exit codes, signals, kill, timeout,
 reattach and bounded output (`tests/processes.rs`); file operations, ranges,
-modes, digests, resumable uploads and tree unpacks (`tests/files.rs`); a
-streamed transfer larger than 512 MiB in bounded memory (`tests/large_files.rs`);
+modes, digests, resumable uploads and tree unpacks (`tests/files.rs`);
+fetches by digest from upstream, OCI and push sources against in-process
+stand-ins, with resume, fall-through, unpack refusals and links
+(`tests/artifacts.rs`); a streamed transfer and a fetch larger than 512 MiB
+in bounded memory (`tests/large_files.rs`, `tests/large_fetch.rs`);
 and every refusal as a structured error. Subprocess tests push a distinct ELF
 and verify real re-exec, the new hello and boot ID, explicit confirmation,
 rollback of an unconfirmed candidate, a durable upgrade upload, forward socket cleanup,

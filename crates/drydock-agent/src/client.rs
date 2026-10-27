@@ -633,6 +633,48 @@ impl Client {
         self.link.empty("DELETE", &format!("/blobs/{}", digest(sha256)?), empty()).await.map(drop)
     }
 
+    /// Fetch the artifact named by `sha256` into the agent's store, from the
+    /// first of `fetch.sources` that yields bytes with that digest. A repeat
+    /// fetch is answered from the agent's index ([`Origin::Index`]).
+    pub async fn fetch_artifact(&self, sha256: &str, fetch: &Fetch) -> io::Result<Fetched> {
+        self.link.json("PUT", &format!("/artifacts/{}", digest(sha256)?), json_body(fetch)?).await
+    }
+    /// As [`Client::fetch_artifact`], pushing `length` bytes from `content`
+    /// when the fetch reaches an [`ArtifactSource::Push`] source: the push
+    /// resumes whatever is already staged for the digest, and the fetch is
+    /// then asked again.
+    pub async fn fetch_artifact_or_push<R>(&self, sha256: &str, fetch: &Fetch, length: u64, content: R) -> io::Result<Fetched>
+    where
+        R: AsyncRead + tokio::io::AsyncSeek + Send + Unpin + 'static,
+    {
+        match self.fetch_artifact(sha256, fetch).await {
+            Err(error) if AgentError::of(&error).is_some_and(|e| e.operation == "artifact.push") => {
+                self.resume_upload(sha256, length, content).await?;
+                self.fetch_artifact(sha256, fetch).await
+            }
+            result => result,
+        }
+    }
+    /// The complete store entry for `sha256`.
+    pub async fn artifact(&self, sha256: &str) -> io::Result<Artifact> {
+        self.link.json("GET", &format!("/artifacts/{}", digest(sha256)?), empty()).await
+    }
+    pub async fn artifacts(&self) -> io::Result<Vec<Artifact>> {
+        self.link.json("GET", "/artifacts", empty()).await
+    }
+    /// Remove a store entry; refused (409) while a link placed through
+    /// [`Client::link_artifact`] still points into it.
+    pub async fn remove_artifact(&self, sha256: &str) -> io::Result<()> {
+        self.link.empty("DELETE", &format!("/artifacts/{}", digest(sha256)?), empty()).await.map(drop)
+    }
+    /// Point a symlink at `path` to the store entry for `sha256`, or to
+    /// `member` inside it, replacing what is there atomically unless
+    /// `exclusive`. The link counts as a use of the entry.
+    pub async fn link_artifact(&self, path: &Path, sha256: &str, member: &Path, options: &FileOptions) -> io::Result<()> {
+        let uri = format!("{}{}", route(&format!("/artifacts/{}/links", digest(sha256)?), path)?, query(&LinkQuery::from(options))?);
+        self.link.empty("PUT", &uri, json_body(&ArtifactLink { member: member.into() })?).await.map(drop)
+    }
+
     /// Upload then activate. Reconnect afterwards and verify the new hello
     /// fingerprint, then confirm, before using any generation-specific routes.
     pub async fn upgrade(&self, executable: impl Into<Bytes>) -> io::Result<()> {

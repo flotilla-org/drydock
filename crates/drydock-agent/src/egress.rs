@@ -136,7 +136,7 @@ impl FakeDns {
     }
 }
 
-async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<ByteStream> {
+pub(crate) async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<ByteStream> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let opener = opener.lock().await.clone();
         let mut stream = opener.open(Purpose::Forward { id }).await?;
@@ -147,11 +147,30 @@ async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<By
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "egress upstream opening timed out"))?
 }
 
+/// Why an upstream refused a CONNECT: its status line, and its
+/// `Proxy-Status` (RFC 9209) when it gave one, which names the policy.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub status: String,
+    pub proxy_status: Option<String>,
+}
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upstream refused CONNECT: {}", self.status)?;
+        if let Some(reason) = &self.proxy_status {
+            write!(f, " (Proxy-Status: {reason})")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for Refused {}
+
 // Read exactly the CONNECT response head, leaving any coalesced tunnel bytes
 // in the stream. Never send application bytes until the upstream accepts.
 // A CONNECT upstream must send its final 2xx response directly; interim 1xx
 // replies are deliberately rejected rather than treated as tunnel acceptance.
-async fn connect(remote: &mut ByteStream, authority: &str) -> io::Result<()> {
+// A refusal is ConnectionRefused carrying [`Refused`].
+pub(crate) async fn connect(remote: &mut ByteStream, authority: &str) -> io::Result<()> {
     if authority.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()) {
         return Err(invalid("invalid CONNECT authority"));
     }
@@ -168,12 +187,19 @@ async fn connect(remote: &mut ByteStream, authority: &str) -> io::Result<()> {
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "CONNECT response timed out"))??;
-    let line = head.split(|b| *b == b'\r').next().unwrap_or_default();
+    let mut lines = head.split(|b| *b == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let line = lines.next().unwrap_or_default();
     let mut fields = line.split(|b| *b == b' ');
     let version = fields.next().unwrap_or_default();
     let status = fields.next().unwrap_or_default();
     if !matches!(version, b"HTTP/1.0" | b"HTTP/1.1") || status.len() != 3 || status[0] != b'2' || !status.iter().all(u8::is_ascii_digit) {
-        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "upstream refused CONNECT"));
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).take(512).collect::<String>();
+        let proxy_status = lines.find_map(|line| {
+            let (name, value) = line.split_at(line.iter().position(|b| *b == b':')?);
+            name.eq_ignore_ascii_case(b"proxy-status").then(|| text(&value[1..]).trim().to_owned())
+        });
+        let status = text(line.splitn(2, |b| *b == b' ').nth(1).unwrap_or(line));
+        return Err(io::Error::new(io::ErrorKind::ConnectionRefused, Refused { status, proxy_status }));
     }
     Ok(())
 }
