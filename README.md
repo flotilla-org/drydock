@@ -117,6 +117,14 @@ them. Keys and launch evidence currently remain after errors and destruction;
 cleanup without losing access after ambiguous provider outcomes. Progress is on
 stderr; JSON results are on stdout.
 
+`agent_link = "reverse_forward"` (the default) or `"local_forward"` picks how
+guest-to-host streams travel on a vessel agent's SSH link, where the provider's
+server accepts remote forwards. A server that refuses them, such as Daytona's
+gateway, always shares the local forward. Embedding clients reach an agent
+through `drydock::agent::AgentReach`. It applies this preference, the provider's
+declared `agent` capability and its reach. It reports what it chose as an
+`AgentReport`: the provider, its module, the vessel, the endpoint and the link.
+
 The daemon discovers loadable modules from host `hello`, then sends only the
 providers assigned to each host. A failed optional host is logged and skipped;
 providers with no available module remain visible with a missing-tool reason.
