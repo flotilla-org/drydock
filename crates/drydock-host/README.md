@@ -392,3 +392,6 @@ The export reuses the public generator's schema constraints and corrects Utoipa'
 unit/tuple/generic limitations. The normal workspace test command checks drift
 and the document's route inventory against the Rust host. The private contract
 contains no server-side rate, credential-state, inventory or replay policy.
+
+The drift/router tests are workspace checks: they require the repository's root
+JSON document and sibling Rust-host source, not an isolated packaged crate.

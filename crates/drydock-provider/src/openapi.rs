@@ -1,16 +1,18 @@
 //! Private host REST contract, generated with the public protocol's Utoipa exporter.
 //! Declarations document the thin adapter, not main-server policy or public routes.
-#![allow(dead_code)]
 use crate::*;
 use utoipa::OpenApi;
 type Unit = ();
 // Utoipa cannot name tuple generic arguments; these schema-only tuples have
 // exactly the same Serde shape as the Rust adapter arguments.
+#[allow(dead_code)]
 #[derive(utoipa::ToSchema)]
 struct ExecArgs(String, ExecRequest);
+#[allow(dead_code)]
 #[derive(utoipa::ToSchema)]
 struct ResumeArgs(String, ResumeToken);
 
+#[allow(dead_code)]
 #[derive(utoipa::IntoResponses)]
 enum Errors {
     #[response(status = 404, description = "Unknown provider handle")]
@@ -32,65 +34,84 @@ enum Errors {
 }
 
 #[utoipa::path(get, path = "/v1/hello", responses((status = 200, body = BridgeHello)))]
+#[allow(dead_code)]
 fn hello() {}
 #[utoipa::path(post, path = "/private/modules/{module}/configure",
     params(("module" = String, Path)), request_body = ProviderConfiguration,
     responses((status = 200, body = ConfiguredProvider), Errors))]
+#[allow(dead_code)]
 fn configure() {}
 #[utoipa::path(delete, path = "/private/providers/{provider}", params(("provider" = String, Path)),
     responses((status = 204, description = "Handle released; logical module binding remains loaded")))]
+#[allow(dead_code)]
 fn release() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/facts", params(("provider" = String, Path)),
     request_body = Call<Unit>, responses((status = 200, body = Facts), Errors))]
+#[allow(dead_code)]
 fn facts() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/prepare", params(("provider" = String, Path)),
     request_body = Call<PrepareRequest>, responses((status = 200, body = Prepared), Errors))]
+#[allow(dead_code)]
 fn prepare() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/provision", params(("provider" = String, Path)),
     request_body = Call<ProvisionRequest>, responses((status = 200, body = Provisioned), Errors))]
+#[allow(dead_code)]
 fn provision() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/list", params(("provider" = String, Path)),
     request_body = Call<Unit>, responses((status = 200, body = Vec<ObservedEnvironment>), Errors))]
+#[allow(dead_code)]
 fn list() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/inspect", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = ObservedEnvironment), Errors))]
+#[allow(dead_code)]
 fn inspect() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/inspect-after-lifecycle", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = ObservedEnvironment), Errors))]
+#[allow(dead_code)]
 fn inspect_after_lifecycle() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/destroy", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = ()), Errors))]
+#[allow(dead_code)]
 fn destroy() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/reach", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = Connection), Errors))]
+#[allow(dead_code)]
 fn reach() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/relay", params(("provider" = String, Path)),
     request_body = Call<String>,
     responses((status = 101, description = "Connection: Upgrade; Upgrade: drydock-relay; raw duplex bytes"), Errors))]
+#[allow(dead_code)]
 fn relay() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/subscribe", params(("provider" = String, Path)),
     request_body = Call<Unit>,
     responses((status = 200, description = "NDJSON records, not an array; immutable subscription credentials; disconnect cancels run",
     body = SubscriptionRecord, content_type = "application/x-ndjson"), Errors))]
+#[allow(dead_code)]
 fn subscribe() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/exec", params(("provider" = String, Path)),
     request_body = Call<ExecArgs>,
     responses((status = 101, description = "Connection: Upgrade; Upgrade: drydock-stream; raw duplex bytes"), Errors))]
+#[allow(dead_code)]
 fn exec() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/suspend", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = ResumeToken), Errors))]
+#[allow(dead_code)]
 fn suspend() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/resume", params(("provider" = String, Path)),
     request_body = Call<ResumeArgs>, responses((status = 200, body = ()), Errors))]
+#[allow(dead_code)]
 fn resume() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/export", params(("provider" = String, Path)),
     request_body = Call<String>, responses((status = 200, body = Export), Errors))]
+#[allow(dead_code)]
 fn export() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/usage", params(("provider" = String, Path)),
     request_body = Call<Period>, responses((status = 200, body = Usage), Errors))]
+#[allow(dead_code)]
 fn usage() {}
 #[utoipa::path(post, path = "/private/providers/{provider}/quota", params(("provider" = String, Path)),
     request_body = Call<Unit>, responses((status = 200, body = Quota), Errors))]
+#[allow(dead_code)]
 fn quota() {}
 
 #[derive(OpenApi)]
@@ -147,7 +168,7 @@ pub fn document() -> serde_json::Value {
         .expect("components")
         .schemas
         .extend(drydock_protocol::openapi::document().components.expect("public components").schemas);
-    // Utoipa 5 inlines generic arguments (losing the public schema patches),
+    // Utoipa 5.5 (Cargo.lock) inlines generic arguments (losing the public schema patches),
     // leaves unit unconstrained and erases tuple item types. Correct those
     // exporter limitations without changing the Rust or Serde contract.
     let mut value = serde_json::to_value(document).expect("document JSON");

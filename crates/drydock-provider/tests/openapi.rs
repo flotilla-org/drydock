@@ -16,6 +16,7 @@ fn document_covers_the_rust_router() {
         .filter_map(|line| line.trim().strip_prefix(".route(\""))
         .map(|line| line.split('"').next().unwrap())
         .collect();
+    assert!(!routes.is_empty(), "Rust router inventory must not be empty");
     assert_eq!(routes, value["paths"].as_object().unwrap().keys().map(String::as_str).collect());
     assert_eq!(
         value["paths"]["/private/providers/{provider}"]["delete"]["responses"]["204"]["description"],
@@ -23,29 +24,49 @@ fn document_covers_the_rust_router() {
     );
 }
 
-// Utoipa's unit/tuple/generic fallbacks must not erase the actual Serde shapes.
+// Generic call arguments must reference the public generator's constrained
+// schemas, rather than retaining Utoipa's unpatched inline copies.
 #[test]
-fn generic_arguments_keep_null_tuple_and_canonical_schema_rules() {
-    use drydock_protocol::{CredentialMode, ExecRequest};
-    use drydock_provider::{Call, Credentials};
-    let value: serde_json::Value = serde_json::from_str(&openapi::to_json()).unwrap();
-    let schemas = &value["components"]["schemas"];
-    assert_eq!(schemas["Call_TupleUnit"]["properties"]["argument"]["type"], "null");
-    let call = Call {
-        credentials: Credentials::new(CredentialMode::Direct { credential_reference: "test-only".into() }),
-        argument: ("opaque/id", ExecRequest { command: vec!["cat".into(), "".into()] }),
-    };
-    let serialized = serde_json::to_value(call).unwrap();
-    assert_eq!(serialized["argument"], serde_json::json!(["opaque/id", {"command":["cat", ""]}]));
-    for (name, payload) in [("ExecArgs", "ExecRequest"), ("ResumeArgs", "ResumeToken")] {
-        assert_eq!(schemas[name]["prefixItems"][0]["type"], "string");
-        assert_eq!(schemas[name]["prefixItems"][1]["$ref"], format!("#/components/schemas/{payload}"));
-        assert_eq!(schemas[name]["items"], false);
-        assert_eq!(schemas[name]["minItems"], 2);
-        assert_eq!(schemas[name]["maxItems"], 2);
-    }
+fn generic_calls_reuse_canonical_schema_rules() {
+    let document = openapi::document();
+    let schemas = &document["components"]["schemas"];
     assert_eq!(schemas["Call_PrepareRequest"]["properties"]["argument"]["$ref"], "#/components/schemas/PrepareRequest");
     assert_eq!(schemas["ExecRequest"]["properties"]["command"]["prefixItems"][0]["minLength"], 1);
-    assert!(schemas["ObservedEnvironment"]["properties"].get("egress_measured").is_some());
-    assert!(schemas["SubscriptionRecord"].get("oneOf").is_some());
+}
+
+// Validate real Serde samples at the cross-language seam, including rejection of
+// swapped tuple elements, non-null unit, and a string duration (Utoipa defaults).
+#[test]
+fn serialized_provider_facts_validate_against_the_document() {
+    use drydock_protocol::*;
+    use drydock_provider::*;
+    let document = drydock_provider::openapi::document();
+    let credentials = || Credentials::new(CredentialMode::Direct { credential_reference: "test-only".into() });
+    let samples = [
+        (
+            "Call_TupleUnit",
+            serde_json::to_value(Call { credentials: credentials(), argument: () }).unwrap(),
+            serde_json::json!({"credentials":credentials(),"argument":"not-null"}),
+        ),
+        (
+            "Call_ExecArgs",
+            serde_json::to_value(Call {
+                credentials: credentials(),
+                argument: ("opaque/id", ExecRequest { command: vec!["cat".into(), "".into()] }),
+            })
+            .unwrap(),
+            serde_json::json!({"credentials":credentials(),"argument":[{"command":["cat"]},"opaque/id"]}),
+        ),
+        (
+            "ObservationMode",
+            serde_json::to_value(ObservationMode::Poll { interval: std::time::Duration::new(1, 2) }).unwrap(),
+            serde_json::json!({"Poll":{"interval":"PT1S"}}),
+        ),
+    ];
+    for (name, valid, invalid) in samples {
+        let root = serde_json::json!({"$ref":format!("#/components/schemas/{name}"),"components":document["components"]});
+        let validator = jsonschema::draft202012::new(&root).unwrap();
+        assert!(validator.is_valid(&valid), "{name}: {valid}");
+        assert!(!validator.is_valid(&invalid), "{name}: {invalid}");
+    }
 }
