@@ -21,6 +21,13 @@ Production images are produced by CI from a merged revision. The script archives
 that exact revision rather than sending the working tree to the builder. Publish
 refuses revisions not reachable from the fetched origin/main.
 
+CI rebuilds only when something the agent build reads has changed since the
+previous push or the pull request's base. `ci/tools_inputs.py` decides this from
+the agent's workspace path dependencies, the lockfile, the toolchain pin and the
+image build files; Markdown never counts. Any other merge keeps the published
+image and opens no pin PR. Run the workflow by hand (`workflow_dispatch`) to
+rebuild from main anyway, for example after a failed publish.
+
 CI builds each platform on a runner of that architecture (`ubuntu-24.04` and
 `ubuntu-24.04-arm`), so nothing is compiled or tested under emulation. Each
 publishes its platform image by digest and runs the stock-Ubuntu check on its own
