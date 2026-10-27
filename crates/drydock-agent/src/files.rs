@@ -193,7 +193,7 @@ fn parent_of(operation: &str, path: &Path) -> Refusal<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or_else(|| AgentError::new(operation, path.display(), ErrorKind::InvalidInput, "path needs a parent directory"))
 }
-fn prepare_parent(operation: &str, path: &Path, parents: bool, uid: Option<u32>, gid: Option<u32>) -> Refusal<PathBuf> {
+pub(crate) fn prepare_parent(operation: &str, path: &Path, parents: bool, uid: Option<u32>, gid: Option<u32>) -> Refusal<PathBuf> {
     let parent = parent_of(operation, path)?;
     if parents {
         create_parents(operation, &parent, uid, gid)?;
@@ -600,30 +600,36 @@ pub(crate) async fn put_link(uri: Uri, Query(query): Query<LinkQuery>, Json(link
     if link.target.as_os_str().is_empty() || link.target.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(AgentError::new(OP, path.display(), ErrorKind::InvalidInput, "link target must be nonempty and contain no NUL"));
     }
-    let parent = prepare_parent(OP, &path, query.parents, query.uid, query.gid)?;
-    let existing = std::fs::symlink_metadata(&path).ok();
+    let existed = place_link(OP, &path, &link.target, &query)?;
+    Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
+}
+/// Place a symlink at `path`: a uniquely named sibling renamed over it, so
+/// the path names the old entry or the new link, never nothing. Returns
+/// whether something was there.
+pub(crate) fn place_link(operation: &str, path: &Path, target: &Path, query: &LinkQuery) -> Refusal<bool> {
+    let parent = prepare_parent(operation, path, query.parents, query.uid, query.gid)?;
+    let existing = std::fs::symlink_metadata(path).ok();
     if existing.as_ref().is_some_and(|m| m.is_dir()) {
-        return Err(AgentError::new(OP, path.display(), ErrorKind::IsADirectory, "a directory is in the way"));
+        return Err(AgentError::new(operation, path.display(), ErrorKind::IsADirectory, "a directory is in the way"));
     }
-    let at = |e| AgentError::io(OP, path.display(), e);
+    let at = |e| AgentError::io(operation, path.display(), e);
     if query.exclusive {
-        std::os::unix::fs::symlink(&link.target, &path).map_err(at)?;
-        if let Err(error) = std::os::unix::fs::lchown(&path, query.uid, query.gid) {
-            let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink(target, path).map_err(at)?;
+        if let Err(error) = std::os::unix::fs::lchown(path, query.uid, query.gid) {
+            let _ = std::fs::remove_file(path);
             return Err(at(error));
         }
     } else {
-        // A uniquely named sibling link, renamed over the path.
         let temporary = tempfile::Builder::new()
             .prefix(".drydock-link-")
-            .make_in(&parent, |name| std::os::unix::fs::symlink(&link.target, name))
+            .make_in(&parent, |name| std::os::unix::fs::symlink(target, name))
             .map_err(at)?;
         let installed = std::os::unix::fs::lchown(temporary.path(), query.uid, query.gid);
         installed.map_err(at)?;
-        temporary.persist(&path).map_err(|e| at(e.error))?;
+        temporary.persist(path).map_err(|e| at(e.error))?;
     }
     sync_directory(&parent).map_err(at)?;
-    Ok(if existing.is_some() { StatusCode::OK } else { StatusCode::CREATED })
+    Ok(existing.is_some())
 }
 
 pub(crate) async fn post_rename(Json(rename): Json<Rename>) -> Refusal<StatusCode> {
@@ -668,7 +674,7 @@ impl Drop for Staging {
 }
 /// Give the owner write and search permission on every directory under
 /// `root`, so the tree can be removed.
-fn open_up(root: &Path) -> io::Result<()> {
+pub(crate) fn open_up(root: &Path) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(root)?;
     if metadata.is_dir() {
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(metadata.mode() | 0o700))?;
@@ -679,7 +685,7 @@ fn open_up(root: &Path) -> io::Result<()> {
     Ok(())
 }
 /// Make everything written on the filesystem holding `path` durable.
-fn sync_filesystem(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_filesystem(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let directory = rustix::fs::open(

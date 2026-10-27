@@ -453,9 +453,13 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "percent-encoding",
  "rustix",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -465,11 +469,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tokio-vsock",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
+ "webpki-root-certs",
 ]
 
 [[package]]
