@@ -163,6 +163,10 @@ impl AgentError {
         agent.causes = causes;
         agent
     }
+    pub(crate) fn with_cause(mut self, cause: impl fmt::Display) -> Self {
+        self.causes.push(cause.to_string());
+        self
+    }
     pub(crate) fn with_status(mut self, status: u16) -> Self {
         self.status = status;
         self

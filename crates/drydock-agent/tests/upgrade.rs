@@ -1,5 +1,5 @@
 mod support;
-use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, GuestForward, HostForward, Platform};
+use drydock_agent::{Client, Configuration, Endpoint, Exec, ExecEvent, FileOptions, GuestForward, HostForward, Platform};
 use std::{os::unix::fs::PermissionsExt, time::Duration};
 use support::*;
 use tokio::process::Command;
@@ -82,9 +82,8 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     assert_mismatch(mismatch.configure(Configuration::default()).await);
     assert_mismatch(mismatch.configuration().await);
     assert_mismatch(mismatch.exec(Exec { program: "/bin/true".into(), args: vec![], cwd: None }).await);
-    assert_mismatch(mismatch.write(file.clone(), vec![], false).await);
-    assert_mismatch(mismatch.read(file.clone()).await);
-    assert_mismatch(mismatch.flush(file.clone()).await);
+    assert_mismatch(mismatch.write_bytes(&file, vec![], &FileOptions::default()).await);
+    assert_mismatch(mismatch.read(&file).await);
     assert_mismatch(mismatch.forward("x").await);
     assert_mismatch(mismatch.put_host_forward(HostForward { id: "x".into(), endpoint: Endpoint::Unix(file.clone()) }).await);
     assert_mismatch(mismatch.remove_host_forward("x").await);
@@ -185,7 +184,7 @@ async fn failed_file_write_never_publishes_a_partial_file_or_upgrade() {
     }
     let mut child = start(&mut command);
     let client = connect(&socket, &fingerprint).await;
-    let error = client.write(path.clone(), vec![7; 8192], false).await.expect_err("failed write must be reported");
+    let error = client.write_bytes(&path, vec![7; 8192], &FileOptions::default()).await.expect_err("failed write must be reported");
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
     let detail = agent_error(&error);
     assert_eq!(detail.operation, "file.write");

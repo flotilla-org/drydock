@@ -26,7 +26,7 @@ fn read(path: &Path) -> io::Result<Option<Probation>> {
 }
 pub(crate) async fn prepare(installed: &Path, candidate: &Path) -> io::Result<()> {
     let bytes = serde_json::to_vec(&Probation { installed: installed.into(), candidate: candidate.into() }).map_err(invalid)?;
-    crate::server::atomic_write(&marker(installed), &bytes, false).await
+    crate::durable::replace(&marker(installed), &bytes, 0o600)
 }
 /// Called after exclusively binding the control socket, before serving clients.
 /// Returns the stable install path, including when running a probation candidate.

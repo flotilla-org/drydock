@@ -561,12 +561,13 @@ async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
 
 // The one error layer: a refusal from a handler and every refusal the
 // framework makes before any handler runs (unknown route, wrong method, wrong
-// content type, malformed JSON, JSON of the wrong shape, an oversized body,
-// an undecodable path) is the same structured JSON error, with the status its
-// kind maps to, a message that says what was wrong, and the framework's other
-// headers. Nothing comes back as text, and nothing refused changes state.
-// Other tests check only which kind an operation chooses; how a kind is
-// encoded is proven here, and the kind to status table in `error::tests`.
+// content type, malformed JSON, JSON of the wrong shape, an oversized body, a
+// misspelt query parameter, an undecodable path) is the same structured JSON
+// error, with the status its kind maps to, a message that says what was wrong,
+// and the framework's other headers. Nothing comes back as text, and nothing
+// refused changes state. Other tests check only which kind an operation
+// chooses; how a kind is encoded is proven here, and the kind to status table
+// in `error::tests`.
 #[tokio::test]
 async fn refusals_are_structured() {
     let h = harness(false, "test-build").await;
@@ -593,6 +594,9 @@ async fn refusals_are_structured() {
     assert_eq!((error.operation.as_str(), error.kind), ("request", ErrorKind::PayloadTooLarge));
     let error = refused(&h, "PUT", "/configuration", &json, r#"{"egress":null,"ca":"","features":[],"environment":{"A=B":""}}"#, 400).await;
     assert_eq!(error.operation, "configuration.replace");
+    let error = refused(&h, "DELETE", "/entries/tmp/absent?colour=blue", &[], "", 400).await;
+    assert_eq!(error.operation, "request");
+    assert!(error.message.contains("unknown field `colour`"), "{error}");
     let error = refused(&h, "GET", "/forwards/guest/%FF", &[], "", 400).await;
     assert_eq!(error.operation, "request");
     assert!(error.message.to_lowercase().contains("utf-8") || error.message.contains("decode"), "{error}");
@@ -601,10 +605,9 @@ async fn refusals_are_structured() {
 }
 
 // Exec is a pipeline with null stdin and no tty, with independently streamed
-// stdout/stderr. Atomic writes, read-back, and explicit flush use the same API
-// on both in-memory and Unix-socket transports.
+// stdout/stderr, on both in-memory and Unix-socket transports.
 #[tokio::test]
-async fn exec_and_files_on_both_transports() {
+async fn exec_on_both_transports() {
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         let environment = [("HTTPS_PROXY", "proxy"), ("SSL_CERT_FILE", "/tmp/ca"), ("TOKEN", "placeholder")];
@@ -624,65 +627,7 @@ async fn exec_and_files_on_both_transports() {
         assert_eq!(first, ExecEvent::Stdout(b"first".to_vec()));
         std::fs::write(gate, []).unwrap();
         assert_eq!(output(stream).await.0, b"second");
-        let path = h.dir.path().join("push");
-        h.client.write(path.clone(), vec![], false).await.unwrap();
-        assert_eq!(h.client.read(path.clone()).await.unwrap(), Vec::<u8>::new());
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let flag = running.clone();
-        let observed = path.clone();
-        let reader = tokio::spawn(async move {
-            while flag.load(std::sync::atomic::Ordering::Relaxed) {
-                let bytes = tokio::fs::read(&observed).await.unwrap();
-                assert!(bytes.is_empty() || bytes == vec![7; 65536] || bytes == vec![9; 32768]);
-                tokio::task::yield_now().await;
-            }
-        });
-        for bytes in [vec![7; 65536], vec![9; 32768], vec![]] {
-            h.client.write(path.clone(), bytes.clone(), false).await.unwrap();
-            h.client.flush(path.clone()).await.unwrap();
-            assert_eq!(h.client.read(path.clone()).await.unwrap(), bytes);
-        }
-        running.store(false, std::sync::atomic::Ordering::Relaxed);
-        reader.await.unwrap();
     }
-}
-
-// Non-executable pushes default to a CA-readable 0644; replacement preserves
-// existing mode/owner, while an explicit executable push uses 0755. Oversized
-// reads fail up front, and absent paths have a distinct HTTP error.
-#[tokio::test]
-async fn file_modes_and_bounded_read_errors() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let h = harness(false, "test-build").await;
-    let path = h.dir.path().join("ca");
-    h.client.write(path.clone(), b"CA".to_vec(), false).await.unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-    let before = std::fs::metadata(&path).unwrap();
-    h.client.write(path.clone(), b"replacement".to_vec(), false).await.unwrap();
-    let after = std::fs::metadata(&path).unwrap();
-    assert_eq!((after.mode() & 0o777, after.uid(), after.gid()), (0o640, before.uid(), before.gid()));
-    h.client.write(path.clone(), vec![], true).await.unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
-    assert!(h.client.read(h.dir.path().join("absent")).await.unwrap_err().to_string().contains("NotFound"));
-    let large = h.dir.path().join("large");
-    std::fs::File::create(&large).unwrap().set_len(128 * 1024 * 1024 + 1).unwrap();
-    assert!(h.client.read(large).await.unwrap_err().to_string().contains("read exceeds 128 MiB"));
-}
-
-// JSON writes are bounded by encoded body size. Three-digit binary data near
-// that limit is accepted at 31 MiB and rejected at 32 MiB; rejection is atomic.
-#[tokio::test]
-async fn large_binary_write_obeys_encoded_body_limit() {
-    let h = harness(false, "test-build").await;
-    let path = h.dir.path().join("large-push");
-    h.client.write(path.clone(), vec![255; 31 * 1024 * 1024], false).await.unwrap();
-    let bytes = h.client.read(path.clone()).await.unwrap();
-    assert_eq!(bytes.len(), 31 * 1024 * 1024);
-    assert!(bytes.iter().all(|byte| *byte == 255));
-    drop(bytes);
-    assert!(h.client.write(path.clone(), vec![255; 32 * 1024 * 1024], false).await.unwrap_err().to_string().contains("413"));
-    assert_eq!(std::fs::metadata(path).unwrap().len(), 31 * 1024 * 1024);
 }
 
 // Detached exec output remains writable after its consumer disconnects. The
@@ -724,16 +669,14 @@ async fn disconnected_exec_drains_to_spool_and_is_reaped() {
     .unwrap();
 }
 
-// Exec and file errors cross both real control transports with the original
-// kind and enough context to distinguish missing programs, cwd and files.
+// Exec errors cross both real control transports with the original kind and
+// enough context to distinguish missing programs and working directories.
 #[tokio::test]
-async fn exec_and_file_errors_name_the_failed_operation_and_subject() {
+async fn exec_errors_name_the_failed_operation_and_subject() {
     use std::io::ErrorKind;
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         let path = h.dir.path().join("absent");
-        assert_error(h.client.read(path.clone()).await.unwrap_err(), ErrorKind::NotFound, "file.read", "absent");
-        assert_error(h.client.flush(path.clone()).await.unwrap_err(), ErrorKind::NotFound, "file.flush", "absent");
         assert_error(
             h.client.exec(Exec { program: "/missing-program".into(), args: vec![], cwd: None }).await.err().unwrap(),
             ErrorKind::NotFound,
@@ -746,15 +689,6 @@ async fn exec_and_file_errors_name_the_failed_operation_and_subject() {
             "exec.cwd",
             "absent",
         );
-        let relative = std::path::PathBuf::from("relative");
-        assert_error(
-            h.client.write(relative.clone(), vec![1], false).await.unwrap_err(),
-            ErrorKind::InvalidInput,
-            "file.write",
-            "relative",
-        );
-        assert_error(h.client.read(relative.clone()).await.unwrap_err(), ErrorKind::InvalidInput, "file.read", "relative");
-        assert_error(h.client.flush(relative).await.unwrap_err(), ErrorKind::InvalidInput, "file.flush", "relative");
     }
 }
 

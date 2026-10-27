@@ -59,7 +59,9 @@ normal handshake, not a reason to refuse an older tools pin.
 ## Control contract
 
 The host-facing `Purpose::Control` stream carries HTTP/2 through
-`drydock_transport::http2`. These routes are private to that link:
+`drydock_transport::http2`. These routes are private to that link. File
+paths in a route are absolute vessel paths, percent-encoded byte by byte, so
+any Unix path can be named; relative paths and `.`/`..` components are refused.
 
 | Method | Route | Body / result |
 | --- | --- | --- |
@@ -68,9 +70,11 @@ The host-facing `Purpose::Control` stream carries HTTP/2 through
 | GET / PUT / DELETE | `/forwards/guest/{id}` | Read / upsert / remove one `GuestForward`; GET `/forwards/guest` lists them |
 | GET / PUT / DELETE | `/forwards/host/{id}` | Read / upsert / remove one `HostForward`; GET `/forwards/host` lists them |
 | POST | `/exec` | `Exec { program, args, cwd }`; NDJSON `ExecEvent` stream |
-| POST | `/files/write` | `{ path, bytes, executable }`; atomic sibling write, fsync, rename, parent fsync |
-| POST | `/files/read` | `{ path }`; raw bytes |
-| POST | `/files/flush` | `{ path }`; fsync file or directory |
+| GET / HEAD / PUT | `/files/{path}` | Stream a file (Range, `ETag`, `If-Match`) / its size / an atomic streamed write |
+| GET / PATCH / DELETE | `/entries/{path}` | Stat without following links / change mode and owner / remove (`?recursive=true`) |
+| GET / PUT | `/dirs/{path}` | List a directory / create one |
+| PUT | `/links/{path}` | `{ "target": ... }`; create or atomically replace a symlink |
+| POST | `/renames` | `Rename { from, to, exclusive, parents }` |
 | PUT | `/upgrade` | Raw executable bytes; stage beside the installed binary |
 | POST | `/upgrade` | Activate staged binary and re-exec with the original flags |
 
@@ -83,31 +87,50 @@ a digest mismatch 422, duplicates and wrong-state calls 409, a failed
 `If-Match` 412, an unsatisfiable range 416, a wrong content type 415, and a
 deliberate size limit 413. `causes` keeps the chain behind the message, such
 as the OS error. The framework's own refusals (unknown routes, wrong methods,
-JSON bodies and paths it cannot decode, oversized JSON) are the same
+JSON bodies, queries and paths it cannot decode, oversized JSON) are the same
 structured error; a last-resort layer converts anything else that is not,
-and a handler that panics is answered with a structured 500. The
-client rebuilds the `AgentError` as the source of its `io::Error`
-(`AgentError::of(&error)`), keeping the I/O kind for kinds that have one.
+and a handler that panics is answered with a structured 500. The client
+rebuilds the `AgentError` as the source of its `io::Error`
+(`AgentError::of(&error)`), keeping the I/O kind for kinds that have one. HEAD
+replies have no body, so a HEAD refusal carries only its status.
 
 ### Files
 
-JSON byte fields are deliberately arrays of integers for this push-focused API;
-exec events use the same representation, with roughly 2–4 encoded bytes per
-output byte. Streaming general file transfer remains part of #50. File writes, upgrade images and read-back are
-limited to 128 MiB (oversized reads return 413 before buffering); other JSON
-control bodies are capped at 16 MiB. For JSON writes this is
-the encoded body limit: three-digit byte arrays fit slightly less than 32 MiB
-of file data, and single-digit arrays fit slightly less than 64 MiB, after path
-and JSON metadata. The near-limit test covers accepted 31 MiB and rejected
-32 MiB worst-case binary writes. Upgrade uploads and read-back use raw bytes;
-large general file operations, archives, directory traversal and diffs belong
-to #50. Empty writes and arbitrary binary read-back are supported. File writes
-replace the entire file atomically; new non-executable files use mode 644,
-replacements preserve the existing mode and preserve ownership when permitted.
-The optional executable flag sets mode 755. An unprivileged agent tolerates ownership EPERM when directory
-permissions allow replacement; root and other I/O failures remain strict.
-A destination symlink is replaced rather than followed.
-`flush` can also sync a parent directory. File routes require absolute paths within the vessel.
+File bytes travel as `application/octet-stream` bodies, streamed to and from
+disk; neither side holds a file whole. File bodies have no limit; JSON
+control bodies are capped at 16 MiB and upgrade images, which arrive whole,
+at 128 MiB.
+
+- `PUT /files/{path}` writes a sibling temporary, hashes it while writing,
+  fsyncs, renames atomically and fsyncs the parent. Readers see the complete
+  old file or the complete new one. The query takes `FileOptions`: `sha256`
+  (refuse with 422 and leave nothing behind on a mismatch), `mode`, `uid`,
+  `gid`, `parents` (create missing parents, mode 0755, the given owner) and
+  `exclusive` (409 if the file exists). New files default to mode 0600, so a
+  credential written through the agent is never world-readable. A replaced
+  file keeps its mode, and its owner when permitted (an unprivileged agent
+  tolerates EPERM there; root and other failures stay strict). A destination
+  symlink is replaced, not followed. setuid and setgid bits are never set
+  through the agent: they are cleared from requested and preserved modes
+  alike. With `If-Match`, the write replaces only a file that still has one
+  of the listed tags (412 otherwise, also for an absent file). The reply is
+  `Written { sha256, size }` with the new `ETag`; 201 for a new file, 200
+  for a replacement.
+- `GET /files/{path}` streams the file with `Content-Length`, `ETag` and
+  `Accept-Ranges`. A single `Range: bytes=` range returns 206 with
+  `Content-Range`; multiple ranges and ranges past the end are 416, as is any
+  range of an empty file (a plain GET returns it).
+  A `Range` header that is not a byte range is ignored, as RFC 9110 asks.
+  `If-Match` refuses (412) a file that changed since its tag was read, so a
+  ranged resume never splices two versions; any listed tag may match, and an
+  `If-Match` that is not a list of tags is refused (400). The tag is a strong validator of
+  inode, size and modification time; writes replace the inode.
+- Stat, list, remove, rename, symlink, mkdir and chmod/chown have their own
+  routes, so callers need no shell commands for them. A mode or owner change
+  acts on a descriptor opened without following a symlink, so it always
+  concerns the entry that was checked; on Linux it is an `O_PATH` descriptor,
+  so an owner can change an entry nobody can read. Rename replaces by
+  default (`rename(2)`); `exclusive` refuses an existing target atomically.
 
 ### Configuration, forwards and restarts
 
@@ -283,7 +306,7 @@ clears the capture table and resets configuration.
 Stale socket inodes from a crash are reclaimed only when they refuse a connection;
 live listeners and ordinary files are preserved.
 The host pushes it again after hello. Children continue running with their
-original environment. Embedders update their own files using `/files/write`
+original environment. Embedders update their own files with `PUT /files`
 without agent re-exec.
 
 ## Byte forwards and endpoint ownership
@@ -326,8 +349,9 @@ the agent inspects no forwarded bytes and holds no token.
 
 `cargo test -p drydock-agent` covers the control contract over in-memory yamux
 and Unix connections: tagged configuration, forward resources and generated
-upsert/removal sequences, every refusal as a structured error, atomic file
-visibility, streamed exec, byte-transparent HTTP/1.1, WebSocket upgrade frames,
+upsert/removal sequences, every refusal as a structured error, file
+operations, ranges, modes and digests (`tests/files.rs`), a streamed transfer
+larger than 512 MiB in bounded memory (`tests/large_files.rs`), streamed exec, byte-transparent HTTP/1.1, WebSocket upgrade frames,
 chunked bodies, dynamic forward changes, TCP and Unix endpoints, and isolation.
 A subprocess test pushes a distinct ELF and verifies real re-exec, the new hello,
 forward socket cleanup, fingerprint gating and survival/reaping of a child.
