@@ -28,7 +28,7 @@ pub const HOST_SOCKET: &str = "/run/drydock/host.sock";
 ///
 /// As a provider setting (`agent_link` in drydock's configuration) it is the
 /// preferred link, used where the provider's SSH server allows it; reverse
-/// forward is the default. As a [`ConnectedAgent`]'s link it is the one in use.
+/// forward is the default. In an [`AgentReport`] it is the link in use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLink {
@@ -95,10 +95,32 @@ pub struct Vessel<'a> {
     pub build: &'a [u8],
 }
 
-/// A connected agent and the link it uses.
+/// What drydock chose for one vessel's agent connection, reported to clients
+/// as information: they show it and never decide on it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReport {
+    /// The provider instance.
+    pub provider: String,
+    /// The provider's module, such as `daytona`.
+    pub module: String,
+    /// The provider's environment ID for the vessel.
+    pub environment: String,
+    /// The SSH endpoint the agent is reached through, without credentials.
+    pub endpoint: String,
+    /// How guest-to-host streams travel on that link.
+    pub link: AgentLink,
+}
+
+impl std::fmt::Display for AgentReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} over ssh {} to {} vessel {} (provider {})", self.link, self.endpoint, self.module, self.environment, self.provider)
+    }
+}
+
+/// A connected agent and what drydock chose to reach it.
 pub struct ConnectedAgent {
     pub client: drydock_agent::Client,
-    pub link: AgentLink,
+    pub report: AgentReport,
 }
 
 /// Connects to vessel agents under one provider's link preference.
@@ -147,7 +169,7 @@ impl AgentReach {
         }
         // Each reach mints a fresh gateway username, which is an access token.
         let masker = Mutex::new(DiagnosticMasker::default());
-        let link = Mutex::new(None);
+        let choice = Mutex::new(None);
         let open = || async {
             let reach = api.reach(vessel.provider, vessel.environment).await.map_err(|e| io::Error::other(format!("agent reach: {e}")))?;
             let Reach::Ssh { endpoint, user, host_key, reverse_forwards } = reach else {
@@ -155,11 +177,12 @@ impl AgentReach {
             };
             masker.lock().unwrap().remember(user.expose());
             let chosen = self.preferred.under(reverse_forwards);
+            let reached = endpoint.clone();
             let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into(), chosen)?;
             config.agent_socket = socket.into();
             let transport = self.dialer.dial(config).await?;
             // The link of the last dial that succeeded, which carries the agent returned.
-            *link.lock().unwrap() = Some(chosen);
+            *choice.lock().unwrap() = Some((reached, chosen));
             Ok(transport)
         };
         let client = wait_for_agent(open, vessel.platform, vessel.build, self.timeout, |text| masker.lock().unwrap().text(text))
@@ -171,8 +194,15 @@ impl AgentReach {
                     _ => ProtocolError::unavailable(reason, None),
                 })
             })?;
-        let link = link.lock().unwrap().expect("a connected agent was reached");
-        Ok(ConnectedAgent { client, link })
+        let (endpoint, link) = choice.lock().unwrap().take().expect("a connected agent was reached");
+        let report = AgentReport {
+            provider: declaration.provider.clone(),
+            module: declaration.module.clone(),
+            environment: vessel.environment.into(),
+            endpoint,
+            link,
+        };
+        Ok(ConnectedAgent { client, report })
     }
 }
 

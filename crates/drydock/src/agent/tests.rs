@@ -74,8 +74,9 @@ fn the_link_follows_the_preference_where_the_server_allows_it() {
     }
 }
 
-// Behaviour (flotilla#3980 contracts 1 and 8): the entry point connects through
-// whichever link the provider's reach and the preference allow, and reports it.
+// Behaviour (flotilla#3980 contracts 1, 8 and 9): the entry point connects through
+// whichever link the provider's reach and the preference allow, and reports
+// what it chose: provider, module, vessel, endpoint and link.
 // Against a gateway that refuses remote forwards it never asks for one; against
 // one that accepts them it uses them unless the provider prefers the local
 // forward. Either way the guest reaches the host through a guest forward.
@@ -94,7 +95,14 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
         let identity = directory.path().join("id_ed25519");
         let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
         let connected = reach.connect(&api, &vessel).await.unwrap();
-        assert_eq!(connected.link, link);
+        let report = AgentReport {
+            provider: "a".into(),
+            module: "memory".into(),
+            environment: environment.clone(),
+            endpoint: "gateway.test:22".into(),
+            link,
+        };
+        assert_eq!(connected.report, report, "drydock reports what it chose");
         assert_eq!(gateway.links(), vec![link], "the gateway is never asked for a link it refuses");
         guest_reaches_host(&connected.client, directory.path()).await;
     }
@@ -254,7 +262,7 @@ async fn agent_reach_works_through_a_gateway_without_reverse_forwards() {
         Vessel { provider: "a", environment: &environment, identity: &sshd.identity_file, platform: &Platform::current(), build: BUILD };
     let connected =
         AgentReach::new(AgentLink::default()).with_timeout(Duration::from_secs(10)).connect_at(&api, &vessel, &agent_socket).await.unwrap();
-    assert_eq!(connected.link, AgentLink::LocalForward);
+    assert_eq!(connected.report.link, AgentLink::LocalForward);
     guest_reaches_host(&connected.client, directory.path()).await;
     assert!(!directory.path().join("host.sock").exists());
     drop(connected);
