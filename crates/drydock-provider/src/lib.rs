@@ -1,4 +1,5 @@
 //! Compiled Rust provider interface. Shared methods permit independent concurrent calls.
+pub mod openapi;
 pub mod rest;
 use async_trait::async_trait;
 use drydock_protocol::*;
@@ -6,6 +7,7 @@ pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use utoipa::ToSchema;
 /// Errors are serialized to authenticated host clients, including snapshot readers.
 /// The main server masks configured credential values in public diagnostics.
 /// Credentials, tokens and reach recipes still use Secret fields.
@@ -65,7 +67,7 @@ pub trait Module: Send + Sync {
     /// resources; factories must yield while waiting on external work.
     async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct Credentials {
     pub mode: CredentialMode,
     pub value: Option<Secret>,
@@ -81,13 +83,16 @@ impl Credentials {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ToSchema)]
 pub enum ObservationMode {
-    Poll { interval: Duration },
+    Poll {
+        #[schema(schema_with = openapi::duration_schema)]
+        interval: Duration,
+    },
     Push,
 }
 /// Optional provider time travels separately from the environment wire representation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct ObservedEnvironment {
     /// True only when this call measured the isolation claim; conversion from
     /// a bare Environment conservatively supplies no measurement evidence.
@@ -95,6 +100,7 @@ pub struct ObservedEnvironment {
     /// Opaque effective-policy identity, present on every cheap observation when supported.
     pub egress_policy: Option<String>,
     pub environment: Environment,
+    #[schema(value_type = Option<String>, format = DateTime)]
     pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
 }
 impl From<Environment> for ObservedEnvironment {
@@ -103,7 +109,7 @@ impl From<Environment> for ObservedEnvironment {
     }
 }
 /// Created versus Existing preserves the public 201/200 distinction.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub enum Provisioned<T = ObservedEnvironment> {
     Created(T),
     Existing(T),
@@ -120,7 +126,7 @@ impl<T> Provisioned<T> {
         row
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub enum Connection {
     /// `reverse_forwards`: whether the SSH server accepts remote Unix-socket forwards.
     Ssh {
@@ -138,10 +144,14 @@ pub enum Connection {
 }
 
 /// Raw provider facts. No public events, billing transitions or cursors cross this seam.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub enum Update {
     Observed(ObservedEnvironment),
-    Removed { id: String, timestamp: Option<chrono::DateTime<chrono::Utc>> },
+    Removed {
+        id: String,
+        #[schema(value_type = Option<String>, format = DateTime)]
+        timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 #[derive(Clone)]
 pub struct EventSink(Arc<dyn Fn(Update) -> Result<()> + Send + Sync>);
@@ -306,12 +316,12 @@ mod tests {
 }
 
 /// Private adapter payload. Credentials are immutable for this call or subscription.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct Call<T> {
     pub credentials: Credentials,
     pub argument: T,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct Facts {
     pub ports: Ports,
     pub capabilities: Capabilities,
@@ -320,7 +330,7 @@ pub struct Facts {
     pub readiness: Readiness,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct Ports {
     pub exec: bool,
     pub suspend_resume: bool,
@@ -341,7 +351,7 @@ impl From<Operations<'_>> for Ports {
 }
 
 /// Private loader identity. The public Hello payload remains unchanged.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct BridgeHello {
     #[serde(flatten)]
     pub hello: Hello,
@@ -352,7 +362,7 @@ pub struct BridgeHello {
 
 /// A configured provider is a loader-owned handle, released when the server
 /// drops its trait object (including a rejected configuration transaction).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct ConfiguredProvider {
     pub instance: String,
     pub facts: Facts,
@@ -360,7 +370,7 @@ pub struct ConfiguredProvider {
 
 /// Subscription errors remain typed provider results on the private transport.
 /// These records are not public ObserveRecord events/history.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub enum SubscriptionRecord {
     Update(Update),
     Failed(ProtocolError),

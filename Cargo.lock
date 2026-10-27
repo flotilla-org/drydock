@@ -569,6 +569,7 @@ dependencies = [
  "serde_path_to_error",
  "tokio",
  "tracing",
+ "utoipa",
 ]
 
 [[package]]
