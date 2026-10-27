@@ -159,6 +159,13 @@ impl Agent {
         Arc::get_mut(&mut self.shared).expect("the store is chosen before the agent runs").store = crate::store::Store::new(root);
         self
     }
+    /// Report `platform` in the hello instead of this build's own. Only
+    /// stand-in vessels use it, to model a guest of the platform their vessel
+    /// was prepared for: a real agent reports the platform it runs on.
+    pub fn with_platform(mut self, platform: Platform) -> Self {
+        Arc::get_mut(&mut self.shared).expect("the platform is chosen before the agent runs").hello.platform = Some(platform);
+        self
+    }
     /// Add another host-facing native link (e.g. vsock). All links share state.
     pub fn add_transport(&mut self, transport: Transport) {
         self.transports.push(transport);
