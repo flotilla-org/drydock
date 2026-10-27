@@ -21,12 +21,13 @@ hyper = { version = "1", features = ["http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 async-stream = "0.3"
 chrono = "0.4"
-libc = "0.2"
+rustix = { version = "1", features = ["process"] }
 url = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+libc = "0.2"
 drydock = { path = "../drydock" }
 tokio = { version = "1", features = ["process", "test-util"] }
 rigging-tls.workspace = true
