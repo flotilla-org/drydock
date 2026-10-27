@@ -3,7 +3,7 @@
 //! real agent executable as a subprocess, for restarts and re-execs.
 #![allow(dead_code)]
 use bytes::Bytes;
-use drydock_agent::{Agent, AgentError, Client, ErrorKind, Exec, ExecEvent};
+use drydock_agent::{Agent, AgentError, Client, ErrorKind, ExecEvent, ExitStatus};
 use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};
 use http_body_util::{BodyExt, Full};
 use std::{
@@ -58,17 +58,19 @@ pub async fn pair(unix: bool, dir: &Path) -> (Transport, Transport) {
     }
 }
 pub async fn harness(unix: bool, expected: &str) -> Harness {
+    harness_with(unix, expected, |guest, dir| Agent::new(guest, "test-build".into(), dir.join("agent"))).await
+}
+pub async fn harness_with(unix: bool, expected: &str, agent: impl FnOnce(Transport, &Path) -> Agent) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let (host, guest) = pair(unix, dir.path()).await;
     let guest_opener = guest.opener.clone();
-    let agent = tokio::spawn(Agent::new(guest, "test-build".into(), dir.path().join("agent")).run());
+    let agent = tokio::spawn(agent(guest, dir.path()).run());
     let (raw, driver) = drydock_transport::http2::connect(&host.opener, Purpose::Control).await.unwrap();
     // The raw connection lives as long as the test; its driver is detached.
     drop(driver);
     let client = Client::connect(host, expected).await.unwrap();
     Harness { client, guest_opener, raw, agent, dir }
 }
-
 /// A multi-threaded runtime for a hegel test body.
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
@@ -127,19 +129,19 @@ pub fn assert_error(error: std::io::Error, kind: std::io::ErrorKind, operation: 
     detail
 }
 
-pub fn shell(script: &str) -> Exec {
-    Exec { program: "/bin/sh".into(), args: vec!["-c".into(), script.into()], cwd: None }
+pub fn shell(script: &str) -> drydock_agent::Exec {
+    drydock_agent::Exec::new("/bin/sh", ["-c", script])
 }
-pub async fn output(mut output: drydock_agent::ExecOutput) -> (Vec<u8>, Vec<u8>, Option<i32>) {
-    let (mut stdout, mut stderr, mut status) = (vec![], vec![], None);
-    while let Some(event) = output.next().await.unwrap() {
-        match event {
-            ExecEvent::Stdout(bytes) => stdout.extend(bytes),
-            ExecEvent::Stderr(bytes) => stderr.extend(bytes),
-            ExecEvent::Exit { code } => status = code,
+pub async fn output(mut output: drydock_agent::ExecOutput) -> (Vec<u8>, Vec<u8>, ExitStatus) {
+    let (mut stdout, mut stderr) = (vec![], vec![]);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), output.next()).await.expect("process output stalled").unwrap() {
+            Some(ExecEvent::Stdout(bytes)) => stdout.extend_from_slice(&bytes),
+            Some(ExecEvent::Stderr(bytes)) => stderr.extend_from_slice(&bytes),
+            Some(ExecEvent::Exit(status)) => return (stdout, stderr, status),
+            None => unreachable!("exit comes before the end"),
         }
     }
-    (stdout, stderr, status)
 }
 
 pub async fn echo(listener: UnixListener) {

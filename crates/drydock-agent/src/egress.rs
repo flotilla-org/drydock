@@ -793,14 +793,14 @@ mod tests {
                         "import os,socket; os.environ.clear(); s=socket.create_connection(('{fake}',8443),5); s.sendall(b'hello'); assert s.recv(5)==b'world'"
                     ),
                 ],
-                cwd: None,
+                ..Exec::default()
             })
             .await
             .unwrap();
         let mut code = None;
         while let Some(event) = output.next().await.unwrap() {
-            if let crate::ExecEvent::Exit { code: exit } = event {
-                code = exit;
+            if let crate::ExecEvent::Exit(status) = event {
+                code = status.code;
             }
         }
         assert_eq!(code, Some(0));

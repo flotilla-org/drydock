@@ -5,9 +5,10 @@ mod durable;
 mod egress;
 mod error;
 pub use egress::{CA_PATH, Egress, PROXY_PORT};
-mod exec;
 mod files;
 mod forward;
+mod frames;
+mod process;
 mod query;
 mod rest;
 pub use error::{AgentError, ErrorKind};
@@ -15,13 +16,13 @@ mod server;
 pub mod socket;
 mod store;
 pub mod upgrade;
-pub use client::{Client, Download, ExecOutput};
+pub use client::{Client, Download, ExecOutput, Process};
 use drydock_transport::ByteStream;
 use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configuration", "exec", "files", "uploads", "trees", "forwards", "egress", "upgrade"];
+pub const FEATURES: &[&str] = &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -103,17 +104,72 @@ impl Endpoint {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A process to start. It leads its own process group, with no terminal.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Exec {
     pub program: String,
+    #[serde(default)]
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// Added to the configured environment, overriding it per variable.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Give the process a stdin pipe, written through [`Process::write_stdin`].
+    /// Without it, stdin is `/dev/null`.
+    #[serde(default)]
+    pub stdin: bool,
+    /// Kill the process group this many milliseconds after start.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+impl Exec {
+    pub fn new(program: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self { program: program.into(), args: args.into_iter().map(Into::into).collect(), ..Self::default() }
+    }
+}
+/// How a process ended. A process killed by a signal has no code; one killed
+/// for exceeding its timeout also reports `timed_out`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExitStatus {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+impl ExitStatus {
+    pub fn success(&self) -> bool {
+        self.code == Some(0)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ProcessState {
+    Running,
+    Exited(ExitStatus),
+}
+/// A process handle's status.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub id: String,
+    pub pid: u32,
+    pub program: String,
+    #[serde(flatten)]
+    pub state: ProcessState,
+    /// Output bytes held by the agent and not yet sent to a reader. The agent
+    /// holds at most a fixed amount, sent bytes kept for a reattach included;
+    /// beyond it the process blocks on its pipe.
+    pub buffered: u64,
+    /// The offsets on stdout and stderr the current reader has reached. A
+    /// reattach at lower offsets moves them back.
+    pub stdout: u64,
+    pub stderr: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecEvent {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
-    Exit { code: Option<i32> },
+    Stdout(bytes::Bytes),
+    Stderr(bytes::Bytes),
+    Exit(ExitStatus),
 }
 /// Options for creating a file, directory, link or unpacked tree.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
