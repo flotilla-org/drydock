@@ -1,7 +1,8 @@
 //! A stand-in agent for hosts' tests of how they handle a process whose output
 //! ends badly. It answers hello and serves every process spawned through it the
 //! scripted output, in the agent's own process framing, so a host test never
-//! encodes drydock's wire format itself. Everything else is not found.
+//! encodes drydock's wire format itself. It accepts a configuration, as hosts
+//! push one on connecting, and drops it. Everything else is not found.
 use crate::{ExitStatus, FEATURES, Hello, ProcessInfo, ProcessState, frames::Frame};
 use axum::{
     Json, Router,
@@ -53,6 +54,11 @@ pub async fn serve(
     let script = Arc::new(script);
     let router = Router::new()
         .route("/hello", get(move || async move { Json(hello.clone()) }))
+        .route(
+            "/configuration",
+            get(|| async { ([(header::ETAG, "\"stand-in\"")], Json(crate::Configuration::default())) })
+                .put(|_: Json<crate::Configuration>| async { (StatusCode::NO_CONTENT, [(header::ETAG, "\"stand-in\"")]) }),
+        )
         .route(
             "/processes",
             post(|Json(request): Json<crate::Exec>| async move {
@@ -106,7 +112,8 @@ mod tests {
 
     // A host reading a scripted process sees exactly the scripted output; a stream
     // closed without its exit is UnexpectedEof, as from a real agent; and a
-    // stalled one stays open with nothing more to read.
+    // stalled one stays open with nothing more to read. The configuration a host
+    // pushes on connecting is accepted.
     #[tokio::test]
     async fn scripted_output_reaches_the_real_client() {
         let (host, guest) = tokio::io::duplex(64 * 1024);
@@ -122,6 +129,8 @@ mod tests {
             ending: scripted.lock().unwrap().clone(),
         }));
         let client = Client::connect(host.unwrap(), "stand-in-test").await.unwrap();
+        let etag = client.configure(crate::Configuration::default()).await.unwrap();
+        assert_eq!(client.configuration().await.unwrap().etag, etag);
         let (stdout, stderr, status) = client.exec(Exec::new("anything", ["at", "all"])).await.unwrap().collect(1024).await.unwrap();
         assert_eq!((stdout.as_slice(), stderr.as_slice(), status.code), (b"out".as_slice(), b"err".as_slice(), Some(0)));
         *ending.lock().unwrap() = Ending::Close;

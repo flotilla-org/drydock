@@ -103,7 +103,12 @@ start rotates the previous run to `drydock.log.1`, replacing the older backup.
 bounding a single long-running daemon's log.
 
 Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
-`egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
+`egress = "open"` or `"deny-all"`. `agent_link = "reverse_forward"` (the default) or
+`"local_forward"` chooses how guest-to-host streams reach the host on the agent's
+SSH link where the provider's server accepts remote forwards; a server that refuses
+them (Daytona's gateway) always shares the local forward. Embedding clients reach
+an agent through `drydock::agent::AgentReach`, which applies this preference, the
+provider's declared `agent` capability and its reach, and reports the link in use. Memory/disk accept bytes or integer quantities
 such as `2GiB`/`512MiB`. Suffixes are case-sensitive; `"5 GiB"` also works,
 and a numeric string such as `"12"` means bytes. Missing size fields use the module's declared smallest
 size. The standalone default is Open, declared Advisory by today's modules;

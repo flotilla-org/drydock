@@ -25,6 +25,10 @@ pub struct Provider {
     #[serde(default)]
     pub size: SizeDefaults,
     pub egress: Option<Egress>,
+    /// The preferred link to this provider's vessel agents, used where its SSH
+    /// server allows it. Defaults to reverse forwards.
+    #[serde(default)]
+    pub agent_link: crate::agent::AgentLink,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

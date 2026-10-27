@@ -1,5 +1,6 @@
 //! Managed host lifecycle, injected runtime detection, and credential refresh.
 //! Dropping a HostHandle cancels supervision and terminates its managed child.
+pub mod agent;
 pub mod api;
 pub mod config;
 pub mod conformance;

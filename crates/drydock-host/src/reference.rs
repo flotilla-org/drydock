@@ -47,6 +47,13 @@ struct ReferenceSettings {
     rate_limits: Vec<RateLimit>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u64,
+    /// The workspace root to declare. Tests whose stand-in vessel is the
+    /// test host point it at a directory of their own.
+    #[serde(default = "default_workspace_root")]
+    workspace_root: String,
+}
+fn default_workspace_root() -> String {
+    "/workspace".into()
 }
 fn default_platforms() -> Vec<Platform> {
     vec![Platform::new("linux", "amd64"), Platform::new("linux", "arm64")]
@@ -107,7 +114,7 @@ impl Provider for Reference {
         Capabilities {
             material_modes: vec![MaterialMode::Frozen, MaterialMode::Pushed, MaterialMode::Shared],
             checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
+            workspace_root: self.settings.workspace_root.clone(),
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
             export: true,
