@@ -307,6 +307,14 @@ Images above `max_image_gib` (default 20, Daytona's default snapshot maximum;
 compressed size is the lower bound checked), platforms other than amd64 and
 push access that expires mid-upload are typed refusals.
 
+On this route the host itself contacts the registries the request names, and
+their token realms, over HTTPS. It applies no registry allowlist or address
+policy, because lab registries usually sit on private networks. Prepare callers
+are authenticated host clients and are trusted to name registries. A pull
+credential goes only to its registry's origin, or to Docker Hub's
+`auth.docker.io` token service for `docker.io`. In proxied mode, registry
+traffic uses the same egress proxy as every other provider call.
+
 The fallback, `registry_pull` with the tools layer added by the provider, builds
 the snapshot with `buildInfo.dockerfileContent`: the pinned base plus
 `COPY --from` the pinned tools image's `/opt/drydock/`. Daytona's builder pulls

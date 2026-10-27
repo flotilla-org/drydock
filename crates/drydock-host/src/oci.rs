@@ -59,14 +59,15 @@ impl ImageRef {
                 && c.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
                 && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
         };
-        if registry.is_empty()
-            || !registry.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
-            || !repository.split('/').all(component_valid)
-        {
+        if !registry_host_valid(&registry) || !repository.split('/').all(component_valid) {
             return Err(invalid());
         }
         Ok(Self { registry, repository, digest: digest.to_owned() })
     }
+}
+/// `host[:port]` as a reference spells it. IPv6 literals are refused.
+pub fn registry_host_valid(host: &str) -> bool {
+    !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
 }
 fn digest_valid(digest: &str) -> bool {
     digest
@@ -178,12 +179,18 @@ pub fn compose(base: &Manifest, base_config: &[u8], tools: &Manifest, tools_conf
     let tools_diff_ids = tools_image["rootfs"]["diff_ids"].as_array().cloned().unwrap_or_default();
     let added = tools_diff_ids.len();
     config["rootfs"]["diff_ids"].as_array_mut().ok_or_else(|| malformed("image config has no diff_ids"))?.extend(tools_diff_ids);
+    // History is optional and also lists empty layers, so its length need not
+    // match diff_ids; it gains one entry per added layer only when present.
     if let Some(history) = config.get_mut("history").and_then(Value::as_array_mut) {
         history.extend((0..added).map(|_| json!({"created_by": "drydock tools layer: /opt/drydock"})));
     }
     let config = serde_json::to_vec(&config).map_err(|_| malformed("image config cannot be encoded"))?;
     let config_digest = sha256(&config);
     let mut manifest = base.json.clone();
+    // A referrer of some other image the base pointed at; the composed image is not.
+    if let Some(object) = manifest.as_object_mut() {
+        object.remove("subject");
+    }
     manifest["config"] = json!({"mediaType": base.config()?.media_type, "digest": config_digest, "size": config.len()});
     manifest["layers"] = layers.iter().map(|(_, l)| json!({"mediaType": l.media_type, "digest": l.digest, "size": l.size})).collect();
     let manifest = serde_json::to_vec(&manifest).map_err(|_| malformed("manifest cannot be encoded"))?;
@@ -246,6 +253,12 @@ impl Registry {
     }
     fn same_origin(&self, url: &Url) -> bool {
         url.origin() == self.origin.origin()
+    }
+    /// Whether a token realm may receive this registry's credential: its own
+    /// origin, or the token service a public registry is known to delegate to.
+    fn realm_trusted(&self, realm: &Url) -> bool {
+        self.same_origin(realm)
+            || (self.host == "docker.io" && realm.origin() == Url::parse("https://auth.docker.io/").expect("static URL").origin())
     }
     async fn execute(&self, request: reqwest::Request, what: &str) -> Result<http::Response<Bytes>> {
         rigging_http_client::http_execute!(self.http, request)
@@ -314,7 +327,7 @@ impl Registry {
         realm.query_pairs_mut().append_pair("scope", scope);
         let mut request = reqwest::Request::new(Method::GET, realm.clone());
         // A realm elsewhere gets an anonymous token request, never our credential.
-        if self.same_origin(&realm)
+        if self.realm_trusted(&realm)
             && let Some(basic) = self.basic()
         {
             request.headers_mut().insert(header::AUTHORIZATION, basic);
@@ -363,6 +376,7 @@ impl Registry {
         if expected.contains(&status) {
             return Ok(());
         }
+        // Integer seconds only; an HTTP-date leaves the retry hint unset.
         let retry_after = response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
         Err(self.status_error(status, what, retry_after))
     }
@@ -520,9 +534,10 @@ pub async fn copy_blob(
         let range = [(header::RANGE, format!("bytes={offset}-{end}"))];
         let response = source.get(&pull_scope(source_repository), url.clone(), &range, "blob").await?;
         source.check(&response, &[200, 206], "blob")?;
-        // A registry may ignore Range and send the whole blob.
+        // A registry may ignore Range and send the whole blob; accept that only
+        // when the whole blob fits one bounded request.
         let bytes = match response.status().as_u16() {
-            200 if offset == 0 => response.into_body(),
+            200 if offset == 0 && layer.size <= chunk => response.into_body(),
             206 => response.into_body(),
             _ => return Err(malformed("registry ignored a ranged blob read")),
         };
@@ -581,7 +596,7 @@ mod tests {
     // and a config whose diff_ids grow by exactly the tools layer. Composing the
     // same inputs again yields the same digest. Generator: base layer counts
     // 0..6 (including an empty base), both manifest families for base and
-    // tools, with and without history.
+    // tools, with and without history, with and without a referrer subject.
     #[hegel::test]
     fn composed_image_appends_the_tools_layer(tc: hegel::TestCase) {
         let platform = Platform::new("linux", "amd64");
@@ -592,13 +607,18 @@ mod tests {
         // Few distinct contents, so layers repeat as they can in real images.
         let layers: Vec<Vec<u8>> = (0..count).map(|_| vec![tc.draw(gs::integers::<u8>().min_value(0).max_value(3)); 8]).collect();
         let history = tc.draw(gs::booleans());
-        let (base, base_config) = image(base_type, base_layer_type, &layers, &platform, history);
+        let (mut base, base_config) = image(base_type, base_layer_type, &layers, &platform, history);
+        let subject = tc.draw(gs::booleans());
+        if subject {
+            base.json["subject"] = descriptor(OCI_MANIFEST, b"some other image");
+        }
         let (tools, tools_config) = image(tools_type, tools_layer_type, &[b"drydock-agent".to_vec()], &platform, false);
         let composed = compose(&base, &base_config, &tools, &tools_config, &platform).unwrap();
 
         let manifest: Value = serde_json::from_slice(&composed.manifest).unwrap();
         assert_eq!(composed.digest, sha256(&composed.manifest));
         assert_eq!(manifest["mediaType"], base_type);
+        assert!(manifest.get("subject").is_none(), "the composed image refers to nothing");
         let mut expected = base.json["layers"].as_array().unwrap().clone();
         let mut tools_layer = tools.json["layers"][0].clone();
         tools_layer["mediaType"] = json!(base_layer_type);
@@ -658,6 +678,21 @@ mod tests {
         ] {
             assert!(ImageRef::parse(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    // A pull credential goes to a token realm on the registry's own origin, or
+    // to the token service Docker Hub delegates to, and never to anyone else.
+    #[test]
+    fn realms_receiving_credentials() {
+        let http: Arc<dyn HttpClient> = Arc::new(rigging_http_client::ReqwestHttpClient::new());
+        let trusted = |registry: &str, realm: &str| {
+            Registry::new(http.clone(), registry, None, None).unwrap().realm_trusted(&Url::parse(realm).unwrap())
+        };
+        assert!(trusted("ghcr.io", "https://ghcr.io/token"));
+        assert!(trusted("docker.io", "https://auth.docker.io/token"));
+        assert!(!trusted("ghcr.io", "https://auth.docker.io/token"));
+        assert!(!trusted("docker.io", "https://auth.docker.io.evil.test/token"));
+        assert!(!trusted("lab.test", "https://lab.test:8443/token"));
     }
 
     // Challenge parameters may be quoted (and contain commas) or bare.

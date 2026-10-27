@@ -70,6 +70,8 @@ struct Registries {
     tokens: BTreeMap<String, (String, chrono::DateTime<chrono::Utc>)>,
     mints: usize,
     patch_sizes: Vec<usize>,
+    /// Source registries answer ranged reads with the whole blob.
+    ignore_range: bool,
 }
 const LAB: &str = "lab.invalid";
 const TOOLS: &str = "registry.invalid";
@@ -502,8 +504,10 @@ fn registry_response(s: &mut State, request: &reqwest::Request) -> http::Respons
         format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")))
     };
     let path = request.url().path().to_owned();
+    let ignore_range = s.oci.ignore_range && host != HARBOR;
     let range = |bytes: &Bytes| -> http::Response<Bytes> {
-        match request.headers().get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes=")) {
+        match request.headers().get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes=")).filter(|_| !ignore_range)
+        {
             None => reply(200, &[], bytes.clone()),
             Some(r) => {
                 let (start, end) = r.split_once('-').unwrap();
@@ -2336,6 +2340,40 @@ async fn push_route_refusals_are_typed() {
     assert_eq!(http.0.lock().unwrap().oci.mints, 0, "refused before minting push access");
     http.0.lock().unwrap().oci.push_lifetime = Some(chrono::TimeDelta::seconds(10));
     assert_eq!(refusal(p.prepare(push_request(base, tools), &c).await), ImageRefusal::PushCredentialExpired);
+    assert!(http.0.lock().unwrap().snapshot_requests.is_empty());
+}
+
+// A source blob is copied only when it can be verified inside bounded
+// requests: a registry that ignores Range for a blob larger than one chunk,
+// and a blob whose bytes do not match its digest, are each refused before the
+// upload commits, so Daytona's registry never holds the layer and no snapshot
+// is created.
+#[tokio::test]
+async fn unverifiable_source_blobs_are_refused() {
+    let http = Arc::new(StandIn::default());
+    let (base, base_manifests, tools) = {
+        let mut s = http.0.lock().unwrap();
+        let (base, base_manifests) = seed(&mut s, lab_base(&["amd64"]));
+        (base, base_manifests, seed(&mut s, published_tools()).0)
+    };
+    let layer = base_manifests["amd64"]["layers"][0]["digest"].as_str().unwrap().to_owned();
+    let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": 7})).await;
+    let c = credentials(false);
+    let refused_unstored = |result: Result<Prepared>| {
+        assert!(matches!(result, Err(ProtocolError::Internal { .. })), "{result:?}");
+        assert!(!http.0.lock().unwrap().oci.blobs.contains_key(&(HARBOR.to_owned(), layer.clone())));
+    };
+    http.0.lock().unwrap().oci.ignore_range = true;
+    refused_unstored(p.prepare(push_request(base.clone(), tools.clone()), &c).await);
+    {
+        let mut s = http.0.lock().unwrap();
+        s.oci.ignore_range = false;
+        let stored = s.oci.blobs.get_mut(&(LAB.to_owned(), layer.clone())).unwrap();
+        let mut corrupt = stored.to_vec();
+        corrupt[0] ^= 1;
+        *stored = Bytes::from(corrupt);
+    }
+    refused_unstored(p.prepare(push_request(base, tools), &c).await);
     assert!(http.0.lock().unwrap().snapshot_requests.is_empty());
 }
 

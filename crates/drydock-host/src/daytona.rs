@@ -389,20 +389,14 @@ impl Daytona {
         let tools_manifest = tools_registry.platform_manifest(&tools, platform).await?;
         let tools_config = tools_registry.config(&tools.repository, &tools_manifest).await?;
         let composed = oci::compose(&base_manifest, &base_config, &tools_manifest, &tools_config, platform)?;
-        let limit_bytes = self.settings.max_image_gib.saturating_mul(GIB);
-        if composed.bytes() > limit_bytes {
-            return Err(ProtocolError::ImageRefused {
-                reason: format!("image needs at least {} bytes; Daytona snapshots hold {limit_bytes}", composed.bytes()),
-                refusal: ImageRefusal::TooLarge { bytes: composed.bytes(), limit_bytes },
-            });
-        }
+        fits_snapshot(composed.bytes(), self.settings.max_image_gib)?;
         let mut url = self.path(&self.settings.api_url, &["docker-registry", "registry-push-access"])?;
         url.query_pairs_mut().append_pair("regionId", &self.settings.region);
         let access = self.call(Method::GET, url, None, c).await?;
         let expires_at = text(&access, "expiresAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response())?;
         let host = text(&access, "registryUrl")?;
         let host = host.strip_prefix("https://").unwrap_or(host).trim_end_matches('/');
-        if host.contains(['/', '@']) || host.starts_with("http:") {
+        if !oci::registry_host_valid(host) {
             return Err(bad_response());
         }
         let credential = RegistryCredential { username: text(&access, "username")?.into(), secret: Secret::new(text(&access, "secret")?) };
@@ -430,6 +424,17 @@ impl Daytona {
     }
 }
 const GIB: u64 = 1 << 30;
+/// An image fills a snapshot exactly at the limit; one byte more is refused.
+fn fits_snapshot(bytes: u64, max_gib: u64) -> Result<()> {
+    let limit_bytes = max_gib.saturating_mul(GIB);
+    if bytes <= limit_bytes {
+        return Ok(());
+    }
+    Err(ProtocolError::ImageRefused {
+        reason: format!("image needs at least {bytes} bytes; Daytona snapshots hold {limit_bytes}"),
+        refusal: ImageRefusal::TooLarge { bytes, limit_bytes },
+    })
+}
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
     let url = Url::parse(endpoint).map_err(|_| refused("invalid Daytona endpoint"))?;
     if url.scheme() != "https"
@@ -1074,6 +1079,15 @@ fn validate_size(size: &Size) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The snapshot limit is inclusive: an image of exactly max_image_gib fits.
+    #[test]
+    fn snapshot_limit_boundary() {
+        assert!(fits_snapshot(20 * GIB, 20).is_ok());
+        assert!(matches!(
+            fits_snapshot(20 * GIB + 1, 20),
+            Err(ProtocolError::ImageRefused { refusal: ImageRefusal::TooLarge { bytes, limit_bytes }, .. }) if bytes == 20 * GIB + 1 && limit_bytes == 20 * GIB
+        ));
+    }
     // Vendor decimal lexemes retain all digits, beyond binary64's exact range.
     #[test]
     fn exact_vendor_money_and_complete_errors() {
