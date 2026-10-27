@@ -17,3 +17,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json.workspace = true
 serde_path_to_error = "0.1"
 tracing = "0.1"
+utoipa.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.60.2", default-features = false }

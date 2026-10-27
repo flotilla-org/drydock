@@ -370,3 +370,28 @@ with existing subscription lifetime policy, it does not introduce a same-snapsho
 retry loop. Rotation can reopen the subscription. Transport loss during mutation
 reports unavailability with an uncertain-outcome reason and never proves rollback;
 malformed host responses are internal adapter errors rather than transient outages.
+
+## Generated private host contract
+
+[`host-openapi.json`](../../host-openapi.json) describes the thin host's private
+provider calls, discovery, handle release, raw relay/exec upgrades and NDJSON raw
+subscriptions. It is distinct from the public server API in `openapi.json`.
+The Rust host and client continue to use `drydock-provider` declarations directly.
+Other languages generate their payload types and runtime validators from this document.
+
+Regenerate from the repository root:
+
+```sh
+cargo run --locked -p drydock-provider --bin generate-host-openapi > host-openapi.json
+cargo test --locked -p drydock-provider --test openapi
+```
+
+Do not edit generated JSON. Utoipa derives payload schemas from the Rust/Serde
+wire declarations; route documentation is in `drydock-provider/src/openapi.rs`.
+The export reuses the public generator's schema constraints and corrects Utoipa's
+unit/tuple/generic limitations. The normal workspace test command checks drift
+and the document's route inventory against the Rust host. The private contract
+contains no server-side rate, credential-state, inventory or replay policy.
+
+The drift/router tests are workspace checks: they require the repository's root
+JSON document and sibling Rust-host source, not an isolated packaged crate.
