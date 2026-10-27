@@ -413,7 +413,7 @@ fn dual_listener(port: u16) -> io::Result<TcpListener> {
 fn original_destination(stream: &TcpStream) -> io::Result<SocketAddr> {
     let socket = socket2::SockRef::from(stream);
     // IPv4 connections on the dual-stack listener use SOL_IP; native IPv6 uses
-    // SOL_IPV6.
+    // SOL_IPV6. Both conntrack families use original-destination option 80.
     let address = if stream.peer_addr()?.ip().to_canonical().is_ipv4() { socket.original_dst_v4()? } else { socket.original_dst_v6()? };
     address.as_socket().ok_or_else(|| invalid("invalid original destination family"))
 }
