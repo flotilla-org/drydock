@@ -249,6 +249,8 @@ pub async fn optional_contract(
             &PrepareRequest {
                 size: request.size.clone(),
                 platform: Some(request.prepared.platform.clone()),
+                route: None,
+                image_pull: None,
                 image_digest: request.prepared.image_digest.clone(),
                 tools_digest: request.prepared.tools_digest.clone(),
             },
@@ -263,6 +265,8 @@ pub async fn optional_contract(
                     &PrepareRequest {
                         size: request.size.clone(),
                         platform: Some(prepared.platform.clone()),
+                        route: None,
+                        image_pull: None,
                         image_digest: prepared.image_digest.clone(),
                         tools_digest: prepared.tools_digest.clone(),
                     },
@@ -470,6 +474,8 @@ pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &st
         let preparation = PrepareRequest {
             size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
             platform: None,
+            route: None,
+            image_pull: None,
             image_digest: "sequence-image".into(),
             tools_digest: "sequence-tools".into(),
         };
@@ -538,6 +544,8 @@ async fn provider_isolation(client: &Client, providers: [&str; 2], main: &Enviro
                 &PrepareRequest {
                     size: options.request.size.clone(),
                     platform: Some(options.request.prepared.platform.clone()),
+                    route: None,
+                    image_pull: None,
                     image_digest: "isolation-image".into(),
                     tools_digest: "isolation-tools".into(),
                 },

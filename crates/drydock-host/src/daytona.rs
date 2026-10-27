@@ -1,6 +1,9 @@
 //! Stateless Daytona REST translator. The host owns inventory, event diffs and retries.
 //! API contract: https://www.daytona.io/docs/openapi.json (2026-10-20).
-use crate::module::*;
+use crate::{
+    module::*,
+    oci::{self, ImageRef, Registry},
+};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use reqwest::{Method, Url};
@@ -43,6 +46,20 @@ struct Settings {
     /// alone upgrades the claim: provision/resume/explicit inspect measure it.
     #[serde(default)]
     egress_probe: Option<ExecRequest>,
+    /// Largest image a snapshot may hold, in GiB: Daytona's default snapshot
+    /// maximum is 20. Organizations with a raised limit configure it.
+    #[serde(default = "max_image_gib")]
+    max_image_gib: u64,
+    /// Bytes per blob request on the push route. Each request must finish
+    /// inside the host's HTTP deadline, so slow links want smaller chunks.
+    #[serde(default = "push_chunk_bytes")]
+    push_chunk_bytes: u64,
+}
+fn max_image_gib() -> u64 {
+    20
+}
+fn push_chunk_bytes() -> u64 {
+    16 << 20
 }
 fn analytics_url() -> String {
     "https://analytics.app.daytona.io/".into()
@@ -71,8 +88,10 @@ impl Module for DaytonaModule {
             || settings.organization_id.is_empty()
             || settings.ssh_host_key.is_empty()
             || settings.region.is_empty()
+            || settings.max_image_gib == 0
+            || settings.push_chunk_bytes == 0
         {
-            return Err(refused("Daytona requires organization_id, ssh_host_key, region and tier 1..4"));
+            return Err(refused("Daytona requires organization_id, ssh_host_key, region, tier 1..4 and positive image limits"));
         }
         for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
             endpoint_url(endpoint, true)?;
@@ -355,6 +374,60 @@ impl Daytona {
         }
         Err(ProtocolError::unavailable("Daytona sandbox has not started", Some(5)))
     }
+    /// Push route: append the tools layer to the base image's manifest here,
+    /// upload the result into Daytona's registry with minted push access, and
+    /// wait until a pull by digest succeeds. Returns the digest reference.
+    async fn push(&self, r: &PrepareRequest, platform: &Platform, tag: &str, c: &Credentials) -> Result<String> {
+        let base = ImageRef::parse(&r.image_digest)?;
+        let tools = ImageRef::parse(&r.tools_digest)?;
+        // The pull credential belongs to the base's registry and goes nowhere else.
+        let base_registry = Registry::new(self.http.clone(), &base.registry, r.image_pull.clone(), None)?;
+        let tools_credential = if tools.registry == base.registry { r.image_pull.clone() } else { None };
+        let tools_registry = Registry::new(self.http.clone(), &tools.registry, tools_credential, None)?;
+        let base_manifest = base_registry.platform_manifest(&base, platform).await?;
+        let base_config = base_registry.config(&base.repository, &base_manifest).await?;
+        let tools_manifest = tools_registry.platform_manifest(&tools, platform).await?;
+        let tools_config = tools_registry.config(&tools.repository, &tools_manifest).await?;
+        let composed = oci::compose(&base_manifest, &base_config, &tools_manifest, &tools_config, platform)?;
+        let limit_bytes = self.settings.max_image_gib.saturating_mul(GIB);
+        if composed.bytes() > limit_bytes {
+            return Err(ProtocolError::ImageRefused {
+                reason: format!("image needs at least {} bytes; Daytona snapshots hold {limit_bytes}", composed.bytes()),
+                refusal: ImageRefusal::TooLarge { bytes: composed.bytes(), limit_bytes },
+            });
+        }
+        let mut url = self.path(&self.settings.api_url, &["docker-registry", "registry-push-access"])?;
+        url.query_pairs_mut().append_pair("regionId", &self.settings.region);
+        let access = self.call(Method::GET, url, None, c).await?;
+        let expires_at = text(&access, "expiresAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response())?;
+        let host = text(&access, "registryUrl")?;
+        let host = host.strip_prefix("https://").unwrap_or(host).trim_end_matches('/');
+        if host.contains(['/', '@']) || host.starts_with("http:") {
+            return Err(bad_response());
+        }
+        let credential = RegistryCredential { username: text(&access, "username")?.into(), secret: Secret::new(text(&access, "secret")?) };
+        let target = Registry::new(self.http.clone(), host, Some(credential), Some(expires_at)).map_err(|_| bad_response())?;
+        let repository = format!("{}/drydock-vessel", text(&access, "project")?);
+        for (source, layer) in &composed.layers {
+            let (registry, from) = match source {
+                oci::Source::Base => (&base_registry, &base.repository),
+                oci::Source::Tools => (&tools_registry, &tools.repository),
+            };
+            oci::copy_blob(registry, from, &target, &repository, layer, self.settings.push_chunk_bytes).await?;
+        }
+        target.put_blob(&repository, &composed.config_digest, composed.config.clone().into()).await?;
+        // Tagged so the registry retains it; Daytona itself is given the digest.
+        target.put_manifest(&repository, tag, &composed).await?;
+        // Daytona's registry serves a new manifest only after a delay, and its
+        // builder pulls once at snapshot creation (cf. `daytona snapshot push`).
+        for _ in 0..60 {
+            if target.manifest_visible(&repository, &composed.digest).await? {
+                return Ok(format!("{host}/{repository}@{}", composed.digest));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Err(ProtocolError::unavailable("pushed image is not yet visible in Daytona's registry", Some(5)))
+    }
 }
 const GIB: u64 = 1 << 30;
 fn endpoint_url(endpoint: &str, trailing_slash: bool) -> Result<Url> {
@@ -478,6 +551,22 @@ impl Provider for Daytona {
             bootstrap: BootstrapRoute::Bake,
             agent: true,
             platforms: vec![platform()],
+            image_routes: vec![
+                // Default: our own images live in registries Daytona cannot reach.
+                ImageRoute::ProviderPush {
+                    protocol: PushProtocol::OciDistribution,
+                    credential_lifetime_seconds: Some(3600),
+                    tools_layer: ToolsLayer::Host,
+                },
+                // Daytona's builder pulls the base and tools itself, from a
+                // registry the organization registered via POST /docker-registry.
+                ImageRoute::RegistryPull {
+                    auth: RegistryAuthKind::Basic,
+                    registration: CredentialRegistration::ProviderApi,
+                    digest_references: true,
+                    tools_layer: ToolsLayer::Provider,
+                },
+            ],
             usage: true,
             quota: true,
         }
@@ -506,6 +595,7 @@ impl Provider for Daytona {
         ]
     }
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+        let route = prepare_route(&r)?;
         if !r
             .image_digest
             .split_once("@sha256:")
@@ -525,32 +615,41 @@ impl Provider for Daytona {
         if r.image_digest.contains(['\n', '\r', ' ', '\t']) {
             return Err(refused("invalid Daytona base image reference"));
         }
+        let supported = platform();
         let platform = prepare_platform(&r)?;
-        // Daytona's snapshot API takes no platform; pin both multi-arch references
-        // in the build so the snapshot matches the recorded prepared form.
-        let dockerfile = format!(
-            "FROM --platform={platform} {} AS drydock_tools\nFROM --platform={platform} {}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
-            r.tools_digest, r.image_digest
-        );
+        if platform != supported {
+            return Err(ProtocolError::ImageRefused {
+                reason: format!("Daytona runs only {supported} sandboxes"),
+                refusal: ImageRefusal::UnsupportedPlatform { platform },
+            });
+        }
         validate_size(&r.size)?;
         // CreateSnapshot labels memory/disk "GB", but the resource guide and
         // default snapshot table specify GiB for the resulting sandbox:
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
         // Keep binary units consistent with sandbox readback; decimal conversion
         // would also produce fractions rejected by CreateSnapshot's integer fields.
+        // Both routes produce the same filesystem, so the route is not part of the key.
         let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &platform, &r.size);
         let url = self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?;
         let snapshot = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
             Err(ProtocolError::NotFound { .. }) => {
-                match self
-                    .create(
-                        self.path(&self.settings.api_url, &["snapshots"])?,
-                        json!({"name":snapshot_name,"buildInfo":{"dockerfileContent":dockerfile},"regionId":self.settings.region,"sandboxClass":"container","cpu":r.size.cpus as u64,"memory":r.size.memory_bytes/GIB,"disk":r.size.disk_bytes/GIB}),
-                        c,
-                    )
-                    .await?
-                {
+                let mut body = json!({"name":snapshot_name,"regionId":self.settings.region,"sandboxClass":"container","cpu":r.size.cpus as u64,"memory":r.size.memory_bytes/GIB,"disk":r.size.disk_bytes/GIB});
+                match route {
+                    ImageRouteKind::ProviderPush => body["imageName"] = json!(self.push(&r, &platform, &snapshot_name, c).await?),
+                    ImageRouteKind::RegistryPull => {
+                        // Daytona's snapshot API takes no platform; pin both multi-arch
+                        // references in the build so the snapshot matches the prepared form.
+                        let dockerfile = format!(
+                            "FROM --platform={platform} {} AS drydock_tools\nFROM --platform={platform} {}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
+                            r.tools_digest, r.image_digest
+                        );
+                        body["buildInfo"] = json!({"dockerfileContent":dockerfile});
+                    }
+                    ImageRouteKind::RemoteBuild => return Err(refused("Daytona declares no remote_build image route")),
+                }
+                match self.create(self.path(&self.settings.api_url, &["snapshots"])?, body, c).await? {
                     Some(snapshot) => snapshot,
                     None => self.call(Method::GET, self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?, None, c).await?,
                 }

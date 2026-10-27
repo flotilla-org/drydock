@@ -449,6 +449,8 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
     let request = PrepareRequest {
         size: provision.size.clone(),
         platform: Some(prepared.platform.clone()),
+        route: None,
+        image_pull: None,
         image_digest: prepared.image_digest.clone(),
         tools_digest: prepared.tools_digest.clone(),
     };

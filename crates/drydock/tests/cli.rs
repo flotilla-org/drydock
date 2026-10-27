@@ -222,6 +222,8 @@ async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Envir
             "demo",
             &PrepareRequest {
                 platform: None,
+                route: None,
+                image_pull: None,
                 size: size.clone(),
                 image_digest: "routing-image".into(),
                 tools_digest: "routing-tools".into(),
@@ -356,6 +358,8 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
                             provider,
                             &PrepareRequest {
                                 platform: None,
+                                route: None,
+                                image_pull: None,
                                 size: size.clone(),
                                 image_digest: "image".into(),
                                 tools_digest: "tools".into(),

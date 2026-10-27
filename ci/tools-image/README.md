@@ -114,8 +114,8 @@ by this build's checked-in pin (or build-time override), including registry
 location and index digest. It may identify an older agent; upgrade it after hello
 as described above, rather than refusing the vessel for a fingerprint mismatch. Resolve the index
 for the guest architecture. The prepared form is the selected base plus the
-tools layer, built at the provider when possible, otherwise by appending its
-layer. Record the prepared form at the provider. Leave the base's entrypoint,
+tools layer, added where the image route the module declares says: built at
+the provider, or appended to the base manifest by the host. Record the prepared form at the provider. Leave the base's entrypoint,
 command and init unchanged. On `BootstrapRoute::Upload`, deliver the identical
 files under `/opt/drydock` instead of baking them.
 

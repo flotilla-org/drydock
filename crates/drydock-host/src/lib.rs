@@ -2,6 +2,7 @@
 pub mod daytona;
 pub mod module;
 mod observer;
+pub mod oci;
 pub mod reference;
 use axum::{
     Json, Router,
@@ -15,6 +16,7 @@ use axum::{
 use drydock_protocol::*;
 use module::{
     Connection, Credentials, ObservationMode, ObservedEnvironment, Provider, Provisioned, Registry, Result, refused, resolve_platform,
+    resolve_route,
 };
 use serde::Deserialize;
 use std::{
@@ -951,9 +953,12 @@ fn operation_port<T: ?Sized>(port: Option<&T>) -> Result<&T> {
 async fn prepare(State(h): State<Host>, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<PrepareRequest>) -> ApiResult<Json<Prepared>> {
     Ok(Json(h.call(&p, Gate::Prepare, |p, c| async move { prepare_for_platform(&*p, r, &c).await }).await?))
 }
-/// Modules always receive a declared platform: the requested one, or the first.
+/// Modules always receive a declared platform and image route: the requested
+/// ones, or the first of each.
 async fn prepare_for_platform(p: &dyn Provider, mut r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-    let platform = resolve_platform(r.platform.take(), &p.capabilities().platforms)?;
+    let capabilities = p.capabilities();
+    let platform = resolve_platform(r.platform.take(), &capabilities.platforms)?;
+    r.route = Some(resolve_route(r.route.take(), &capabilities.image_routes)?);
     r.platform = Some(platform.clone());
     let prepared = p.prepare(r, c).await?;
     // The prepared form names what was built; a different platform is a module bug.
@@ -1581,6 +1586,8 @@ mod operation_tests {
                 p.prepare(
                     PrepareRequest {
                         platform: Some(Platform::new("linux", "amd64")),
+                        route: None,
+                        image_pull: None,
                         size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
                         image_digest: "image".into(),
                         tools_digest: "tools".into(),
@@ -1597,13 +1604,16 @@ mod operation_tests {
             assert!(matches!(result, Err(ProtocolError::Refused { .. })));
         }
     }
-    // The host defaults and checks the platform for every module, and a module
-    // that reports building something else is an internal error, not a success.
+    // The host defaults and checks the platform and image route for every
+    // module, and a module that reports building something else is an internal
+    // error, not a success.
     #[tokio::test]
     async fn prepare_resolves_and_checks_the_platform() {
         let i = instance("list").await;
         let request = |platform: Option<Platform>| PrepareRequest {
             platform,
+            route: None,
+            image_pull: None,
             size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
             image_digest: "image".into(),
             tools_digest: "tools".into(),
@@ -1614,7 +1624,16 @@ mod operation_tests {
         let undeclared = i
             .call(Gate::Prepare, |p, c| async move { prepare_for_platform(&*p, request(Some(Platform::new("linux", "s390x"))), &c).await })
             .await;
-        assert!(matches!(undeclared, Err(ProtocolError::Refused { reason }) if reason.contains("cannot run linux/s390x; it offers")));
+        assert!(matches!(
+            undeclared,
+            Err(ProtocolError::ImageRefused { refusal: ImageRefusal::UnsupportedPlatform { .. }, reason }) if reason.contains("cannot run linux/s390x; it offers")
+        ));
+        let undeclared_route = i
+            .call(Gate::Prepare, |p, c| async move {
+                prepare_for_platform(&*p, PrepareRequest { route: Some(ImageRouteKind::RemoteBuild), ..request(None) }, &c).await
+            })
+            .await;
+        assert!(matches!(undeclared_route, Err(ProtocolError::Refused { reason }) if reason.contains("no remote_build image route")));
         let lying = Lying(i.provider.clone());
         let c = Credentials::new(CredentialMode::Direct { credential_reference: "test".into() });
         let error = prepare_for_platform(&lying, request(None), &c).await.unwrap_err();

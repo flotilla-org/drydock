@@ -23,6 +23,9 @@ async-stream = "0.3"
 chrono = "0.4"
 rustix = { version = "1", features = ["process"] }
 url = "2"
+base64 = "0.22"
+bytes = "1"
+http.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

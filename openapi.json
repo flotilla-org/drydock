@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "7"
+    "version": "8"
   },
   "paths": {
     "/v1/config": {
@@ -1095,6 +1095,12 @@
           "upload"
         ]
       },
+      "BuildInput": {
+        "type": "string",
+        "enum": [
+          "dockerfile"
+        ]
+      },
       "Capabilities": {
         "type": "object",
         "required": [
@@ -1131,6 +1137,13 @@
           },
           "fallback_runner": {
             "type": "boolean"
+          },
+          "image_routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ImageRoute"
+            },
+            "description": "How a vessel image reaches this provider, preferred first. A prepare\nrequest that names no route gets the first; one naming another is refused."
           },
           "material_modes": {
             "type": "array",
@@ -1254,6 +1267,15 @@
             "minLength": 1
           }
         }
+      },
+      "CredentialRegistration": {
+        "type": "string",
+        "description": "How the provider learns the credential for a private registry.",
+        "enum": [
+          "not_required",
+          "provider_api",
+          "per_request"
+        ]
       },
       "Destination": {
         "oneOf": [
@@ -1805,6 +1827,176 @@
           }
         }
       },
+      "ImageRefusal": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The provider, or the image, offers nothing for this platform.",
+            "required": [
+              "platform",
+              "cause"
+            ],
+            "properties": {
+              "cause": {
+                "type": "string",
+                "enum": [
+                  "unsupported_platform"
+                ]
+              },
+              "platform": {
+                "$ref": "#/components/schemas/Platform"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The image is larger than the provider accepts. `bytes` is a lower bound.",
+            "required": [
+              "bytes",
+              "limit_bytes",
+              "cause"
+            ],
+            "properties": {
+              "bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "cause": {
+                "type": "string",
+                "enum": [
+                  "too_large"
+                ]
+              },
+              "limit_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A minted push credential expired before the upload finished. Retrying\nmints a new one and resumes from the blobs already uploaded.",
+            "required": [
+              "cause"
+            ],
+            "properties": {
+              "cause": {
+                "type": "string",
+                "enum": [
+                  "push_credential_expired"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Why a provider cannot take an image. Stable codes for client policy."
+      },
+      "ImageRoute": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The host uploads the prepared image into the provider's own registry.",
+            "required": [
+              "protocol",
+              "tools_layer",
+              "route"
+            ],
+            "properties": {
+              "credential_lifetime_seconds": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "How long one minted push credential stays valid, when it expires.",
+                "minimum": 0
+              },
+              "protocol": {
+                "$ref": "#/components/schemas/PushProtocol"
+              },
+              "route": {
+                "type": "string",
+                "enum": [
+                  "provider_push"
+                ]
+              },
+              "tools_layer": {
+                "$ref": "#/components/schemas/ToolsLayer"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The provider pulls the base image from a registry it can reach.",
+            "required": [
+              "auth",
+              "registration",
+              "digest_references",
+              "tools_layer",
+              "route"
+            ],
+            "properties": {
+              "auth": {
+                "$ref": "#/components/schemas/RegistryAuthKind"
+              },
+              "digest_references": {
+                "type": "boolean",
+                "description": "Whether the provider accepts `name@sha256:…` references."
+              },
+              "registration": {
+                "$ref": "#/components/schemas/CredentialRegistration"
+              },
+              "route": {
+                "type": "string",
+                "enum": [
+                  "registry_pull"
+                ]
+              },
+              "tools_layer": {
+                "$ref": "#/components/schemas/ToolsLayer"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The provider builds the image from a recipe the host sends.",
+            "required": [
+              "input",
+              "multi_stage",
+              "tools_layer",
+              "route"
+            ],
+            "properties": {
+              "input": {
+                "$ref": "#/components/schemas/BuildInput"
+              },
+              "multi_stage": {
+                "type": "boolean"
+              },
+              "route": {
+                "type": "string",
+                "enum": [
+                  "remote_build"
+                ]
+              },
+              "tools_layer": {
+                "$ref": "#/components/schemas/ToolsLayer"
+              }
+            }
+          }
+        ],
+        "description": "One way a vessel image gets into a provider. Clients choose among declared\nroutes by these properties and their own policy, never by provider name; a\nprovider's limits stay properties of its own declaration."
+      },
+      "ImageRouteKind": {
+        "type": "string",
+        "enum": [
+          "provider_push",
+          "registry_pull",
+          "remote_build"
+        ]
+      },
       "LoadableModule": {
         "type": "object",
         "required": [
@@ -2068,6 +2260,17 @@
             "type": "string",
             "minLength": 1
           },
+          "image_pull": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegistryCredential",
+                "description": "Pull access to `image_digest`'s registry, for routes where the host reads\nthe base image itself. Never sent anywhere else."
+              }
+            ]
+          },
           "platform": {
             "oneOf": [
               {
@@ -2076,6 +2279,17 @@
               {
                 "$ref": "#/components/schemas/Platform",
                 "description": "Omitted: the provider's first declared platform. Hosts resolve it before\na module prepares, so modules always receive a declared platform."
+              }
+            ]
+          },
+          "route": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ImageRouteKind",
+                "description": "Omitted: the provider's first declared image route. Hosts resolve it\nbefore a module prepares, so modules always receive a declared route."
               }
             ]
           },
@@ -2171,6 +2385,29 @@
               },
               "reason": {
                 "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A refusal of the image itself, or of how it was to reach the provider.",
+            "required": [
+              "reason",
+              "refusal",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "image_refused"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              },
+              "refusal": {
+                "$ref": "#/components/schemas/ImageRefusal"
               }
             }
           },
@@ -2411,6 +2648,12 @@
             ]
           }
         }
+      },
+      "PushProtocol": {
+        "type": "string",
+        "enum": [
+          "oci_distribution"
+        ]
       },
       "Quantity": {
         "type": "object",
@@ -2684,6 +2927,30 @@
           }
         ]
       },
+      "RegistryAuthKind": {
+        "type": "string",
+        "enum": [
+          "anonymous",
+          "basic"
+        ]
+      },
+      "RegistryCredential": {
+        "type": "object",
+        "description": "Pull access to one registry. Hosts send it only to the registry that the\nreference it accompanies names.",
+        "required": [
+          "username",
+          "secret"
+        ],
+        "properties": {
+          "secret": {
+            "type": "string",
+            "format": "password"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
       "ResourceKind": {
         "type": "string",
         "description": "Initial provider-neutral vocabulary. Adding a resource is a protocol change,\nrather than inventing provider-specific encodings inside resource names.",
@@ -2802,6 +3069,14 @@
         "enum": [
           "provider",
           "adaptor"
+        ]
+      },
+      "ToolsLayer": {
+        "type": "string",
+        "description": "Where the drydock tools layer joins the base image.",
+        "enum": [
+          "provider",
+          "host"
         ]
       },
       "TransitionPhase": {

@@ -39,6 +39,10 @@ pub struct LaunchOptions {
     /// first declared platform.
     #[arg(long)]
     pub platform: Option<Platform>,
+    /// How the image reaches the provider: provider_push, registry_pull or
+    /// remote_build. Defaults to the provider's first declared image route.
+    #[arg(long)]
+    pub image_route: Option<ImageRouteKind>,
 }
 impl LaunchOptions {
     pub fn size(&self, provider: &Provider, minimum: &Size) -> Result<Size, String> {
@@ -206,7 +210,14 @@ pub async fn prepare(
         .with_request_timeout(Duration::from_secs(600))
         .prepare(
             name,
-            &PrepareRequest { size: size.clone(), platform: options.platform.clone(), image_digest, tools_digest: tools_digest.into() },
+            &PrepareRequest {
+                size: size.clone(),
+                platform: options.platform.clone(),
+                route: options.image_route,
+                image_pull: None,
+                image_digest,
+                tools_digest: tools_digest.into(),
+            },
         )
         .await?;
     Ok((prepared, size))

@@ -1020,6 +1020,8 @@ interactions:
         .prepare(
             PrepareRequest {
                 platform: Some(drydock_protocol::Platform::new("linux", "amd64")),
+                route: None,
+                image_pull: None,
                 size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),

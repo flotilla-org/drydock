@@ -11,7 +11,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "7";
+pub const PROTOCOL_VERSION: &str = "8";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -151,6 +151,10 @@ pub struct Capabilities {
     /// that names none gets the first; one naming another is refused.
     #[serde(default)]
     pub platforms: Vec<Platform>,
+    /// How a vessel image reaches this provider, preferred first. A prepare
+    /// request that names no route gets the first; one naming another is refused.
+    #[serde(default)]
+    pub image_routes: Vec<ImageRoute>,
     pub usage: bool,
     pub quota: bool,
 }
@@ -173,6 +177,131 @@ pub enum CheckoutStrategy {
 pub enum BootstrapRoute {
     Bake,
     Upload,
+}
+/// One way a vessel image gets into a provider. Clients choose among declared
+/// routes by these properties and their own policy, never by provider name; a
+/// provider's limits stay properties of its own declaration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "route", rename_all = "snake_case")]
+pub enum ImageRoute {
+    /// The host uploads the prepared image into the provider's own registry.
+    ProviderPush {
+        protocol: PushProtocol,
+        /// How long one minted push credential stays valid, when it expires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_lifetime_seconds: Option<u64>,
+        tools_layer: ToolsLayer,
+    },
+    /// The provider pulls the base image from a registry it can reach.
+    RegistryPull {
+        auth: RegistryAuthKind,
+        registration: CredentialRegistration,
+        /// Whether the provider accepts `name@sha256:…` references.
+        digest_references: bool,
+        tools_layer: ToolsLayer,
+    },
+    /// The provider builds the image from a recipe the host sends.
+    RemoteBuild { input: BuildInput, multi_stage: bool, tools_layer: ToolsLayer },
+}
+impl ImageRoute {
+    pub fn kind(&self) -> ImageRouteKind {
+        match self {
+            Self::ProviderPush { .. } => ImageRouteKind::ProviderPush,
+            Self::RegistryPull { .. } => ImageRouteKind::RegistryPull,
+            Self::RemoteBuild { .. } => ImageRouteKind::RemoteBuild,
+        }
+    }
+    pub fn tools_layer(&self) -> ToolsLayer {
+        match self {
+            Self::ProviderPush { tools_layer, .. } | Self::RegistryPull { tools_layer, .. } | Self::RemoteBuild { tools_layer, .. } => {
+                *tools_layer
+            }
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageRouteKind {
+    ProviderPush,
+    RegistryPull,
+    RemoteBuild,
+}
+impl std::str::FromStr for ImageRouteKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "provider_push" => Ok(Self::ProviderPush),
+            "registry_pull" => Ok(Self::RegistryPull),
+            "remote_build" => Ok(Self::RemoteBuild),
+            _ => Err(format!("unknown image route {s:?}; expected provider_push, registry_pull or remote_build")),
+        }
+    }
+}
+impl std::fmt::Display for ImageRouteKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ProviderPush => "provider_push",
+            Self::RegistryPull => "registry_pull",
+            Self::RemoteBuild => "remote_build",
+        })
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PushProtocol {
+    /// The OCI distribution protocol (`/v2/` blob uploads and manifest puts).
+    OciDistribution,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryAuthKind {
+    Anonymous,
+    /// Username and password or token.
+    Basic,
+}
+/// How the provider learns the credential for a private registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRegistration {
+    NotRequired,
+    /// Registered once, out of band, through the provider's own API.
+    ProviderApi,
+    /// Supplied alongside each image reference.
+    PerRequest,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildInput {
+    Dockerfile,
+}
+/// Where the drydock tools layer joins the base image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsLayer {
+    /// The provider adds it, for example in its own build.
+    Provider,
+    /// The host appends it to the base image's manifest before handing it over.
+    Host,
+}
+/// Pull access to one registry. Hosts send it only to the registry that the
+/// reference it accompanies names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RegistryCredential {
+    pub username: String,
+    #[schema(value_type = String, format = Password)]
+    pub secret: Secret,
+}
+/// Why a provider cannot take an image. Stable codes for client policy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum ImageRefusal {
+    /// The provider, or the image, offers nothing for this platform.
+    UnsupportedPlatform { platform: Platform },
+    /// The image is larger than the provider accepts. `bytes` is a lower bound.
+    TooLarge { bytes: u64, limit_bytes: u64 },
+    /// A minted push credential expired before the upload finished. Retrying
+    /// mints a new one and resumes from the blobs already uploaded.
+    PushCredentialExpired,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EgressCapability {
@@ -239,6 +368,14 @@ pub struct PrepareRequest {
     /// a module prepares, so modules always receive a declared platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
+    /// Omitted: the provider's first declared image route. Hosts resolve it
+    /// before a module prepares, so modules always receive a declared route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<ImageRouteKind>,
+    /// Pull access to `image_digest`'s registry, for routes where the host reads
+    /// the base image itself. Never sent anywhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull: Option<RegistryCredential>,
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub image_digest: String,
@@ -638,6 +775,11 @@ pub enum ProtocolError {
     Refused {
         reason: String,
     },
+    /// A refusal of the image itself, or of how it was to reach the provider.
+    ImageRefused {
+        reason: String,
+        refusal: ImageRefusal,
+    },
     Unavailable {
         reason: String,
         retry_after: Option<u64>,
@@ -696,6 +838,7 @@ impl ProtocolError {
             Self::NotFound { .. } => "not_found",
             Self::MethodNotAllowed { .. } => "method_not_allowed",
             Self::Refused { .. } => "refused",
+            Self::ImageRefused { .. } => "image_refused",
             Self::Unavailable { .. } => "unavailable",
             Self::RateLimited { .. } => "rate_limited",
             Self::QuotaExhausted { .. } => "quota_exhausted",
@@ -708,7 +851,7 @@ impl ProtocolError {
     /// HTTP status is part of the shared wire contract, independent of a host framework.
     pub const fn status(&self) -> u16 {
         match self {
-            Self::Refused { .. } => 422,
+            Self::Refused { .. } | Self::ImageRefused { .. } => 422,
             Self::NotFound { .. } => 404,
             Self::MethodNotAllowed { .. } => 405,
             Self::Unavailable { .. } => 503,
@@ -733,6 +876,7 @@ impl std::fmt::Display for ProtocolError {
             Self::NotFound { reason }
             | Self::MethodNotAllowed { reason }
             | Self::Refused { reason }
+            | Self::ImageRefused { reason, .. }
             | Self::Unavailable { reason, .. }
             | Self::RateLimited { reason, .. }
             | Self::QuotaExhausted { reason }

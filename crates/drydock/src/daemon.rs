@@ -1012,6 +1012,7 @@ fn conservative_capabilities() -> Capabilities {
         bootstrap: BootstrapRoute::Upload,
         agent: false,
         platforms: vec![],
+        image_routes: vec![],
         usage: false,
         quota: false,
     }
