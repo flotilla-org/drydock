@@ -53,7 +53,7 @@ async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
     let target = dir.path().join("target");
     let target_listener = UnixListener::bind(&target).unwrap();
     let forward = GuestForward { id: "service".into(), unix: dir.path().join("forward"), tcp: None };
-    client.add_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
+    client.put_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
     for round in 0..3u8 {
         let mut guest = UnixStream::connect(&forward.unix).await.unwrap();
         guest.write_all(&[round; 4]).await.unwrap();

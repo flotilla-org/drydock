@@ -31,6 +31,19 @@ fn supervisor(socket: &Path) -> ProcessGroup {
             .unwrap(),
     )
 }
+// A concurrent test's fork can briefly hold the descriptor that wrote an
+// executable (until its exec closes it), so exec fails with ETXTBSY; retry.
+fn spawn(command: &mut Command) -> Child {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match command.spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            result => return result.unwrap(),
+        }
+    }
+}
 // Every process's PID and space-joined argv, from ps rather than /proc so the
 // listing (and cleanup that depends on it) also works off Linux.
 fn processes() -> Vec<(i32, String)> {
@@ -162,15 +175,9 @@ async fn supervised_tools_upgrade_and_restart_current_agent() {
     std::fs::write(&installed, old).unwrap();
     std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
     let socket = directory.path().join("agent.sock");
-    let _supervisor = ProcessGroup(
-        Command::new(installed)
-            .args(["--supervisor", "--socket"])
-            .arg(&socket)
-            .env("PATH", "/nonexistent")
-            .process_group(0)
-            .spawn()
-            .unwrap(),
-    );
+    let _supervisor = ProcessGroup(spawn(
+        Command::new(installed).args(["--supervisor", "--socket"]).arg(&socket).env("PATH", "/nonexistent").process_group(0),
+    ));
     let desired = format!("{:x}", Sha256::digest(&current));
     assert_ne!(hello(&socket).await, desired);
     let client = drydock_agent::Client::connect_current(

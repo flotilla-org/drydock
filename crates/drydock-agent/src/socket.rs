@@ -13,8 +13,7 @@ pub fn private_directory(path: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
         let metadata = std::fs::symlink_metadata(path)?;
-        // SAFETY: geteuid has no arguments or memory effects.
-        if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o1000 != 0 {
+        if !metadata.is_dir() || metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o1000 != 0 {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "run directory must be an owned, non-sticky directory"));
         }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
