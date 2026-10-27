@@ -149,7 +149,9 @@ impl AgentReach {
     /// Wait for the vessel agent's current hello. A provider that declares no
     /// agent, or a reach this client cannot follow, is refused at once; other
     /// failures retry until the timeout and report the last one, with the
-    /// reach's minted gateway username masked.
+    /// reach's minted gateway username masked. Each distinct retry reason is
+    /// written once to stderr (the daemon's `drydock.log`), masked the same way;
+    /// an embedding client sees those lines on its own stderr.
     pub async fn connect(&self, api: &dyn ProviderApi, vessel: &Vessel<'_>) -> Result<ConnectedAgent, Error> {
         self.connect_at(api, vessel, Path::new(AGENT_SOCKET)).await
     }
@@ -177,7 +179,8 @@ impl AgentReach {
             };
             masker.lock().unwrap().remember(user.expose());
             let chosen = self.preferred.under(reverse_forwards);
-            let reached = endpoint.clone();
+            // Reported without any userinfo a provider might put in the endpoint.
+            let reached = endpoint.rsplit_once('@').map_or(endpoint.as_str(), |(_, host)| host).to_owned();
             let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into(), chosen)?;
             config.agent_socket = socket.into();
             let transport = self.dialer.dial(config).await?;

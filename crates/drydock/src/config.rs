@@ -231,6 +231,10 @@ settings = {{
         assert_eq!(parse("agent_link = \"reverse_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
         assert_eq!(parse("agent_link = \"local_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::LocalForward);
         assert!(parse("agent_link = \"over_the_rainbow\"").is_err());
+        // The names a report shows are the configured ones.
+        for link in [crate::agent::AgentLink::ReverseForward, crate::agent::AgentLink::LocalForward] {
+            assert_eq!(serde_json::to_value(link).unwrap(), link.as_str());
+        }
     }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]

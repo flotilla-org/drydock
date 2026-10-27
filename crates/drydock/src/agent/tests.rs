@@ -82,14 +82,17 @@ fn the_link_follows_the_preference_where_the_server_allows_it() {
 // forward. Either way the guest reaches the host through a guest forward.
 #[tokio::test]
 async fn connects_through_the_link_the_reach_and_preference_allow() {
-    for (reverse_forwards, preferred, link) in [
-        (false, AgentLink::ReverseForward, AgentLink::LocalForward),
-        (true, AgentLink::ReverseForward, AgentLink::ReverseForward),
-        (true, AgentLink::LocalForward, AgentLink::LocalForward),
+    // The last row's endpoint carries userinfo, which the report never shows.
+    for (reverse_forwards, preferred, link, endpoint) in [
+        (false, AgentLink::ReverseForward, AgentLink::LocalForward, "gateway.test:22"),
+        (true, AgentLink::ReverseForward, AgentLink::ReverseForward, "gateway.test:22"),
+        (true, AgentLink::LocalForward, AgentLink::LocalForward, "secret@gateway.test:22"),
     ] {
         // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
         let directory = tempfile::tempdir_in("/tmp").unwrap();
-        let (api, environment) = provider(true, ssh_reach(reverse_forwards)).await;
+        let reach =
+            Reach::Ssh { endpoint: endpoint.into(), user: Secret::new("minted"), host_key: "ssh-ed25519 AAAA".into(), reverse_forwards };
+        let (api, environment) = provider(true, reach).await;
         let gateway = Gateway::start(directory.path(), reverse_forwards, BUILD).unwrap();
         let reach = AgentReach::new(preferred).with_dialer(gateway.clone()).with_timeout(Duration::from_secs(10));
         let identity = directory.path().join("id_ed25519");
