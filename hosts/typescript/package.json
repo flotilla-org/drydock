@@ -18,8 +18,9 @@
     "test": "corepack pnpm build && node --test --test-timeout=10000 test/*.test.ts",
     "format": "prettier --write src/*.ts scripts/*.mjs test/*.ts *.json README.md",
     "format:check": "prettier --check src/*.ts scripts/*.mjs test/*.ts *.json README.md",
-    "check": "corepack pnpm test && corepack pnpm check:generated && corepack pnpm format:check && corepack pnpm typecheck",
-    "pack:companion": "corepack pnpm build && node scripts/package.mjs"
+    "check": "corepack pnpm test && corepack pnpm check:generated && corepack pnpm format:check && corepack pnpm typecheck && corepack pnpm conformance",
+    "pack:companion": "corepack pnpm build && node scripts/package.mjs",
+    "conformance": "node scripts/conformance.mjs"
   },
   "dependencies": {
     "ajv": "8.17.1",
