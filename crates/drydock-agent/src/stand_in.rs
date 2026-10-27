@@ -35,8 +35,9 @@ pub struct ScriptedOutput {
 }
 
 /// Serve the stand-in on `transport`'s host-facing links until it closes,
-/// reporting `fingerprint` in its hello. `script` is asked for each process's
-/// output as the process is read, so a test can change it between processes.
+/// reporting `fingerprint` in its hello. `script` is asked for the output each
+/// time a process's output is read, so a test can change it between processes.
+/// Every process is `stand-in`: the stand-in tells processes apart by nothing.
 pub async fn serve(
     mut transport: Transport,
     fingerprint: String,
@@ -103,8 +104,9 @@ mod tests {
     use drydock_transport::Limits;
     use std::sync::Mutex;
 
-    // A host reading a scripted process sees exactly the scripted output, and a
-    // stream closed without its exit is UnexpectedEof, as from a real agent.
+    // A host reading a scripted process sees exactly the scripted output; a stream
+    // closed without its exit is UnexpectedEof, as from a real agent; and a
+    // stalled one stays open with nothing more to read.
     #[tokio::test]
     async fn scripted_output_reaches_the_real_client() {
         let (host, guest) = tokio::io::duplex(64 * 1024);
@@ -127,6 +129,12 @@ mod tests {
         assert_eq!(output.next().await.unwrap(), Some(ExecEvent::Stdout(Bytes::from_static(b"out"))));
         assert_eq!(output.next().await.unwrap(), Some(ExecEvent::Stderr(Bytes::from_static(b"err"))));
         assert_eq!(output.next().await.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        *ending.lock().unwrap() = Ending::Stall;
+        let mut output = client.exec(Exec::new("anything", Vec::<String>::new())).await.unwrap();
+        assert_eq!(output.next().await.unwrap(), Some(ExecEvent::Stdout(Bytes::from_static(b"out"))));
+        assert_eq!(output.next().await.unwrap(), Some(ExecEvent::Stderr(Bytes::from_static(b"err"))));
+        let stalled = tokio::time::timeout(std::time::Duration::from_millis(200), output.next()).await;
+        assert!(stalled.is_err(), "a stalled stream stays open and silent");
         server.abort();
     }
 }
