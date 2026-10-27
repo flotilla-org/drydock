@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
     paths-ignore: ['crates/drydock/tools-image.txt']
+  # Rebuilds and publishes from main even when no input changed.
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -14,11 +16,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - run: rustup show
       - run: python3 -m unittest discover -s ci -p 'test_tools_*.py'
+  # The image holds only the agent build, so a change that leaves the agent's
+  # inputs alone keeps the published image and opens no pin PR.
+  inputs:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show
+      - id: decide
+        env:
+          BASE: ${{ github.event_name == 'push' && github.event.before || github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}
+        run: python3 ci/tools_inputs.py --base "$BASE" --head "$GITHUB_SHA"
   # Each platform builds and is checked on a runner of its own architecture,
   # so nothing is compiled or tested under emulation.
   platform:
-    needs: script-tests
+    needs: [script-tests, inputs]
+    if: needs.inputs.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +52,7 @@ jobs:
       packages: write
     env:
       DRYDOCK_TOOLS_REGISTRY: ${{ vars.DRYDOCK_TOOLS_REGISTRY || 'ghcr.io/flotilla-org' }}
-      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,7 +86,7 @@ jobs:
           path: target/tools-image/platform-${{ matrix.arch }}.txt
           if-no-files-found: error
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: platform
     runs-on: ubuntu-24.04
     permissions:
