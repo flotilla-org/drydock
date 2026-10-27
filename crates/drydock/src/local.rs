@@ -60,8 +60,7 @@ fn agent_build_from(
 pub fn private_dir(path: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path).map_err(|e| e.to_string())?;
     let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    // SAFETY: geteuid has no preconditions.
-    if !meta.is_dir() || meta.mode() & 0o077 != 0 || meta.uid() != unsafe { libc::geteuid() } {
+    if !meta.is_dir() || meta.mode() & 0o077 != 0 || meta.uid() != rustix::process::geteuid().as_raw() {
         return Err("directory must be private and owned by this user".into());
     }
     Ok(())
@@ -83,8 +82,7 @@ pub fn lock(path: &Path) -> Result<std::fs::File, String> {
         .open(path)
         .map_err(|e| e.to_string())?;
     let meta = f.metadata().map_err(|e| e.to_string())?;
-    // SAFETY: geteuid has no preconditions.
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+    if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
         return Err("unsafe lock file".into());
     }
     Ok(f)
@@ -94,8 +92,7 @@ pub fn lock(path: &Path) -> Result<std::fs::File, String> {
 fn rotate_log(path: &Path) -> Result<std::fs::File, String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
-            // SAFETY: geteuid has no preconditions.
-            if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+            if !meta.is_file() || meta.uid() != rustix::process::geteuid().as_raw() || meta.mode() & 0o077 != 0 {
                 return Err("unsafe daemon log".into());
             }
             let mut previous = path.as_os_str().to_os_string();

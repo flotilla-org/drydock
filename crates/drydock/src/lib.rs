@@ -176,8 +176,8 @@ impl Supervisor {
                     Err(_) => return Err(client::Error::Transport),
                 }
                 let metadata = tokio::fs::symlink_metadata(&self.runtime_directory).await.map_err(|_| client::Error::Transport)?;
-                // SAFETY: geteuid has no preconditions.
-                if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+                if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != rustix::process::geteuid().as_raw()
+                {
                     return Err(client::Error::InvalidRequest);
                 }
                 use std::os::unix::fs::OpenOptionsExt;
@@ -406,11 +406,11 @@ async fn read_bearer_token(path: &Path) -> Result<Secret, client::Error> {
         .await
         .map_err(|_| client::Error::InvalidRequest)?;
     let metadata = file.metadata().await.map_err(|_| client::Error::InvalidRequest)?;
-    // SAFETY: geteuid has no preconditions. Validate the descriptor we will read,
-    // rather than a pathname that could be replaced between metadata and open.
+    // Validate the descriptor we will read, rather than a pathname that could
+    // be replaced between metadata and open.
     if !metadata.is_file()
         || !matches!(metadata.permissions().mode() & 0o7777, 0o400 | 0o600)
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.uid() != rustix::process::geteuid().as_raw()
     {
         return Err(client::Error::InvalidRequest);
     }

@@ -100,7 +100,7 @@ impl Endpoint {
                 if marked {
                     let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
                     #[cfg(target_os = "linux")]
-                    egress::set_option(&socket, libc::SOL_SOCKET, libc::SO_MARK, egress::SOCKET_MARK)?;
+                    socket2::SockRef::from(&socket).set_mark(egress::SOCKET_MARK)?;
                     Ok(Box::new(socket.connect(*addr).await?))
                 } else {
                     Ok(Box::new(tokio::net::TcpStream::connect(addr).await?))

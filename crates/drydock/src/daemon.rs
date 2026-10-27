@@ -323,8 +323,7 @@ impl Daemon {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
         use rigging_http_serve::{Caller, UnixServer};
-        // SAFETY: geteuid has no preconditions.
-        let uid = unsafe { libc::geteuid() };
+        let uid = rustix::process::geteuid().as_raw();
         let router = self.router().layer(middleware::from_fn(
             move |axum::Extension(caller): axum::Extension<Caller>, req: Request, next: Next| async move {
                 match caller {

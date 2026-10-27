@@ -404,55 +404,18 @@ fn dual_listener(port: u16) -> io::Result<TcpListener> {
     socket.set_reuseaddr(true)?;
     // Linux's default is dual-stack; explicitly set it for hosts overriding
     // bindv6only, so IPv4 redirected SYNs also reach this listener.
-    set_option(&socket, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+    socket2::SockRef::from(&socket).set_only_v6(false)?;
     socket.bind(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)))?;
     socket.listen(128)
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn set_option(socket: &impl std::os::fd::AsRawFd, level: i32, option: i32, value: u32) -> io::Result<()> {
-    // SAFETY: the live socket and the integer's exact size are supplied.
-    let result =
-        unsafe { libc::setsockopt(socket.as_raw_fd(), level, option, (&value as *const u32).cast(), std::mem::size_of_val(&value) as _) };
-    if result == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
-}
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn set_option(_: &impl std::os::fd::AsRawFd, _: i32, _: i32, _: u32) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"))
-}
-
-#[cfg(target_os = "linux")]
 fn original_destination(stream: &TcpStream) -> io::Result<SocketAddr> {
-    use std::os::fd::AsRawFd;
+    let socket = socket2::SockRef::from(stream);
     // IPv4 connections on the dual-stack listener use SOL_IP; native IPv6 uses
-    // SOL_IPV6. SO_ORIGINAL_DST is 80 for both conntrack families.
-    let ipv4 = stream.peer_addr()?.ip().to_canonical().is_ipv4();
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of_val(&storage) as libc::socklen_t;
-    // SAFETY: storage and length are writable and correctly sized for either family.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            if ipv4 { libc::SOL_IP } else { libc::SOL_IPV6 },
-            80,
-            (&mut storage as *mut libc::sockaddr_storage).cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    match storage.ss_family as i32 {
-        libc::AF_INET if length as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
-            let addr = unsafe { &*(&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
-            Ok(SocketAddr::from((Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes()), u16::from_be(addr.sin_port))))
-        }
-        libc::AF_INET6 if length as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
-            let addr = unsafe { &*(&storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
-            Ok(SocketAddr::from((std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr), u16::from_be(addr.sin6_port))))
-        }
-        _ => Err(invalid("invalid original destination family")),
-    }
+    // SOL_IPV6.
+    let address = if stream.peer_addr()?.ip().to_canonical().is_ipv4() { socket.original_dst_v4()? } else { socket.original_dst_v6()? };
+    address.as_socket().ok_or_else(|| invalid("invalid original destination family"))
 }
 #[cfg(not(target_os = "linux"))]
 fn original_destination(_: &TcpStream) -> io::Result<SocketAddr> {

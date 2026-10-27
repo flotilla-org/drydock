@@ -101,10 +101,8 @@ fn reap_inherited_children() {
         tokio::spawn(async move {
             while !children.is_empty() {
                 children.retain(|pid| {
-                    // SAFETY: waitpid writes only to the supplied local status;
-                    // the PID came from this process's own inherited children.
-                    let mut status = 0;
-                    unsafe { libc::waitpid(*pid, &mut status, libc::WNOHANG) == 0 }
+                    rustix::process::Pid::from_raw(*pid)
+                        .is_some_and(|pid| matches!(rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG), Ok(None)))
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
