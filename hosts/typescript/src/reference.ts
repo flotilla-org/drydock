@@ -165,6 +165,7 @@ class Memory implements Provider {
   }
   async destroy(id: string, { signal }: Context) {
     signal.throwIfAborted();
+    // Destroy is idempotent: an already absent environment is a successful no-op.
     this.rows.delete(id);
   }
   async reach(id: string, context: Context): Promise<Types["Reach"]> {
