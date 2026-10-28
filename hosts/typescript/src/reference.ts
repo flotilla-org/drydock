@@ -132,6 +132,7 @@ class Memory implements Provider {
     const existing = [...this.rows.values()].find(
       (row) => row.environment.label === request.label,
     );
+    // Label idempotency wins over a new/stale prepared form, as in the Rust reference.
     if (existing) return { Existing: structuredClone(existing) };
     if (
       !isDeepStrictEqual(this.builds.get(request.prepared.id), request.prepared)
