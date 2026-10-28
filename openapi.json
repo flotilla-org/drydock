@@ -16,6 +16,17 @@
           "host"
         ],
         "operationId": "configure",
+        "parameters": [
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -67,6 +78,17 @@
           "host"
         ],
         "operationId": "patch_configuration",
+        "parameters": [
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "description": "RFC 7396 JSON merge patch of the configuration document",
           "content": {
@@ -134,7 +156,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "NDJSON stream: one ObserveRecord JSON value per line",
             "content": {
               "application/x-ndjson": {
                 "schema": {
@@ -183,9 +205,20 @@
           "host"
         ],
         "operationId": "hello",
+        "parameters": [
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Protocol and module discovery",
             "content": {
               "application/json": {
                 "schema": {
@@ -233,6 +266,17 @@
           "host"
         ],
         "operationId": "providers",
+        "parameters": [
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Configured providers",
@@ -308,7 +352,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Provider declaration",
             "content": {
               "application/json": {
                 "schema": {
@@ -443,7 +487,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Environment inventory",
             "content": {
               "application/json": {
                 "schema": {
@@ -524,7 +568,7 @@
         },
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Environment",
             "content": {
               "application/json": {
                 "schema": {
@@ -613,7 +657,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Environment",
             "content": {
               "application/json": {
                 "schema": {
@@ -858,7 +902,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Export reference",
             "content": {
               "application/json": {
                 "schema": {
@@ -937,7 +981,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Reach recipe",
             "content": {
               "application/json": {
                 "schema": {
@@ -1184,7 +1228,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Resume token",
             "content": {
               "application/json": {
                 "schema": {
@@ -1264,7 +1308,7 @@
         },
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Prepared provider form",
             "content": {
               "application/json": {
                 "schema": {
@@ -1334,7 +1378,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Quota",
             "content": {
               "application/json": {
                 "schema": {
@@ -1422,7 +1466,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Usage for the requested period",
             "content": {
               "application/json": {
                 "schema": {

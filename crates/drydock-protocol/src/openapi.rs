@@ -5,6 +5,8 @@ use utoipa::OpenApi;
 
 #[derive(utoipa::IntoResponses)]
 pub enum ErrorResponses {
+    #[response(status = 401, description = "Loopback bearer authentication required; not used on managed UDS")]
+    Unauthorized,
     #[response(status = 404, description = "NotFound: route, provider or environment does not exist")]
     NotFound(ProtocolError),
     #[response(status = 405, description = "MethodNotAllowed")]
@@ -77,7 +79,7 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
         for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
             if server_only {
                 operation.extensions = Some(ExtensionsBuilder::new().add("x-drydock-server-only", true).build());
-            } else if route.starts_with("/v1/providers/{provider}") {
+            } else {
                 let header = ParameterBuilder::new()
                     .name("Drydock-Credential")
                     .parameter_in(ParameterIn::Header)

@@ -32,7 +32,48 @@ fn serialized_values_match_the_document() {
         egress_policy: Some("raw-policy".into()),
         timestamp: Some("2026-01-01T00:00:00Z".parse().unwrap()),
     };
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let prepared = Prepared {
+        provider: "a".into(),
+        id: "opaque".into(),
+        platform: Platform::new("linux", "amd64"),
+        image_digest: "image".into(),
+        tools_digest: "tools".into(),
+    };
     let samples = [
+        (
+            "PrepareRequest",
+            serde_json::to_value(PrepareRequest {
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+                size: size.clone(),
+                platform: Some(prepared.platform.clone()),
+                route: None,
+                image_pull: None,
+            })
+            .unwrap(),
+            serde_json::json!({"image_digest":"","tools_digest":"tools","size":{"cpus":1,"memory_bytes":0,"disk_bytes":0}}),
+        ),
+        (
+            "ProvisionRequest",
+            serde_json::to_value(ProvisionRequest {
+                label: "opaque".into(),
+                prepared,
+                size,
+                egress: EgressRequest::default(),
+                ssh_public_key: None,
+            })
+            .unwrap(),
+            serde_json::json!({"label":""}),
+        ),
+        (
+            "ExecRequest",
+            serde_json::to_value(ExecRequest { command: vec!["cat".into(), "".into()] }).unwrap(),
+            serde_json::json!({"command":[""]}),
+        ),
+        ("Port", serde_json::json!(65535), serde_json::json!(0)),
+        ("Port", serde_json::json!(1), serde_json::json!(65536)),
+        ("Cidr", serde_json::to_value("2001:db8::/128".parse::<Cidr>().unwrap()).unwrap(), serde_json::json!("1.2.3.999/2")),
         ("Configuration", serde_json::to_value(config).unwrap(), serde_json::json!({"providers":{"p":{"module":false}}})),
         ("Hello", serde_json::to_value(hello).unwrap(), serde_json::json!({"protocol_version":false})),
         ("Environment", serde_json::to_value(environment).unwrap(), serde_json::json!({"id":5})),
