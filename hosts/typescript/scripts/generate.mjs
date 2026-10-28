@@ -3,7 +3,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import openapiTS, { astToString } from "openapi-typescript";
 const input = new URL("../../../openapi.json", import.meta.url);
 const document = JSON.parse(await readFile(input, "utf8"));
-// Generate the private host surface while retaining canonical shared schemas.
+// Generate the common host surface while retaining canonical shared schemas.
 document.paths = Object.fromEntries(
   Object.entries(document.paths)
     .map(([path, item]) => [
@@ -19,7 +19,7 @@ document.paths = Object.fromEntries(
 const directory = new URL("../src/generated/", import.meta.url);
 await mkdir(directory, { recursive: true });
 const types =
-  "// GENERATED / DO NOT EDIT: Rust provider declarations + real host handlers -> /openapi.json (host tag).\n// Regenerate: corepack pnpm generate (hosts/typescript/).\n" +
+  "// GENERATED / DO NOT EDIT: Rust protocol declarations + drydock-client shared handlers -> /openapi.json (host tag).\n// Regenerate: corepack pnpm generate (hosts/typescript/).\n" +
   astToString(await openapiTS(document));
 for (const [name, content] of [
   ["protocol.ts", types],

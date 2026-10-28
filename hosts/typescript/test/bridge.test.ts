@@ -16,22 +16,16 @@ import type {
   Types,
 } from "../src/provider.ts";
 const size = { cpus: 1, memory_bytes: 1024, disk_bytes: 0 };
-const credentials = (value = "test-only-one") => ({
-  mode: { mode: "direct", credential_reference: "test" },
-  value,
-});
-const observed: Types["ObservedEnvironment"] = {
-  environment: {
-    id: "opaque / percent%",
-    provider: "a",
-    label: "test",
-    state: { state: "running" },
-    granted_size: size,
-    egress: "advisory",
-  },
-  timestamp: "2026-01-01T00:00:00Z",
+const environment: Types["Environment"] = {
+  id: "opaque /%",
+  provider: "a",
+  label: "test",
+  state: { state: "running" },
+  granted_size: size,
+  egress: "advisory",
   egress_measured: true,
   egress_policy: "raw-policy",
+  timestamp: "2026-01-01T00:00:00Z",
 };
 const capabilities = {
   material_modes: [],
@@ -49,42 +43,26 @@ const capabilities = {
   platforms: [{ os: "linux", architecture: "amd64" }],
   image_routes: [{ route: "remote_build" }],
 } as Types["Capabilities"];
-// In-memory provider fake at the module interface; it records facts/calls rather
-// than implementing inventory, billing, readiness recovery or replay policy.
+// Fake SDK boundary: only trait calls, no main-server policy.
 function provider(): Provider {
   return {
     capabilities,
-    observation: "Push",
+    observation: { mode: "poll", interval_ms: 1000 },
     rateLimits: [],
     readiness: () => ({ status: "ready" }),
     prepare: async (r) => ({
-      ...r,
       id: "prepared",
       provider: "a",
+      image_digest: r.image_digest,
+      tools_digest: r.tools_digest,
       platform: capabilities.platforms[0],
     }),
-    provision: async (r) =>
-      r.label === "existing" ? { Existing: observed } : { Created: observed },
-    list: async () => [observed],
-    inspect: async () => observed,
-    inspectAfterLifecycle: async () => ({
-      ...observed,
-      timestamp: "2026-01-02T00:00:00Z",
-    }),
+    provision: async (r) => ({ created: r.label !== "existing", environment }),
+    list: async () => [environment],
+    inspect: async () => environment,
     destroy: async () => {},
-    reach: async () => "Relay",
+    reach: async () => ({ kind: "relay", path: "/opaque" }),
     relay: async () => new PassThrough(),
-    async *subscribe(ctx) {
-      yield { Observed: observed };
-      yield {
-        Removed: { id: observed.environment.id, timestamp: observed.timestamp },
-      };
-      await new Promise<void>((resolve) => {
-        if (ctx.signal.aborted) resolve();
-        else
-          ctx.signal.addEventListener("abort", () => resolve(), { once: true });
-      });
-    },
   };
 }
 function request(
@@ -124,20 +102,20 @@ function request(
     );
   });
 }
-async function fixture(t: any, p = provider(), replacement = provider()) {
+async function fixture(t: any, p = provider()) {
   const dir = await mkdtemp(`${tmpdir()}/drydock-thin-`),
     socketPath = `${dir}/host.sock`;
-  let configurations = 0,
-    settings: unknown;
+  let configurations = 0;
+  const configured: { name: string; settings: unknown }[] = [];
   const name = "module /% " + "x".repeat(150);
   const module: ProviderModule = {
     name,
     version: "test",
     smallestSize: size,
-    async configure(c) {
+    async configure(name, config) {
       configurations++;
-      settings = c.settings;
-      return c.settings.replacement === true ? replacement : p;
+      configured.push({ name, settings: config.settings });
+      return p;
     },
   };
   const host = await serve([module], socketPath);
@@ -146,403 +124,286 @@ async function fixture(t: any, p = provider(), replacement = provider()) {
     await rm(dir, { recursive: true, force: true });
   });
   const config = {
-    name: "a",
-    module: "alias",
-    settings: JSON.parse(
-      '{"constructor":{"opaque":true},"__proto__":{"opaque":1},"custom":[1,"x"]}',
-    ),
-    credential: credentials().mode,
+    providers: {
+      a: {
+        module: name,
+        settings: JSON.parse(
+          '{"constructor":{"opaque":true},"__proto__":{"opaque":1},"custom":[1,"x"]}',
+        ),
+      },
+    },
   };
-  const configure = () =>
-    request(
-      socketPath,
-      `/private/modules/${encodeURIComponent(name)}/configure`,
-      config,
-    );
-  const response = await configure();
-  assert.equal(response.status, 200);
-  const handle: string = response.body.instance;
-  const call = (operation: string, argument: unknown = null, value?: string) =>
-    request(
-      socketPath,
-      `/private/providers/${encodeURIComponent(handle)}/${operation}`,
-      { credentials: credentials(value), argument },
-    );
+  assert.equal(
+    (await request(socketPath, "/v1/config", config, "PUT")).status,
+    204,
+  );
   return {
     socketPath,
-    name,
     host,
-    p,
-    call,
-    configure,
-    handle,
+    name,
     config,
-    settings: () => settings,
+    configured,
     configurations: () => configurations,
   };
 }
-// One real-socket scenario specifies discovery/configuration/handle routing and
-// exact trait result serialization, with immutable independent per-call secrets.
-test("UDS trait routing preserves payloads, credentials and handles", async (t) => {
+// Shared resource routes pass exact payloads and request-only credentials. A
+// configuration transaction keeps unchanged instances and applies RFC7396 atomically.
+test("shared UDS API delegates lifecycle and atomic configuration", async (t) => {
   const p = provider(),
     captured: Context[] = [];
-  p.list = async (c) => {
-    captured.push(c);
-    return [observed];
+  p.list = async (ctx) => {
+    captured.push(ctx);
+    return [environment];
   };
   p.inspect = async (id) => {
-    if (id === "quota")
+    if (id === "typed")
       throw new ProtocolFailure({
         kind: "quota_exhausted",
-        reason: "typed vendor result",
+        reason: "typed result",
       });
-    if (id === "unexpected") throw Error("test-only-one must not escape");
-    assert.equal(id, observed.environment.id);
-    return observed;
+    if (id === "unexpected") throw Error("secret-must-not-escape");
+    assert.equal(id, environment.id);
+    return environment;
   };
-  const replacement = provider();
-  replacement.inspect = async () => ({
-    ...observed,
-    timestamp: "2026-02-01T00:00:00Z",
-  });
-  const f = await fixture(t, p, replacement);
-  for (const [path, method, status, kind] of [
-    ["/v1/hello?opaque=%3F", "POST", 405, "method_not_allowed"],
-    ["/unknown", "GET", 404, "not_found"],
-  ] as const) {
-    const response = await request(f.socketPath, path, undefined, method);
-    assert.equal(response.status, status);
-    assert.equal(response.body.kind, kind);
-  }
-  assert.equal(
-    (await request(f.socketPath, "/v1/hello", undefined, "HEAD")).status,
-    405,
-  );
-  for (const [payload, media] of [
-    ['{"secret":"test-only-one"', "application/json"],
-    ["x".repeat(2 * 1024 * 1024 + 1), "application/json"],
-    ["test-only-one", "application/octet-stream"],
-  ]) {
-    const response = await request(
-      f.socketPath,
-      `/private/providers/${f.handle}/inspect`,
-      undefined,
-      "POST",
-      { payload, headers: { "content-type": media } },
-    );
-    assert.equal(response.status, 422);
-    assert.equal(response.body.kind, "refused");
-    assert.ok(!JSON.stringify(response.body).includes("test-only-one"));
-  }
-  const wrongUpgrade = await request(
-    f.socketPath,
-    `/private/providers/${f.handle}/relay`,
-    undefined,
-    "GET",
-    {
-      payload: "",
-      headers: { connection: "Upgrade", upgrade: "drydock-relay" },
-    },
-  );
-  assert.equal(wrongUpgrade.status, 405);
-  assert.equal(wrongUpgrade.body.kind, "method_not_allowed");
+  const f = await fixture(t, p),
+    url = "/v1/providers/a/environments",
+    id = encodeURIComponent(environment.id);
   assert.equal((await stat(f.socketPath)).mode & 0o777, 0o600);
   const hello = await request(f.socketPath, "/v1/hello", undefined, "GET");
+  assert.equal(hello.body.protocol_version, "9");
+  assert.equal(hello.body.loadable_modules[0].name, f.name);
   assert.equal(
-    hello.body.incarnation,
-    (await request(f.socketPath, "/v1/hello", undefined, "GET")).body
-      .incarnation,
+    (await request(f.socketPath, "/v1/hello", undefined, "HEAD")).status,
+    200,
   );
-  assert.equal(hello.body.modules[0].name, "alias");
-  assert.deepEqual(f.settings(), f.config.settings);
-  assert.deepEqual((await f.call("facts")).body.ports, {
-    exec: false,
-    suspend_resume: false,
-    export: false,
-    usage: false,
-    quota: false,
-  });
-  const repeat = await f.configure();
-  assert.notEqual(repeat.body.instance, f.handle);
-  assert.equal(f.configurations(), 1);
-  const results = await Promise.all([
-    f.call("list", null, "test-only-one"),
-    f.call("list", null, "test-only-two"),
-  ]);
+  const declarations = await request(
+    f.socketPath,
+    "/v1/providers",
+    undefined,
+    "GET",
+  );
+  assert.equal(declarations.body[0].provider, "a");
+  assert.equal(declarations.body[0].ports.exec, false);
   assert.deepEqual(
-    results.map((r) => r.body),
-    [[observed], [observed]],
+    (await request(f.socketPath, "/v1/providers/a", undefined, "GET")).body,
+    declarations.body[0],
   );
-  assert.deepEqual(captured.map((c) => c.credentials.value).sort(), [
-    "test-only-one",
-    "test-only-two",
-  ]);
-  assert.ok(
-    captured.every(
-      (c) =>
-        Object.isFrozen(c.credentials) && Object.isFrozen(c.credentials.mode),
-    ),
+  for (const credential of ["test-only-first", "test-only-second"]) {
+    const result = await request(f.socketPath, url, undefined, "GET", {
+      payload: "",
+      headers: { "Drydock-Credential": credential },
+    });
+    assert.deepEqual(result.body, [environment]);
+    assert.equal(captured.at(-1)!.credential, credential);
+    assert.ok(!JSON.stringify(result).includes(credential));
+  }
+  await request(f.socketPath, url, undefined, "GET");
+  assert.equal(captured.at(-1)!.credential, undefined);
+  const prepare = { image_digest: "image", tools_digest: "tools", size };
+  const prepared = await request(
+    f.socketPath,
+    "/v1/providers/a/prepare",
+    prepare,
   );
-  assert.deepEqual(
-    (await f.call("inspect", observed.environment.id)).body,
-    observed,
-  );
-  assert.equal(
-    (await f.call("inspect-after-lifecycle", observed.environment.id)).body
-      .timestamp,
-    "2026-01-02T00:00:00Z",
-  );
-  const preparation = {
-    size,
-    image_digest: "image",
-    tools_digest: "tools",
-    platform: capabilities.platforms[0],
-    route: "remote_build",
-  };
-  const prepared = await f.call("prepare", preparation);
   assert.equal(prepared.status, 200);
-  for (const [label, variant] of [
-    ["new", "Created"],
-    ["existing", "Existing"],
-  ]) {
-    const result = await f.call("provision", {
+  for (const [label, status] of [
+    ["new", 201],
+    ["existing", 200],
+  ] as const) {
+    const result = await request(f.socketPath, url, {
       label,
       prepared: prepared.body,
       size,
     });
-    assert.deepEqual(result.body, { [variant]: observed });
+    assert.equal(result.status, status);
+    assert.deepEqual(result.body, environment);
   }
-  assert.equal((await f.call("destroy", observed.environment.id)).body, null);
-  assert.equal((await f.call("reach", observed.environment.id)).body, "Relay");
-  assert.equal((await f.call("inspect", "quota")).status, 402);
-  const unexpected = await f.call("inspect", "unexpected");
-  assert.equal(unexpected.status, 500);
-  assert.ok(!JSON.stringify(unexpected).includes("test-only"));
-  assert.equal((await f.call("inspect", 123)).status, 422);
+  assert.deepEqual(
+    (await request(f.socketPath, `${url}/${id}`, undefined, "GET")).body,
+    environment,
+  );
+  assert.deepEqual((await request(f.socketPath, `${url}/${id}/reach`)).body, {
+    kind: "relay",
+    path: "/opaque",
+  });
   assert.equal(
-    (await f.call("prepare", { ...preparation, size: { ...size, cpus: "1" } }))
-      .status,
-    422,
+    (await request(f.socketPath, `${url}/${id}`, undefined, "DELETE")).status,
+    204,
+  );
+  for (const [path, method, status, kind] of [
+    ["/v1/hello?query=1", "POST", 405, "method_not_allowed"],
+    ["/unknown", "GET", 404, "not_found"],
+    ["/v1/events", "GET", 404, "not_found"],
+    ["/v1/providers/a/credential", "PUT", 404, "not_found"],
+    [`${url}/typed`, "GET", 402, "quota_exhausted"],
+    [`${url}/unexpected`, "GET", 500, "internal"],
+    [`${url}/x/exec`, "POST", 404, "not_found"],
+  ] as const) {
+    const result = await request(f.socketPath, path, undefined, method);
+    assert.equal(result.status, status, path);
+    assert.equal(result.body.kind, kind);
+    assert.ok(!JSON.stringify(result).includes("secret-must-not-escape"));
+  }
+  for (const body of [
+    { ...prepare, size: { ...size, cpus: "1" } },
+    { ...prepare, image_digest: "" },
+  ])
+    assert.equal(
+      (await request(f.socketPath, "/v1/providers/a/prepare", body)).status,
+      422,
+    );
+  for (const [payload, type] of [
+    ["{", "application/json"],
+    ["{}", "text/plain"],
+    [" ".repeat(2 * 1024 * 1024 + 1), "application/json"],
+  ]) {
+    const result = await request(
+      f.socketPath,
+      "/v1/providers/a/prepare",
+      undefined,
+      "POST",
+      { payload, headers: { "content-type": type } },
+    );
+    assert.equal(result.status, 422);
+  }
+  await request(f.socketPath, "/v1/config", f.config, "PUT");
+  assert.equal(f.configurations(), 1);
+  const patch = JSON.parse(
+    '{"providers":{"a":{"settings":{"constructor":{"added":2},"__proto__":{"opaque":null,"new":3},"custom":[2],"fresh":{"__proto__":{"data":true}}}}}}',
   );
   assert.equal(
-    (await f.call("exec", ["id", { command: ["cat"] }])).status,
-    404,
+    (
+      await request(f.socketPath, "/v1/config", patch, "PATCH", {
+        payload: JSON.stringify(patch),
+        headers: { "content-type": "application/merge-patch+json" },
+      })
+    ).status,
+    204,
   );
-  await request(
-    f.socketPath,
-    `/private/providers/${f.handle}`,
-    undefined,
-    "DELETE",
+  assert.deepEqual(
+    f.configured.at(-1)!.settings,
+    JSON.parse(
+      '{"constructor":{"opaque":true,"added":2},"__proto__":{"new":3},"custom":[2],"fresh":{"__proto__":{"data":true}}}',
+    ),
   );
-  assert.equal((await f.call("list")).status, 404);
+  assert.equal(({} as any).new, undefined);
   assert.equal(
     (
       await request(
         f.socketPath,
-        `/private/providers/${repeat.body.instance}/list`,
-        { credentials: credentials(), argument: null },
+        "/v1/config",
+        { providers: { bad: { module: "missing" } } },
+        "PATCH",
       )
     ).status,
-    200,
-  );
-  // Replacing a binding cannot invalidate the old handles still owned by Daemon.
-  const changed = await request(
-    f.socketPath,
-    `/private/modules/${encodeURIComponent(f.name)}/configure`,
-    { ...f.config, settings: { replacement: true } },
-  );
-  assert.equal(changed.status, 200);
-  const old = await request(
-    f.socketPath,
-    `/private/providers/${repeat.body.instance}/inspect`,
-    { credentials: credentials(), argument: observed.environment.id },
-  );
-  const current = await request(
-    f.socketPath,
-    `/private/providers/${changed.body.instance}/inspect`,
-    { credentials: credentials(), argument: observed.environment.id },
-  );
-  assert.deepEqual(old.body, observed);
-  assert.equal(current.body.timestamp, "2026-02-01T00:00:00Z");
-  await request(
-    f.socketPath,
-    `/private/modules/${encodeURIComponent(f.name)}/configure`,
-    { ...f.config, name: "b" },
-  );
-  replacement.readiness = () => {
-    throw Error("test-only-two must not escape");
-  };
-  const degraded = await request(f.socketPath, "/v1/hello", undefined, "GET");
-  assert.equal(degraded.status, 200);
-  assert.equal(
-    degraded.body.providers.find((p: any) => p.provider === "a").readiness
-      .status,
-    "unknown",
+    422,
   );
   assert.equal(
-    degraded.body.providers.find((p: any) => p.provider === "b").readiness
-      .status,
-    "ready",
+    (await request(f.socketPath, "/v1/providers", undefined, "GET")).body
+      .length,
+    1,
   );
-  assert.ok(!JSON.stringify(degraded).includes("test-only"));
+  assert.equal(
+    (
+      await request(
+        f.socketPath,
+        "/v1/config",
+        { providers: { a: { credential: { env: "TEST_ONLY" } } } },
+        "PATCH",
+      )
+    ).status,
+    422,
+  );
+  assert.equal(
+    (
+      await request(
+        f.socketPath,
+        "/v1/config",
+        { providers: { a: null } },
+        "PATCH",
+      )
+    ).status,
+    204,
+  );
+  assert.deepEqual(
+    (await request(f.socketPath, "/v1/providers", undefined, "GET")).body,
+    [],
+  );
 });
-async function upgraded(socketPath: string, path: string, chunked = false) {
-  const socket = net.connect(socketPath);
-  const body = JSON.stringify({
-    credentials: credentials(),
-    argument: observed.environment.id,
-  });
-  const framed = chunked
-    ? `${Buffer.byteLength(body).toString(16)}\r\n${body}\r\n0\r\n\r\n`
-    : body;
-  socket.write(
-    `POST ${path} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\nContent-Type: application/json\r\n${chunked ? "Transfer-Encoding: chunked" : `Content-Length: ${Buffer.byteLength(body)}`}\r\n\r\n${framed}`,
-  );
-  await new Promise<void>((resolve, reject) => {
-    let text = "";
-    const data = (b: Buffer) => {
-      text += b;
-      if (text.includes("\r\n\r\n")) {
-        socket.off("data", data);
-        assert.match(text, /^HTTP\/1.1 101/);
-        resolve();
-      }
-    };
-    socket.on("data", data);
-    socket.once("error", reject);
-  });
-  return socket;
-}
-// Raw duplex bytes and both HTTP body framings remain independent of NDJSON.
-// Subscription updates/removals pass through without deriving public events.
-test("raw relay and subscription forwarding have disconnect cleanup", async (t) => {
+// A real raw upgrade retains bytes after the HTTP headers and closes both ends.
+test("GET relay forwards raw bytes and host stop closes upgrades", async (t) => {
   const f = await fixture(t);
-  for (const chunked of [false, true]) {
-    const socket = await upgraded(
-      f.socketPath,
-      `/private/providers/${f.handle}/relay`,
-      chunked,
-    );
-    const echo = new Promise<Buffer>((resolve) => socket.once("data", resolve));
-    socket.write("raw\0bytes");
-    assert.equal((await echo).toString(), "raw\0bytes");
-    socket.destroy();
-  }
-  // Invalid hand-rolled chunk framing must return a typed refusal, not hang.
-  for (const frame of [
-    "f".repeat(8193),
-    "0\r\n" + ("x:" + "x".repeat(70) + "\r\n").repeat(1000),
-  ]) {
-    const socket = net.connect(f.socketPath);
-    const response = new Promise<string>((resolve, reject) => {
-      let text = "";
-      socket.on("data", (b) => (text += b));
-      socket.once("end", () => resolve(text));
-      socket.once("error", reject);
-    });
-    socket.write(
-      `POST /private/providers/${f.handle}/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\nTransfer-Encoding: chunked\r\n\r\n${frame}`,
-    );
-    const text = await response;
-    assert.match(text, /^HTTP\/1.1 422/);
-    assert.equal(JSON.parse(text.split("\r\n\r\n")[1]).kind, "refused");
-    socket.destroy();
-  }
-  const req = http.request({
-    socketPath: f.socketPath,
-    path: `/private/providers/${f.handle}/subscribe`,
-    method: "POST",
-    agent: false,
-    headers: { "content-type": "application/json" },
-  });
-  const response = new Promise<http.IncomingMessage>((r) =>
-    req.once("response", r),
+  const socket = net.connect(f.socketPath);
+  t.after(() => socket.destroy());
+  socket.write(
+    "GET /v1/providers/a/environments/opaque/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\nround-trip",
   );
-  req.end(JSON.stringify({ credentials: credentials(), argument: null }));
-  const res = await response;
-  assert.equal(res.headers["content-type"], "application/x-ndjson");
-  const lines: any[] = [];
-  let text = "";
-  await new Promise<void>((resolve) => {
-    res.on("data", (b) => {
-      text += b;
-      let i;
-      while ((i = text.indexOf("\n")) >= 0) {
-        lines.push(JSON.parse(text.slice(0, i)));
-        text = text.slice(i + 1);
-      }
-      if (lines.length === 2) resolve();
+  let received = "";
+  await new Promise<void>((resolve, reject) => {
+    socket.on("error", reject);
+    socket.on("data", (chunk) => {
+      received += chunk;
+      if (received.endsWith("round-trip")) resolve();
     });
   });
-  assert.deepEqual(lines, [
-    { Update: { Observed: observed } },
-    {
-      Update: {
-        Removed: { id: observed.environment.id, timestamp: observed.timestamp },
-      },
-    },
-  ]);
-  res.destroy();
-  req.destroy();
+  assert.match(received, /^HTTP\/1.1 101 /);
+  const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+  await f.host.close();
+  await closed;
 });
-// Client disconnect must abort an ordinary call and a pending relay setup.
-// A provider ignoring abort may finish late, but its returned duplex is disposed.
-test("disconnect aborts pending provider calls and disposes late relay", async (t) => {
+// Client disconnect cancels awaited trait work; a late duplex must be disposed.
+test("disconnect aborts inspect and disposes late relay setup", async (t) => {
   const p = provider();
-  let entered!: () => void,
-    aborted!: () => void,
-    release!: (value: PassThrough) => void;
-  let started = new Promise<void>((r) => (entered = r)),
-    cancelled = new Promise<void>((r) => (aborted = r));
+  let inspectStarted!: () => void,
+    relayStarted!: () => void,
+    release!: (stream: PassThrough) => void;
+  const inspectReady = new Promise<void>((r) => (inspectStarted = r)),
+    relayReady = new Promise<void>((r) => (relayStarted = r));
+  let inspectSignal!: AbortSignal, relaySignal!: AbortSignal;
   p.inspect = async (_id, ctx) => {
-    entered();
+    inspectSignal = ctx.signal;
+    inspectStarted();
     await new Promise<void>((resolve) =>
-      ctx.signal.addEventListener(
-        "abort",
-        () => {
-          aborted();
-          resolve();
-        },
-        { once: true },
-      ),
+      ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
     );
-    return observed;
+    return environment;
+  };
+  p.relay = async (_id, ctx) => {
+    relaySignal = ctx.signal;
+    relayStarted();
+    return new Promise((r) => (release = r));
   };
   const f = await fixture(t, p);
   const req = http.request({
     socketPath: f.socketPath,
-    path: `/private/providers/${f.handle}/inspect`,
-    method: "POST",
-    headers: { "content-type": "application/json" },
+    path: "/v1/providers/a/environments/x",
+    method: "GET",
   });
   req.on("error", () => {});
-  req.end(JSON.stringify({ credentials: credentials(), argument: "id" }));
-  await started;
+  req.end();
+  await inspectReady;
   req.destroy();
-  await cancelled;
-  started = new Promise<void>((r) => (entered = r));
-  cancelled = new Promise<void>((r) => (aborted = r));
-  p.relay = async (_id, ctx) => {
-    ctx.signal.addEventListener("abort", () => aborted(), { once: true });
-    entered();
-    return new Promise<PassThrough>((r) => (release = r));
-  };
-  const socket = net.connect(f.socketPath),
-    body = JSON.stringify({ credentials: credentials(), argument: "id" });
+  await new Promise<void>((r) => {
+    if (inspectSignal.aborted) r();
+    else inspectSignal.addEventListener("abort", () => r(), { once: true });
+  });
+  const socket = net.connect(f.socketPath);
+  socket.on("error", () => {});
   socket.write(
-    `POST /private/providers/${f.handle}/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\nContent-Length: ${body.length}\r\n\r\n${body}`,
+    "GET /v1/providers/a/environments/x/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\n",
   );
-  await started;
+  await relayReady;
   socket.destroy();
-  await cancelled;
-  const stream = new PassThrough();
-  release(stream);
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.ok(stream.destroyed);
+  await new Promise<void>((r) => {
+    if (relaySignal.aborted) r();
+    else relaySignal.addEventListener("abort", () => r(), { once: true });
+  });
+  const late = new PassThrough(),
+    disposed = new Promise<void>((r) => late.once("close", r));
+  release(late);
+  await disposed;
+  assert.equal(late.destroyed, true);
 });
-
-// The real executable diagnoses malformed supervisor-selected exports without
-// echoing imported exceptions or starting a listener.
 test("CLI rejects invalid provider module exports before listen", async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/drydock-loader-`);
   t.after(() => rm(dir, { recursive: true, force: true }));

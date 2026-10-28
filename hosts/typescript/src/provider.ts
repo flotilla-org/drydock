@@ -2,7 +2,7 @@ import type { Duplex } from "node:stream";
 import type { components } from "./generated/protocol.js";
 export type Types = components["schemas"];
 export type Context = {
-  readonly credentials: Readonly<Types["Credentials"]>;
+  readonly credential: string | undefined;
   signal: AbortSignal;
 };
 export interface ProviderModule {
@@ -11,6 +11,7 @@ export interface ProviderModule {
   smallestSize: Types["Size"];
   // Factories own cleanup on rejection/abort; retain no call-scoped SDK work.
   configure(
+    name: string,
     config: Types["ProviderConfiguration"],
     signal: AbortSignal,
   ): Promise<Provider>;
@@ -28,18 +29,12 @@ export interface Provider {
   provision(
     request: Types["ProvisionRequest"],
     context: Context,
-  ): Promise<Types["Provisioned"]>;
-  list(context: Context): Promise<Types["ObservedEnvironment"][]>;
-  inspect(id: string, context: Context): Promise<Types["ObservedEnvironment"]>;
-  inspectAfterLifecycle(
-    id: string,
-    context: Context,
-  ): Promise<Types["ObservedEnvironment"]>;
+  ): Promise<{ created: boolean; environment: Types["Environment"] }>;
+  list(context: Context): Promise<Types["Environment"][]>;
+  inspect(id: string, context: Context): Promise<Types["Environment"]>;
   destroy(id: string, context: Context): Promise<void>;
-  reach(id: string, context: Context): Promise<Types["Connection"]>;
+  reach(id: string, context: Context): Promise<Types["Reach"]>;
   relay(id: string, context: Context): Promise<Duplex>;
-  /** Must settle pending next() on signal abort; async iterator return cannot preempt it. */
-  subscribe(context: Context): AsyncIterable<Types["Update"]>;
 }
 // Optional ports are deliberately absent until drydock#85's interface lands.
 export const absentPorts: Types["Ports"] = {

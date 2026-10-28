@@ -1,23 +1,25 @@
 # Thin TypeScript provider bridge
 
 Node >=24.18.0 on Linux/Unix, with pinned pnpm via Corepack. Daemon owns all
-admission, rate, credential, inventory, billing and replay policy. This companion
-only loads modules, invokes provider methods and forwards private REST/streams.
+admission, rate, credential-state, inventory, billing and replay policy. This
+companion loads modules and delegates the common `/v1` API to provider methods.
 Exec, suspend/resume, export, usage and quota are absent until drydock#85.
 
 ```sh
-export COREPACK_HOME="$(mktemp -d)"  # private writable directory
+export COREPACK_HOME="$(mktemp -d)" # private writable directory
 corepack pnpm install --frozen-lockfile
 corepack pnpm check
 corepack pnpm pack:companion
 ```
 
 Build generates `src/generated/protocol.ts` and `schema.json` from canonical
-`/openapi.json` host-tagged paths (Rust exporter: `drydock-host/src/lib.rs`). Generated
-outputs are untracked, marked GENERATED and verified by `check:generated`.
-Rust's workspace drift test verifies the canonical document. The package includes
-compiled bindings and runtime schemas; no repository files are needed at runtime.
-AJV never coerces values, inserts defaults or strips fields.
+`/openapi.json` host-tagged paths. Rust declarations and the actual shared handlers
+in `crates/drydock-client/src/api.rs` own the document; export it with
+`cargo run --locked -p drydock-client --bin generate-openapi > openapi.json`.
+Generated outputs are untracked, marked GENERATED and verified by
+`check:generated`. Rust's drift test verifies the canonical document. The package
+includes compiled bindings and runtime schemas; no repository files are needed at
+runtime. AJV never coerces values, inserts defaults or strips fields.
 
 Unpack the tarball into a dedicated installation directory, run `corepack pnpm
 install --prod --frozen-lockfile`, and link executable `dist/main.js` beside
@@ -27,28 +29,30 @@ FFI/native module or shared toolchain changes are needed.
 
 Launch: `drydock-host-typescript --unix /private/run/host.sock`. The supervisor
 owns the same-user directory (0700), socket (0600) and launched process/path.
-There are no peer UID checks or TCP listener. This is a private provider channel,
-not a network-facing public API. Request/error logging is disabled; unexpected
-exceptions become static Internal errors. Typed provider diagnostics are sent to
-Daemon, which owns public credential masking; modules must never log secrets.
+There are no peer UID checks or TCP listener. Request/error logging is disabled;
+unexpected exceptions become static Internal errors. Typed provider diagnostics
+are sent to Daemon, which owns public credential masking; modules must never log
+secrets.
 
 Set `DRYDOCK_TYPESCRIPT_MODULES` to comma-separated absolute ESM paths/file URLs.
-Each exports a default `ProviderModule` from `src/provider.ts`. Requests select
-only those modules by name; wire settings cannot import code. Modules validate
-opaque settings and honor cancellation. Credentials are frozen per-call snapshots;
-rotation/rejection state belongs to Daemon. Cancellation does not prove rollback.
-Push subscriptions yield raw Update facts with immutable lifetime credentials;
-there are no host cursors or retry loops. Slow readers apply stream backpressure.
+Each exports a default `ProviderModule` from handwritten `src/provider.ts`.
+Configuration selects only these modules by name; settings cannot import code.
+PUT `/v1/config` replaces `{providers: {instance: {module, settings}}}`; PATCH uses
+RFC7396 merge patch. Unchanged configurations reuse their provider; failed
+configuration leaves the previous document intact. Credential configuration is
+server-only and rejected by the host. The optional `Drydock-Credential` header is
+an opaque per-call string, never retained in configuration or provider bindings.
 
-Handwritten sources: `provider.ts` is the transport-independent interface;
-`server.ts` contains direct framework routes; `stream.ts` handles raw HTTP upgrade
-framing and duplex forwarding. `src/generated/**` and `dist/**` are build outputs.
+Providers return generated Environment values; provision's internal `created`
+flag chooses HTTP201 or200 without a wire wrapper. Provider declarations expose
+facts; observation is polling performed by the main server. There are no host
+handles, push subscriptions, cursors, credential refresh routes or policy loops.
+Modules validate opaque settings and honor cancellation; cancellation does not
+prove rollback. Factories own cleanup on rejection/abort, and modules own their
+SDK resources. Raw relay upgrades use GET and backpressured Node duplex pipes;
+disconnect aborts setup and disposes a stream returned after disconnect.
 
-Provider handles follow Rust loader ownership: reconfiguration creates a new
-handle without invalidating the server's old handles; `RemoteProvider::drop`
-releases each via DELETE. A logical binding stays loaded across server reconnects
-and keeps its provider until replacement or host shutdown. DELETE does not destroy
-vendor resources. The bridge has no extra SDK disposal protocol; modules own
-call/subscription resources and must release them on abort or factory failure.
-A subscription must settle a pending `next()` when its signal aborts; an async
-iterator's `return()` cannot interrupt pending provider work. No retries occur.
+`server.ts` contains direct Fastify routes; `stream.ts` forwards raw duplex bytes.
+`provider.ts` is handwritten and free of framework types. `src/generated/**` and
+`dist/**` are generated outputs, including JSON. Rust types → canonical OpenAPI →
+TypeScript bindings and packaged AJV schema form one generation chain.

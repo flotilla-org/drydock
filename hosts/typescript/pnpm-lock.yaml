@@ -175,6 +175,9 @@ importers:
       fastify:
         specifier: 5.12.7
         version: 5.12.7
+      tiny-merge-patch:
+        specifier: 1.0.0
+        version: 1.0.0
     devDependencies:
       '@types/node':
         specifier: 24.10.0
@@ -457,6 +460,9 @@ packages:
   thread-stream@4.2.0:
     resolution: {integrity: sha512-e2zZ96wSChazBsbENf/Pcm/4swHt2cEKQ92rhUjkL9GCKiTDJIaTBenjE/m9DXi0QBmTMDkFDdOomUy20A1tDQ==}
     engines: {node: '>=20'}
+
+  tiny-merge-patch@1.0.0:
+    resolution: {integrity: sha512-NR7dpqibfxA1uHaFJn5YXViH7REa0wPcZh8MLFrEn9OvDWyIY9YyyKHHmFBE66ER18CQwJ+VGknsQbgiBtL8Uw==}
 
   toad-cache@3.7.4:
     resolution: {integrity: sha512-m1TdR/rvT7kgGJZhspNtXdsdYk0fddFpJJFlG5s+UkPFo6lkLoZ3YLOaovPYjq1R75NP5JfeTlSHaOsE09peCg==}
@@ -762,6 +768,8 @@ snapshots:
   thread-stream@4.2.0:
     dependencies:
       real-require: 1.0.0
+
+  tiny-merge-patch@1.0.0: {}
 
   toad-cache@3.7.4: {}
 
