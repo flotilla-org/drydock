@@ -1,12 +1,5 @@
 use drydock_protocol::*;
 
-// ADR 0070 requires the checked-in document to match the Rust source of truth.
-// One exact comparison covers this deterministic generation boundary.
-#[test]
-fn checked_in_openapi_does_not_drift() {
-    assert_eq!(openapi::to_json(), include_str!("../../../openapi.json"));
-}
-
 // Omitted egress must deny all; Open requires an explicit placement opt-in.
 #[test]
 fn omitted_egress_denies_all() {

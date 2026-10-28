@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Drydock adaptor protocol",
-    "description": "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams.",
+    "description": "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets use private directory/socket permissions; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
@@ -12,7 +12,9 @@
   "paths": {
     "/v1/config": {
       "put": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "configure",
         "requestBody": {
           "content": {
@@ -27,6 +29,9 @@
         "responses": {
           "204": {
             "description": "Success"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -58,7 +63,9 @@
         }
       },
       "patch": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "patch_configuration",
         "requestBody": {
           "description": "RFC 7396 JSON merge patch of the configuration document",
@@ -74,6 +81,9 @@
         "responses": {
           "204": {
             "description": "Success"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -107,8 +117,10 @@
     },
     "/v1/events": {
       "get": {
-        "tags": [],
-        "operationId": "observe",
+        "tags": [
+          "server"
+        ],
+        "operationId": "events",
         "parameters": [
           {
             "name": "since",
@@ -130,6 +142,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -164,7 +179,9 @@
     },
     "/v1/hello": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "hello",
         "responses": {
           "200": {
@@ -176,6 +193,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -209,7 +229,9 @@
     },
     "/v1/providers": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "providers",
         "responses": {
           "200": {
@@ -224,6 +246,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -257,7 +282,9 @@
     },
     "/v1/providers/{provider}": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "provider",
         "parameters": [
           {
@@ -289,6 +316,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -322,8 +352,10 @@
     },
     "/v1/providers/{provider}/credential": {
       "put": {
-        "tags": [],
-        "operationId": "refresh_credential",
+        "tags": [
+          "server"
+        ],
+        "operationId": "credential",
         "parameters": [
           {
             "name": "provider",
@@ -348,6 +380,9 @@
         "responses": {
           "204": {
             "description": "Success"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -382,7 +417,9 @@
     },
     "/v1/providers/{provider}/environments": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "list",
         "parameters": [
           {
@@ -418,6 +455,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -448,7 +488,9 @@
         }
       },
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "provision",
         "parameters": [
           {
@@ -501,6 +543,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -533,7 +578,9 @@
     },
     "/v1/providers/{provider}/environments/{id}": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "inspect",
         "parameters": [
           {
@@ -575,6 +622,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -605,7 +655,9 @@
         }
       },
       "delete": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "destroy",
         "parameters": [
           {
@@ -640,6 +692,9 @@
           "204": {
             "description": "Success; destroying an already absent resource succeeds"
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -672,7 +727,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/exec": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "exec",
         "parameters": [
           {
@@ -731,6 +788,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -763,7 +823,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/export": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "export",
         "parameters": [
           {
@@ -805,6 +867,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -837,7 +902,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/reach": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "reach",
         "parameters": [
           {
@@ -879,6 +946,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -911,7 +981,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/relay": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "relay",
         "parameters": [
           {
@@ -960,6 +1032,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -992,7 +1067,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/resume": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "resume",
         "parameters": [
           {
@@ -1037,6 +1114,9 @@
           "204": {
             "description": "Success"
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -1069,7 +1149,9 @@
     },
     "/v1/providers/{provider}/environments/{id}/suspend": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "suspend",
         "parameters": [
           {
@@ -1111,6 +1193,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -1143,7 +1228,9 @@
     },
     "/v1/providers/{provider}/prepare": {
       "post": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "prepare",
         "parameters": [
           {
@@ -1186,6 +1273,9 @@
               }
             }
           },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
           "402": {
             "$ref": "#/components/responses/Error402"
           },
@@ -1218,7 +1308,9 @@
     },
     "/v1/providers/{provider}/quota": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "quota",
         "parameters": [
           {
@@ -1250,6 +1342,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"
@@ -1283,7 +1378,9 @@
     },
     "/v1/providers/{provider}/usage": {
       "get": {
-        "tags": [],
+        "tags": [
+          "host"
+        ],
         "operationId": "usage",
         "parameters": [
           {
@@ -1333,6 +1430,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
             "$ref": "#/components/responses/Error402"

@@ -26,6 +26,13 @@ tower-http = { version = "0.7.1", features = ["sensitive-headers"] }
 tracing = "0.1.44"
 serde_path_to_error = "0.1.20"
 
+utoipa.workspace = true
+utoipa-axum = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "net"] }
 tempfile = "3"
+hegeltest = "=0.48.1"
+regex = "1"
+chrono = "0.4"
+jsonschema = { version = "0.60.2", default-features = false }

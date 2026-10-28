@@ -45,3 +45,11 @@ budget returns `Error::RateLimited`, with no hidden sleep or retry. No declarati
 means no caching. Each declared provider holds at most 1024 cached entries. Recreate the cache when
 host generation or declarations change; provider-side polling and other clients
 may consume additional budget and return typed remote rate errors.
+
+The real handlers register the shared host/server routes and their OpenAPI
+annotations together via utoipa-axum. Root `openapi.json` remains the single
+canonical document; `host` tags select the common surface, while the two
+server-only extensions retain `x-drydock-server-only`. Regenerate with
+`cargo run --locked -p drydock-client --bin generate-openapi > openapi.json`.
+The client crate owns the one drift check and serialization-against-document
+check; existing protocol schema-validation assertions run there unchanged.
