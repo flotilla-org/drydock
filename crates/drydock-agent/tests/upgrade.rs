@@ -459,3 +459,30 @@ async fn upgrades_activate_a_durable_verified_upload() {
     child.kill().await.unwrap();
     child.wait().await.unwrap();
 }
+
+// An upgrade whose upload was cut off partway leaves an incomplete upload of
+// the digest; the next upgrade continues it rather than being refused.
+#[tokio::test]
+async fn upgrade_resumes_a_partial_upload_of_the_same_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = agent_binary();
+    let executable = install(&dir.path().join("drydock-agent"), &binary);
+    let old = sha256(&binary);
+    let socket = dir.path().join("agent.sock");
+    let mut child = start_agent(&executable, &socket);
+    let client = connect(&socket, &old).await;
+    let mut candidate = binary.clone();
+    candidate.extend_from_slice(b"resumed upgrade");
+    let new = sha256(&candidate);
+    let length = candidate.len() as u64;
+    let half = candidate.len() / 2;
+    let _ = client.upload(&new, length, std::io::Cursor::new(candidate[..half].to_vec())).await;
+    assert_eq!(client.upload_offset(&new).await.unwrap(), (half as u64, false), "the cut-off upload is left incomplete");
+    client.upgrade(candidate.clone()).await.unwrap();
+    drop(client);
+    let candidate_client = connect_compatible(&socket, &new).await;
+    candidate_client.confirm_upgrade().await.unwrap();
+    assert_eq!(std::fs::read(&executable).unwrap(), candidate);
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+}
