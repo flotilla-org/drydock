@@ -145,14 +145,17 @@ async fn host_configuration_document() {
     assert_eq!(names, [("a".into(), false), ("b".into(), true)]);
     // The reference keeps prepared forms in memory: the same form proves the same provider.
     assert_eq!(client.prepare("a", &preparation()).await.unwrap(), prepared);
-    let refused = client
-        .configure(ConfigUpdate::MergePatch(
-            serde_json::json!({"providers":{"a":null,"c":{"module":"reference","credential":{"env":"PATH"}}}}),
-        ))
-        .await;
-    assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
-    assert_eq!(client.providers().await.unwrap().len(), 2);
-    assert_eq!(client.prepare("a", &preparation()).await.unwrap(), prepared);
+    // Refused documents apply nothing: a server-only key, or a provider that
+    // fails to build after an earlier new one was built.
+    for patch in [
+        serde_json::json!({"providers":{"a":null,"c":{"module":"reference","credential":{"env":"PATH"}}}}),
+        serde_json::json!({"providers":{"a":null,"c":{"module":"reference"},"d":{"module":"reference","settings":{"bogus":1}}}}),
+    ] {
+        let refused = client.configure(ConfigUpdate::MergePatch(patch)).await;
+        assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
+        assert_eq!(client.providers().await.unwrap().len(), 2);
+        assert_eq!(client.prepare("a", &preparation()).await.unwrap(), prepared);
+    }
 }
 
 // The host holds no credential: each call reaches the module with exactly the

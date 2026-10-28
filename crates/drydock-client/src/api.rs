@@ -179,6 +179,9 @@ impl FromRequestParts<Surface> for Api {
             None => api,
             Some(value) => {
                 let value = value.to_str().map_err(|_| Error::InvalidRequest("Drydock-Credential is not visible ASCII".into()))?;
+                if value.is_empty() {
+                    return Err(Error::InvalidRequest("Drydock-Credential is empty".into()).into());
+                }
                 api.with_credential(Secret::new(value))
             }
         }))
@@ -342,7 +345,8 @@ async fn events(Api(api): Api, ApiQuery(query): ApiQuery<EventQuery>) -> ApiResu
     use futures::StreamExt;
     // A failed observation ends the body; readers resume from their last cursor.
     let lines = api.observe(query.since.as_deref()).await?.map(|record| {
-        let mut line = serde_json::to_vec(&record.map_err(std::io::Error::other)?).expect("wire record serializes");
+        let record = record.inspect_err(|error| tracing::warn!(%error, "event stream ended by an error")).map_err(std::io::Error::other)?;
+        let mut line = serde_json::to_vec(&record).expect("wire record serializes");
         line.push(b'\n');
         Ok::<_, std::io::Error>(line)
     });

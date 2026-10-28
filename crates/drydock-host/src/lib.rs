@@ -58,18 +58,23 @@ impl Host {
         let bindings = self.bindings.read().await;
         bindings.get(name).map(|b| b.provider.clone()).ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })
     }
-    async fn declaration(&self, name: &str, binding: &Binding) -> ProviderDeclaration {
-        let p = &binding.provider;
+    /// Declarations refresh readiness, which can be a provider network call, so
+    /// they never run under the bindings lock.
+    async fn declaration(&self, name: String, module: String, p: Arc<dyn Provider>) -> ProviderDeclaration {
         p.refresh_readiness(&self.credentials).await;
         ProviderDeclaration {
-            provider: name.to_owned(),
-            module: binding.config.module.clone(),
+            provider: name,
+            module,
             capabilities: p.capabilities(),
             readiness: p.readiness(&self.credentials),
             rate_limits: p.rate_limits(),
             ports: p.operations().into(),
             observation: p.observation(),
         }
+    }
+    async fn bindings(&self) -> Vec<(String, String, Arc<dyn Provider>)> {
+        let bindings = self.bindings.read().await;
+        bindings.iter().map(|(name, b)| (name.clone(), b.config.module.clone(), b.provider.clone())).collect()
     }
 
     pub fn router(&self) -> Router {
@@ -164,13 +169,13 @@ impl ProviderApi for Host {
         Ok(())
     }
     async fn providers(&self) -> ApiResult<Vec<ProviderDeclaration>> {
-        let bindings = self.bindings.read().await;
-        Ok(futures::future::join_all(bindings.iter().map(|(name, b)| self.declaration(name, b))).await)
+        let bindings = self.bindings().await;
+        Ok(futures::future::join_all(bindings.into_iter().map(|(name, module, p)| self.declaration(name, module, p))).await)
     }
     async fn provider(&self, p: &str) -> ApiResult<ProviderDeclaration> {
-        let bindings = self.bindings.read().await;
-        let binding = bindings.get(p).ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })?;
-        Ok(self.declaration(p, binding).await)
+        let binding = self.bindings().await.into_iter().find(|(name, ..)| name == p);
+        let (name, module, provider) = binding.ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })?;
+        Ok(self.declaration(name, module, provider).await)
     }
     async fn prepare(&self, p: &str, r: &PrepareRequest) -> ApiResult<Prepared> {
         Ok(prepare_for_platform(&*self.instance(p).await?, r.clone(), &self.credentials).await?)
