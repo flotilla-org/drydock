@@ -20,6 +20,11 @@ bytes = "1"
 futures = "0.3"
 tokio = { version = "1", features = ["sync", "time", "io-util"] }
 thiserror = "2"
+json-patch = "4.2.0"
+axum = "0.8"
+tower-http = { version = "0.7.1", features = ["sensitive-headers"] }
+tracing = "0.1.44"
+serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "net"] }

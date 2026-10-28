@@ -10,7 +10,7 @@ pub mod launch;
 pub mod local;
 pub mod runtime;
 pub mod shell;
-use api::ProviderApi;
+use api::{ConfigUpdate, ProviderApi};
 use client::Client;
 use credentials::*;
 pub use drydock_client as client;
@@ -29,13 +29,10 @@ use tokio::{sync::watch, task::JoinHandle};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostConnection {
+    /// The host inherits this process's environment.
     Managed {
         command: Vec<String>,
         runtime: Option<String>,
-        /// Non-secret proxy URLs and CA paths only. Never put credentials here:
-        /// the command runner currently carries these values through env argv.
-        #[serde(default)]
-        proxy_environment: BTreeMap<String, String>,
     },
     ExternalUnix {
         path: PathBuf,
@@ -49,8 +46,10 @@ pub enum HostConnection {
 pub struct HostSpec {
     pub name: String,
     pub connection: HostConnection,
-    pub configuration: HostConfiguration,
-    /// Keys match the opaque credential_reference in Direct wire configuration.
+    /// The providers this host serves. Their credentials are resolved by the
+    /// server, never sent to the host as configuration.
+    pub configuration: Configuration,
+    /// Where each provider's credential comes from, keyed by provider name.
     #[serde(default)]
     pub credentials: BTreeMap<String, CredentialReference>,
 }
@@ -74,7 +73,6 @@ impl ToolDetector for PathDetector {
 }
 #[derive(Clone, Debug)]
 pub struct HostStatus {
-    pub modules: Vec<LoadedModule>,
     pub loadable_modules: Vec<LoadableModule>,
     pub readiness: Readiness,
     pub providers: Vec<ProviderDeclaration>,
@@ -83,7 +81,7 @@ pub struct HostStatus {
 }
 impl HostStatus {
     fn new(readiness: Readiness, generation: u64) -> Self {
-        Self { readiness, modules: Vec::new(), loadable_modules: Vec::new(), providers: Vec::new(), generation }
+        Self { readiness, loadable_modules: Vec::new(), providers: Vec::new(), generation }
     }
 }
 pub struct HostHandle {
@@ -217,7 +215,7 @@ impl Supervisor {
         let host_client = client.clone();
         let public_client = runtime::Runtime::new(Default::default()).with_request_timeout(self.request_timeout);
         let policy = public_client.clone();
-        let instances = spec.configuration.providers.iter().map(|p| p.name.clone()).collect();
+        let instances = spec.configuration.providers.keys().cloned().collect();
         let task = tokio::spawn(async move {
             let _lease = lease;
             supervisor.run(spec, socket, host_client, policy, status).await;
@@ -232,26 +230,25 @@ impl Supervisor {
         masker: &mut DiagnosticMasker,
     ) -> Result<BTreeMap<String, Readiness>, client::Error> {
         let mut unavailable = BTreeMap::new();
-        for provider in &spec.configuration.providers {
-            let CredentialMode::Direct { credential_reference } = &provider.credential else { continue };
+        for name in spec.configuration.providers.keys() {
             let result = async {
-                let reference = spec.credentials.get(credential_reference).ok_or_else(missing_credential)?;
+                let reference = spec.credentials.get(name).ok_or_else(missing_credential)?;
                 let credential = self.credentials.resolve(reference).await.map_err(|_| missing_credential())?;
                 if credential.value.expose().is_empty() || credential.expires_at.is_some_and(|at| at <= SystemTime::now()) {
                     return Err(missing_credential());
                 }
                 masker.remember(credential.value.expose());
-                if previous.get(&provider.name) != Some(&credential.value) {
-                    client.credential(&provider.name, credential.value.clone()).await.map_err(client::Error::Protocol)?;
-                    previous.insert(provider.name.clone(), credential.value);
+                if previous.get(name) != Some(&credential.value) {
+                    client.credential(name, credential.value.clone()).await.map_err(client::Error::Protocol)?;
+                    previous.insert(name.clone(), credential.value);
                 }
                 Ok(())
             }
             .await;
             match result {
                 Err(client::Error::Protocol(ProtocolError::CredentialRejected { .. })) => {
-                    previous.remove(&provider.name);
-                    unavailable.insert(provider.name.clone(), Readiness::MissingCredential { reason: "missing credential".into() });
+                    previous.remove(name);
+                    unavailable.insert(name.clone(), Readiness::MissingCredential { reason: "missing credential".into() });
                 }
                 Err(error) => return Err(error),
                 Ok(()) => {}
@@ -279,7 +276,7 @@ impl Supervisor {
                 _ => {}
             }
         }
-        for provider in &spec.configuration.providers {
+        for provider in spec.configuration.providers.values() {
             for value in provider.settings.values() {
                 remember_settings(value, &mut masker);
             }
@@ -287,7 +284,7 @@ impl Supervisor {
         let mut generation = 0;
         loop {
             let mut child = None;
-            if let HostConnection::Managed { command, runtime, proxy_environment } = &spec.connection {
+            if let HostConnection::Managed { command, runtime } = &spec.connection {
                 if let Some(runtime) = runtime
                     && !self.detector.available(runtime).await
                 {
@@ -296,18 +293,8 @@ impl Supervisor {
                     continue;
                 }
                 let _ = tokio::fs::remove_file(&socket).await;
-                let mut args = vec![];
-                // env is used solely to attach the embedder's proxy environment;
-                // direct credentials always travel over the authenticated socket.
-                let executable = if proxy_environment.is_empty() {
-                    command[0].as_str()
-                } else {
-                    args.push("--".to_owned());
-                    args.extend(proxy_environment.iter().map(|(k, v)| format!("{k}={v}")));
-                    args.push(command[0].clone());
-                    "env"
-                };
-                args.extend_from_slice(&command[1..]);
+                let executable = command[0].as_str();
+                let mut args = command[1..].to_vec();
                 args.extend(["--unix".to_owned(), socket.to_string_lossy().into_owned()]);
                 let refs: Vec<_> = args.iter().map(String::as_str).collect();
                 match self
@@ -324,9 +311,13 @@ impl Supervisor {
                 }
             }
             let mut initialized = false;
-            let mut incarnation = None;
             let mut previous = BTreeMap::new();
             let mut changes = self.credentials.changes();
+            // The host receives the document without server-only keys.
+            let mut document = spec.configuration.clone();
+            for provider in document.providers.values_mut() {
+                provider.credential = None;
+            }
             loop {
                 if let Some(child) = &mut child
                     && !matches!(child.try_wait(), Ok(None))
@@ -334,46 +325,30 @@ impl Supervisor {
                     break;
                 }
                 let result = async {
-                    let discovered = raw_client.provider_hello().await?;
-                    if initialized && incarnation != discovered.incarnation {
-                        initialized = false;
-                    }
-                    incarnation = discovered.incarnation;
-                    let raw_hello = discovered.hello;
-                    // The independent host owns loader instances. Missing bindings
-                    // after restart invalidate the server's remote trait handles.
-                    if initialized && spec.configuration.providers.iter().any(|p| !raw_hello.providers.iter().any(|d| d.provider == p.name))
-                    {
+                    let raw_hello = raw_client.hello().await?;
+                    // A host that lost its providers, for example by restarting,
+                    // invalidates the server's remote providers.
+                    let listed = raw_client.providers().await?;
+                    if initialized && spec.configuration.providers.keys().any(|name| !listed.iter().any(|d| &d.provider == name)) {
                         initialized = false;
                     }
                     if !initialized {
+                        raw_client.configure(ConfigUpdate::Replace(document.clone())).await?;
                         client.reconnect(runtime::remote::registry(raw_client.clone(), &raw_hello)).await;
-                    }
-                    // Runtime calls carry their own deadlines; remote factories use the host client's.
-                    let hello = client.hello().await?;
-                    for provider in &hello.providers {
-                        if matches!(provider.readiness, Readiness::MissingCredential { .. }) {
-                            previous.remove(&provider.provider);
-                        }
-                    }
-                    if !initialized {
-                        client.configure(&spec.configuration).await?;
+                        // Runtime calls carry their own deadlines.
+                        client.configure(ConfigUpdate::Replace(spec.configuration.clone())).await?;
                         generation += 1;
                         initialized = true;
                         previous.clear();
                     }
-                    let mut unavailable = self.refresh(&spec, &client, &mut previous, &mut masker).await?;
-                    let mut hello = client.hello().await?;
-                    // The host reports its live module versions and host-level readiness.
-                    let raw_hello = raw_client.hello().await?;
-                    hello.modules = raw_hello.modules;
-                    hello.loadable_modules = raw_hello.loadable_modules;
-                    for provider in &mut hello.providers {
-                        if let Some(raw) = raw_hello.providers.iter().find(|raw| raw.provider == provider.provider)
-                            && !matches!(raw.readiness, Readiness::Ready | Readiness::MissingCredential { .. })
-                        {
-                            provider.readiness = raw.readiness.clone();
+                    for provider in client.providers().await? {
+                        if matches!(provider.readiness, Readiness::MissingCredential { .. }) {
+                            previous.remove(&provider.provider);
                         }
+                    }
+                    let mut unavailable = self.refresh(&spec, &client, &mut previous, &mut masker).await?;
+                    let mut providers = client.providers().await?;
+                    for provider in &mut providers {
                         match &mut provider.readiness {
                             Readiness::Ready => {}
                             Readiness::MissingTool { reason }
@@ -385,18 +360,12 @@ impl Supervisor {
                             provider.readiness = readiness;
                         }
                     }
-                    Ok::<_, client::Error>(hello)
+                    Ok::<_, client::Error>((raw_hello.loadable_modules, providers))
                 }
                 .await;
                 let readiness = match result {
-                    Ok(hello) => {
-                        status.send_replace(HostStatus {
-                            readiness: Readiness::Ready,
-                            modules: hello.modules,
-                            loadable_modules: hello.loadable_modules,
-                            providers: hello.providers,
-                            generation,
-                        });
+                    Ok((loadable_modules, providers)) => {
+                        status.send_replace(HostStatus { readiness: Readiness::Ready, loadable_modules, providers, generation });
                         None
                     }
                     Err(client::Error::VersionMismatch) => {

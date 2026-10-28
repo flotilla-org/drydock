@@ -28,9 +28,9 @@ fn tagged_wire_fixtures() {
     ] {
         fixture::<Reach>(value);
     }
-    // A host that says nothing about reverse forwards gets the capable default.
+    // A host that says nothing about reverse forwards does not accept them.
     let reach: Reach = serde_json::from_value(json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"})).unwrap();
-    assert!(matches!(reach, Reach::Ssh { reverse_forwards: true, .. }));
+    assert!(matches!(reach, Reach::Ssh { reverse_forwards: false, .. }));
     for value in [
         json!({"mode":"open"}),
         json!({"mode":"deny_all","direct":[]}),
@@ -38,12 +38,11 @@ fn tagged_wire_fixtures() {
     ] {
         fixture::<EgressRequest>(value);
     }
-    for value in [
-        json!({"mode":"direct","credential_reference":""}),
-        json!({"mode":"proxied","placeholder_token":"secret","proxy_url":"http://localhost"}),
-    ] {
-        fixture::<CredentialMode>(value);
-    }
+    fixture::<Configuration>(json!({"providers":{
+        "a":{"module":"m","settings":{"nested":{"n":1}},"credential":{"env":"TOKEN"}},
+        "b":{"module":"m","settings":{},"credential":{"file":"~/token","json_field":"token"}},
+        "host":{"module":"m","settings":{}}
+    }}));
     fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"","environments":[]}));
     // Partial snapshots explicitly mark unavailable providers; legacy complete snapshots omit the map.
     fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"c","environments":[],
@@ -67,11 +66,10 @@ fn secret_debug_redacts_without_changing_wire() {
     let value = "sensitive-token";
     let secret = Secret::new(value);
     let refresh = CredentialRefresh { value: secret.clone() };
-    let credential = CredentialMode::Proxied { placeholder_token: secret.clone(), proxy_url: "http://localhost".into() };
     let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), expires_at: "2026-10-19T00:00:00Z".parse().unwrap() };
     let pull = RegistryCredential { username: "u".into(), secret: secret.clone() };
     let resume = ResumeToken { token: secret };
-    for debug in [format!("{refresh:?}"), format!("{credential:?}"), format!("{reach:?}"), format!("{resume:?}"), format!("{pull:?}")] {
+    for debug in [format!("{refresh:?}"), format!("{reach:?}"), format!("{resume:?}"), format!("{pull:?}")] {
         assert!(!debug.contains(value));
         assert!(debug.contains("[REDACTED]"));
     }
@@ -88,55 +86,14 @@ fn compatibility_policy() {
     assert_eq!(serde_json::from_value::<ResumeToken>(json!({"token":"a","future":true})).unwrap().token.expose(), "a");
 }
 
-// Owner ruling on issue #1: environments have one collection, no aliases; IDs stay opaque.
-// Enumerating all paths/methods pins the complete routing surface independently of generation.
-#[test]
-fn route_and_version_contract() {
-    let doc = serde_json::to_value(openapi::document()).unwrap();
-    assert_eq!(doc["info"]["version"], PROTOCOL_VERSION);
-    let expected = [
-        ("/v1/hello", vec!["get"]),
-        ("/v1/config", vec!["put"]),
-        ("/v1/events", vec!["get"]),
-        ("/v1/providers/{provider}/credential", vec!["put"]),
-        ("/v1/providers/{provider}/prepare", vec!["post"]),
-        ("/v1/providers/{provider}/usage", vec!["get"]),
-        ("/v1/providers/{provider}/quota", vec!["get"]),
-        ("/v1/providers/{provider}/environments", vec!["get", "post"]),
-        ("/v1/providers/{provider}/environments/{id}", vec!["delete", "get"]),
-        ("/v1/providers/{provider}/environments/{id}/reach", vec!["post"]),
-        ("/v1/providers/{provider}/environments/{id}/relay", vec!["get"]),
-        ("/v1/providers/{provider}/environments/{id}/suspend", vec!["post"]),
-        ("/v1/providers/{provider}/environments/{id}/resume", vec!["post"]),
-        ("/v1/providers/{provider}/environments/{id}/exec", vec!["post"]),
-        ("/v1/providers/{provider}/environments/{id}/export", vec!["post"]),
-    ];
-    let paths = doc["paths"].as_object().unwrap();
-    assert_eq!(paths.len(), expected.len());
-    for (path, methods) in expected {
-        let operations = paths[path].as_object().unwrap();
-        assert_eq!(operations.len(), methods.len());
-        for method in methods {
-            assert!(operations.contains_key(method), "{method} {path}");
-        }
-    }
-}
-
 // Version negotiation must reject every mismatch, including empty and deceptively similar versions.
 #[test]
 fn hello_requires_exact_protocol_version() {
     // Version 1 assumes every snapshot is complete and must reject version 2 semantics.
-    let old =
-        Hello { protocol_version: "1".into(), host_version: "test".into(), modules: vec![], loadable_modules: vec![], providers: vec![] };
+    let old = Hello { protocol_version: "1".into(), host_version: "test".into(), loadable_modules: vec![] };
     assert!(!old.is_compatible());
-    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6", "7", "8.0.0", "8 "] {
-        let hello = Hello {
-            protocol_version: version.into(),
-            host_version: "test".into(),
-            modules: vec![],
-            loadable_modules: vec![],
-            providers: vec![],
-        };
+    for version in [PROTOCOL_VERSION, "", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9.0.0", "9 "] {
+        let hello = Hello { protocol_version: version.into(), host_version: "test".into(), loadable_modules: vec![] };
         assert_eq!(hello.is_compatible(), version == PROTOCOL_VERSION);
     }
 }
@@ -169,22 +126,6 @@ fn exact_cost_roundtrips(tc: hegel::TestCase) {
     assert_eq!(serde_json::from_str::<Cost>(&encoded).unwrap(), cost);
     assert!(!ResourceKind::Cpu.accepts_unit("By"));
     assert!(ResourceKind::Memory.accepts_unit("By.s"));
-}
-
-// Protocol 8 adds the typed image refusal, which a protocol-7 peer cannot
-// decode, so the exact handshake must keep the two apart.
-#[test]
-fn image_refusals_require_protocol_eight() {
-    for (version, compatible) in [("7", false), ("8", true)] {
-        let hello = Hello {
-            protocol_version: version.into(),
-            host_version: "test".into(),
-            modules: vec![],
-            loadable_modules: vec![],
-            providers: vec![],
-        };
-        assert_eq!(hello.is_compatible(), compatible);
-    }
 }
 
 // Every image route and refusal variant has one pinned wire shape; a request

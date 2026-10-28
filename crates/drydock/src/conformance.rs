@@ -2,7 +2,7 @@
 //! The caller configures/authenticates the client and owns the host's lifetime.
 use drydock_client::{
     Client, Error, Method, Records,
-    api::{ProviderApi, Provisioned},
+    api::{ConfigUpdate, ProviderApi, Provisioned},
 };
 use drydock_protocol::*;
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ pub struct Options {
     #[serde(default)]
     pub scenarios: Vec<Scenario>,
     /// Full non-secret fixture configuration, only used by the host-contract suite.
-    pub fixture_configuration: Option<HostConfiguration>,
+    pub fixture_configuration: Option<Configuration>,
     pub null_environment_id: Option<String>,
     pub auth_audit: Option<Vec<String>>,
     #[serde(default = "default_sample_millis")]
@@ -324,13 +324,16 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         }
     };
     report.record("hello", Ok(()));
-    let Some(declaration) = hello.providers.iter().find(|d| d.provider == provider) else {
-        report.record("hello", Err("provider absent".into()));
-        return report;
+    let declaration = match client.provider(provider).await {
+        Ok(declaration) => declaration,
+        Err(error) => {
+            report.record("provider", Err(error.category()));
+            return report;
+        }
     };
     let caps = &declaration.capabilities;
     if options.selected(Scenario::Capabilities) {
-        report.record("capabilities", capabilities(&hello, provider));
+        report.record("capabilities", capabilities(&hello, &declaration));
     }
     if options.selected(Scenario::Authentication) {
         report.record("authentication", authentication(client, Duration::from_secs(options.timeouts.request_seconds)).await);
@@ -471,13 +474,12 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
     )?;
     Ok(first)
 }
-fn capabilities(hello: &Hello, provider: &str) -> Result<()> {
-    let declaration = hello.providers.iter().find(|d| d.provider == provider).ok_or("provider absent")?;
+fn capabilities(hello: &Hello, declaration: &ProviderDeclaration) -> Result<()> {
     let c = &declaration.capabilities;
     require(
         matches!(declaration.readiness, Readiness::Ready)
-            && hello.modules.iter().any(|m| m.name == declaration.module && !m.version.is_empty()),
-        "provider readiness or loaded module declaration invalid",
+            && hello.loadable_modules.iter().any(|m| m.name == declaration.module && !m.version.is_empty()),
+        "provider readiness or loadable module declaration invalid",
     )?;
     require(
         !c.material_modes.is_empty()

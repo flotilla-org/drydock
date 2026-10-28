@@ -1,6 +1,10 @@
-//! Private REST client implementing the policy-free provider traits.
+//! Provider traits over a host's public API: the routes a client would use
+//! against the server, each call carrying its credential as `Drydock-Credential`.
 use super::module::*;
-use crate::client::{Client, Error};
+use crate::{
+    api::ProviderApi,
+    client::{Client, Error},
+};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use std::sync::Arc;
@@ -25,7 +29,11 @@ struct RemoteModule {
     client: Client,
     module: LoadableModule,
 }
+/// The host's modules. Configuring one configures the host's provider of that
+/// name, without the server-only credential key.
 pub fn registry(client: Client, hello: &Hello) -> Registry {
+    // The runtime owns each call's deadline; the host transport adds none.
+    let client = client.with_request_timeout(std::time::Duration::MAX);
     hello
         .loadable_modules
         .iter()
@@ -40,48 +48,41 @@ impl Module for RemoteModule {
     fn smallest_size(&self) -> Size {
         self.module.smallest_size.clone()
     }
-    async fn configure(&self, c: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        let configured = self.client.configure_provider(&self.module.name, c).await.map_err(error)?;
-        let facts = configured.facts;
+    async fn configure(&self, name: &str, config: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+        let config = ProviderConfiguration { credential: None, ..config.clone() };
+        let patch = serde_json::json!({ "providers": { name: config } });
+        self.client.configure(crate::api::ConfigUpdate::MergePatch(patch)).await.map_err(error)?;
+        let declaration = self.client.provider(name).await.map_err(error)?;
         Ok(Arc::new(RemoteProvider {
             client: self.client.clone(),
-            name: configured.instance,
-            readiness: std::sync::Mutex::new(facts.readiness.clone()),
-            facts,
+            readiness: std::sync::Mutex::new(declaration.readiness.clone()),
+            declaration,
         }))
     }
 }
 struct RemoteProvider {
     client: Client,
-    name: String,
-    facts: Facts,
+    declaration: ProviderDeclaration,
     readiness: std::sync::Mutex<Readiness>,
 }
-impl Drop for RemoteProvider {
-    fn drop(&mut self) {
-        let client = self.client.clone();
-        let instance = self.name.clone();
-        // Releasing a loader handle is not a provider operation and never
-        // destroys vendor resources. Unique handles make rollback race-free.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = client.release_provider(&instance).await;
-            });
-        } else {
-            tracing::debug!("provider handle release skipped: no Tokio runtime");
-        }
+impl RemoteProvider {
+    fn host(&self, c: &Credentials) -> Client {
+        self.client.clone().credentialed(c.token().cloned())
+    }
+    fn name(&self) -> &str {
+        &self.declaration.provider
     }
 }
 #[async_trait]
 impl Provider for RemoteProvider {
     fn capabilities(&self) -> Capabilities {
-        self.facts.capabilities.clone()
+        self.declaration.capabilities.clone()
     }
     fn observation(&self) -> ObservationMode {
-        self.facts.observation
+        self.declaration.observation
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
-        self.facts.rate_limits.clone()
+        self.declaration.rate_limits.clone()
     }
     fn readiness(&self, c: &Credentials) -> Readiness {
         let readiness = self.readiness.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -91,80 +92,74 @@ impl Provider for RemoteProvider {
         if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
     }
     async fn refresh_readiness(&self, c: &Credentials) {
-        let readiness = match self.client.provider_call::<Facts, _>(&self.name, "facts", (), c).await {
-            Ok(facts) => facts.readiness,
+        let readiness = match self.host(c).provider(self.name()).await {
+            Ok(declaration) => declaration.readiness,
             Err(e) => Readiness::Unknown { reason: format!("provider host unavailable: {e}") },
         };
         *self.readiness.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = readiness;
     }
     fn operations(&self) -> Operations<'_> {
-        let c = &self.facts.ports;
+        let ports = &self.declaration.ports;
         Operations {
-            exec: c.exec.then_some(self),
-            suspend_resume: c.suspend_resume.then_some(self),
-            export: c.export.then_some(self),
-            usage: c.usage.then_some(self),
-            quota: c.quota.then_some(self),
+            exec: ports.exec.then_some(self),
+            suspend_resume: ports.suspend_resume.then_some(self),
+            export: ports.export.then_some(self),
+            usage: ports.usage.then_some(self),
+            quota: ports.quota.then_some(self),
         }
     }
-    async fn run(&self, context: PushContext) -> Result<()> {
-        self.client.provider_updates(&self.name, &context.credentials, context.events).await.map_err(error)
-    }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-        self.client.provider_call(&self.name, "prepare", request, c).await.map_err(mutation)
+        self.host(c).prepare(self.name(), &request).await.map_err(mutation)
     }
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        self.client.provider_call(&self.name, "provision", request, c).await.map_err(mutation)
+        self.host(c).provision(self.name(), &request).await.map_err(mutation)
     }
-    async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
-        self.client.provider_call(&self.name, "list", (), c).await.map_err(error)
+    async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
+        self.host(c).list(self.name()).await.map_err(error)
     }
-    async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        self.client.provider_call(&self.name, "inspect", id, c).await.map_err(error)
-    }
-    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        self.client.provider_call(&self.name, "inspect-after-lifecycle", id, c).await.map_err(error)
+    async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
+        self.host(c).inspect(self.name(), id).await.map_err(error)
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        self.client.provider_call(&self.name, "destroy", id, c).await.map_err(mutation)
+        self.host(c).destroy(self.name(), id).await.map_err(mutation)
     }
-    async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
-        self.client.provider_call(&self.name, "reach", id, c).await.map_err(error)
+    async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
+        self.host(c).reach(self.name(), id).await.map_err(error)
     }
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-        self.client.provider_stream(&self.name, "relay", id, c, "drydock-relay").await.map_err(error)
+        self.host(c).relay(self.name(), id).await.map_err(error)
     }
 }
 #[async_trait]
 impl Exec for RemoteProvider {
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream> {
-        self.client.provider_stream(&self.name, "exec", (id, request), c, "drydock-stream").await.map_err(mutation)
+        self.host(c).exec(self.name(), id, &request).await.map_err(mutation)
     }
 }
 #[async_trait]
 impl SuspendResume for RemoteProvider {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        self.client.provider_call(&self.name, "suspend", id, c).await.map_err(mutation)
+        self.host(c).suspend(self.name(), id).await.map_err(mutation)
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        self.client.provider_call(&self.name, "resume", (id, token), c).await.map_err(mutation)
+        self.host(c).resume(self.name(), id, &token).await.map_err(mutation)
     }
 }
 #[async_trait]
 impl ExportOperation for RemoteProvider {
     async fn export(&self, id: &str, c: &Credentials) -> Result<Export> {
-        self.client.provider_call(&self.name, "export", id, c).await.map_err(mutation)
+        self.host(c).export(self.name(), id).await.map_err(mutation)
     }
 }
 #[async_trait]
 impl UsageOperation for RemoteProvider {
     async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
-        self.client.provider_call(&self.name, "usage", period, c).await.map_err(error)
+        self.host(c).usage(self.name(), &period).await.map_err(error)
     }
 }
 #[async_trait]
 impl QuotaOperation for RemoteProvider {
     async fn quota(&self, c: &Credentials) -> Result<Quota> {
-        self.client.provider_call(&self.name, "quota", (), c).await.map_err(error)
+        self.host(c).quota(self.name()).await.map_err(error)
     }
 }

@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn config_text(socket_credential: &std::path::Path) -> String {
     format!(
         r#"
-[provider.demo]
+[providers.demo]
 module = "reference"
 credential = {{ file = {:?} }}
 image = "image@sha256:{}"
@@ -21,7 +21,7 @@ settings = {{
   fixture = true,
   poll_interval_ms = 10,
 }}
-[provider.other]
+[providers.other]
 module = "reference"
 credential = {{ env = "PATH" }}
 image = "image@sha256:{}"
@@ -31,22 +31,6 @@ settings = {{}}
         "a".repeat(64),
         "a".repeat(64)
     )
-}
-async fn raw_provider(client: &Client, config: &Config, name: &str) -> String {
-    let provider = &config.provider[name];
-    client
-        .configure_provider(
-            &provider.module,
-            &ProviderConfiguration {
-                name: name.into(),
-                module: provider.module.clone(),
-                settings: provider.settings.clone(),
-                credential: CredentialMode::Direct { credential_reference: name.into() },
-            },
-        )
-        .await
-        .unwrap()
-        .instance
 }
 async fn reference(dir: &std::path::Path) -> (std::path::PathBuf, tokio::task::JoinHandle<()>) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -173,13 +157,8 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     assert_eq!(request.egress, EgressRequest::Open);
     // Change provider state directly while no CLI process is running. The host
     // server poller, rather than a CLI read, must emit the stopped transition.
-    let upstream = Client::unix(host).unwrap();
-    let credentials = drydock_provider::Credentials {
-        mode: CredentialMode::Direct { credential_reference: "demo".into() },
-        value: Some(Secret::new("test-token")),
-    };
-    let handle = raw_provider(&upstream, &Config::parse(&config_text(&token)).unwrap(), "demo").await;
-    let resume: ResumeToken = upstream.provider_call(&handle, "suspend", &environment.id, &credentials).await.unwrap();
+    let upstream = Client::unix(host).unwrap().credentialed(Some(Secret::new("test-token")));
+    let resume = upstream.suspend("demo", &environment.id).await.unwrap();
     let event = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(ObserveRecord::Event { event }) = records.next().await.unwrap()
@@ -193,7 +172,7 @@ async fn cli_starts_reuses_and_observes_between_calls() {
     .await
     .unwrap();
     assert_eq!(event.provider, "demo");
-    upstream.provider_call::<(), _>(&handle, "resume", (&environment.id, resume), &credentials).await.unwrap();
+    upstream.resume("demo", &environment.id, &resume).await.unwrap();
     let inspected = json(cli(&config, &socket, &shim, &["inspect", "demo", &environment.id]).await);
     assert_eq!(inspected["id"], environment.id);
     let shell = cli(&config, &socket, &shim, &["shell", "demo", &environment.id]).await;
@@ -267,7 +246,7 @@ async fn daemon_routes_provider_api_and_streams() {
     let (socket, task) = reference(dir.path()).await;
     let token = dir.path().join("token");
     std::fs::write(&token, "token").unwrap();
-    let config = Config::parse(&(config_text(&token) + "\n[provider.missing]\nmodule='absent'\ncredential={env='PATH'}\n")).unwrap();
+    let config = Config::parse(&(config_text(&token) + "\n[providers.missing]\nmodule='absent'\ncredential={env='PATH'}\n")).unwrap();
     let run = dir.path().join("run");
     let daemon = Daemon::start(
         config,
@@ -277,9 +256,9 @@ async fn daemon_routes_provider_api_and_streams() {
     )
     .await
     .unwrap();
-    assert_eq!(daemon.providers()[2]["readiness"]["status"], "ready");
-    let missing = daemon.providers().as_array().unwrap().iter().find(|p| p["provider"] == "missing").unwrap().clone();
-    assert_eq!(missing["readiness"]["status"], "missing_tool");
+    assert!(matches!(daemon.providers()[2].readiness, Readiness::Ready));
+    let missing = daemon.providers().into_iter().find(|p| p.provider == "missing").unwrap();
+    assert!(matches!(missing.readiness, Readiness::MissingTool { .. }));
     let path = run.join("api.sock");
     let api = daemon.clone();
     let bind = path.clone();
@@ -305,7 +284,7 @@ async fn daemon_routes_provider_api_and_streams() {
     assert!(
         matches!(client.list("missing").await,Err(drydock::client::Error::Protocol(ProtocolError::Unavailable {reason,..})) if reason.contains("missing tool"))
     );
-    assert!(client.credential("demo", Secret::new("bad")).await.is_err());
+    assert!(client.configure(drydock::api::ConfigUpdate::Replace(Configuration::default())).await.is_err());
     let command: ExecRequest = serde_json::from_value(serde_json::json!({"command":["echo","hello"],"env":{},"cwd":null})).unwrap();
     for api in [daemon.clone() as std::sync::Arc<dyn ProviderApi>, std::sync::Arc::new(client.clone())] {
         assert_eq!(api.inspect("demo", &env.id).await.unwrap(), env);
@@ -403,14 +382,14 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
                 }
                 _ => {
                     if let Some(env) = model.get(&(p, label)) {
-                        assert_eq!(&api.inspect(provider, &env.id).await.unwrap(), env);
+                        assert_eq!(api.inspect(provider, &env.id).await.unwrap(), *env);
                     } else {
                         assert!(api.inspect(provider, "absent").await.is_err());
                     }
                 }
             }
             for (p, provider) in ["demo", "other"].into_iter().enumerate() {
-                let mut actual = api.list(provider).await.unwrap();
+                let mut actual: Vec<_> = api.list(provider).await.unwrap();
                 actual.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut expected: Vec<_> = model.iter().filter(|((owner, _), _)| *owner == p).map(|(_, e)| e.clone()).collect();
                 expected.sort_by(|a, b| a.id.cmp(&b.id));
@@ -431,7 +410,7 @@ async fn cli_preserves_masked_provider_diagnostics() {
     let token = dir.path().join("token");
     std::fs::write(&token, "test-secret-value").unwrap();
     let text = format!(
-        r#"[provider.broken]
+        r#"[providers.broken]
 module="reference"
 credential={{file={:?}}}
 settings={{fault={{kind="internal",reason="HTTP 400 vendor validation",provider_error="test-secret-value rejected"}}}}
@@ -486,11 +465,11 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     let (socket, task) = reference(dir.path()).await;
     let token = dir.path().join("token");
     std::fs::write(&token, "token").unwrap();
-    let config = Config::parse(&(config_text(&token) + "\n[provider.python]\nmodule='python-only'\ncredential={env='PATH'}\n")).unwrap();
+    let config = Config::parse(&(config_text(&token) + "\n[providers.python]\nmodule='python-only'\ncredential={env='PATH'}\n")).unwrap();
     let broken = |optional| HostOption {
         name: "python".into(),
         optional,
-        connection: HostConnection::Managed { command: vec!["/bin/false".into()], runtime: None, proxy_environment: Default::default() },
+        connection: HostConnection::Managed { command: vec!["/bin/false".into()], runtime: None },
     };
     let run = dir.path().join("run");
     let daemon = Daemon::start_with_resolver(
@@ -505,10 +484,9 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     )
     .await
     .unwrap();
-    assert_eq!(daemon.providers()[0]["readiness"]["status"], "ready");
-    let row = daemon.providers().as_array().unwrap().iter().find(|p| p["provider"] == "python").unwrap().clone();
-    assert_eq!(row["readiness"]["status"], "missing_tool");
-    assert!(row["readiness"]["reason"].as_str().unwrap().contains("optional host unavailable"));
+    assert!(matches!(daemon.providers()[0].readiness, Readiness::Ready));
+    let row = daemon.providers().into_iter().find(|p| p.provider == "python").unwrap();
+    assert!(matches!(row.readiness, Readiness::MissingTool { reason } if reason.contains("optional host unavailable")));
     assert!(matches!(
         ProviderApi::list(daemon.as_ref(), "python").await,
         Err(drydock::client::Error::NotReady(Readiness::MissingTool { .. }))
@@ -535,9 +513,9 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     let (socket, task) = reference(dir.path()).await;
     let image = format!("image@sha256:{}", "a".repeat(64));
     let text = format!(
-        "[provider.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n\
-         [provider.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{agent=true}}\n\
-         [provider.foreign]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\n\
+        "[providers.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n\
+         [providers.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{agent=true}}\n\
+         [providers.foreign]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\n\
          settings={{agent=true, platforms=[{{os='linux', architecture='riscv64'}}]}}\n"
     );
     let run = dir.path().join("run");
@@ -550,8 +528,8 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     .await
     .unwrap();
     let host = Client::unix(&socket).unwrap();
-    let hello = host.hello().await.unwrap();
-    let declares = |name: &str| hello.providers.iter().find(|p| p.provider == name).unwrap().capabilities.agent;
+    let providers = host.providers().await.unwrap();
+    let declares = |name: &str| providers.iter().find(|p| p.provider == name).unwrap().capabilities.agent;
     assert_eq!((declares("plain"), declares("agent")), (false, true));
     daemon.launch("plain", &drydock::launch::LaunchOptions::default()).await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(10), daemon.launch("agent", &drydock::launch::LaunchOptions::default()))
@@ -564,12 +542,7 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     // No build for the prepared platform: refused before anything is created.
     let error = daemon.launch("foreign", &drydock::launch::LaunchOptions::default()).await.err().unwrap().to_string();
     assert!(error.contains("no vessel agent build for linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");
-    let credentials = drydock_provider::Credentials {
-        mode: CredentialMode::Direct { credential_reference: "foreign".into() },
-        value: Some(Secret::new("test-token")),
-    };
-    let handle = raw_provider(&host, &Config::parse(&text).unwrap(), "foreign").await;
-    let rows: Vec<drydock_provider::ObservedEnvironment> = host.provider_call(&handle, "list", (), &credentials).await.unwrap();
+    let rows = host.credentialed(Some(Secret::new("test-token"))).list("foreign").await.unwrap();
     assert!(rows.is_empty());
     task.abort();
 }
@@ -584,7 +557,7 @@ async fn launch_records_the_prepared_platform() {
     let dir = tempfile::tempdir().unwrap();
     let (socket, task) = reference(dir.path()).await;
     let image = format!("image@sha256:{}", "a".repeat(64));
-    let text = format!("[provider.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n");
+    let text = format!("[providers.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n");
     let run = dir.path().join("run");
     let daemon = Daemon::start(
         Config::parse(&text).unwrap(),
@@ -625,24 +598,24 @@ async fn advertised_host(
     let router = host.router().layer(middleware::from_fn(move |req: Request, next: Next| {
         let current = current.clone();
         async move {
-            let hello = req.uri().path() == "/v1/hello";
+            let path = req.uri().path().to_owned();
             let response = next.run(req).await;
-            if !hello {
+            let phase = current.load(std::sync::atomic::Ordering::SeqCst);
+            // One provider's declaration: /v1/providers/{provider}.
+            let declaration = path.starts_with("/v1/providers/") && path.split('/').count() == 4;
+            if phase == 2 && declaration && response.status().is_success() {
+                let (parts, body) = response.into_parts();
+                let mut declaration: ProviderDeclaration = serde_json::from_slice(&to_bytes(body, usize::MAX).await.unwrap()).unwrap();
+                declaration.readiness =
+                    Readiness::Unknown { reason: format!("host diagnostic test-identity nested-setting {}", "界".repeat(20000)) };
+                return axum::response::Response::from_parts(parts, Body::from(serde_json::to_vec(&declaration).unwrap()));
+            }
+            if path != "/v1/hello" {
                 return response;
             }
             let (parts, body) = response.into_parts();
             let mut hello: Hello = serde_json::from_slice(&to_bytes(body, usize::MAX).await.unwrap()).unwrap();
-            let phase = current.load(std::sync::atomic::Ordering::SeqCst);
             let version = if phase > 0 { "upgraded" } else { version };
-            if phase == 2 {
-                for p in &mut hello.providers {
-                    p.readiness =
-                        Readiness::Unknown { reason: format!("host diagnostic test-identity nested-setting {}", "界".repeat(20000)) };
-                }
-            }
-            for m in &mut hello.modules {
-                m.version = version.into();
-            }
             for m in &mut hello.loadable_modules {
                 m.version = version.into();
             }
@@ -665,29 +638,29 @@ async fn advertised_host(
     (socket, task, state)
 }
 
-async fn discovery_contract(api: std::sync::Arc<dyn ProviderApi>, recovered: bool) -> Hello {
+async fn discovery_contract(api: std::sync::Arc<dyn ProviderApi>, recovered: bool) -> (Hello, Vec<ProviderDeclaration>) {
     let hello = api.hello().await.unwrap();
+    let providers = api.providers().await.unwrap();
     assert!(hello.is_compatible());
-    assert_eq!(hello.providers.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["demo", "missing", "other", "recover"]);
-    assert_eq!(hello.modules.iter().map(|m| (m.name.as_str(), m.version.as_str())).collect::<Vec<_>>(), [("reference", "first")]);
+    assert_eq!(providers.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["demo", "missing", "other", "recover"]);
     assert_eq!(
         hello.loadable_modules.iter().map(|m| (m.name.as_str(), m.version.as_str())).collect::<Vec<_>>(),
         [("reference", "first"), ("unused-first", "first"), ("unused-second", "second")]
     );
-    let missing = &hello.providers[1];
+    let missing = &providers[1];
     assert!(
         matches!(&missing.readiness, Readiness::MissingTool { reason } if reason.len() <= 16384 && reason.contains("optional host protocol version mismatch"))
     );
     assert!(missing.capabilities.platforms.is_empty());
     assert!(missing.capabilities.material_modes.is_empty());
     assert!(!missing.capabilities.agent && !missing.capabilities.quota && !missing.capabilities.usage);
-    assert!(matches!(hello.providers[0].readiness, Readiness::Ready));
+    assert!(matches!(providers[0].readiness, Readiness::Ready));
     if recovered {
-        assert!(matches!(hello.providers[3].readiness, Readiness::Ready));
+        assert!(matches!(providers[3].readiness, Readiness::Ready));
     } else {
-        assert!(matches!(hello.providers[3].readiness, Readiness::MissingCredential { .. }));
+        assert!(matches!(providers[3].readiness, Readiness::MissingCredential { .. }));
     }
-    hello
+    (hello, providers)
 }
 
 // Discovery is identical through an object-safe embedded API (before any daemon
@@ -705,7 +678,7 @@ async fn typed_discovery_parity_and_recovery() {
     let token = dir.path().join("token");
     let recovery = dir.path().join("recover");
     std::fs::write(&token, "test-identity").unwrap();
-    let config = Config::parse(&(config_text(&token).replace("fixture = true,", "fixture = true, reach = {kind = 'relay', path = 'nested-setting'},") + &format!("\n[provider.missing]\nmodule='absent'\ncredential={{file={:?}}}\n[provider.recover]\nmodule='reference'\ncredential={{file={:?}}}\nsettings={{fixture=true}}\n", token, recovery))).unwrap();
+    let config = Config::parse(&(config_text(&token).replace("fixture = true,", "fixture = true, reach = {kind = 'relay', path = 'nested-setting'},") + &format!("\n[providers.missing]\nmodule='absent'\ncredential={{file={:?}}}\n[providers.recover]\nmodule='reference'\ncredential={{file={:?}}}\nsettings={{fixture=true}}\n", token, recovery))).unwrap();
     let run = dir.path().join("run");
     let options = [("first", first), ("second", second), ("bad", bad)]
         .into_iter()
@@ -732,7 +705,7 @@ async fn typed_discovery_parity_and_recovery() {
     assert_eq!(discovery_contract(remote.clone(), false).await, expected);
     std::fs::write(&recovery, "recovered-test-identity").unwrap();
     for _ in 0..400 {
-        if matches!(embedded.hello().await.unwrap().providers[3].readiness, Readiness::Ready) {
+        if matches!(embedded.providers().await.unwrap()[3].readiness, Readiness::Ready) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -740,30 +713,29 @@ async fn typed_discovery_parity_and_recovery() {
     assert_eq!(discovery_contract(embedded.clone(), true).await, discovery_contract(remote.clone(), true).await);
     phase.store(1, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..400 {
-        if embedded.hello().await.unwrap().modules[0].version == "upgraded" {
+        if embedded.hello().await.unwrap().loadable_modules[0].version == "upgraded" {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let upgraded = embedded.hello().await.unwrap();
-    assert_eq!(upgraded.modules[0].version, "upgraded");
     assert_eq!(upgraded.loadable_modules[0].version, "upgraded");
     assert!(!upgraded.loadable_modules.iter().any(|m| m.name == "unused-first"));
     assert_eq!(upgraded, remote.hello().await.unwrap());
     phase.store(2, std::sync::atomic::Ordering::SeqCst);
     for _ in 0..400 {
-        if matches!(embedded.hello().await.unwrap().providers[0].readiness, Readiness::Unknown { .. }) {
+        if matches!(embedded.providers().await.unwrap()[0].readiness, Readiness::Unknown { .. }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let diagnostic = embedded.hello().await.unwrap();
-    let Readiness::Unknown { reason } = &diagnostic.providers[0].readiness else {
+    let diagnostic = embedded.providers().await.unwrap();
+    let Readiness::Unknown { reason } = &diagnostic[0].readiness else {
         panic!("expected host diagnostic");
     };
     assert!(reason.len() <= 16384 && reason.contains("host diagnostic") && reason.contains("<REDACTED>"));
     assert!(!reason.contains("test-identity") && !reason.contains("nested-setting"));
-    assert_eq!(diagnostic, remote.hello().await.unwrap());
+    assert_eq!(diagnostic, remote.providers().await.unwrap());
     server.abort();
     first_task.abort();
     second_task.abort();
@@ -776,18 +748,19 @@ async fn typed_discovery_parity_and_recovery() {
 async fn discovery_without_hosts_or_listener() {
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
-    for text in ["", "[provider.unavailable]\nmodule='absent'\ncredential={env='DRYDOCK_TEST_MISSING_CREDENTIAL'}\n"] {
+    for text in ["", "[providers.unavailable]\nmodule='absent'\ncredential={env='DRYDOCK_TEST_MISSING_CREDENTIAL'}\n"] {
         let run = dir.path().join(if text.is_empty() { "empty" } else { "configured" });
         let api: Arc<dyn ProviderApi> = Daemon::start(Config::parse(text).unwrap(), &run, run.join("keys"), vec![]).await.unwrap();
         let hello = api.hello().await.unwrap();
         assert!(hello.is_compatible());
-        assert!(hello.modules.is_empty() && hello.loadable_modules.is_empty());
+        assert!(hello.loadable_modules.is_empty());
+        let providers = api.providers().await.unwrap();
         if text.is_empty() {
-            assert!(hello.providers.is_empty());
+            assert!(providers.is_empty());
         } else {
-            assert_eq!(hello.providers.len(), 1);
-            assert_eq!(hello.providers[0].provider, "unavailable");
-            assert!(matches!(hello.providers[0].readiness, Readiness::MissingTool { .. }));
+            assert_eq!(providers.len(), 1);
+            assert_eq!(providers[0].provider, "unavailable");
+            assert!(matches!(providers[0].readiness, Readiness::MissingTool { .. }));
         }
         assert!(!run.join("api.sock").exists());
     }

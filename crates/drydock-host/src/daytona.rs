@@ -82,7 +82,7 @@ impl Module for DaytonaModule {
     fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
     }
-    async fn configure(&self, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+    async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings = serde_json::from_value(json!(config.settings)).map_err(|_| refused("invalid Daytona settings"))?;
         if !(1..=4).contains(&settings.tier)
             || settings.organization_id.is_empty()
@@ -96,7 +96,7 @@ impl Module for DaytonaModule {
         for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
             endpoint_url(endpoint, true)?;
         }
-        Ok(Arc::new(Daytona { name: config.name.clone(), settings, http }))
+        Ok(Arc::new(Daytona { name: name.to_owned(), settings, http }))
     }
 }
 pub struct Daytona {
@@ -204,7 +204,7 @@ impl Daytona {
             }
         }
     }
-    fn environment(&self, v: Value) -> Result<ObservedEnvironment> {
+    fn environment(&self, v: Value) -> Result<Environment> {
         let state = match text(&v, "state")? {
             "started" => Observation::Running,
             "creating" | "pulling_snapshot" | "pending_build" | "building_snapshot" => {
@@ -249,37 +249,35 @@ impl Daytona {
             .transpose()?;
         let policy = json!({"block":v.get("networkBlockAll"),"cidrs":v.get("networkAllowList"),"domains":v.get("domainAllowList")});
         let fingerprint = format!("{:x}", Sha256::digest(policy.to_string().as_bytes()));
-        Ok(ObservedEnvironment {
-            egress_policy: Some(fingerprint),
+        Ok(Environment {
+            id: text(&v, "id")?.into(),
+            provider: self.name.clone(),
+            label: v.pointer("/labels/flotilla.label").and_then(Value::as_str).map(str::to_owned),
+            state,
+            granted_size: size,
+            egress: Enforcement::Advisory,
+            // Every Daytona sandbox runs on x86_64 (see `platform`).
+            platform: Some(platform()),
             egress_measured: false,
-            environment: Environment {
-                id: text(&v, "id")?.into(),
-                provider: self.name.clone(),
-                label: v.pointer("/labels/flotilla.label").and_then(Value::as_str).map(str::to_owned),
-                state,
-                granted_size: size,
-                egress: Enforcement::Advisory,
-                // Every Daytona sandbox runs on x86_64 (see `platform`).
-                platform: Some(platform()),
-            },
-            timestamp,
+            egress_policy: Some(fingerprint),
+            timestamp: timestamp.map(Into::into),
         })
     }
     fn check_existing_request(&self, v: &Value, size: &Size, policy: &Value) -> Result<()> {
         let row = self.environment(v.clone())?;
-        if row.environment.granted_size.as_ref() != Some(size) || !policy_matches(v, policy) {
+        if row.granted_size.as_ref() != Some(size) || !policy_matches(v, policy) {
             return Err(refused("existing Daytona label has a different or unknown size/egress policy; provision a new label"));
         }
         Ok(())
     }
-    async fn observed(&self, v: Value, c: &Credentials) -> Result<ObservedEnvironment> {
+    async fn observed(&self, v: Value, c: &Credentials) -> Result<Environment> {
         let deny_all = v.get("networkBlockAll").and_then(Value::as_bool) == Some(true);
         let restricted = deny_all
             || v.get("domainAllowList").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
             || v.get("networkAllowList").and_then(Value::as_str).is_some_and(|s| !s.is_empty() && s != "0.0.0.0/0");
         let mut row = self.environment(v)?;
         if restricted
-            && matches!(row.environment.state, Observation::Running)
+            && matches!(row.state, Observation::Running)
             && let Some(probe) = &self.settings.egress_probe
         {
             // The image probe receives policy mode, so deny-all does not need a
@@ -289,7 +287,7 @@ impl Daytona {
                 if deny_all { "1" } else { "0" },
                 shell_command(&probe.command)
             );
-            let output = self.execute(&row.environment.id, &command, 20, c).await?;
+            let output = self.execute(&row.id, &command, 20, c).await?;
             let proof: Value = serde_json::from_str(&output).map_err(|_| ProtocolError::Internal {
                 reason: "invalid Daytona egress probe response".into(),
                 provider_error: "probe output omitted".into(),
@@ -309,7 +307,7 @@ impl Daytona {
                 && proof["raw_dns"] == false
                 && (deny_all || proof["listed_direct"] == true)
             {
-                row.environment.egress = Enforcement::Enforced;
+                row.egress = Enforcement::Enforced;
             }
             row.egress_measured = true;
         }
@@ -354,7 +352,7 @@ impl Daytona {
     }
     // Lifecycle state checks deliberately avoid explicit inspect's root probe.
     async fn lifecycle_state(&self, id: &str, c: &Credentials) -> Result<Observation> {
-        Ok(self.environment(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?)?.environment.state)
+        Ok(self.environment(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?)?.state)
     }
     async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
         // Observe only successful asynchronous operations. Any failed GET exits
@@ -364,7 +362,7 @@ impl Daytona {
         for _ in 0..60 {
             let raw = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
             match text(&raw, "state")? {
-                "started" => return Ok(self.environment(raw)?.environment),
+                "started" => return self.environment(raw),
                 "error" | "build_failed" | "destroyed" | "destroying" => {
                     return Err(refused("Daytona sandbox entered a terminal state before startup"));
                 }
@@ -577,7 +575,7 @@ impl Provider for Daytona {
         }
     }
     fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval: Duration::from_secs(30) }
+        ObservationMode::Poll { interval_ms: 30_000 }
     }
     fn operations(&self) -> Operations<'_> {
         Operations { exec: Some(self), suspend_resume: Some(self), quota: Some(self), usage: Some(self), ..Operations::default() }
@@ -716,11 +714,11 @@ impl Provider for Daytona {
             // Re-adoption returns the observed stopped/error state unchanged;
             // provision does not implicitly resume an existing label.
             let mut row = self.environment(v)?;
-            if matches!(row.environment.state, Observation::Running) {
+            if matches!(row.state, Observation::Running) {
                 // Every Running re-adoption bootstraps; the guest supervisor's
                 // lock makes this idempotent even across concurrent hosts.
-                self.bootstrap(&row.environment.id, c).await?;
-                row = self.inspect_after_lifecycle(&row.environment.id, c).await?;
+                self.bootstrap(&row.id, c).await?;
+                row = self.inspect(&row.id, c).await?;
             }
             return Ok(Provisioned::Existing(row));
         }
@@ -739,37 +737,31 @@ impl Provider for Daytona {
                 }
                 self.check_existing_request(&v, size, &policy)?;
                 let existing = self.environment(v.clone())?;
-                if matches!(
-                    existing.environment.state,
-                    Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }
-                ) {
+                if matches!(existing.state, Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }) {
                     return Ok(Provisioned::Existing(existing));
                 }
 
                 let row = self.wait_started(text(&v, "id")?, c).await?;
                 self.bootstrap(&row.id, c).await?;
-                return Ok(Provisioned::Existing(self.inspect_after_lifecycle(&row.id, c).await?));
+                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
             }
             Some(v) => v,
         };
         let row = self.wait_started(text(&v, "id")?, c).await?;
         self.bootstrap(&row.id, c).await?;
-        Ok(Provisioned::Created(self.inspect_after_lifecycle(&row.id, c).await?))
+        Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
     }
-    async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
+    async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         self.inventory(None, c).await?.into_iter().map(|v| self.environment(v)).collect()
     }
-    async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        self.observed(self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?, c).await
-    }
-    async fn inspect_after_lifecycle(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
+    async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         let value = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;
         let fallback = self.environment(value.clone())?;
         match self.observed(value, c).await {
             Ok(row) => Ok(row),
             Err(error) => {
                 // This fallback bypasses host error masking: log only its category.
-                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), "lifecycle succeeded; egress measurement failed");
+                tracing::warn!(provider = %self.name, environment = %id, error_class = error.class(), "egress measurement failed");
                 Ok(fallback)
             }
         }
@@ -780,11 +772,11 @@ impl Provider for Daytona {
             Err(e) => Err(e),
         }
     }
-    async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
+    async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
         let mut url = self.sandbox_url(id, Some("ssh-access"))?;
         url.query_pairs_mut().append_pair("expiresInMinutes", SSH_TOKEN_TTL_MINUTES);
         let v = self.call(Method::POST, url, None, c).await?;
-        Ok(Connection::Ssh {
+        Ok(Reach::Ssh {
             endpoint: self.settings.ssh_endpoint.clone(),
             user: Secret::new(text(&v, "token")?),
             host_key: self.settings.ssh_host_key.clone(),

@@ -3,7 +3,8 @@ use crate::{ProtocolError, Secret};
 use base64::{Engine, engine::general_purpose};
 
 const LIMIT: usize = 16 * 1024;
-const URL_RESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
+pub(crate) const URL_RESERVED: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
 
 fn patterns(secrets: &[&str]) -> Vec<String> {
     let mut patterns = Vec::new();

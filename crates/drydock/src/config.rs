@@ -1,6 +1,6 @@
 //! Provider-only user configuration. Module settings are passed through unchanged.
 use crate::credentials::CredentialReference;
-use drydock_protocol::{EgressRequest, Size};
+use drydock_protocol::{Configuration, CredentialLocation, EgressRequest, ProviderConfiguration, Size};
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,19 +8,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The configuration document in TOML, plus the CLI's launch defaults, which
+/// are not part of that document.
 #[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub provider: BTreeMap<String, Provider>,
+    pub providers: BTreeMap<String, Provider>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     pub module: String,
-    pub credential: Credential,
     #[serde(default)]
     pub settings: BTreeMap<String, serde_json::Value>,
+    pub credential: Option<CredentialLocation>,
     pub image: Option<String>,
     #[serde(default)]
     pub size: SizeDefaults,
@@ -29,6 +31,18 @@ pub struct Provider {
     /// server allows it. Defaults to reverse forwards.
     #[serde(default)]
     pub agent_link: crate::agent::AgentLink,
+}
+impl Config {
+    /// The configuration document, without the launch defaults.
+    pub fn document(&self) -> Configuration {
+        let providers = self.providers.iter().map(|(name, p)| (name.clone(), p.configuration())).collect();
+        Configuration { providers }
+    }
+}
+impl Provider {
+    pub fn configuration(&self) -> ProviderConfiguration {
+        ProviderConfiguration { module: self.module.clone(), settings: self.settings.clone(), credential: self.credential.clone() }
+    }
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -91,43 +105,26 @@ impl Egress {
         }
     }
 }
-#[derive(Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Credential {
-    File(FileCredential),
-    Env(EnvCredential),
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileCredential {
-    pub file: PathBuf,
-    pub json_field: Option<String>,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EnvCredential {
-    pub env: String,
-}
-impl Credential {
-    pub fn reference(&self, env: &dyn EnvVars) -> Result<CredentialReference, String> {
-        Ok(match self {
-            Self::File(c) => {
-                let path = if let Ok(rest) = c.file.strip_prefix("~") {
-                    PathBuf::from(env.get_os("HOME").filter(|v| !v.is_empty()).ok_or("HOME required for credential path")?).join(rest)
-                } else {
-                    c.file.clone()
-                };
-                CredentialReference::File { path, json_field: c.json_field.clone() }
-            }
-            Self::Env(c) => CredentialReference::Env { name: c.env.clone() },
-        })
-    }
+/// Where the server reads a configured credential.
+pub fn credential_reference(source: &CredentialLocation, env: &dyn EnvVars) -> Result<CredentialReference, String> {
+    Ok(match source {
+        CredentialLocation::File { file, json_field } => {
+            let file = Path::new(file);
+            let path = if let Ok(rest) = file.strip_prefix("~") {
+                PathBuf::from(env.get_os("HOME").filter(|v| !v.is_empty()).ok_or("HOME required for credential path")?).join(rest)
+            } else {
+                file.to_owned()
+            };
+            CredentialReference::File { path, json_field: json_field.clone() }
+        }
+        CredentialLocation::Env { env } => CredentialReference::Env { name: env.clone() },
+    })
 }
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
         // Do not echo malformed configuration: it can contain sensitive values.
         let config: Self = toml::from_str(text).map_err(|_| "invalid provider TOML configuration")?;
-        for (name, p) in &config.provider {
+        for (name, p) in &config.providers {
             if name.is_empty() || p.module.is_empty() {
                 return Err("provider and module names must not be empty".into());
             }
@@ -198,7 +195,7 @@ mod tests {
         let n = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
         let enabled = tc.draw(gs::booleans());
         let text = format!(
-            r#"[provider.demo]
+            r#"[providers.demo]
 module = "unknown-language-module"
 credential = {{env="PATH"}}
 image = "image:tag"
@@ -212,7 +209,7 @@ settings = {{
 "#
         );
         let config = Config::parse(&text).unwrap();
-        let p = &config.provider["demo"];
+        let p = &config.providers["demo"];
         assert_eq!(
             serde_json::to_value(&p.settings).unwrap(),
             serde_json::json!({"organization_id":"org","nested":{"value":n,"enabled":enabled},"array":["a","b"]})
@@ -226,10 +223,13 @@ settings = {{
     // either link, and refuses anything else.
     #[test]
     fn agent_link_parses_with_a_default() {
-        let parse = |line: &str| Config::parse(&format!("[provider.demo]\nmodule = \"m\"\ncredential = {{env=\"PATH\"}}\n{line}\n"));
-        assert_eq!(parse("").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
-        assert_eq!(parse("agent_link = \"reverse_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
-        assert_eq!(parse("agent_link = \"local_forward\"").unwrap().provider["demo"].agent_link, crate::agent::AgentLink::LocalForward);
+        let parse = |line: &str| Config::parse(&format!("[providers.demo]\nmodule = \"m\"\ncredential = {{env=\"PATH\"}}\n{line}\n"));
+        assert_eq!(parse("").unwrap().providers["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
+        assert_eq!(
+            parse("agent_link = \"reverse_forward\"").unwrap().providers["demo"].agent_link,
+            crate::agent::AgentLink::ReverseForward
+        );
+        assert_eq!(parse("agent_link = \"local_forward\"").unwrap().providers["demo"].agent_link, crate::agent::AgentLink::LocalForward);
         assert!(parse("agent_link = \"over_the_rainbow\"").is_err());
         // The names a report shows are the configured ones.
         for link in [crate::agent::AgentLink::ReverseForward, crate::agent::AgentLink::LocalForward] {
@@ -250,21 +250,21 @@ settings = {{
     fn invalid_config_and_credential_paths() {
         for text in [
             "",
-            "[provider.demo]\nmodule='x'\ncredential={env='PATH',file='secret'}",
+            "[providers.demo]\nmodule='x'\ncredential={env='PATH',file='secret'}",
             "[hosts]\nsecret='secret'",
-            "[provider.demo]\nmodule='x'\ncredential={env='PATH'}\nsize={cpus=0}",
+            "[providers.demo]\nmodule='x'\ncredential={env='PATH'}\nsize={cpus=0}",
             "secret is not TOML",
         ] {
             if text.is_empty() {
-                assert!(Config::parse(text).unwrap().provider.is_empty());
+                assert!(Config::parse(text).unwrap().providers.is_empty());
             } else {
                 assert!(!Config::parse(text).err().unwrap().contains("secret"));
             }
         }
         let env = Env(BTreeMap::from([("HOME".into(), "/home/test".into())]));
-        let credential = Credential::File(FileCredential { file: "~/.config/key".into(), json_field: Some("token".into()) });
+        let credential = CredentialLocation::File { file: "~/.config/key".into(), json_field: Some("token".into()) };
         assert_eq!(
-            credential.reference(&env).unwrap(),
+            credential_reference(&credential, &env).unwrap(),
             CredentialReference::File { path: "/home/test/.config/key".into(), json_field: Some("token".into()) }
         );
         for bad in ["-1GiB", "1.5GiB", "infinite", "18446744073709551616B"] {
@@ -288,17 +288,17 @@ settings = {{
             return;
         }
         let config = Config::parse(
-            r#"[provider.demo]
+            r#"[providers.demo]
 module="reference"
 credential={file="~/token"}
 settings={}
 "#,
         )
         .unwrap();
-        let credential = &config.provider["demo"].credential;
-        assert!(credential.reference(&Env(BTreeMap::new())).is_err());
+        let credential = config.providers["demo"].credential.as_ref().unwrap();
+        assert!(credential_reference(credential, &Env(BTreeMap::new())).is_err());
         assert_eq!(
-            credential.reference(&Env(BTreeMap::from([("HOME".into(), "/injected".into())]))).unwrap(),
+            credential_reference(credential, &Env(BTreeMap::from([("HOME".into(), "/injected".into())]))).unwrap(),
             CredentialReference::File { path: "/injected/token".into(), json_field: None }
         );
         for text in ["5GiB", "5 GiB"] {

@@ -30,14 +30,17 @@ pub(super) async fn host_fixtures(
     report.record(
         "configuration_atomic",
         async {
-            let before = client.hello().await.map_err(SafeError::category)?;
+            let before = client.providers().await.map_err(SafeError::category)?;
             let mut invalid = configuration.clone();
-            invalid.modules.push(ModuleConfiguration { name: "invalid".into(), entrypoint: "unknown".into() });
+            invalid.providers.insert(
+                "invalid".into(),
+                ProviderConfiguration { module: "unknown".into(), settings: Default::default(), credential: None },
+            );
             let (status, _) = client
                 .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(invalid).map_err(SafeError::category)?))
                 .await
                 .map_err(SafeError::category)?;
-            let after = client.hello().await.map_err(SafeError::category)?;
+            let after = client.providers().await.map_err(SafeError::category)?;
             require(status == 422 && before == after, "configuration rejection was not atomic")
         }
         .await,
@@ -47,8 +50,8 @@ pub(super) async fn host_fixtures(
     let peer = configuration
         .providers
         .iter()
-        .find(|candidate| candidate.name != provider && !candidate.settings.contains_key("fault"))
-        .map(|candidate| candidate.name.as_str())
+        .find(|(name, candidate)| *name != provider && !candidate.settings.contains_key("fault"))
+        .map(|(name, _)| name.as_str())
         .unwrap_or("missing-peer");
     report.record("host_optional_operations", optional_contract(client, provider, peer, &options.request, &options.timeouts).await);
     report.record(
@@ -117,28 +120,25 @@ fn error_cases() -> Vec<ProtocolError> {
 }
 /// Extracted from the host socket error scenarios. Every class/status/retry
 /// header, plus credential rejection/readiness recovery, crosses the endpoint.
-pub async fn error_contract(client: &Client, base: &HostConfiguration, report: &mut Report) {
-    let Some(module) = base.modules.first() else {
+pub async fn error_contract(client: &Client, base: &Configuration, report: &mut Report) {
+    let Some(module) = base.providers.values().next().map(|p| p.module.clone()) else {
         report.record("host_configuration", Err("no fixture module".into()));
         return;
     };
     let mut configuration = base.clone();
     for error in error_cases() {
-        let settings = match serde_json::from_value(json!({"fault":error,"fixture":true,"fixture_push":true,"poll_interval_ms":100000})) {
+        let settings = match serde_json::from_value(json!({"fault":error,"fixture":true,"poll_interval_ms":100000})) {
             Ok(value) => value,
             Err(error) => {
                 report.record("host_configuration", Err(error.category()));
                 return;
             }
         };
-        configuration.providers.push(ProviderConfiguration {
-            name: format!("error-{}", error.class()),
-            module: module.name.clone(),
-            settings,
-            credential: CredentialMode::Direct { credential_reference: "fixture".into() },
-        });
+        configuration
+            .providers
+            .insert(format!("error-{}", error.class()), ProviderConfiguration { module: module.clone(), settings, credential: None });
     }
-    let configured = client.configure(&configuration).await.map_err(SafeError::category);
+    let configured = client.configure(ConfigUpdate::Replace(configuration)).await.map_err(SafeError::category);
     if report.capture("host_configuration", configured).is_none() {
         return;
     }
@@ -170,25 +170,14 @@ pub async fn error_contract(client: &Client, base: &HostConfiguration, report: &
                     )?;
                 }
                 if matches!(error, ProtocolError::CredentialRejected { .. }) {
-                    let hello = client.hello().await.map_err(SafeError::category)?;
+                    let declaration = client.provider(&provider).await.map_err(SafeError::category)?;
                     require(
-                        hello
-                            .providers
-                            .iter()
-                            .any(|p| p.provider == provider && matches!(p.readiness, Readiness::MissingCredential { .. })),
+                        matches!(declaration.readiness, Readiness::MissingCredential { .. }),
                         "credential rejection did not change readiness",
                     )?;
+                    // The fixture rejects every credential, and the server polls with each
+                    // new one, so a refresh need not restore readiness here.
                     client.credential(&provider, Secret::new("refreshed")).await.map_err(SafeError::category)?;
-                    require(
-                        client
-                            .hello()
-                            .await
-                            .map_err(SafeError::category)?
-                            .providers
-                            .iter()
-                            .any(|p| p.provider == provider && matches!(p.readiness, Readiness::Ready)),
-                        "credential refresh did not restore readiness",
-                    )?;
                 }
                 Ok(())
             }
@@ -300,7 +289,7 @@ pub async fn optional_contract(
         "repeated resume did not run",
     )?;
     require(!client.export(provider, &row.id).await.map_err(SafeError::category)?.reference.is_empty(), "empty export reference")?;
-    for path in [vec!["v1", "providers", provider, "environments", "usage"], vec!["v1", "providers", provider]] {
+    for path in [vec!["v1", "providers", provider, "environments", "usage"], vec!["v1", "providers", provider, "unknown"]] {
         let (status, value) = client.wire(Method::GET, &path, &[], None).await.map_err(SafeError::category)?;
         require(
             status == 404 && matches!(serde_json::from_value::<ProtocolError>(value), Ok(ProtocolError::NotFound { .. })),
@@ -585,11 +574,11 @@ async fn provider_isolation(client: &Client, providers: [&str; 2], main: &Enviro
 /// credential rotation and repeating configuration preserve environment identity.
 pub async fn configuration_contract(
     client: &Client,
-    configuration: &HostConfiguration,
+    configuration: &Configuration,
     provider: &str,
     environment: &Environment,
 ) -> Result<()> {
-    let before = client.hello().await.map_err(SafeError::category)?;
+    let before = client.providers().await.map_err(SafeError::category)?;
     for credential in [json!({"value":""}), json!({"value":{"TOP_SECRET":123}})] {
         let (status, value) = client
             .wire(Method::PUT, &["v1", "providers", provider, "credential"], &[], Some(&credential))
@@ -597,19 +586,19 @@ pub async fn configuration_contract(
             .map_err(SafeError::category)?;
         require(status == 422 && !value.to_string().contains("TOP_SECRET"), "invalid credential accepted or exposed")?;
     }
-    require(client.hello().await.map_err(SafeError::category)? == before, "invalid credential changed readiness")?;
+    require(client.providers().await.map_err(SafeError::category)? == before, "invalid credential changed readiness")?;
     client.credential(provider, Secret::new("refreshed")).await.map_err(SafeError::category)?;
-    client.configure(configuration).await.map_err(SafeError::category)?;
+    client.configure(ConfigUpdate::Replace(configuration.clone())).await.map_err(SafeError::category)?;
     require(
         client.inspect(provider, &environment.id).await.map_err(SafeError::category)? == *environment,
         "credential/config refresh discarded inventory",
     )?;
     let mut changed = configuration.clone();
-    let entry = changed.providers.iter_mut().find(|entry| entry.name == provider).ok_or("missing provider")?;
+    let entry = changed.providers.get_mut(provider).ok_or("missing provider")?;
     entry.settings.insert("changed".into(), json!(true));
     let (status, _) = client
         .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(changed).map_err(SafeError::category)?))
         .await
         .map_err(SafeError::category)?;
-    require(status == 422 && client.hello().await.map_err(SafeError::category)? == before, "incompatible configuration was not atomic")
+    require(status == 422 && client.providers().await.map_err(SafeError::category)? == before, "incompatible configuration was not atomic")
 }

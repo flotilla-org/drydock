@@ -120,8 +120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let options: drydock::conformance::Options =
                 serde_json::from_slice(&tokio::fs::read(options).await?).map_err(|_| "invalid conformance options")?;
             options.timeouts.validate()?;
-            let hello = client.hello().await?;
-            let declaration = hello.providers.iter().find(|p| p.provider == provider).ok_or("unknown provider")?;
+            let declaration = client.provider(&provider).await?;
             if !live && declaration.module != "reference" {
                 return Err("live-provider conformance requires --live".into());
             }

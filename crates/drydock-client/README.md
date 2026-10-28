@@ -1,7 +1,11 @@
-# Typed host client
+# The provider API and its client
 
-`Client` implements every `/v1` protocol route with protocol types, including
-relay and exec byte streams. It uses rigging's `HttpClient` execution port for
+`api::ProviderApi` is the provider API served by both the drydock server and
+language hosts, and `api::router` is its one HTTP adapter (`api::server_router`
+adds the server-only credential and event routes). `Client` implements every `/v1`
+protocol route with protocol types, including relay and exec byte streams.
+`Client::credentialed` sends a provider credential as `Drydock-Credential`,
+marked sensitive, on every request. It uses rigging's `HttpClient` execution port for
 buffered calls; `with_http` injects recording or stand-in clients. The Unix socket
 adapter and streaming routes retain a restricted reqwest client because rigging's
 buffered port cannot carry a long-lived stream or an HTTP upgrade.
@@ -31,7 +35,7 @@ is limited to 8 MiB, and buffered framing input to 8 MiB plus its newline;
 chunks that exceed the remaining framing budget are rejected before copying. Dropping the observer drops its stream.
 
 `StatusCache::new(client, declarations)` caches list/inspect results according to
-the provider's hello rate limits. Entries expire at the most conservative declared
+the providers' declared rate limits. Entries expire at the most conservative declared
 period/requests interval. Rolling budgets are per provider and operation; `*`
 shares one budget across both operations. Distinct inspect IDs share the same
 budget, and concurrent identical reads coalesce. Different providers have independent

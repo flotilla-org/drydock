@@ -2,12 +2,12 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Drydock adaptor protocol",
-    "description": "ADR 0070. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by capabilities. Observe is NDJSON; relay and exec upgrade to raw streams.",
+    "description": "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "8"
+    "version": "9"
   },
   "paths": {
     "/v1/config": {
@@ -18,7 +18,54 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/HostConfiguration"
+                "$ref": "#/components/schemas/Configuration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      },
+      "patch": {
+        "tags": [],
+        "operationId": "patch_configuration",
+        "requestBody": {
+          "description": "RFC 7396 JSON merge patch of the configuration document",
+          "content": {
+            "application/merge-patch+json": {
+              "schema": {
+                "type": "object"
               }
             }
           },
@@ -111,7 +158,8 @@
           "503": {
             "$ref": "#/components/responses/Error503"
           }
-        }
+        },
+        "x-drydock-server-only": true
       }
     },
     "/v1/hello": {
@@ -125,6 +173,119 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Hello"
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/providers": {
+      "get": {
+        "tags": [],
+        "operationId": "providers",
+        "responses": {
+          "200": {
+            "description": "Configured providers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderDeclaration"
+                  }
+                }
+              }
+            }
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
+    "/v1/providers/{provider}": {
+      "get": {
+        "tags": [],
+        "operationId": "provider",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDeclaration"
                 }
               }
             }
@@ -215,7 +376,8 @@
           "503": {
             "$ref": "#/components/responses/Error503"
           }
-        }
+        },
+        "x-drydock-server-only": true
       }
     },
     "/v1/providers/{provider}/environments": {
@@ -228,6 +390,15 @@
             "in": "path",
             "description": "Opaque provider",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -285,6 +456,15 @@
             "in": "path",
             "description": "Opaque provider",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -373,6 +553,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -436,6 +625,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -491,6 +689,15 @@
             "in": "path",
             "description": "Opaque id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -576,6 +783,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -641,6 +857,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -703,6 +928,15 @@
             "in": "path",
             "description": "Opaque id",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -778,6 +1012,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -846,6 +1089,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -899,6 +1151,15 @@
             "in": "path",
             "description": "Opaque provider",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -965,6 +1226,15 @@
             "in": "path",
             "description": "Opaque provider",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1041,6 +1311,15 @@
             "required": true,
             "schema": {
               "$ref": "#/components/schemas/Timestamp"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -1192,6 +1471,23 @@
         "description": "A validated IPv4/IPv6 CIDR, preserving the caller's wire spelling.",
         "pattern": "^(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(?:[0-9]|[12][0-9]|3[0-2])|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))$"
       },
+      "Configuration": {
+        "type": "object",
+        "description": "The one configuration document: the TOML file and the `PUT /v1/config` body\nin two syntaxes. Hosts receive it with server-only keys omitted.",
+        "properties": {
+          "providers": {
+            "type": "object",
+            "description": "Keyed by instance name, which is arbitrary: two instances of one module are normal.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ProviderConfiguration"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
       "Cost": {
         "type": "object",
         "description": "Currency is explicit, e.g. USD or EUR; the field name fixes no currency.\nA missing cost is unknown, whereas an amount of zero is a known zero cost.",
@@ -1208,22 +1504,22 @@
           }
         }
       },
-      "CredentialMode": {
+      "CredentialLocation": {
         "oneOf": [
           {
             "type": "object",
+            "description": "A file's contents, or one top-level string field of a JSON file.",
             "required": [
-              "credential_reference",
-              "mode"
+              "file"
             ],
             "properties": {
-              "credential_reference": {
+              "file": {
                 "type": "string"
               },
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "direct"
+              "json_field": {
+                "type": [
+                  "string",
+                  "null"
                 ]
               }
             }
@@ -1231,23 +1527,10 @@
           {
             "type": "object",
             "required": [
-              "placeholder_token",
-              "proxy_url",
-              "mode"
+              "env"
             ],
             "properties": {
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "proxied"
-                ]
-              },
-              "placeholder_token": {
-                "type": "string",
-                "format": "password",
-                "minLength": 1
-              },
-              "proxy_url": {
+              "env": {
                 "type": "string"
               }
             }
@@ -1425,6 +1708,17 @@
           "egress": {
             "$ref": "#/components/schemas/Enforcement"
           },
+          "egress_measured": {
+            "type": "boolean",
+            "description": "True only when this observation measured the egress claim."
+          },
+          "egress_policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque effective-policy identity, when the provider supports one."
+          },
           "granted_size": {
             "oneOf": [
               {
@@ -1461,6 +1755,17 @@
           },
           "state": {
             "$ref": "#/components/schemas/Observation"
+          },
+          "timestamp": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When the provider observed this state, if it says."
+              }
+            ]
           }
         }
       },
@@ -1768,9 +2073,7 @@
         "type": "object",
         "required": [
           "protocol_version",
-          "host_version",
-          "modules",
-          "providers"
+          "host_version"
         ],
         "properties": {
           "host_version": {
@@ -1781,22 +2084,10 @@
             "items": {
               "$ref": "#/components/schemas/LoadableModule"
             },
-            "description": "Modules the host can configure, including those not yet loaded."
-          },
-          "modules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/LoadedModule"
-            }
+            "description": "Modules this server or host can configure."
           },
           "protocol_version": {
             "type": "string"
-          },
-          "providers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ProviderDeclaration"
-            }
           }
         }
       },
@@ -1805,27 +2096,6 @@
         "description": "A validated DNS name or IP literal. Schema uses the exact decoder pattern.",
         "maxLength": 253,
         "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\\.?|(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|\\[(?:(?:(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,7}:|(?:[0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|(?:[0-9A-Fa-f]{1,4}:){1,5}(?::[0-9A-Fa-f]{1,4}){1,2}|(?:[0-9A-Fa-f]{1,4}:){1,4}(?::[0-9A-Fa-f]{1,4}){1,3}|(?:[0-9A-Fa-f]{1,4}:){1,3}(?::[0-9A-Fa-f]{1,4}){1,4}|(?:[0-9A-Fa-f]{1,4}:){1,2}(?::[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:(?:(?::[0-9A-Fa-f]{1,4}){1,6})|:(?:(?::[0-9A-Fa-f]{1,4}){1,7}|:))|(?:[0-9A-Fa-f]{1,4}:){6}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|::(?:[0-9A-Fa-f]{1,4}:){5}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){0}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){4}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){1}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){3}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){2}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){2}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){3}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){1}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:[0-9A-Fa-f]{1,4}:){4}[0-9A-Fa-f]{1,4}::(?:[0-9A-Fa-f]{1,4}:){0}(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))\\])$"
-      },
-      "HostConfiguration": {
-        "type": "object",
-        "required": [
-          "modules",
-          "providers"
-        ],
-        "properties": {
-          "modules": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ModuleConfiguration"
-            }
-          },
-          "providers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ProviderConfiguration"
-            }
-          }
-        }
       },
       "ImageRefusal": {
         "oneOf": [
@@ -2017,21 +2287,6 @@
           }
         }
       },
-      "LoadedModule": {
-        "type": "object",
-        "required": [
-          "name",
-          "version"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "version": {
-            "type": "string"
-          }
-        }
-      },
       "MaterialMode": {
         "type": "string",
         "enum": [
@@ -2039,21 +2294,6 @@
           "pushed",
           "shared"
         ]
-      },
-      "ModuleConfiguration": {
-        "type": "object",
-        "required": [
-          "name",
-          "entrypoint"
-        ],
-        "properties": {
-          "entrypoint": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          }
-        }
       },
       "Observation": {
         "oneOf": [
@@ -2144,6 +2384,31 @@
             }
           }
         ]
+      },
+      "ObservationMode": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "interval_ms",
+              "mode"
+            ],
+            "properties": {
+              "interval_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "poll"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How the server observes a provider: it polls the environment list."
       },
       "ObserveRecord": {
         "oneOf": [
@@ -2246,6 +2511,34 @@
         "description": "Zero is not a destination port.",
         "maximum": 65535,
         "minimum": 1
+      },
+      "Ports": {
+        "type": "object",
+        "description": "Which optional operations exist.",
+        "required": [
+          "exec",
+          "suspend_resume",
+          "export",
+          "usage",
+          "quota"
+        ],
+        "properties": {
+          "exec": {
+            "type": "boolean"
+          },
+          "export": {
+            "type": "boolean"
+          },
+          "quota": {
+            "type": "boolean"
+          },
+          "suspend_resume": {
+            "type": "boolean"
+          },
+          "usage": {
+            "type": "boolean"
+          }
+        }
       },
       "PrepareRequest": {
         "type": "object",
@@ -2564,19 +2857,21 @@
       "ProviderConfiguration": {
         "type": "object",
         "required": [
-          "name",
-          "module",
-          "settings",
-          "credential"
+          "module"
         ],
         "properties": {
           "credential": {
-            "$ref": "#/components/schemas/CredentialMode"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CredentialLocation",
+                "description": "Server only: where the server gets this provider's credential."
+              }
+            ]
           },
           "module": {
-            "type": "string"
-          },
-          "name": {
             "type": "string"
           },
           "settings": {
@@ -2587,16 +2882,20 @@
               "type": "string"
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ProviderDeclaration": {
         "type": "object",
+        "description": "A configured provider, the same on the server and on hosts.",
         "required": [
           "provider",
           "module",
           "capabilities",
           "readiness",
-          "rate_limits"
+          "rate_limits",
+          "ports",
+          "observation"
         ],
         "properties": {
           "capabilities": {
@@ -2604,6 +2903,12 @@
           },
           "module": {
             "type": "string"
+          },
+          "observation": {
+            "$ref": "#/components/schemas/ObservationMode"
+          },
+          "ports": {
+            "$ref": "#/components/schemas/Ports"
           },
           "provider": {
             "type": "string"

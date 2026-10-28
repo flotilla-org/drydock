@@ -31,10 +31,27 @@ responses((status = 200, description = "Success", body = Hello), ErrorResponses)
 fn hello() {}
 
 #[utoipa::path(put, path = "/v1/config",
-request_body = HostConfiguration,
+request_body = Configuration,
 responses((status = 204, description = "Success"), ErrorResponses)
 )]
 fn configure() {}
+
+#[utoipa::path(patch, path = "/v1/config",
+request_body(content = Object, content_type = "application/merge-patch+json", description = "RFC 7396 JSON merge patch of the configuration document"),
+responses((status = 204, description = "Success"), ErrorResponses)
+)]
+fn patch_configuration() {}
+
+#[utoipa::path(get, path = "/v1/providers",
+responses((status = 200, description = "Configured providers", body = Vec<ProviderDeclaration>), ErrorResponses)
+)]
+fn providers() {}
+
+#[utoipa::path(get, path = "/v1/providers/{provider}",
+params(("provider" = String, Path, description = "Opaque provider")),
+responses((status = 200, description = "Success", body = ProviderDeclaration), ErrorResponses)
+)]
+fn provider() {}
 
 #[utoipa::path(put, path = "/v1/providers/{provider}/credential",
 params(("provider" = String, Path, description = "Opaque provider")),
@@ -137,11 +154,14 @@ fn quota() {}
     info(
         title = "Drydock adaptor protocol",
         version = "1.0.0",
-        description = "ADR 0070. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by capabilities. Observe is NDJSON; relay and exec upgrade to raw streams."
+        description = "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets authenticate peer credentials; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams."
     ),
     paths(
         hello,
         configure,
+        patch_configuration,
+        providers,
+        provider,
         refresh_credential,
         prepare,
         provision,
@@ -192,13 +212,32 @@ pub fn document() -> utoipa::openapi::OpenApi {
         utoipa::openapi::schema::ObjectBuilder::new().schema_type(utoipa::openapi::schema::Type::String).min_length(Some(1)).build().into(),
     ];
 
+    use utoipa::openapi::{
+        extensions::ExtensionsBuilder,
+        path::{ParameterBuilder, ParameterIn},
+    };
+    for (route, path) in document.paths.paths.iter_mut() {
+        let server_only = route == "/v1/events" || route.ends_with("/credential");
+        for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
+            if server_only {
+                operation.extensions = Some(ExtensionsBuilder::new().add("x-drydock-server-only", true).build());
+            } else if route.starts_with("/v1/providers/{provider}") {
+                let header = ParameterBuilder::new()
+                    .name("Drydock-Credential")
+                    .parameter_in(ParameterIn::Header)
+                    .description(Some("Opaque provider credential for this request only, passed as-is; never stored or logged"))
+                    .schema(Some(utoipa::openapi::schema::ObjectBuilder::new().schema_type(utoipa::openapi::schema::Type::String)));
+                operation.parameters.get_or_insert_with(Vec::new).push(header.build());
+            }
+        }
+    }
     // Deduplicate response declarations, narrowing each body to its status class.
     // Locate variants by their serialized discriminator rather than their order.
     let Some(RefOr::T(Schema::OneOf(errors))) = schemas.get("ProtocolError") else { panic!("ProtocolError schema changed") };
     let variants = errors.items.clone();
     let components = document.components.as_mut().expect("components");
     for path in document.paths.paths.values_mut() {
-        for operation in [&mut path.get, &mut path.put, &mut path.post, &mut path.delete].into_iter().flatten() {
+        for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
             for (status, class) in [
                 ("404", "not_found"),
                 ("405", "method_not_allowed"),

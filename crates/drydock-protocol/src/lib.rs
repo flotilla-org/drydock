@@ -1,4 +1,4 @@
-//! JSON wire contract for ADR 0070 language hosts. No provider or HTTP runtime lives here.
+//! JSON wire contract shared by the server and language hosts. No provider or HTTP runtime lives here.
 //! Provider IDs are opaque; labels identify a client's environment for idempotent creation.
 mod diagnostic;
 pub use diagnostic::DiagnosticMasker;
@@ -11,7 +11,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "8";
+pub const PROTOCOL_VERSION: &str = "9";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -39,35 +39,40 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct HostConfiguration {
-    pub modules: Vec<ModuleConfiguration>,
-    pub providers: Vec<ProviderConfiguration>,
+/// Credential override for one request, passed to the host as-is. Never stored or logged.
+pub const CREDENTIAL_HEADER: &str = "drydock-credential";
+
+/// The one configuration document: the TOML file and the `PUT /v1/config` body
+/// in two syntaxes. Hosts receive it with server-only keys omitted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Configuration {
+    /// Keyed by instance name, which is arbitrary: two instances of one module are normal.
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfiguration>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ModuleConfiguration {
-    pub name: String,
-    pub entrypoint: String,
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfiguration {
-    pub name: String,
     pub module: String,
     /// Non-secret vendor-specific configuration only.
+    #[serde(default)]
     pub settings: BTreeMap<String, serde_json::Value>,
-    pub credential: CredentialMode,
+    /// Server only: where the server gets this provider's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<CredentialLocation>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum CredentialMode {
-    Direct {
-        credential_reference: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum CredentialLocation {
+    /// A file's contents, or one top-level string field of a JSON file.
+    File {
+        file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        json_field: Option<String>,
     },
-    Proxied {
-        #[serde(deserialize_with = "validation::nonempty_secret")]
-        #[schema(value_type = String, format = Password, min_length = 1)]
-        placeholder_token: Secret,
-        proxy_url: String,
+    Env {
+        env: String,
     },
 }
 /// Delivered in memory over the authenticated host connection; never persisted.
@@ -81,11 +86,9 @@ pub struct CredentialRefresh {
 pub struct Hello {
     pub protocol_version: String,
     pub host_version: String,
-    pub modules: Vec<LoadedModule>,
-    /// Modules the host can configure, including those not yet loaded.
+    /// Modules this server or host can configure.
     #[serde(default)]
     pub loadable_modules: Vec<LoadableModule>,
-    pub providers: Vec<ProviderDeclaration>,
 }
 impl Hello {
     /// Whether this host speaks exactly the client's current wire version.
@@ -102,11 +105,7 @@ pub struct LoadableModule {
     /// Smallest supported resource request, used when the caller has no default.
     pub smallest_size: Size,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct LoadedModule {
-    pub name: String,
-    pub version: String,
-}
+/// A configured provider, the same on the server and on hosts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ProviderDeclaration {
     pub provider: String,
@@ -114,6 +113,23 @@ pub struct ProviderDeclaration {
     pub capabilities: Capabilities,
     pub readiness: Readiness,
     pub rate_limits: Vec<RateLimit>,
+    pub ports: Ports,
+    pub observation: ObservationMode,
+}
+/// Which optional operations exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Ports {
+    pub exec: bool,
+    pub suspend_resume: bool,
+    pub export: bool,
+    pub usage: bool,
+    pub quota: bool,
+}
+/// How the server observes a provider: it polls the environment list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ObservationMode {
+    Poll { interval_ms: u64 },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RateLimit {
@@ -440,6 +456,22 @@ pub struct Environment {
     /// The platform the environment runs, when the provider records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
+    /// True only when this observation measured the egress claim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub egress_measured: bool,
+    /// Opaque effective-policy identity, when the provider supports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_policy: Option<String>,
+    /// When the provider observed this state, if it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime)]
+    pub timestamp: Option<Timestamp>,
+}
+impl Environment {
+    /// The observation without its evidence fields, for comparing states.
+    pub fn without_evidence(&self) -> Self {
+        Self { egress_measured: false, egress_policy: None, timestamp: None, ..self.clone() }
+    }
 }
 /// An OCI platform: `os` and `architecture` by OCI names (`linux`, `amd64`,
 /// `arm64`), each 1 to 32 lowercase letters or digits. They become agent build
@@ -489,9 +521,6 @@ impl std::str::FromStr for Platform {
         platform.filter(Platform::is_plain).ok_or_else(|| format!("platform {text:?} must be os/architecture in lowercase OCI names"))
     }
 }
-fn accepts_reverse_forwards() -> bool {
-    true
-}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Reach {
@@ -503,7 +532,7 @@ pub enum Reach {
         /// Whether this SSH server accepts remote (reverse) Unix-socket forwards.
         /// When it does, guest-to-host streams get their own SSH channels; when it
         /// doesn't (Daytona's gateway), they share a link through the local forward.
-        #[serde(default = "accepts_reverse_forwards")]
+        #[serde(default)]
         reverse_forwards: bool,
     },
     Dial {
@@ -515,6 +544,13 @@ pub enum Reach {
     Relay {
         path: String,
     },
+}
+impl Reach {
+    /// Relay through the public relay route of this provider and environment.
+    pub fn relay(provider: &str, id: &str) -> Self {
+        let segment = |s: &str| percent_encoding::utf8_percent_encode(s, diagnostic::URL_RESERVED).to_string();
+        Self::Relay { path: format!("/v1/providers/{}/environments/{}/relay", segment(provider), segment(id)) }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]

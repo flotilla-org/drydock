@@ -83,6 +83,7 @@ pub struct WireResponse {
 pub struct Client {
     base: Url,
     bearer: Option<Secret>,
+    credential: Option<Secret>,
     transport: reqwest::Client,
     http: Arc<dyn HttpClient>,
     request_timeout: Duration,
@@ -93,6 +94,7 @@ impl Client {
         Ok(Self {
             base: Url::parse("http://localhost/").expect("constant URL"),
             bearer: None,
+            credential: None,
             request_timeout: Duration::from_secs(30),
             http: Arc::new(SocketHttp(transport.clone())),
             transport,
@@ -117,7 +119,7 @@ impl Client {
         }
         let transport = Self::builder().build().map_err(|e| Error::transport(&e))?;
         let http = rigging_http_client::ReqwestHttpClient::restricted(None, None).map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(Self { base, bearer: Some(bearer), transport, http: Arc::new(http), request_timeout: Duration::from_secs(30) })
+        Ok(Self { base, bearer: Some(bearer), credential: None, transport, http: Arc::new(http), request_timeout: Duration::from_secs(30) })
     }
     /// Bound buffered calls and upgrade setup independently of stream lifetimes.
     /// The 30-second default is shorter than the server's 600-second deadline
@@ -145,6 +147,12 @@ impl Client {
         let mut request = self.transport.request(method, url);
         if let Some(token) = &self.bearer {
             request = request.bearer_auth(token.expose());
+        }
+        if let Some(credential) = &self.credential {
+            let mut value = http::HeaderValue::from_str(credential.expose())
+                .map_err(|_| Error::InvalidRequest("credential is not a valid header value".into()))?;
+            value.set_sensitive(true);
+            request = request.header(CREDENTIAL_HEADER, value);
         }
         Ok(request)
     }
@@ -174,6 +182,11 @@ impl Client {
     /// The configured credential, for refresh and credential-aware callers.
     pub fn bearer(&self) -> Option<&Secret> {
         self.bearer.as_ref()
+    }
+    /// Send this provider credential with every request, as `Drydock-Credential`.
+    pub fn credentialed(mut self, credential: Option<Secret>) -> Self {
+        self.credential = credential;
+        self
     }
     /// Inspect the JSON wire contract, including status and explicit null fields.
     /// Uses the same endpoint, authentication and injectable HTTP port as typed calls.
@@ -206,78 +219,6 @@ impl Client {
             serde_json::from_slice(response.body()).map_err(Error::response)?
         };
         Ok(WireResponse { status: response.status().as_u16(), headers: response.headers().clone(), body: value })
-    }
-    pub async fn provider_hello(&self) -> Result<drydock_provider::BridgeHello> {
-        let hello: drydock_provider::BridgeHello = self.call::<_, ()>(Method::GET, &["v1", "hello"], None).await?;
-        if !hello.hello.is_compatible() {
-            return Err(Error::VersionMismatch);
-        }
-        Ok(hello)
-    }
-    pub async fn configure_provider(
-        &self,
-        module: &str,
-        configuration: &ProviderConfiguration,
-    ) -> Result<drydock_provider::ConfiguredProvider> {
-        self.call(Method::POST, &["private", "modules", module, "configure"], Some(configuration)).await
-    }
-    pub async fn release_provider(&self, instance: &str) -> Result<()> {
-        self.call::<_, ()>(Method::DELETE, &["private", "providers", instance], None).await
-    }
-    /// Private trait adapter. Each request carries its own credential snapshot.
-    pub async fn provider_call<T: DeserializeOwned, A: Serialize>(
-        &self,
-        provider: &str,
-        operation: &str,
-        argument: A,
-        credentials: &drydock_provider::Credentials,
-    ) -> Result<T> {
-        let request = self
-            .request(Method::POST, &["private", "providers", provider, operation])?
-            .json(&drydock_provider::Call { credentials: credentials.clone(), argument });
-        // The server's policy owns this operation's deadline. Do not add a
-        // second, shorter private-transport deadline for long mutating calls.
-        Ok(decode(self.execute_buffered(request).await?)?.1)
-    }
-    pub async fn provider_stream<A: Serialize>(
-        &self,
-        provider: &str,
-        operation: &str,
-        argument: A,
-        credentials: &drydock_provider::Credentials,
-        protocol: &str,
-    ) -> Result<rigging_stream::ByteStream> {
-        let request = self
-            .request(Method::POST, &["private", "providers", provider, operation])?
-            .json(&drydock_provider::Call { credentials: credentials.clone(), argument });
-        upgraded(request, protocol).await
-    }
-    pub async fn provider_updates(
-        &self,
-        provider: &str,
-        credentials: &drydock_provider::Credentials,
-        sink: drydock_provider::EventSink,
-    ) -> Result<()> {
-        let response = self
-            .request(Method::POST, &["private", "providers", provider, "subscribe"])?
-            .json(&drydock_provider::Call { credentials: credentials.clone(), argument: () })
-            .send()
-            .await
-            .map_err(|e| Error::transport(&e))?;
-        let mut records = Records::new(success(response).await?);
-        while let Some(record) = records.next_line::<drydock_provider::SubscriptionRecord>().await? {
-            match record {
-                drydock_provider::SubscriptionRecord::Update(update) => sink.publish(update)?,
-                drydock_provider::SubscriptionRecord::Failed(error) => return Err(Error::Protocol(error)),
-            }
-        }
-        Ok(())
-    }
-    pub async fn configure(&self, configuration: &HostConfiguration) -> Result<()> {
-        self.call(Method::PUT, &["v1", "config"], Some(configuration)).await
-    }
-    pub async fn credential(&self, provider: &str, value: Secret) -> Result<()> {
-        self.call(Method::PUT, &["v1", "providers", provider, "credential"], Some(&CredentialRefresh { value })).await
     }
     async fn upgrade<B: Serialize + ?Sized>(
         &self,

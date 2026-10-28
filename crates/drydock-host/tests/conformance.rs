@@ -1,4 +1,4 @@
-use drydock::api::ProviderApi;
+use drydock::api::{ConfigUpdate, ProviderApi};
 #[path = "support/public_server.rs"]
 mod public_server;
 use drydock::{
@@ -92,7 +92,7 @@ async fn reference_binary_passes_conformance() {
     binary.kill().await.unwrap();
 }
 
-async fn start_binary(configuration: HostConfiguration) -> (tempfile::TempDir, tokio::process::Child, drydock::HostHandle) {
+async fn start_binary(configuration: Configuration) -> (tempfile::TempDir, tokio::process::Child, drydock::HostHandle) {
     let dir = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -119,16 +119,16 @@ async fn start_binary(configuration: HostConfiguration) -> (tempfile::TempDir, t
     let spec = HostSpec {
         name: "rust".into(),
         connection: HostConnection::External { url: format!("http://{address}"), token_file },
-        configuration: configuration.clone(),
-        credentials: BTreeMap::from([("test".into(), CredentialReference::Env { name: "PATH".into() })]),
+        credentials: configuration.providers.keys().map(|name| (name.clone(), CredentialReference::Env { name: "PATH".into() })).collect(),
+        configuration,
     };
     let supervisor = Supervisor::new(dir.path().join("runtime"), Arc::new(BuiltinCredentials::default()));
     let mut host = supervisor.start(spec).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
     (dir, binary, host)
 }
-fn fixture_configuration() -> HostConfiguration {
-    serde_json::from_value(serde_json::json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[{"name":"a","module":"memory","settings":{"fixture":true},"credential":{"mode":"direct","credential_reference":"test"}},{"name":"b","module":"memory","settings":{"fixture":true},"credential":{"mode":"direct","credential_reference":"test"}}]})).unwrap()
+fn fixture_configuration() -> Configuration {
+    serde_json::from_value(serde_json::json!({"providers":{"a":{"module":"reference","settings":{"fixture":true}},"b":{"module":"reference","settings":{"fixture":true}}}})).unwrap()
 }
 async fn python_report(fault: &str) -> conformance::Report {
     python_report_with(fault, conformance::Timeouts { record_seconds: 1, transition_seconds: 1, probe_seconds: 5, ..Default::default() })
@@ -164,7 +164,7 @@ async fn python_report_selection(
     .await
     .unwrap();
     let client = drydock::client::Client::external(&url, Secret::new("fixture-token")).unwrap();
-    client.configure(&fixture_configuration()).await.unwrap();
+    client.configure(ConfigUpdate::Replace(fixture_configuration())).await.unwrap();
     for provider in ["a", "b"] {
         client.credential(provider, Secret::new("fixture-token")).await.unwrap();
     }
@@ -328,15 +328,10 @@ async fn declared_reach_recipes_and_faults() {
             if broken && (kind == "tcp" || kind == "ws") {
                 recipe["token"] = serde_json::json!("wrong-token");
             }
-            configuration.providers.push(ProviderConfiguration {
-                name,
-                module: "memory".into(),
-                credential: CredentialMode::Direct { credential_reference: "test".into() },
-                settings: serde_json::from_value(
-                    serde_json::json!({"fixture":true,"fixture_bad_relay":kind == "relay" && broken,"reach":recipe}),
-                )
-                .unwrap(),
-            });
+            let settings =
+                serde_json::from_value(serde_json::json!({"fixture":true,"fixture_bad_relay":kind == "relay" && broken,"reach":recipe}))
+                    .unwrap();
+            configuration.providers.insert(name, ProviderConfiguration { module: "reference".into(), settings, credential: None });
         }
     }
     let (runtime, mut binary, host) = start_binary(configuration).await;

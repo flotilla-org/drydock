@@ -18,7 +18,6 @@ axum = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
-async-stream = "0.3"
 chrono = "0.4"
 url = "2"
 base64 = "0.22"
@@ -26,6 +25,7 @@ bytes = "1"
 http.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+drydock-client = { version = "0.1.0", path = "../drydock-client" }
 
 [dev-dependencies]
 libc = "0.2"

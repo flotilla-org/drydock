@@ -14,11 +14,11 @@ pub(crate) mod remote;
 mod tests;
 use diagnostics::*;
 use drydock_protocol::*;
+pub use events::EVENT_HISTORY_CAPACITY;
 use events::*;
-pub use events::{EVENT_HISTORY_CAPACITY, PUSH_SNAPSHOT_TIMEOUT};
 use evidence::*;
 use instance::*;
-use module::{Credentials, ObservationMode, ObservedEnvironment, Provider, Registry, Result, refused};
+use module::{Credentials, Provider, Registry, Result, refused};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
@@ -35,9 +35,7 @@ impl<T> RecoverLock<T> for Mutex<T> {
 }
 
 #[derive(Default, Clone)]
-struct Configuration {
-    modules: Vec<LoadedModule>,
-    entrypoints: BTreeMap<String, String>,
+struct Loaded {
     providers: BTreeMap<String, Arc<Instance>>,
 }
 #[derive(Clone)]
@@ -45,12 +43,13 @@ pub struct Runtime {
     diagnostic_secrets: Arc<Mutex<DiagnosticSecrets>>,
     registry: Arc<Mutex<Registry>>,
     request_timeout: std::time::Duration,
-    config: Arc<RwLock<Configuration>>,
+    config: Arc<RwLock<Loaded>>,
     configuring: Arc<AsyncMutex<()>>,
     events: EventLog,
-    proxy_ca: Option<Arc<Vec<u8>>>,
     stopping: watch::Sender<bool>,
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// A request's credential, used instead of the held one; never stored.
+    credential: Option<Secret>,
 }
 impl Runtime {
     pub fn new(registry: Registry) -> Self {
@@ -59,7 +58,7 @@ impl Runtime {
             registry: Arc::new(Mutex::new(registry)),
             request_timeout: std::time::Duration::from_secs(30),
             diagnostic_secrets: Arc::default(),
-            config: Arc::new(RwLock::new(Configuration::default())),
+            config: Arc::new(RwLock::new(Loaded::default())),
             configuring: Arc::new(AsyncMutex::new(())),
             events: EventLog {
                 log: Arc::new(Mutex::new(Log {
@@ -74,9 +73,9 @@ impl Runtime {
                 })),
                 changed,
             },
-            proxy_ca: None,
             stopping: watch::channel(false).0,
             tasks: Arc::new(Mutex::new(vec![])),
+            credential: None,
         }
     }
     /// Deadline for ordinary provider calls; long mutations get `LONG_CALL`.
@@ -85,10 +84,9 @@ impl Runtime {
         self.request_timeout = timeout;
         self
     }
-    /// PEM trust root supplied out of band by the supervisor; never a vendor credential.
-    pub fn with_proxy_ca(mut self, pem: Vec<u8>) -> Self {
-        self.proxy_ca = Some(Arc::new(pem));
-        self
+    /// This runtime, calling providers with `credential` instead of the held one.
+    pub fn credentialed(&self, credential: Option<Secret>) -> Self {
+        Self { credential, ..self.clone() }
     }
     pub fn shutdown<F: std::future::Future<Output = ()> + Send + 'static>(
         &self,
@@ -124,8 +122,7 @@ impl Runtime {
 }
 
 impl Runtime {
-    pub async fn configure(&self, request: &HostConfiguration) -> Result<()> {
-        let request = request.clone();
+    pub async fn configure(&self, update: crate::api::ConfigUpdate) -> Result<()> {
         let mut stopping = self.stopping.subscribe();
         let _transaction = tokio::select! {
             biased;
@@ -137,66 +134,44 @@ impl Runtime {
         }
         let registry = self.registry.recover().clone();
         let mut config = self.config.read().await.clone();
+        let current = Configuration { providers: config.providers.iter().map(|(name, i)| (name.clone(), i.config.clone())).collect() };
+        let request = update.apply(&current)?;
         // Exact repeats preserve resources and delivered credentials. Changes to live providers
         // are refused: silently replacing one would lose in-memory reference resources.
-        let mut modules = BTreeMap::new();
-        for m in &request.modules {
-            if modules.insert(m.name.clone(), m.entrypoint.clone()).is_some() {
-                return Err(refused("duplicate module"));
+        for (name, p) in &request.providers {
+            if name.is_empty() || !registry.contains_key(&p.module) {
+                return Err(refused("invalid provider name or unregistered module"));
             }
-            if !registry.contains_key(&m.entrypoint) {
-                return Err(refused("unregistered module entrypoint"));
-            }
-        }
-        let mut names = BTreeSet::new();
-        for p in &request.providers {
-            if p.name.is_empty() || !names.insert(p.name.clone()) || !modules.contains_key(&p.module) {
-                return Err(refused("invalid or duplicate provider/module"));
-            }
-            if let Some(old) = config.providers.get(&p.name) {
-                let same_entrypoint = config.entrypoints.get(&p.module) == modules.get(&p.module);
-                if old.config != *p || !same_entrypoint {
-                    return Err(refused("cannot replace a configured provider; restart host"));
-                }
+            if config.providers.get(name).is_some_and(|old| old.config != *p) {
+                return Err(refused("cannot replace a configured provider; restart host"));
             }
         }
-        if config.providers.keys().any(|name| !names.contains(name)) {
+        if config.providers.keys().any(|name| !request.providers.contains_key(name)) {
             return Err(refused("cannot remove a configured provider; restart host"));
         }
         // Build before committing configuration, so a rejected document cannot partly apply.
         let mut additions = BTreeMap::new();
-        for p in &request.providers {
-            if config.providers.contains_key(&p.name) {
+        for (name, p) in &request.providers {
+            if config.providers.contains_key(name) {
                 continue;
             }
-            let module = &registry[&modules[&p.module]];
-            // Also validate programmatic configurations, which can bypass the wire decoder.
-            if matches!(&p.credential, CredentialMode::Proxied { placeholder_token, .. } if placeholder_token.expose().is_empty()) {
-                return Err(refused("empty proxy placeholder token"));
-            }
-            if let CredentialMode::Proxied { placeholder_token, .. } = &p.credential {
-                self.diagnostic_secrets.recover().remember(&p.name, placeholder_token.clone());
-            }
-            let credentials = Credentials::new(p.credential.clone());
-            let proxy = match &p.credential {
-                CredentialMode::Proxied { proxy_url, .. } => Some(proxy_url.as_str()),
-                _ => None,
-            };
+            let module = &registry[&p.module];
             let http = Arc::new(
-                rigging_http_client::ReqwestHttpClient::restricted(proxy, self.proxy_ca.as_deref().map(Vec::as_slice))
+                rigging_http_client::ReqwestHttpClient::restricted(None, None)
                     .map_err(|error| refused(format!("invalid HTTP transport configuration: {error}")))?,
             );
-            let sink = EventSink { shared: self.events.clone(), provider: p.name.clone() };
+            let sink = EventSink { shared: self.events.clone(), provider: name.clone() };
             let provider = tokio::select! {
                 biased;
                 _ = stopping.wait_for(|stopped| *stopped) => return Err(ProtocolError::unavailable("host stopping", None)),
-                result = module.configure(p, http) => result.map_err(|error| {
+                result = module.configure(name, p, http) => result.map_err(|error| {
                     let masker = self.diagnostic_secrets.recover().masker.clone();
-                    let error = masker.context(error, &p.name, "configure");
-                    tracing::warn!(provider = %p.name, route = "configure", error_class = error.class(), error = %error, "provider call failed");
+                    let error = masker.context(error, name, "configure");
+                    tracing::warn!(provider = %name, route = "configure", error_class = error.class(), error = %error, "provider call failed");
                     error
                 })?,
             };
+            let credentials = Credentials::default();
             let (credential_changes, _) = watch::channel(credentials.clone());
             let capabilities = provider.capabilities();
             let ports = provider.operations();
@@ -215,8 +190,9 @@ impl Runtime {
             let observation = provider.observation();
             let poll_interval = observer::poll_interval(observation, &rate_limits)?;
             additions.insert(
-                p.name.clone(),
+                name.clone(),
                 Arc::new(Instance {
+                    name: name.clone(),
                     config: p.clone(),
                     diagnostic_secrets: self.diagnostic_secrets.clone(),
                     provider,
@@ -239,14 +215,8 @@ impl Runtime {
                 }),
             );
         }
-        config.entrypoints = modules;
         let observers: Vec<_> = additions.values().cloned().collect();
         config.providers.extend(additions);
-        config.modules = request
-            .modules
-            .iter()
-            .map(|m| LoadedModule { name: m.name.clone(), version: registry[&m.entrypoint].version().into() })
-            .collect();
         let mut committed = self.config.write().await;
         if *self.stopping.borrow() {
             return Err(ProtocolError::unavailable("host stopping", None));
@@ -259,7 +229,7 @@ impl Runtime {
             return Err(ProtocolError::unavailable("host stopping", None));
         }
         for instance in observers {
-            tracing::info!(provider = %instance.config.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
+            tracing::info!(provider = %instance.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
             let task = observer::spawn(instance, self.stopping.subscribe());
             tasks.push(task);
         }
@@ -269,12 +239,9 @@ impl Runtime {
     pub async fn credential(&self, p: &str, value: Secret) -> Result<()> {
         let instance = self.instance(p).await?;
         let mut auth = instance.auth.recover();
-        if !matches!(auth.credentials.mode, CredentialMode::Direct { .. }) {
-            return Err(refused("proxied provider cannot accept direct credentials"));
-        }
         let before = instance.readiness(&auth);
         self.diagnostic_secrets.recover().remember(p, value.clone());
-        auth.credentials.value = Some(value);
+        auth.credentials = Credentials::new(Some(value));
         auth.generation += 1;
         auth.rejected = false;
         auth.rejection_error = None;
@@ -290,7 +257,7 @@ impl Runtime {
         for task in std::mem::take(&mut *self.tasks.recover()) {
             task.abort();
         }
-        *self.config.write().await = Configuration::default();
+        *self.config.write().await = Loaded::default();
         *self.registry.recover() = registry;
         let mut log = self.events.log.recover();
         log.epoch = format!("{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().expect("current timestamp"));

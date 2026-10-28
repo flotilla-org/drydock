@@ -20,9 +20,8 @@ rows, events, delete_attempts, inspect_attempts = {}, [], {}, {}
 condition = threading.Condition(threading.RLock())
 usage_segments, running_since = [], {}
 prepared, prepare_calls, quota_calls = {}, 0, 0
-providers = {"a": {"name": "a", "module": "memory", "settings": {}, "credential": {"mode": "direct", "credential_reference": "fixture"}}}
+providers = {"a": {"module": "reference", "settings": {}}}
 readiness = {"a": "ready"}
-modules = [{"name": "memory", "version": "fixture"}]
 provider_timestamp, inventory_error = None, False
 size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
 capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clone"],
@@ -109,6 +108,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def declaration(self, name):
+        status = readiness.get(name, "ready")
+        return {"provider": name, "module": providers[name]["module"], "capabilities": capabilities, "rate_limits": [],
+                "readiness": {"status": status, **({"reason": "missing"} if status == "missing_credential" else {})},
+                "ports": {"exec": True, "suspend_resume": True, "export": True, "usage": True, "quota": True},
+                "observation": {"mode": "poll", "interval_ms": 10}}
+
     def refused(self):
         self.respond(422, {"kind": "refused", "reason": "invalid"})
 
@@ -118,7 +124,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self): self.route()
 
     def route(self):
-        global modules, provider_timestamp, inventory_error, prepare_calls, quota_calls
+        global provider_timestamp, inventory_error, prepare_calls, quota_calls
         parsed = urllib.parse.urlsplit(self.path)
         parts = parsed.path.split("/")
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"null")
@@ -126,22 +132,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "8", "host_version": "fixture", "modules": modules,
-                "providers": [{"provider": name, "module": config["module"], "readiness": {"status": readiness.get(name, "ready"), **({"reason": "missing"} if readiness.get(name) == "missing_credential" else {})},
-                               "capabilities": capabilities, "rate_limits": []} for name, config in providers.items()]})
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "9", "host_version": "fixture",
+                "loadable_modules": [{"name": "reference", "version": "fixture", "smallest_size": size}]})
+        if parsed.path == "/v1/providers":
+            return self.respond(200, [self.declaration(name) for name in providers])
+        if len(parts) == 4 and parts[2] == "providers" and self.command == "GET":
+            if provider not in providers:
+                return self.respond(404, {"kind": "not_found", "reason": "unknown provider"})
+            return self.respond(200, self.declaration(provider))
         if parsed.path == "/v1/config":
-            if any(module["entrypoint"] != "reference" for module in body["modules"]):
+            configured = body["providers"]
+            if any(config["module"] != "reference" for config in configured.values()):
                 if fault == "configuration_atomic":
-                    modules = []
+                    providers.update({name: config for name, config in configured.items() if name not in providers})
                 return self.refused()
-            if fault == "host_configuration" and any(config["name"].startswith("error-") for config in body["providers"]):
+            if fault == "host_configuration" and any(name.startswith("error-") for name in configured):
                 return self.refused()
-            if any(config["name"] in providers and any(row["provider"] == config["name"] for row in rows.values()) and config["settings"] != providers[config["name"]]["settings"] for config in body["providers"]):
+            if any(name in providers and any(row["provider"] == name for row in rows.values()) and config.get("settings", {}) != providers[name]["settings"] for name, config in configured.items()):
                 return self.refused()
-            modules = [{"name": module["name"], "version": "fixture"} for module in body["modules"]]
-            for config in body["providers"]:
-                providers[config["name"]] = config
-                readiness.setdefault(config["name"], "missing_credential")
+            for name, config in configured.items():
+                providers[name] = {"module": config["module"], "settings": config.get("settings", {})}
+                readiness.setdefault(name, "missing_credential")
             return self.respond(204)
         if parts[-1] == "credential":
             if not isinstance(body.get("value"), str) or not body["value"]: return self.refused()

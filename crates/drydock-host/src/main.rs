@@ -9,10 +9,7 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut registry = reference::registry();
     registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
-    let mut host = Host::new(registry);
-    if let Ok(path) = std::env::var("DRYDOCK_PROXY_CA") {
-        host = host.with_proxy_ca(std::fs::read(path)?);
-    }
+    let host = Host::new(registry);
     // Register SIGTERM before binding so managed shutdown always drains streams.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let shutdown = async move {

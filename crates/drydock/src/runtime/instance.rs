@@ -10,6 +10,7 @@ pub(super) struct Authentication {
     pub(super) rejection_error: Option<ProtocolError>,
 }
 pub(super) struct Instance {
+    pub(super) name: String,
     pub(super) diagnostic_secrets: Arc<Mutex<DiagnosticSecrets>>,
     pub(super) config: ProviderConfiguration,
     pub(super) provider: Arc<dyn Provider>,
@@ -21,12 +22,12 @@ pub(super) struct Instance {
     pub(super) budget: Mutex<BTreeMap<String, VecDeque<tokio::time::Instant>>>,
     pub(super) events: EventSink,
     pub(super) observation: ObservationMode,
-    pub(super) poll_interval: Option<std::time::Duration>,
+    pub(super) poll_interval: std::time::Duration,
     pub(super) poll_error: Mutex<Option<ProtocolError>>,
     pub(super) credential_changes: watch::Sender<Credentials>,
     pub(super) destroyed: Mutex<BTreeMap<String, DestroyState>>,
     pub(super) lifecycle_changes: watch::Sender<u64>,
-    pub(super) inspected: Mutex<BTreeMap<String, ObservedEnvironment>>,
+    pub(super) inspected: Mutex<BTreeMap<String, Environment>>,
     pub(super) observation_generation: Mutex<u64>,
     pub(super) egress_measured_at: Mutex<BTreeMap<String, tokio::time::Instant>>,
     pub(super) request_timeout: std::time::Duration,
@@ -129,29 +130,15 @@ pub(super) struct Availability {
     pub(super) may_call: bool,
 }
 impl Instance {
-    // All callers, hello and refresh use this single derivation. Direct rejection
-    // is sticky until a new credential generation. Proxy credentials are repaired
-    // out of band, so rejection does not disable subsequent probes or route calls.
+    // All callers, hello and refresh use this single derivation. Rejection is
+    // sticky until a new credential generation.
     pub(super) fn availability(&self, auth: &Authentication) -> Availability {
-        let module = self.provider.readiness(&auth.credentials);
-        let module_ready = matches!(module, Readiness::Ready);
         if auth.rejected {
-            match auth.credentials.mode {
-                CredentialMode::Direct { .. } => Availability {
-                    readiness: Readiness::MissingCredential {
-                        reason: auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into()),
-                    },
-                    may_call: false,
-                },
-                CredentialMode::Proxied { .. } if module_ready => Availability {
-                    readiness: Readiness::Unknown { reason: "proxy credential rejected; awaiting successful probe".into() },
-                    may_call: true,
-                },
-                CredentialMode::Proxied { .. } => Availability { readiness: module, may_call: false },
-            }
-        } else {
-            Availability { readiness: module, may_call: module_ready }
+            let reason = auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into());
+            return Availability { readiness: Readiness::MissingCredential { reason }, may_call: false };
         }
+        let readiness = self.provider.readiness(&auth.credentials);
+        Availability { may_call: matches!(readiness, Readiness::Ready), readiness }
     }
     pub(super) fn readiness(&self, auth: &Authentication) -> Readiness {
         self.availability(auth).readiness
@@ -174,11 +161,16 @@ impl Instance {
     // that overruns keeps the last reported readiness.
     pub(super) async fn refresh_readiness(&self) {
         let credentials = self.auth.recover().credentials.clone();
-        let _ = tokio::time::timeout(self.request_timeout, self.provider.refresh_readiness(&credentials)).await;
+        self.refresh_readiness_with(&credentials).await;
+    }
+    async fn refresh_readiness_with(&self, credentials: &Credentials) {
+        let _ = tokio::time::timeout(self.request_timeout, self.provider.refresh_readiness(credentials)).await;
     }
     /// An ordinary call ends at its deadline; the provider outcome is then unknown.
     /// Calls are never retried here: an `Unavailable` mutation may have happened.
-    pub(super) async fn call<T, F, Fut>(&self, gate: Gate, f: F) -> Result<T>
+    /// A `credential` is used instead of the held one, for this call only: it
+    /// neither needs nor changes the held credential's admission state.
+    pub(super) async fn call<T, F, Fut>(&self, gate: Gate, credential: Option<Secret>, f: F) -> Result<T>
     where
         T: Send,
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
@@ -186,8 +178,8 @@ impl Instance {
     {
         use tracing::Instrument;
         let deadline = gate.deadline(self.request_timeout);
-        tokio::time::timeout(deadline, self.call_with_budget(gate, false, f))
-            .instrument(tracing::info_span!("provider_route", provider = %self.config.name, route = gate.name()))
+        tokio::time::timeout(deadline, self.call_with_budget(gate, false, credential, f))
+            .instrument(tracing::info_span!("provider_route", provider = %self.name, route = gate.name()))
             .await
             .unwrap_or_else(|_| {
                 let unknown = if gate.mutates() { "; the provider outcome is unknown" } else { "" };
@@ -197,32 +189,44 @@ impl Instance {
     }
     /// Resolve readiness, gate cached capabilities, enforce declared budgets, invoke,
     /// and update credential rejection state once for every route and host poll.
-    pub(super) async fn call_with_budget<T, F, Fut>(&self, gate: Gate, poll: bool, f: F) -> Result<T>
+    pub(super) async fn call_with_budget<T, F, Fut>(&self, gate: Gate, poll: bool, credential: Option<Secret>, f: F) -> Result<T>
     where
         T: Send,
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
         Fut: std::future::Future<Output = Result<T>> + Send,
     {
-        self.refresh_readiness().await;
-        let (credentials, generation) = {
-            let auth = self.auth.recover();
-            // Routes and polls use exactly the same admission gate. Direct
-            // rejection blocks both; proxied rejection permits both to probe.
-            // A pending observation reservation can safely survive unready time:
-            // no route can resume while polling remains disabled by readiness.
-            let availability = self.availability(&auth);
-            if !availability.may_call {
-                if auth.rejected
-                    && matches!(auth.credentials.mode, CredentialMode::Direct { .. })
-                    && let Some(error) = &auth.rejection_error
-                {
-                    // Already masked and contextualized at the original failure.
-                    return Err(error.clone());
+        let (credentials, generation) = match credential {
+            Some(value) => {
+                let credentials = Credentials::new(Some(value));
+                self.refresh_readiness_with(&credentials).await;
+                let readiness = self.provider.readiness(&credentials);
+                if !matches!(readiness, Readiness::Ready) {
+                    let reason = format!("provider is not ready: {readiness}");
+                    return Err(self.diagnostic_error_for_token(
+                        ProtocolError::unavailable(reason, None),
+                        gate.name(),
+                        credentials.token(),
+                    ));
                 }
-                let reason = format!("provider is not ready: {}", availability.readiness);
-                return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()));
+                (credentials, None)
             }
-            (auth.credentials.clone(), auth.generation)
+            None => {
+                self.refresh_readiness().await;
+                let auth = self.auth.recover();
+                // Routes and polls use exactly the same admission gate.
+                // A pending observation reservation can safely survive unready time:
+                // no route can resume while polling remains disabled by readiness.
+                let availability = self.availability(&auth);
+                if !availability.may_call {
+                    if let Some(error) = auth.rejection_error.as_ref().filter(|_| auth.rejected) {
+                        // Already masked and contextualized at the original failure.
+                        return Err(error.clone());
+                    }
+                    let reason = format!("provider is not ready: {}", availability.readiness);
+                    return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()));
+                }
+                (auth.credentials.clone(), Some(auth.generation))
+            }
         };
         if !gate.supported(&self.capabilities) {
             return Err(refused("operation capability not declared"));
@@ -236,9 +240,11 @@ impl Instance {
             .await
             .map_err(|error| self.diagnostic_error_for_token(error, gate.name(), call_token.as_ref()));
         if let Err(error) = &result {
-            tracing::warn!(provider = %self.config.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
+            tracing::warn!(provider = %self.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
         }
-        self.finish_call(generation, poll, gate.name(), &result);
+        if let Some(generation) = generation {
+            self.finish_call(generation, poll, gate.name(), &result);
+        }
         result
     }
     pub(super) fn finish_call<T>(&self, generation: u64, poll: bool, operation: &str, result: &Result<T>) {
@@ -252,15 +258,11 @@ impl Instance {
                 auth.rejection_error = result.as_ref().err().cloned();
                 auth.rejected = true;
                 auth.generation += 1; // invalidate every call started before this rejection
-            } else if result.is_ok() && auth.rejected && matches!(auth.credentials.mode, CredentialMode::Proxied { .. }) {
-                auth.rejected = false;
-                auth.rejection_error = None;
-                auth.generation += 1; // only a probe started after rejection can repair it
             }
         }
         let after = self.readiness(&auth);
         if before != after {
-            tracing::info!(provider = %self.config.name, route = operation, readiness = readiness_status(&after), "provider readiness changed");
+            tracing::info!(provider = %self.name, route = operation, readiness = readiness_status(&after), "provider readiness changed");
         }
     }
     pub(super) fn diagnostic_error(&self, error: ProtocolError, operation: &str) -> ProtocolError {
@@ -275,7 +277,7 @@ impl Instance {
             // A long-running call may outlive the recent-generation window.
             Arc::make_mut(&mut masker).remember(token.expose());
         }
-        masker.context(error, &self.config.name, operation)
+        masker.context(error, &self.name, operation)
     }
 
     fn longest_window(&self, operation: &str) -> std::time::Duration {
