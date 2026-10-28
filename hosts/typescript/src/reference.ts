@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { EventEmitter, on } from "node:events";
 import { PassThrough } from "node:stream";
 import {
   ProtocolFailure,
@@ -15,7 +14,6 @@ const settingsValid = compile({
   type: "object",
   additionalProperties: false,
   properties: {
-    push: { type: "boolean" },
     seed_unlabelled: { type: "boolean" },
   },
 });
@@ -37,9 +35,10 @@ const reference: ProviderModule = {
   name: "reference",
   version: "0.1.0",
   smallestSize: { cpus: 1, memory_bytes: 1, disk_bytes: 0 },
-  async configure(config) {
-    if (!settingsValid(config.settings)) refused("invalid reference settings");
-    return new Memory(config.name, config.settings);
+  async configure(name, config) {
+    if (!settingsValid(config.settings ?? {}))
+      refused("invalid reference settings");
+    return new Memory(name, config.settings ?? {});
   },
 };
 export default reference;
@@ -71,34 +70,29 @@ class Memory implements Provider {
   observation: Types["ObservationMode"];
   rateLimits: Types["RateLimit"][] = [];
   private builds = new Map<string, Types["Prepared"]>();
-  private rows = new Map<string, Types["ObservedEnvironment"]>();
-  private updates = new EventEmitter();
+  private rows = new Map<string, Types["Environment"]>();
   private next = 0;
   constructor(
     private name: string,
     settings: Record<string, unknown>,
   ) {
-    this.observation = settings.push
-      ? "Push"
-      : { Poll: { interval: { secs: 0, nanos: 10000000 } } };
+    this.observation = { mode: "poll", interval_ms: 10 };
     if (settings.seed_unlabelled)
       this.rows.set("unlabelled", {
-        environment: {
-          provider: name,
-          id: "unlabelled",
-          label: null,
-          granted_size: null,
-          platform: null,
-          egress: "advisory",
-          state: { state: "transitioning", phase: "starting" },
-        },
+        provider: name,
+        id: "unlabelled",
+        label: null,
+        granted_size: null,
+        platform: null,
+        egress: "advisory",
+        state: { state: "transitioning", phase: "starting" },
         timestamp: null,
         egress_measured: false,
         egress_policy: null,
       });
   }
-  readiness({ credentials }: Context): Types["Readiness"] {
-    return credentials.value || credentials.mode.mode === "proxied"
+  readiness({ credential }: Context): Types["Readiness"] {
+    return credential
       ? { status: "ready" }
       : { status: "missing_credential", reason: "credential not delivered" };
   }
@@ -127,35 +121,33 @@ class Memory implements Provider {
   async provision(
     request: Types["ProvisionRequest"],
     { signal }: Context,
-  ): Promise<Types["Provisioned"]> {
+  ): Promise<{ created: boolean; environment: Types["Environment"] }> {
     signal.throwIfAborted();
     const existing = [...this.rows.values()].find(
-      (row) => row.environment.label === request.label,
+      (row) => row.label === request.label,
     );
     // Label idempotency wins over a new/stale prepared form, as in the Rust reference.
-    if (existing) return { Existing: structuredClone(existing) };
+    if (existing)
+      return { created: false, environment: structuredClone(existing) };
     if (
       !isDeepStrictEqual(this.builds.get(request.prepared.id), request.prepared)
     )
       refused("unknown prepared form");
-    const row: Types["ObservedEnvironment"] = {
-      environment: {
-        provider: this.name,
-        id: `${this.name}-${++this.next}`,
-        label: request.label,
-        granted_size: structuredClone(request.size),
-        platform: request.prepared.platform,
-        state: { state: "running" },
-        egress: "advisory",
-      },
+    const row: Types["Environment"] = {
+      provider: this.name,
+      id: `${this.name}-${++this.next}`,
+      label: request.label,
+      granted_size: structuredClone(request.size),
+      platform: request.prepared.platform,
+      state: { state: "running" },
+      egress: "advisory",
       timestamp: new Date().toISOString(),
       // This fixture measured its advisory result; it makes no enforcement claim.
       egress_measured: true,
       egress_policy: digest(request.egress),
     };
-    this.rows.set(row.environment.id, row);
-    this.updates.emit("update", { Observed: structuredClone(row) });
-    return { Created: structuredClone(row) };
+    this.rows.set(row.id, row);
+    return { created: true, environment: structuredClone(row) };
   }
   async list({ signal }: Context) {
     signal.throwIfAborted();
@@ -171,27 +163,19 @@ class Memory implements Provider {
       });
     return structuredClone(row);
   }
-  inspectAfterLifecycle(id: string, context: Context) {
-    return this.inspect(id, context);
-  }
   async destroy(id: string, { signal }: Context) {
     signal.throwIfAborted();
-    // Destroy is idempotent; absence must not emit a second removal.
-    if (this.rows.delete(id))
-      this.updates.emit("update", {
-        Removed: { id, timestamp: new Date().toISOString() },
-      });
+    this.rows.delete(id);
   }
-  async reach(id: string, context: Context): Promise<Types["Connection"]> {
+  async reach(id: string, context: Context): Promise<Types["Reach"]> {
     await this.inspect(id, context);
-    return "Relay";
+    return {
+      kind: "relay",
+      path: `/v1/providers/${encodeURIComponent(this.name)}/environments/${encodeURIComponent(id)}/relay`,
+    };
   }
   async relay(id: string, context: Context) {
     await this.inspect(id, context);
     return new PassThrough();
-  }
-  async *subscribe({ signal }: Context): AsyncIterable<Types["Update"]> {
-    for await (const [update] of on(this.updates, "update", { signal }))
-      yield update as Types["Update"];
   }
 }

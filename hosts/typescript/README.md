@@ -62,3 +62,17 @@ not served; vessel connections are being redesigned as exposures (#132).
 `provider.ts` is handwritten and free of framework types. `src/generated/**` and
 `dist/**` are generated outputs, including JSON. Rust types → canonical OpenAPI →
 TypeScript bindings and packaged AJV schema form one generation chain.
+
+The built-in `reference` module is the default executable fixture. Its optional
+settings are `{seed_unlabelled: boolean}`; unknown settings are refused. It stores
+prepared forms and Environment rows, implements label idempotency and a raw echo
+relay, and exposes a 10ms polling declaration. It owns no event stream or replay.
+
+`corepack pnpm conformance` discovers and runs the ignored Rust integration test
+against this actual child host through the main Daemon and its existing checker.
+Authentication is exercised by the shared server serving tests; private UDS uses
+filesystem authorization. Exec-based host fixtures await #85. The test drains
+and counts child output without retaining credentials, checks optional-operation
+admission in the embedded server, and requires the shared conformance report to
+pass. The script fails if its named test is missing, rather than silently running
+zero tests. The existing CI check command includes this test without another job.

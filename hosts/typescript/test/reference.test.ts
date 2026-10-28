@@ -1,46 +1,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import reference from "../dist/reference.js";
-// The reference's only extra unit scenario is its push source: updates and
-// explicit removals are provider facts. Main-server conformance covers lifecycle.
-test("reference push source emits facts/removals and honors cancellation", async () => {
-  const signal = new AbortController();
-  const context = {
-    credentials: {
-      mode: { mode: "direct" as const, credential_reference: "test" },
-      value: "test-only",
-    },
-    signal: signal.signal,
-  };
-  await assert.rejects(
-    reference.configure(
-      {
-        name: "a",
-        module: "reference",
-        settings: { foo: 1 },
-        credential: context.credentials.mode,
-      },
-      signal.signal,
-    ),
-    (e: any) => e.detail.kind === "refused",
+// Main-server conformance owns lifecycle, idempotency, polling/replay and relay.
+// This trait-level scenario covers only reference-owned settings, canonical
+// prepared keys and clone isolation across reordered object members.
+test("reference validates settings and owns deterministic prepared keys", async () => {
+  const abort = new AbortController(),
+    context = { credential: "test-only", signal: abort.signal };
+  for (const settings of [{ unknown: true }, { seed_unlabelled: "true" }])
+    await assert.rejects(
+      reference.configure("a", { module: "reference", settings }, abort.signal),
+      (e: any) => e.detail.kind === "refused",
+    );
+  const provider = await reference.configure(
+    "a",
+    { module: "reference" },
+    abort.signal,
   );
-  const p = await reference.configure(
-    {
-      name: "a",
-      module: "reference",
-      settings: { push: true },
-      credential: context.credentials.mode,
-    },
-    signal.signal,
-  );
-  assert.equal(p.observation, "Push");
-  const updates = p.subscribe(context)[Symbol.asyncIterator]();
-  const next = updates.next();
-  const size = { cpus: 1, memory_bytes: 1, disk_bytes: 0 };
   const input = {
     platform: { os: "linux", architecture: "amd64" },
     route: "remote_build",
-    size,
+    size: { cpus: 1, memory_bytes: 1, disk_bytes: 0 },
     image_digest: "image",
     tools_digest: "tools",
   };
@@ -49,16 +29,12 @@ test("reference push source emits facts/removals and honors cancellation", async
     { ...input, route: "registry_pull" },
   ])
     await assert.rejects(
-      p.prepare(invalid, context),
+      provider.prepare(invalid, context),
       (e: any) => e.detail.kind === "refused",
     );
-  await assert.rejects(
-    p.inspect("unknown", context),
-    (e: any) => e.detail.kind === "not_found",
-  );
-  const prepared = await p.prepare(input, context);
+  const prepared = await provider.prepare(input, context);
   assert.deepEqual(
-    await p.prepare(
+    await provider.prepare(
       {
         ...input,
         platform: { architecture: "amd64", os: "linux" },
@@ -68,26 +44,15 @@ test("reference push source emits facts/removals and honors cancellation", async
     ),
     prepared,
   );
-  const created = await p.provision(
-    { prepared, size, label: "push", egress: { mode: "deny_all" } },
-    context,
+  assert.notEqual(
+    (await provider.prepare({ ...input, tools_digest: "other-tools" }, context))
+      .id,
+    prepared.id,
   );
-  assert.ok("Created" in created);
-  assert.deepEqual((await next).value, { Observed: created.Created });
-  assert.deepEqual(
-    await p.provision(
-      { prepared, size, label: "push", egress: { mode: "deny_all" } },
-      context,
-    ),
-    { Existing: created.Created },
-  );
-  const removed = updates.next();
-  await p.destroy(created.Created.environment.id, context);
-  await p.destroy(created.Created.environment.id, context);
-  const update = (await removed).value;
-  assert.ok(update && "Removed" in update);
-  assert.equal(update.Removed.id, created.Created.environment.id);
-  const stopped = updates.next();
-  signal.abort();
-  await assert.rejects(stopped, { name: "AbortError" });
+  prepared.platform.os = "mutated";
+  assert.equal((await provider.prepare(input, context)).platform.os, "linux");
+  abort.abort();
+  await assert.rejects(provider.prepare(input, context), {
+    name: "AbortError",
+  });
 });

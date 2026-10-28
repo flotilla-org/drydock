@@ -49,7 +49,7 @@ async fn typescript_reference_conforms_through_main_server() {
     std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config: Config = toml::from_str(&format!(
         r#"
-[provider.a]
+[providers.a]
 module = "reference"
 credential = {{ file = {:?} }}
 settings = {{ seed_unlabelled = true }}
