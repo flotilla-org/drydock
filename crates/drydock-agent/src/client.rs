@@ -695,7 +695,7 @@ impl Client {
             response.into_body().collect().await.map_err(|e| link_error("PUT /upgrade", e))?;
         } else if self.blob_size(&digest).await?.is_none() {
             // An earlier attempt may have left an incomplete upload of this
-            // digest, which a fresh upload would be refused over.
+            // digest, which a fresh upload would be refused over (409 Conflict, "resume it").
             self.resume_upload(&digest, executable.len() as u64, std::io::Cursor::new(executable)).await?;
         }
         Ok(digest)
