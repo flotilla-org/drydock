@@ -21,6 +21,10 @@ Generated outputs are untracked, marked GENERATED and verified by
 includes compiled bindings and runtime schemas; no repository files are needed at
 runtime. AJV never coerces values, inserts defaults or strips fields.
 
+The root `package.json` repeats the pnpm pin so Corepack selects the same version
+when CI invokes `corepack pnpm --dir hosts/typescript ...` from the repository root.
+Keep both pins aligned; `--dir` is interpreted by pnpm after Corepack selects it.
+
 Unpack the tarball into a dedicated installation directory, run `corepack pnpm
 install --prod --frozen-lockfile`, and link executable `dist/main.js` beside
 `drydockd` as `drydock-host-typescript` (or set `DRYDOCK_TYPESCRIPT_HOST_BIN`).
