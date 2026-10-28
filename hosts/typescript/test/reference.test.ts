@@ -17,6 +17,10 @@ test("reference validates settings and owns deterministic prepared keys", async 
     { module: "reference" },
     abort.signal,
   );
+  await assert.rejects(
+    provider.inspect("unknown", context),
+    (e: any) => e.detail.kind === "not_found",
+  );
   const input = {
     platform: { os: "linux", architecture: "amd64" },
     route: "remote_build",
