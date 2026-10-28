@@ -10,6 +10,9 @@ const ajv = new Ajv2020({
   removeAdditional: false,
 });
 (formats as unknown as (value: Ajv2020) => void)(ajv);
+// JSON.parse uses JS numbers: integer precision beyond2^53 is not lossless.
+// Signed int64 is not range-constrained here; modules must account for that
+// when interpreting large counters. No coercion or string encoding is added.
 // Rust integer formats carry wire widths, not JavaScript's unconstrained integer.
 function widths(value: unknown): void {
   if (!value || typeof value !== "object") return;

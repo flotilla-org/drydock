@@ -39,6 +39,7 @@ are sent to Daemon, which owns public credential masking; modules must never log
 secrets.
 
 Set `DRYDOCK_TYPESCRIPT_MODULES` to comma-separated absolute ESM paths/file URLs.
+Entries are comma-separated; use a file URL with `%2C` for a comma in a path.
 Each exports a default `ProviderModule` from handwritten `src/provider.ts`.
 Configuration selects only these modules by name; settings cannot import code.
 PUT `/v1/config` replaces `{providers: {instance: {module, settings}}}`; PATCH uses

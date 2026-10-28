@@ -261,6 +261,15 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     assert.equal(result.body.kind, kind);
     assert.ok(!JSON.stringify(result).includes("secret-must-not-escape"));
   }
+  assert.equal(
+    (
+      await request(f.socketPath, "/unknown", undefined, "GET", {
+        payload: "",
+        headers: { "Drydock-Credential": "" },
+      })
+    ).status,
+    404,
+  );
   for (const body of [
     { ...prepare, size: { ...size, cpus: "1" } },
     { ...prepare, image_digest: "" },
@@ -285,6 +294,8 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
   }
   await request(f.socketPath, "/v1/config", f.config, "PUT");
   assert.equal(f.configurations(), 1);
+  await request(f.socketPath, "/v1/config", {}, "PATCH");
+  assert.equal(f.configurations(), 1, "empty patch keeps unchanged instances");
   const patch = JSON.parse(
     '{"providers":{"a":{"settings":{"constructor":{"added":2},"__proto__":{"opaque":null,"new":3},"custom":[2],"fresh":{"__proto__":{"data":true}}}}}}',
   );
@@ -309,11 +320,23 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
       await request(
         f.socketPath,
         "/v1/config",
-        { providers: { bad: { module: "missing" } } },
+        {
+          providers: {
+            a: { settings: { uncommitted: true } },
+            bad: { module: "missing" },
+          },
+        },
         "PATCH",
       )
     ).status,
     422,
+  );
+  const afterFailure = f.configurations();
+  await request(f.socketPath, "/v1/config", {}, "PATCH");
+  assert.equal(
+    f.configurations(),
+    afterFailure,
+    "failed transaction retains previous configs",
   );
   assert.equal(
     (await request(f.socketPath, "/v1/providers", undefined, "GET")).body

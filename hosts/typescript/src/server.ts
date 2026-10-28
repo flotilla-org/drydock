@@ -39,6 +39,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
   const directory = await stat(dirname(unix));
   if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700)
     throw Error("private directory must have mode 0700");
+  const validConfiguration = compile(bodySchema("Configuration"));
   const registry = new Map(modules.map((m) => [m.name, m]));
   if (registry.size !== modules.length) throw Error("duplicate module");
   let bindings = new Map<string, Binding>();
@@ -143,7 +144,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
     reply.raw.once("close", () => abort.abort());
     request.raw.once("aborted", () => abort.abort());
     calls.set(request.raw, AbortSignal.any([abort.signal, stopping.signal]));
-    context(request.raw);
+    if (!request.is404) context(request.raw);
     const raw = upgrades.get(request.raw);
     if (!raw) return;
     if (!(request.routeOptions.config as { relay?: boolean }).relay) {
@@ -189,7 +190,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
         const result = errorResponse(error),
           body = JSON.stringify(result.detail);
         raw.socket.end(
-          `HTTP/1.1 ${result.status} Error\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+          `HTTP/1.1 ${result.status} Error\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
         );
       }
     } finally {
@@ -242,8 +243,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
                   mergePatch(keys(current, true), keys(request.body, true)),
                   false,
                 );
-          if (!compile(bodySchema("Configuration"))(document))
-            refused("invalid configuration");
+          if (!validConfiguration(document)) refused("invalid configuration");
           const next = new Map<string, Binding>();
           const signal = calls.get(request.raw)!;
           for (const [name, entry] of Object.entries(
@@ -314,6 +314,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
     refused("missing relay upgrade headers"),
   );
   await app.listen({ path: unix });
+  // The verified0700 parent controls access during bind-to-chmod.
   await chmod(unix, 0o600);
   return {
     app,
