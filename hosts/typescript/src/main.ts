@@ -7,6 +7,7 @@ async function main() {
   if (process.argv.length !== 4 || process.argv[2] !== "--unix")
     throw Error("usage: drydock-host-typescript --unix PATH");
   const modules: ProviderModule[] = [];
+  const validModule = compile(bodySchema("LoadableModule"));
   for (const entry of (process.env.DRYDOCK_TYPESCRIPT_MODULES ?? "")
     .split(",")
     .filter(Boolean)) {
@@ -19,7 +20,7 @@ async function main() {
     ).default;
     if (
       typeof module?.configure !== "function" ||
-      !compile(bodySchema("LoadableModule"))({
+      !validModule({
         name: module?.name,
         version: module?.version,
         smallest_size: module?.smallestSize,
@@ -37,7 +38,9 @@ async function main() {
   const host = await serve(modules, process.argv[3]);
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
-      void host.close();
+      void host.close().catch(() => {
+        process.exitCode = 1;
+      });
     });
 }
 main().catch(() => {

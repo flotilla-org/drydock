@@ -1,3 +1,4 @@
+// Linux/Unix packaging requires the system tar executable.
 // pnpm pack intentionally omits pnpm-lock.yaml. Retain it in the companion
 // distribution so production dependency installation can use --frozen-lockfile.
 import { mkdtemp, cp, mkdir, rm } from "node:fs/promises";

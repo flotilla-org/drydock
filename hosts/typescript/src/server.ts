@@ -110,7 +110,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
     return value;
   };
   function context(request: IncomingMessage): Context {
-    const credential = request.headers["drydock-credential"];
+    const credential = request.headersDistinct["drydock-credential"]?.[0];
     if (
       credential !== undefined &&
       (typeof credential !== "string" || !/^[\x20-\x7e]+$/.test(credential))
@@ -193,6 +193,8 @@ export async function serve(modules: ProviderModule[], unix: string) {
         );
       }
     } finally {
+      // Keep once-only close cancellation for the established stream lifetime;
+      // bridge owns half-closes and errors after setup.
       raw.socket.off("end", closed);
       raw.socket.off("error", closed);
     }
@@ -232,6 +234,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
               [...bindings].map(([name, b]) => [name, b.config]),
             ),
           };
+          // Validate the merged document, not a partial patch with null deletions.
           const document =
             method === "PUT"
               ? request.body

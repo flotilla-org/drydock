@@ -24,6 +24,7 @@ export function errorResponse(error: unknown) {
   const headers: Record<string, string> = {
     "content-type": "application/json",
   };
+  // Canonical OpenAPI defines retry_after as whole seconds (HTTP Retry-After).
   if ("retry_after" in detail && detail.retry_after != null)
     headers["retry-after"] = String(detail.retry_after);
   return { status: status[detail.kind], headers, detail };

@@ -70,7 +70,7 @@ function request(
   path: string,
   body?: unknown,
   method = "POST",
-  wire?: { payload: string; headers?: Record<string, string> },
+  wire?: { payload: string; headers?: Record<string, string | string[]> },
 ) {
   return new Promise<{ status: number; body: any }>((resolve, reject) => {
     const req = http.request(
@@ -197,6 +197,23 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     assert.equal(captured.at(-1)!.credential, credential);
     assert.ok(!JSON.stringify(result).includes(credential));
   }
+  // Invalid credentials are refused before SDK work; duplicate values follow
+  // Rust HeaderMap::get's first-value semantics instead of Node's comma joining.
+  for (const credential of ["", "\x80"]) {
+    const count = captured.length;
+    const result = await request(f.socketPath, url, undefined, "GET", {
+      payload: "",
+      headers: { "Drydock-Credential": credential },
+    });
+    assert.equal(result.status, 422);
+    assert.equal(result.body.kind, "refused");
+    assert.equal(captured.length, count);
+  }
+  await request(f.socketPath, url, undefined, "GET", {
+    payload: "",
+    headers: { "Drydock-Credential": ["first-only", "ignored-second"] },
+  });
+  assert.equal(captured.at(-1)!.credential, "first-only");
   await request(f.socketPath, url, undefined, "GET");
   assert.equal(captured.at(-1)!.credential, undefined);
   const prepare = { image_digest: "image", tools_digest: "tools", size };
