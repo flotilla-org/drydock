@@ -13,7 +13,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post},
+    routing::post,
 };
 use drydock_protocol::*;
 use serde::Deserialize;
@@ -43,7 +43,6 @@ impl HostOption {
             connection: HostConnection::Managed {
                 command: vec![crate::local::companion("drydock-host", "DRYDOCK_HOST_BIN")?.to_string_lossy().into_owned()],
                 runtime: None,
-                proxy_environment: BTreeMap::new(),
             },
         }];
         for (name, binary, runtime, override_var) in [
@@ -60,7 +59,6 @@ impl HostOption {
                     connection: HostConnection::Managed {
                         command: vec![path.to_string_lossy().into_owned()],
                         runtime: Some(runtime.into()),
-                        proxy_environment: BTreeMap::new(),
                     },
                 });
             }
@@ -76,7 +74,21 @@ struct Placement {
     host: usize,
     minimum: Size,
 }
+/// Serves the public API for every configured provider, routing each call to
+/// the host that loads its module. Clones share one daemon.
+#[derive(Clone)]
 pub struct Daemon {
+    inner: Arc<Inner>,
+    /// A request's credential, used instead of the held one; never stored.
+    credential: Option<Secret>,
+}
+impl std::ops::Deref for Daemon {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
+}
+pub struct Inner {
     config: Config,
     modules: BTreeMap<String, (usize, LoadableModule)>,
     hosts: Vec<ManagedHost>,
@@ -129,7 +141,7 @@ impl Daemon {
         let mut assignments: Vec<Vec<String>> = (0..discovered.len()).map(|_| vec![]).collect();
         let mut chosen = BTreeMap::new();
         let mut unavailable = BTreeMap::new();
-        for (name, provider) in &config.provider {
+        for (name, provider) in &config.providers {
             // Stable host order prefers the bundled Rust implementation.
             if let Some((i, module)) = selected.get(&provider.module) {
                 let i = *i;
@@ -147,32 +159,23 @@ impl Daemon {
         let mut placements = BTreeMap::new();
         let mut modules = BTreeMap::new();
         for (i, (option, _)) in discovered.into_iter().enumerate() {
-            let mut configured_modules = BTreeMap::new();
-            let mut providers = vec![];
+            let mut providers = BTreeMap::new();
             let mut credentials = BTreeMap::new();
             for name in &assignments[i] {
-                let p = &config.provider[name];
-                configured_modules.insert(p.module.clone(), ModuleConfiguration { name: p.module.clone(), entrypoint: p.module.clone() });
-                providers.push(ProviderConfiguration {
-                    name: name.clone(),
-                    module: p.module.clone(),
-                    settings: p.settings.clone(),
-                    credential: CredentialMode::Direct { credential_reference: name.clone() },
-                });
+                let p = &config.providers[name];
+                providers.insert(name.clone(), p.configuration());
                 // A credential path that cannot be resolved (for example, no
                 // HOME for ~/...) is missing evidence, not a daemon failure.
                 // The supervisor reports MissingCredential for absent references.
-                if let Ok(reference) = p.credential.reference(&rigging_process::ProcessEnvVars) {
+                if let Some(Ok(reference)) =
+                    p.credential.as_ref().map(|source| crate::config::credential_reference(source, &rigging_process::ProcessEnvVars))
+                {
                     credentials.insert(name.clone(), reference);
                 }
                 placements.insert(name.clone(), Placement { host: hosts.len(), minimum: chosen[name].1.clone() });
             }
-            let spec = HostSpec {
-                name: option.name,
-                connection: option.connection,
-                configuration: HostConfiguration { modules: configured_modules.into_values().collect(), providers },
-                credentials,
-            };
+            let spec =
+                HostSpec { name: option.name, connection: option.connection, configuration: Configuration { providers }, credentials };
             let mut handle = match supervisor.start(spec).await {
                 Ok(handle) => handle,
                 Err(_) if option.optional => {
@@ -195,16 +198,9 @@ impl Daemon {
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
-        Ok(Arc::new(Self {
-            config,
-            modules,
-            hosts,
-            placements,
-            unavailable,
-            keys,
-            resolver,
-            stopping: tokio::sync::watch::channel(false).0,
-        }))
+        let inner =
+            Inner { config, modules, hosts, placements, unavailable, keys, resolver, stopping: tokio::sync::watch::channel(false).0 };
+        Ok(Arc::new(Self { inner: Arc::new(inner), credential: None }))
     }
     fn host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let placement = self.placements.get(provider).ok_or_else(|| {
@@ -225,8 +221,8 @@ impl Daemon {
             readiness => Err(Error::NotReady(readiness)),
         }
     }
-    fn runtime(&self, provider: &str) -> Result<&crate::runtime::Runtime, Error> {
-        Ok(&self.ready_host(provider)?.handle.client)
+    fn runtime(&self, provider: &str) -> Result<crate::runtime::Runtime, Error> {
+        Ok(self.ready_host(provider)?.handle.client.credentialed(self.credential.clone()))
     }
     /// Mutations discard cached status reads, whatever their outcome.
     async fn invalidating<T>(&self, provider: &str, result: Result<T, Error>) -> Result<T, Error> {
@@ -250,11 +246,6 @@ impl Daemon {
         Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: env!("CARGO_PKG_VERSION").into(),
-            modules: self
-                .modules
-                .iter()
-                .filter_map(|(name, (host, _))| statuses[*host].modules.iter().find(|m| &m.name == name).cloned())
-                .collect(),
             loadable_modules: self
                 .modules
                 .iter()
@@ -267,61 +258,48 @@ impl Daemon {
                     }
                 })
                 .collect(),
-            providers: self
-                .config
-                .provider
-                .iter()
-                .map(|(name, configured)| {
-                    let status = self.placements.get(name).map(|p| &statuses[p.host]);
-                    let mut declaration = status
-                        .and_then(|s| s.providers.iter().find(|p| &p.provider == name && p.module == configured.module))
-                        .cloned()
-                        .unwrap_or_else(|| ProviderDeclaration {
-                            provider: name.clone(),
-                            module: configured.module.clone(),
-                            capabilities: conservative_capabilities(),
-                            rate_limits: vec![],
-                            readiness: Readiness::Unknown { reason: "instance absent from hello".into() },
-                        });
-                    if let Some(readiness) = self.unavailable.get(name) {
-                        declaration.readiness = readiness.clone();
-                    } else if let Some(status) = status
-                        && !matches!(status.readiness, Readiness::Ready)
-                    {
-                        declaration.readiness = status.readiness.clone();
-                    }
-                    declaration
-                })
-                .collect(),
         }
     }
-    pub fn providers(&self) -> serde_json::Value {
-        serde_json::Value::Array(
-            self.config
-                .provider
-                .iter()
-                .map(|(name, p)| {
-                    let readiness = self
-                        .host(name)
-                        .ok()
-                        .and_then(|h| h.handle.instances().remove(name))
-                        .or_else(|| self.unavailable.get(name).cloned())
-                        .unwrap_or(Readiness::Unknown { reason: "connecting".into() });
-                    serde_json::json!({"provider":name,"module":p.module,"readiness":readiness})
-                })
-                .collect(),
-        )
+    /// Every configured provider, including those no host can serve, with the reason.
+    pub fn providers(&self) -> Vec<ProviderDeclaration> {
+        let statuses: Vec<_> = self.hosts.iter().map(|h| h.handle.status.borrow().clone()).collect();
+        self.config
+            .providers
+            .iter()
+            .map(|(name, configured)| {
+                let status = self.placements.get(name).map(|p| &statuses[p.host]);
+                let mut declaration = status
+                    .and_then(|s| s.providers.iter().find(|p| &p.provider == name && p.module == configured.module))
+                    .cloned()
+                    .unwrap_or_else(|| ProviderDeclaration {
+                        provider: name.clone(),
+                        module: configured.module.clone(),
+                        capabilities: conservative_capabilities(),
+                        rate_limits: vec![],
+                        readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
+                        ports: Ports::default(),
+                        observation: ObservationMode::Poll { interval_ms: 0 },
+                    });
+                if let Some(readiness) = self.unavailable.get(name) {
+                    declaration.readiness = readiness.clone();
+                } else if let Some(status) = status
+                    && !matches!(status.readiness, Readiness::Ready)
+                {
+                    declaration.readiness = status.readiness.clone();
+                }
+                declaration
+            })
+            .collect()
     }
     /// Daemon routes first; every provider operation falls through to the shared router.
     pub fn router(self: &Arc<Self>) -> Router {
         Router::new()
-            .route("/v1/providers", get(|State(d): State<Arc<Daemon>>| async move { Json(d.providers()) }))
             .route("/v1/providers/{provider}/launch", post(launch_route))
             .route("/v1/providers/{provider}/prepare", post(prepare_route))
             .route("/v1/providers/{provider}/environments/{id}/shell", post(shell_route))
             .method_not_allowed_fallback(crate::api::method_not_allowed)
             .with_state(self.clone())
-            .fallback_service(crate::api::router(self.clone(), self.stopping.subscribe()))
+            .fallback_service(crate::api::server_router(self.clone(), self.stopping.subscribe()))
     }
     pub async fn serve(
         self: &Arc<Self>,
@@ -350,9 +328,9 @@ impl Daemon {
     pub async fn prepare(&self, provider: &str, options: &LaunchOptions) -> Result<(Prepared, Size), Error> {
         let host = self.ready_host(provider)?;
         let request =
-            launch::prepare_request(&self.config.provider[provider], &self.placements[provider].minimum, options, self.resolver.as_ref())
+            launch::prepare_request(&self.config.providers[provider], &self.placements[provider].minimum, options, self.resolver.as_ref())
                 .await?;
-        let prepared = host.handle.client.prepare(provider, &request).await?;
+        let prepared = host.handle.client.credentialed(self.credential.clone()).prepare(provider, &request).await?;
         Ok((prepared, request.size))
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
@@ -365,7 +343,7 @@ impl Daemon {
             label,
             prepared,
             size,
-            egress: options.egress.or(self.config.provider[provider].egress).unwrap_or(Egress::Open).request(),
+            egress: options.egress.or(self.config.providers[provider].egress).unwrap_or(Egress::Open).request(),
             ssh_public_key: Some(public),
         };
         // Retain key and the resolved digests even on an ambiguous provision error.
@@ -380,7 +358,8 @@ impl Daemon {
         let agent = host.handle.status.borrow().providers.iter().any(|d| d.provider == provider && d.capabilities.agent);
         // Find the agent build for the prepared platform before creating anything.
         let agent_build = if agent { Some(agent_build(&platform).await?) } else { None };
-        let environment = self.invalidating(provider, host.handle.client.provision(provider, &request).await).await?.into_inner();
+        let client = host.handle.client.credentialed(self.credential.clone());
+        let environment = self.invalidating(provider, client.provision(provider, &request).await).await?.into_inner();
         if let Some(build) = agent_build {
             self.agent_ready(provider, &environment, &platform, &build).await?;
         }
@@ -390,11 +369,11 @@ impl Daemon {
     /// the prepared `platform`) to an older one.
     async fn agent_ready(&self, provider: &str, environment: &Environment, platform: &Platform, build: &[u8]) -> Result<(), Error> {
         let identity = self.key_for(environment)?;
-        let client = &self.ready_host(provider)?.handle.client;
+        let client = &self.runtime(provider)?;
         let vessel = crate::agent::Vessel { provider, environment: &environment.id, identity: &identity, platform, build };
         let link = self
             .config
-            .provider
+            .providers
             .get(provider)
             .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))?
             .agent_link;
@@ -418,6 +397,33 @@ impl ProviderApi for Daemon {
     async fn hello(&self) -> Result<Hello, Error> {
         Ok(Daemon::hello(self))
     }
+    /// The daemon reads its configuration file at start: a document that
+    /// changes it is refused.
+    async fn configure(&self, update: crate::api::ConfigUpdate) -> Result<(), Error> {
+        let current = self.config.document();
+        if update.apply(&current)? != current {
+            return Err(Error::Protocol(ProtocolError::Refused {
+                reason: "drydockd reads its configuration file at start; edit the file and restart drydockd".into(),
+            }));
+        }
+        Ok(())
+    }
+    async fn providers(&self) -> Result<Vec<ProviderDeclaration>, Error> {
+        Ok(Daemon::providers(self))
+    }
+    async fn provider(&self, p: &str) -> Result<ProviderDeclaration, Error> {
+        if self.credential.is_some() {
+            return self.runtime(p)?.provider(p).await;
+        }
+        let declaration = Daemon::providers(self).into_iter().find(|d| d.provider == p);
+        declaration.ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))
+    }
+    async fn credential(&self, p: &str, value: Secret) -> Result<(), Error> {
+        self.runtime(p)?.credential(p, value).await.map_err(Error::Protocol)
+    }
+    fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi> {
+        Arc::new(Self { inner: self.inner.clone(), credential: Some(credential) })
+    }
     async fn observe(&self, since: Option<&str>) -> Result<crate::api::ObservationStream, Error> {
         Ok(self.observation_stream(since))
     }
@@ -428,9 +434,15 @@ impl ProviderApi for Daemon {
         self.invalidating(p, self.runtime(p)?.provision(p, request).await).await
     }
     async fn list(&self, p: &str) -> Result<Vec<Environment>, Error> {
+        if self.credential.is_some() {
+            return self.runtime(p)?.list(p).await;
+        }
         self.cache(p).await?.list(p).await
     }
     async fn inspect(&self, p: &str, id: &str) -> Result<Environment, Error> {
+        if self.credential.is_some() {
+            return self.runtime(p)?.inspect(p, id).await;
+        }
         self.cache(p).await?.inspect(p, id).await
     }
     async fn destroy(&self, p: &str, id: &str) -> Result<(), Error> {
@@ -585,7 +597,7 @@ impl Daemon {
             })
             .collect();
         let providers: BTreeMap<String, Option<usize>> =
-            self.config.provider.keys().map(|name| (name.clone(), self.placements.get(name).map(|p| p.host))).collect();
+            self.config.providers.keys().map(|name| (name.clone(), self.placements.get(name).map(|p| p.host))).collect();
         let mut stopping = self.stopping.subscribe();
         Box::pin(async_stream::stream! {
             let mut streams=futures::stream::select_all(streams);

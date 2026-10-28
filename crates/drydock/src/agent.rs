@@ -160,12 +160,7 @@ impl AgentReach {
     /// fixed [`AGENT_SOCKET`], for tests whose vessel is the test host.
     pub(crate) async fn connect_at(&self, api: &dyn ProviderApi, vessel: &Vessel<'_>, socket: &Path) -> Result<ConnectedAgent, Error> {
         let refused = |reason: String| Error::Protocol(ProtocolError::Refused { reason });
-        let hello = api.hello().await?;
-        let declaration = hello
-            .providers
-            .iter()
-            .find(|declaration| declaration.provider == vessel.provider)
-            .ok_or_else(|| refused(format!("provider {} is not declared", vessel.provider)))?;
+        let declaration = api.provider(vessel.provider).await?;
         if !declaration.capabilities.agent {
             return Err(refused(format!("provider {} declares no vessel agent", vessel.provider)));
         }

@@ -41,10 +41,14 @@ hello reporting a different platform is refused naming both, and nothing is
 pushed. A hello without a platform (an agent older than platform reporting) gets
 the recorded platform's build.
 
-Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work):
+Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work).
+It is the configuration document of `PUT /v1/config`, written in TOML: providers
+keyed by an arbitrary instance name, each with `module`, opaque `settings` and the
+server-only `credential`. The CLI's launch defaults (`image`, `size`, `egress`,
+`agent_link`) sit beside them but are not part of that document:
 
 ```toml
-[provider.daytona]
+[providers.daytona]
 module = "daytona"
 credential = { file = "~/.config/flotilla/credentials/daytona.token" }
 image = "ubuntu:24.04"
@@ -137,10 +141,11 @@ managed or authenticated external TCP `HostOption`s through the crate. Binary
 lookup overrides are `DRYDOCK_DAEMON_BIN`, `DRYDOCK_HOST_BIN`,
 `DRYDOCK_TYPESCRIPT_HOST_BIN` and `DRYDOCK_PYTHON_HOST_BIN`.
 
-The daemon serves `/v1/providers/{provider}/…`, including existing prepare,
-provision, inspect, destroy, reach, optional operations and stream upgrades,
-plus `/v1/providers`, `/launch` and `/shell` conveniences. It never exposes host
-configuration or credential refresh to CLI clients. The public `ProviderApi`
+The daemon serves the public API, including prepare, provision, inspect,
+destroy, reach, optional operations, stream upgrades, `/v1/providers` and the
+server-only credential and event extensions, plus `/launch` and `/shell`
+conveniences. It reads its configuration file at start: a `PUT` or `PATCH
+/v1/config` that would change it is refused, so edit the file and restart it. The public `ProviderApi`
 trait works against the embedded `Daemon` or a Unix-socket `Client`. `/v1/events`
 merges host streams with an opaque vector cursor; partial snapshots explicitly
 mark other hosts' providers unavailable so they cannot imply deletion.
@@ -163,6 +168,23 @@ uvx --from openapi-spec-validator==0.7.2 openapi-spec-validator openapi.json
 The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
+
+Protocol version 9 makes hosts serve the server's API. A language host serves
+the same `/v1` routes and types as the server; only the server adds
+`PUT /v1/providers/{provider}/credential` and `GET /v1/events` (marked
+`x-drydock-server-only` in the document). The optional `Drydock-Credential`
+request header carries an opaque provider credential, passed as-is: the server
+sends it on every call to a host, and on the public API it overrides the held
+credential for that request only, never stored or logged. Configuration is one
+document (`PUT /v1/config`, or an RFC 7396 merge patch with `PATCH`), with
+providers keyed by instance name; hosts receive it without the server-only
+`credential` key. `GET /v1/providers` and `GET /v1/providers/{provider}` declare
+each provider's module, capabilities, readiness, rate limits, optional `ports`
+and `observation`; hello keeps only the versions and loadable modules. Egress
+evidence (`egress_measured`, `egress_policy`) and the provider `timestamp` are
+optional `Environment` fields. `Reach` is the one reach type; SSH
+`reverse_forwards` defaults to false. The server observes every provider by
+polling its list.
 
 Protocol version 7 adds platforms. Capabilities list the platforms a provider
 runs, preferred first (absent decodes as none). Prepare takes an optional
@@ -204,9 +226,10 @@ Wire conventions chosen for this first protocol version:
   environment `id` is opaque and `label` is the client's environment ID. Provision
   repeats by label return 200; new creations return 201. Inspect and destroy
   use IDs even when a environment has no label. Destroying an absent ID succeeds.
-- Configuration contains non-secret settings and credential references or proxy
-  placeholders. Direct credential values are sent separately through the
-  authenticated credential refresh route, including initial delivery.
+- Configuration contains non-secret settings and, on the server, where each
+  credential comes from. Credential values travel separately: to the server
+  through the credential refresh route, and to hosts in each request's
+  `Drydock-Credential` header.
 - Prepare is look-up-or-build by a module-defined key (Daytona: image/tools
   digests, platform and size); a prepared form belongs to its named provider. Hosts must
   refuse cross-provider use. Baking and upload start the agent with fixed flags,
@@ -238,9 +261,7 @@ suspend/resume/exec/export (POST) append their operation after `/{id}`.
 Provider-level prepare, credential, usage and quota stay directly under
 `/v1/providers/{provider}`. IDs such as `usage` and `quota` therefore remain opaque
 without colliding with provider-level operations. There are no route aliases.
-The server runtime accepts configuration at `PUT /v1/config` and publishes
-`GET /v1/events`. The private host uses one module factory endpoint and raw
-per-provider subscriptions; it does not implement public policy endpoints.
+Hosts serve every route except the server-only credential and event extensions.
 
 Optional fields serialize as explicit `null`; absent optional fields are accepted
 as `None`. Unknown object fields are ignored for additive compatibility. Unknown
@@ -261,7 +282,7 @@ validate their own resource bounds before vendor calls.
 but deliberately serializes the original string for transport. Never log their
 serialized JSON. `Internal.provider_error` and optional
 `Unavailable.provider_error` carry provider explanations to the operator. The host
-masks configured credential values (including proxy placeholders) by content
+masks configured credential values by content
 before returning errors or logging them at warn level. CLI errors include the
 provider, operation, category, reason, upstream HTTP status and provider message.
 A Daytona 401 rejects the key; a 403 is `Refused` for the named operation and
@@ -509,8 +530,7 @@ The main server owns common admission, credential state, budgets, polling,
 inventory/lifecycle reconciliation, billing, snapshots, replay and public diagnostic
 sanitisation. Embedded `Daemon` and standalone `drydockd` use the same
 [`runtime`](crates/drydock/src/runtime) implementation. The
-[Rust host](crates/drydock-host/README.md) is a compiled module loader and private
-REST/stream adapter to [`drydock-provider`](crates/drydock-provider).
-Earlier language-host policy ownership descriptions are superseded by this split.
-The public API is unchanged. Other language bridges require separate migration;
-this Rust change does not complete their adapters or Flotilla rollout.
+[Rust host](crates/drydock-host/README.md) is a compiled module loader serving
+the public API over [`drydock-provider`](crates/drydock-provider); the server
+reaches it through the same routes a client uses against the server. Earlier
+language-host policy ownership descriptions are superseded by this split.

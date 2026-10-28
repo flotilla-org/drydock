@@ -1,76 +1,43 @@
-# Rust provider bridge
+# Rust host
 
-`drydock-host` loads the compiled-in reference and Daytona modules and adapts the
-policy-free traits in `drydock-provider` to private REST. Common provider policy
-lives in `drydock::runtime`, owned by the main server's supervisor in both
-`drydockd` and an embedded `Daemon`. TypeScript and Python must implement this
-private bridge before they can use the new server path; their migration is separate.
+`drydock-host` loads the compiled-in reference and Daytona modules and serves
+them through the same `/v1` API as the drydock server, with the same routes and
+types (`drydock_client::api::router` over its `ProviderApi`), apart from the
+server-only credential and event extensions. Common provider policy lives in
+`drydock::runtime`, owned by the main server's supervisor in both `drydockd` and
+an embedded `Daemon`. The TypeScript and Python hosts are to serve the same API.
 
 ```text
-public API → Daemon / server Runtime → Provider traits → private REST → Rust host → vendor
+public API → Daemon / server Runtime → Provider traits → public API → Rust host → vendor
 ```
 
-The host decodes requests, resolves modules/providers, invokes their shared-reference
+The host decodes requests, resolves providers, invokes their shared-reference
 methods and serializes results. Module settings remain opaque and are validated
 by the module. The host has no provider operation lock, credential store,
 credential rejection state, rate budget, poller, inventory reconciliation, billing
 transitions, public snapshots or event history. It never retries provider calls.
-Optional ports are reported separately from capabilities so server registration
-can validate their agreement.
 
-## Private contract
+## What the server asks of a host
 
-`GET /v1/hello` discovers loadable/loaded modules and configured instances.
-Its private `incarnation` field identifies the loader process, so supervision can
-rebind stale handles even if another server has already configured the same
-logical names after a host restart. The public server Hello remains unchanged.
-`POST /private/modules/{module}/configure` maps `Module::configure` and returns
-an opaque configured-provider handle and its raw facts. The server releases that
-handle when its trait object drops, including rejected configuration transactions;
-release never destroys vendor resources. Logical bindings reuse identical configurations
-to preserve independently owned external-host state across server disconnects;
-they retain no ordinary-call credential snapshots or observation tasks. Independent handles permit a corrected
-configuration to reuse its logical provider name. Logical bindings and opaque
-handles have separate key spaces; reuse includes the actual selected entrypoint.
-Each configure returns a fresh handle, released when the server drops its trait
-object. A release lost while the host is unreachable leaves that handle until the
-host exits; logical bindings, and so their loaded modules, last for the host's
-lifetime. Concurrent loader calls are serialized, without locking ordinary operations.
-This is the only private loader endpoint; bulk configuration/admission belongs
-to the main server. Bridge hello reports module readiness without a delivered
-credential; per-call facts report readiness with that call's snapshot.
-Every `POST /private/providers/{provider}/{operation}` carries a JSON `Call<T>`:
-`{ "credentials": { "mode": ..., "value": ... }, "argument": ... }`.
-The credential value is an immutable snapshot for that ordinary call. Configuration
-contains only credential mode/reference metadata, never a retained vendor secret.
+`PUT /v1/config` (or `PATCH` with an RFC 7396 merge patch) sets the providers the
+host serves, keyed by instance name, each with a `module` and opaque `settings`.
+The whole document is built before any of it applies; an entry identical to the
+current one keeps its provider and any in-memory state. The server-only
+`credential` key is refused. `GET /v1/hello` reports the protocol and host
+versions and the loadable modules. `GET /v1/providers` and
+`GET /v1/providers/{provider}` declare each provider's module, capabilities,
+readiness, rate limits, optional `ports` and `observation` (the poll interval).
+Every other call is the public provider route, carrying the credential to use in
+its `Drydock-Credential` header; a call without one has no credential. Prepare
+resolves the platform and image route before the module sees them, as the server
+does. Provision answers 201 when it created the environment and 200 when it
+already existed. Inspect returns the environment even when a guest probe fails,
+with `egress_measured` false.
 
-Operations map directly to the existing traits:
-
-| Operation | Argument | Result |
-| --- | --- | --- |
-| facts | null | capabilities, optional ports, observation mode, rate limits, provider readiness |
-| prepare / provision | typed request | Prepared / Provisioned (Created or Existing) |
-| list | null | raw ObservedEnvironment array |
-| inspect / inspect-after-lifecycle | environment ID | raw ObservedEnvironment |
-| destroy | environment ID | null |
-| reach | environment ID | raw Connection |
-| suspend / resume | ID / [ID, token] | token / null |
-| export / usage / quota | ID / Period / null | Export / Usage / Quota |
-| relay / exec | ID / [ID, command] | upgraded byte stream |
-| subscribe | null | SubscriptionRecord NDJSON (raw Update or typed failure) |
-
-ObservedEnvironment preserves the provider timestamp, egress_measured and
-opaque egress_policy identity alongside Environment. Lifecycle inspection calls
-`inspect_after_lifecycle`, never ordinary inspect. Provision serialization retains
-Created versus Existing rather than inferring it from an Environment response.
-Subscriptions forward observed rows and explicit removals; the host never assigns
-public cursors or emits derived billing events. Each subscription holds one
-credential snapshot; the server cancels/reopens it on rotation.
-
-Disconnect drops provider futures and subscriptions. Cancellation does not prove
-vendor rollback: a mutating call may have taken effect before cancellation.
-Relay and exec forward stream bytes until disconnection or shutdown. Ctrl-C and
-SIGTERM close streams and unlink the managed socket.
+Disconnect drops provider futures. Cancellation does not prove vendor rollback:
+a mutating call may have taken effect before cancellation. Relay and exec
+forward stream bytes until disconnection or shutdown. Ctrl-C and SIGTERM close
+streams and unlink the managed socket.
 
 ## Transport
 
@@ -81,7 +48,7 @@ cargo run -p drydock-host -- --unix /tmp/drydock-example/host.sock
 ```
 
 The supervisor/server owns the 0700 directory; the socket is 0600. There is no
-peer UID/SO_PEERCRED admission check on this managed private transport. Existing
+peer UID/SO_PEERCRED admission check on this managed transport. Existing
 loopback TCP bearer authentication and Host/Origin restrictions are unchanged.
 Main-server public network admission is unchanged.
 
@@ -89,7 +56,7 @@ Main-server public network admission is unchanged.
 
 Server unit tests and `drydock/tests/runtime.rs` exercise admission, credential
 state, budgets, polling, raw evidence retention, billing and public event replay.
-Host bridge tests exercise module/provider routing, raw serialization, per-call
+Host tests exercise configuration through the public routes and per-call
 credentials, stream forwarding and cancellation. Managed daemon and conformance
 tests run the server policy through the real Rust binary. Daytona tests retain
 the replay/stand-in boundary and run policy assertions against the server Runtime.
@@ -133,22 +100,22 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
 
 ```json
 {
-  "modules": [{"name":"cloud", "entrypoint":"daytona"}],
-  "providers": [{
-    "name":"daytona-eu", "module":"cloud",
-    "settings": {
-      "organization_id":"YOUR_ORGANIZATION_ID",
-      "region":"eu", "tier":1,
-      "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY"
-    },
-    "credential":{"mode":"direct", "credential_reference":"daytona-key"}
-  }]
+  "providers": {
+    "daytona-eu": {
+      "module": "daytona",
+      "settings": {
+        "organization_id":"YOUR_ORGANIZATION_ID",
+        "region":"eu", "tier":1,
+        "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY"
+      }
+    }
+  }
 }
 ```
 
-Deliver the organisation API key through credential refresh. Proxied mode sends
-its placeholder as the bearer token on REST, toolbox and analytics calls, using
-the host's injected HTTP client. There are no module retries or ambient credentials.
+The organisation API key arrives in each call's `Drydock-Credential` header and
+is sent as the bearer token on REST, toolbox and analytics calls, using the
+host's injected HTTP client. There are no module retries or ambient credentials.
 The key needs sandbox creation/modification/deletion, snapshot creation and billing
 read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
@@ -172,8 +139,7 @@ their token realms, over HTTPS. It applies no registry allowlist or address
 policy, because lab registries usually sit on private networks. Prepare callers
 are authenticated host clients and are trusted to name registries. A pull
 credential goes only to its registry's origin, or to Docker Hub's
-`auth.docker.io` token service for `docker.io`. In proxied mode, registry
-traffic uses the same egress proxy as every other provider call.
+`auth.docker.io` token service for `docker.io`.
 
 The fallback, `registry_pull` with the tools layer added by the provider, builds
 the snapshot with `buildInfo.dockerfileContent`: the pinned base plus
@@ -364,9 +330,6 @@ failure retries. These internal reads do not currently consume separate server
 route-budget slots. That is a known limitation under the required rate-window
 review work, not an additional module observation/reconciliation loop.
 
-Raw subscription overflow terminates the stream with a typed failure, including
-when a provider ignores sink errors. The server records that failure; consistent
-with existing subscription lifetime policy, it does not introduce a same-snapshot
-retry loop. Rotation can reopen the subscription. Transport loss during mutation
+Transport loss during mutation
 reports unavailability with an uncertain-outcome reason and never proves rollback;
 malformed host responses are internal adapter errors rather than transient outages.

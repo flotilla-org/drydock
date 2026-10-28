@@ -2,8 +2,6 @@
 use super::*;
 use crate::{api::ObservationStream, client::Error};
 
-/// One deadline for every push list in an initial or recovery snapshot.
-pub const PUSH_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub const EVENT_HISTORY_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
@@ -20,7 +18,7 @@ pub(super) struct Log {
     pub(super) serial: u64,
     pub(super) records: VecDeque<Event>,
     pub(super) epoch: String,
-    pub(super) inventories: BTreeMap<String, Vec<ObservedEnvironment>>,
+    pub(super) inventories: BTreeMap<String, Vec<Environment>>,
 }
 impl EventSink {
     fn append(
@@ -47,7 +45,7 @@ impl EventSink {
             log.records.pop_front();
         }
     }
-    pub(super) fn commit(&self, rows: Vec<ObservedEnvironment>, events: Vec<PendingEvent>) {
+    pub(super) fn commit(&self, rows: Vec<Environment>, events: Vec<PendingEvent>) {
         let mut log = self.shared.log.recover();
         log.inventories.insert(self.provider.clone(), rows);
         for (id, label, timestamp, event) in events {
@@ -112,48 +110,15 @@ impl Runtime {
     async fn snapshot(&self) -> Result<ObserveRecord> {
         let mut changed = self.events.changed.subscribe();
         let mut stopping = self.stopping.subscribe();
-        if *stopping.borrow() {
-            return Err(ProtocolError::unavailable("host stopping", None));
-        }
         let instances: Vec<_> = self.config.read().await.providers.values().cloned().collect();
-        let mut push_errors = BTreeMap::new();
-        let push_cursor = {
-            let log = self.events.log.recover();
-            format!("{}:{}", log.epoch, log.serial)
-        };
-        let has_push = instances.iter().any(|i| matches!(i.observation, ObservationMode::Push));
-        let deadline = tokio::time::Instant::now() + PUSH_SNAPSHOT_TIMEOUT;
-        let lists = instances.iter().filter(|i| matches!(i.observation, ObservationMode::Push)).map(|instance| async move {
-            let result = tokio::time::timeout_at(deadline, instance.call(Gate::List, |p, c| async move { p.list(&c).await }))
-                .await
-                .unwrap_or_else(|_| Err(ProtocolError::unavailable("snapshot list timed out", None)));
-            (instance.config.name.clone(), result)
-        });
-        let results = tokio::select! {
-            results = futures::future::join_all(lists) => results,
-            _ = stopping.changed() => return Err(ProtocolError::unavailable("host stopping", None)),
-        };
-        let mut push_rows = vec![];
-        for (name, result) in results {
-            match result {
-                Ok(rows) => push_rows.extend(rows),
-                Err(error) => {
-                    push_errors.insert(name, error);
-                }
-            }
-        }
         loop {
             if *stopping.borrow() {
                 return Err(ProtocolError::unavailable("host stopping", None));
             }
-            let mut unavailable_providers = push_errors.clone();
+            let mut unavailable_providers = BTreeMap::new();
             for instance in &instances {
-                // Push list calls may repair proxied rejection; never gate them on
-                // Ready, since call() already decides whether a probe is permitted.
-                if instance.poll_interval.is_some()
-                    && let Err(error) = instance.ready()
-                {
-                    unavailable_providers.insert(instance.config.name.clone(), error);
+                if let Err(error) = instance.ready() {
+                    unavailable_providers.insert(instance.name.clone(), error);
                 }
             }
             {
@@ -161,31 +126,24 @@ impl Runtime {
                 let log = self.events.log.recover();
                 let mut pending = false;
                 for i in &instances {
-                    if i.poll_interval.is_none()
-                        || unavailable_providers.contains_key(&i.config.name)
-                        || log.inventories.contains_key(&i.config.name)
-                    {
+                    if unavailable_providers.contains_key(&i.name) || log.inventories.contains_key(&i.name) {
                         continue;
                     }
                     if let Some(error) = i.poll_error.recover().clone() {
-                        unavailable_providers.insert(i.config.name.clone(), error);
+                        unavailable_providers.insert(i.name.clone(), error);
                         continue;
                     }
                     pending = true;
                 }
                 if !pending {
-                    let mut environments: Vec<_> = log
+                    let environments = log
                         .inventories
                         .iter()
-                        .filter(|(name, _)| {
-                            !unavailable_providers.contains_key(*name)
-                                && instances.iter().any(|i| &i.config.name == *name && i.poll_interval.is_some())
-                        })
-                        .flat_map(|(_, rows)| rows.iter().map(|r| r.environment.clone()))
+                        .filter(|(name, _)| !unavailable_providers.contains_key(*name) && instances.iter().any(|i| &i.name == *name))
+                        .flat_map(|(_, rows)| rows.iter().cloned())
                         .collect();
-                    environments.extend(push_rows.iter().map(|r| r.environment.clone()));
                     return Ok(ObserveRecord::Snapshot {
-                        cursor: if has_push { push_cursor } else { format!("{}:{}", log.epoch, log.serial) },
+                        cursor: format!("{}:{}", log.epoch, log.serial),
                         environments,
                         unavailable_providers,
                     });

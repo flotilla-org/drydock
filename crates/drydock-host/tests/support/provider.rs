@@ -1,13 +1,12 @@
 // The one fake provider shared by the bridge, loader and runtime tests.
 #![allow(dead_code)]
-use drydock_host::module::{Connection, HttpClient, ObservationMode, ObservedEnvironment, Provisioned};
+use drydock_host::module::{HttpClient, Provisioned};
 use drydock_host::reference;
 use drydock_protocol::*;
 use std::time::Duration;
 
 #[derive(Default)]
 pub struct Control {
-    pub poll: std::sync::atomic::AtomicBool,
     pub execute_http: std::sync::atomic::AtomicBool,
     pub disable_exec: std::sync::atomic::AtomicBool,
     pub skip_list_timestamp: std::sync::atomic::AtomicBool,
@@ -29,22 +28,19 @@ pub struct Control {
     pub list_held: tokio::sync::Notify,
     pub http_url: std::sync::Mutex<Option<String>>,
     pub reject_list: std::sync::atomic::AtomicBool,
-    pub reject_subscription: std::sync::atomic::AtomicBool,
     pub missing_tool: std::sync::atomic::AtomicBool,
     pub dropped: tokio::sync::Notify,
     pub hold_destroy: std::sync::atomic::AtomicBool,
     pub fail_destroy: std::sync::atomic::AtomicBool,
+    pub fail_inspect: std::sync::atomic::AtomicBool,
     pub destroy_entered: tokio::sync::Notify,
     pub destroy_release: tokio::sync::Notify,
     pub hold_success: std::sync::atomic::AtomicBool,
     pub success_entered: tokio::sync::Notify,
     pub success_release: tokio::sync::Notify,
-    pub started: tokio::sync::Notify,
-    pub stopped: tokio::sync::Notify,
-    pub subscriptions: std::sync::Mutex<Vec<Option<String>>>,
-    pub cancelled: tokio::sync::Notify,
     pub list_calls: std::sync::atomic::AtomicUsize,
-    pub sink: std::sync::Mutex<Option<drydock_host::module::EventSink>>,
+    /// The credential each list call carried.
+    pub list_credentials: std::sync::Mutex<Vec<Option<String>>>,
     pub configured: std::sync::atomic::AtomicUsize,
     pub slow_configure: std::sync::atomic::AtomicBool,
 }
@@ -73,6 +69,7 @@ impl drydock_host::module::Module for ControlledModule {
     }
     async fn configure(
         &self,
+        name: &str,
         c: &ProviderConfiguration,
         http: std::sync::Arc<dyn HttpClient>,
     ) -> drydock_host::module::Result<std::sync::Arc<dyn drydock_host::module::Provider>> {
@@ -80,7 +77,7 @@ impl drydock_host::module::Module for ControlledModule {
         if self.0.slow_configure.load(std::sync::atomic::Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let inner = drydock_host::module::Module::configure(&reference::ReferenceModule, c, http.clone()).await?;
+        let inner = drydock_host::module::Module::configure(&reference::ReferenceModule, name, c, http.clone()).await?;
         Ok(std::sync::Arc::new(ControlledProvider { inner, http, control: self.0.clone() }))
     }
 }
@@ -94,33 +91,8 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
     }
 
-    async fn run(&self, mut context: drydock_host::module::PushContext) -> drydock_host::module::Result<()> {
-        struct Subscription(std::sync::Arc<Control>);
-        impl Drop for Subscription {
-            fn drop(&mut self) {
-                self.0.cancelled.notify_one();
-            }
-        }
-        let _subscription = Subscription(self.control.clone());
-        self.control.subscriptions.lock().unwrap().push(context.credentials.token().map(|token| token.expose().to_owned()));
-        *self.control.sink.lock().unwrap() = Some(context.events.clone());
-        self.control.started.notify_one();
-        if self.control.reject_subscription.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(ProtocolError::CredentialRejected { reason: "subscription rejected".into() });
-        }
-        if !*context.stopping.borrow() {
-            let _ = context.stopping.changed().await;
-        }
-        self.control.stopped.notify_one();
-        Ok(())
-    }
-
     fn observation(&self) -> ObservationMode {
-        if self.control.poll.load(std::sync::atomic::Ordering::SeqCst) {
-            ObservationMode::Poll { interval: Duration::from_millis(10) }
-        } else {
-            ObservationMode::Push
-        }
+        ObservationMode::Poll { interval_ms: 10 }
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         let requests = self.control.list_limit.load(std::sync::atomic::Ordering::SeqCst);
@@ -174,8 +146,9 @@ impl drydock_host::module::Provider for ControlledProvider {
     async fn provision(&self, r: ProvisionRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Provisioned> {
         self.inner.provision(r, c).await
     }
-    async fn list(&self, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Vec<ObservedEnvironment>> {
+    async fn list(&self, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Vec<Environment>> {
         use std::sync::atomic::Ordering::SeqCst;
+        self.control.list_credentials.lock().unwrap().push(c.token().map(|token| token.expose().to_owned()));
         if self.control.hold_list.load(SeqCst) {
             self.control.list_held.notify_one();
             self.control.list_release.notified().await;
@@ -196,11 +169,14 @@ impl drydock_host::module::Provider for ControlledProvider {
             return Err(ProtocolError::unavailable("vendor unavailable", None));
         }
         if let Some(row) = vendor.1 {
-            rows.push(ObservedEnvironment {
-                egress_policy: None,
+            rows.push(Environment {
                 egress_measured: !self.control.skip_egress_measurement.load(SeqCst),
-                environment: row,
-                timestamp: if self.control.skip_list_timestamp.load(SeqCst) { None } else { *self.control.timestamp.lock().unwrap() },
+                timestamp: if self.control.skip_list_timestamp.load(SeqCst) {
+                    None
+                } else {
+                    self.control.timestamp.lock().unwrap().map(Into::into)
+                },
+                ..row
             });
         }
         if self.control.hold_list_result.swap(false, SeqCst) {
@@ -209,14 +185,12 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
         Ok(rows)
     }
-    async fn inspect(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<ObservedEnvironment> {
+    async fn inspect(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Environment> {
+        if self.control.fail_inspect.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ProtocolError::unavailable("vendor unavailable", None));
+        }
         if let Some(row) = self.control.vendor.lock().unwrap().row.clone().filter(|row| row.id == id) {
-            return Ok(ObservedEnvironment {
-                egress_policy: None,
-                egress_measured: true,
-                environment: row,
-                timestamp: *self.control.timestamp.lock().unwrap(),
-            });
+            return Ok(Environment { egress_measured: true, timestamp: self.control.timestamp.lock().unwrap().map(Into::into), ..row });
         }
         self.inner.inspect(id, c).await
     }
@@ -232,7 +206,7 @@ impl drydock_host::module::Provider for ControlledProvider {
             Ok(())
         }
     }
-    async fn reach(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Connection> {
+    async fn reach(&self, id: &str, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Reach> {
         self.inner.reach(id, c).await
     }
     async fn relay(

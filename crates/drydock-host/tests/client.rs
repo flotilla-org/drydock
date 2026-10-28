@@ -18,9 +18,9 @@ use tokio::{
 fn spec() -> HostSpec {
     HostSpec {
         name: "rust".into(),
-        connection: HostConnection::Managed { command: vec![env!("CARGO_BIN_EXE_drydock-host").into()], runtime: None, proxy_environment: BTreeMap::new() },
-        configuration: serde_json::from_value(serde_json::json!({"modules":[{"name":"memory","entrypoint":"reference"}],"providers":[{"name":"a","module":"memory","settings":{},"credential":{"mode":"direct","credential_reference":"test"}}]})).unwrap(),
-        credentials: BTreeMap::from([("test".into(), CredentialReference::Env { name: "PATH".into() })]),
+        connection: HostConnection::Managed { command: vec![env!("CARGO_BIN_EXE_drydock-host").into()], runtime: None },
+        configuration: serde_json::from_value(serde_json::json!({"providers":{"a":{"module":"reference","settings":{}}}})).unwrap(),
+        credentials: BTreeMap::from([("a".into(), CredentialReference::Env { name: "PATH".into() })]),
     }
 }
 // Reference accepts byte-sized RAM and zero disk; vendor modules apply their own limits.
@@ -217,7 +217,10 @@ async fn version_mismatch_refused() {
 async fn cache_honours_declared_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = spec();
-    spec.configuration.providers[0]
+    spec.configuration
+        .providers
+        .get_mut("a")
+        .unwrap()
         .settings
         .insert("rate_limits".into(), serde_json::json!([{"operation":"inspect","requests":1,"period_seconds":1}]));
     let mut host = supervisor(dir.path()).start(spec).await.unwrap();
@@ -250,7 +253,7 @@ fn cache_budget_sequences(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
         let http = Arc::new(Http { calls: Mutex::new(vec![]), version: "1" });
         let client = Client::unix("/unused").unwrap().with_http(http.clone());
-        let mut declaration: ProviderDeclaration = serde_json::from_value(serde_json::json!({"provider":"a","module":"memory","capabilities":{"material_modes":[],"checkout_strategies":[],"workspace_root":"/","suspend_resume":false,"export":false,"egress":{"routes":[],"enforcement":"advisory"},"fallback_runner":false,"bootstrap":"bake","usage":false,"quota":false},"readiness":{"status":"ready"},"rate_limits":[]})).unwrap();
+        let mut declaration: ProviderDeclaration = serde_json::from_value(serde_json::json!({"provider":"a","module":"memory","capabilities":{"material_modes":[],"checkout_strategies":[],"workspace_root":"/","suspend_resume":false,"export":false,"egress":{"routes":[],"enforcement":"advisory"},"fallback_runner":false,"bootstrap":"bake","usage":false,"quota":false},"readiness":{"status":"ready"},"rate_limits":[],"ports":{"exec":false,"suspend_resume":false,"export":false,"usage":false,"quota":false},"observation":{"mode":"poll","interval_ms":10}})).unwrap();
         declaration.rate_limits = vec![RateLimit { operation:"list".into(), requests, period_seconds:seconds }];
         let cache = StatusCache::new(client, &[declaration]);
         let mut calls = Vec::new(); let mut now = 0;
@@ -323,7 +326,7 @@ async fn credential_rotation_preserves_live_state() {
 }
 
 // An external reference host has independent lifetime: dropping the client-side
-// handle must not terminate or replace its server, and reconnect can configure it.
+// handle must not terminate or replace its server, which still serves its providers.
 #[tokio::test]
 async fn external_host_is_not_supervised() {
     let dir = tempfile::tempdir().unwrap();
@@ -336,20 +339,12 @@ async fn external_host_is_not_supervised() {
     });
     let mut spec = spec();
     spec.connection = HostConnection::ExternalUnix { path: socket.clone() };
-    let config = spec.configuration.providers[0].clone();
     let mut host = supervisor(dir.path()).start(spec).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
     let environment = host.client.provision("a", &request(prepare(&host.client).await)).await.unwrap().into_inner();
     drop(host);
-    let credentials = drydock_host::module::Credentials {
-        mode: CredentialMode::Direct { credential_reference: "test".into() },
-        value: Some(Secret::new("snapshot")),
-    };
-    let raw_client = Client::unix(socket).unwrap();
-    let handle = raw_client.configure_provider("reference", &config).await.unwrap().instance;
-    let raw: drydock_host::module::ObservedEnvironment =
-        raw_client.provider_call(&handle, "inspect", &environment.id, &credentials).await.unwrap();
-    assert_eq!(raw.environment, environment);
+    let raw_client = Client::unix(socket).unwrap().credentialed(Some(Secret::new("snapshot")));
+    assert_eq!(raw_client.inspect("a", &environment.id).await.unwrap(), environment);
     assert!(!server.is_finished());
     server.abort();
 }
@@ -438,43 +433,6 @@ async fn builtin_credential_resolution_and_redaction() {
     assert!(source.resolve(&CredentialReference::Env { name: "PATH".into() }).await.is_ok());
     assert!(source.resolve(&CredentialReference::Env { name: "DRYDOCK_MISSING_CREDENTIAL_TEST".into() }).await.is_err());
     assert!(source.resolve(&CredentialReference::Embedder { reference: "owned-by-embedder".into() }).await.is_err());
-}
-
-// Proxied instances never invoke Direct resolution, and the managed command
-// receives the embedder's proxy environment. The reference makes no vendor calls.
-#[tokio::test]
-async fn proxied_host_receives_environment_without_resolving_secrets() {
-    struct NoDirect(watch::Sender<u64>);
-    #[async_trait::async_trait]
-    impl CredentialSource for NoDirect {
-        async fn resolve(&self, _: &CredentialReference) -> Result<Credential, CredentialError> {
-            panic!("proxied mode must not resolve direct secrets")
-        }
-        fn changes(&self) -> watch::Receiver<u64> {
-            self.0.subscribe()
-        }
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let mut s = supervisor(dir.path());
-    s.credentials = Arc::new(NoDirect(watch::channel(0).0));
-    let mut spec = spec();
-    spec.credentials.clear();
-    spec.configuration.providers[0].credential =
-        CredentialMode::Proxied { placeholder_token: Secret::new("placeholder"), proxy_url: "http://127.0.0.1:9".into() };
-    if let HostConnection::Managed { command, proxy_environment, .. } = &mut spec.connection {
-        *command = vec![
-            "sh".into(),
-            "-c".into(),
-            "test \"$HTTP_PROXY\" = http://127.0.0.1:9 || exit 2; exec \"$@\"".into(),
-            "proxy-wrapper".into(),
-            env!("CARGO_BIN_EXE_drydock-host").into(),
-        ];
-        proxy_environment.insert("HTTP_PROXY".into(), "http://127.0.0.1:9".into());
-    }
-    let mut host = s.start(spec).await.unwrap();
-    host.ready(Duration::from_secs(3)).await.unwrap();
-    assert!(matches!(host.instances().get("a"), Some(Readiness::Ready)));
-    assert!(host.client.list("a").await.unwrap().is_empty());
 }
 
 // Repeated connection refusal during restart must be paced, even when no stream
@@ -605,10 +563,9 @@ async fn cache_does_not_block_other_providers() {
 async fn typed_observer_preserves_partial_snapshot_markers() {
     let dir = tempfile::tempdir().unwrap();
     let mut spec = spec();
-    let mut missing = spec.configuration.providers[0].clone();
-    missing.name = "unavailable".into();
-    missing.credential = CredentialMode::Direct { credential_reference: "missing".into() };
-    spec.configuration.providers.push(missing);
+    // No credential source is configured for this provider.
+    let missing = spec.configuration.providers["a"].clone();
+    spec.configuration.providers.insert("unavailable".into(), missing);
     let mut host = supervisor(dir.path()).start(spec).await.unwrap();
     host.ready(Duration::from_secs(5)).await.unwrap();
     let mut observer = Observer::new(host.client.clone(), None);

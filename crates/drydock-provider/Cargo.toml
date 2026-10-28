@@ -9,7 +9,6 @@ async-trait = "0.1"
 rigging-http-client.workspace = true
 rigging-stream.workspace = true
 serde.workspace = true
-chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "rt", "io-util"] }
 axum = "0.8"
 hyper = "1"

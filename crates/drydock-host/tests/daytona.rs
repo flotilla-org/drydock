@@ -736,23 +736,21 @@ fn schema_row(mut row: Value) -> Value {
     row
 }
 
-fn credentials(proxied: bool) -> Credentials {
-    if proxied {
-        Credentials::new(CredentialMode::Proxied { proxy_url: "http://proxy".into(), placeholder_token: Secret::new("placeholder") })
-    } else {
-        Credentials { mode: CredentialMode::Direct { credential_reference: "test".into() }, value: Some(Secret::new("key-a")) }
-    }
+fn credentials() -> Credentials {
+    Credentials::new(Some(Secret::new("key-a")))
 }
 async fn provider(http: Arc<dyn HttpClient>) -> Arc<dyn Provider> {
     provider_with_probe(http, false).await
 }
 async fn provider_with_probe(http: Arc<dyn HttpClient>, probe: bool) -> Arc<dyn Provider> {
-    let config:ProviderConfiguration = serde_json::from_value(json!({"name":"daytona","module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"},"credential":{"mode":"direct","credential_reference":"test"}})).unwrap();
+    let config: ProviderConfiguration =
+        serde_json::from_value(json!({"module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"}}))
+            .unwrap();
     let mut config = config;
     if probe {
         config.settings.insert("egress_probe".into(), json!({"command":["/usr/local/bin/check-egress"]}));
     }
-    DaytonaModule.configure(&config, http).await.unwrap()
+    DaytonaModule.configure("daytona", &config, http).await.unwrap()
 }
 fn tools_image(digit: char) -> String {
     format!("registry.invalid/drydock-tools@sha256:{}", digit.to_string().repeat(64))
@@ -778,90 +776,81 @@ fn request(prepared: Prepared, label: &str) -> ProvisionRequest {
 }
 fn row(p: Provisioned) -> Environment {
     match p {
-        Provisioned::Created(e) | Provisioned::Existing(e) => e.environment,
+        Provisioned::Created(e) | Provisioned::Existing(e) => e,
     }
 }
 
 // A label creates one resource even under concurrent retries. Inventory re-adopts
 // it after factory reconstruction, and resume restarts the agent (not memory).
 #[tokio::test]
-async fn lifecycle_and_credential_modes() {
-    for proxied in [false, true] {
-        let http = Arc::new(StandIn::default());
-        let p = provider(http.clone()).await;
-        let mut c = credentials(proxied);
-        let prep = prepared(p.as_ref(), &c).await;
-        let r = request(prep, "label-a");
-        let (a, b) = tokio::join!(p.provision(r.clone(), &c), p.provision(r.clone(), &c));
-        let a = a.unwrap();
-        let (Provisioned::Created(observation) | Provisioned::Existing(observation)) = &a;
-        assert!(!observation.egress_measured, "no probe means no measured evidence");
-        let b = b.unwrap();
-        assert!(matches!(
-            (&a, &b),
-            (Provisioned::Created(_), Provisioned::Existing(_)) | (Provisioned::Existing(_), Provisioned::Created(_))
-        ));
-        let id = row(a).id;
-        assert_eq!(id, row(b).id);
-        let p = provider(http.clone()).await;
-        assert!(matches!(p.provision(r, &c).await.unwrap(), Provisioned::Existing(_)));
-        if !proxied {
-            c.value = Some(Secret::new("key-b"));
-        }
-        let rows = p.list(&c).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].environment.label.as_deref(), Some("label-a"));
-        assert_eq!(rows[0].environment.granted_size.as_ref().unwrap().memory_bytes, 4 << 30);
-        assert_eq!(rows[0].timestamp.unwrap().to_rfc3339(), "2026-10-19T12:00:00+00:00");
-        let ops = p.operations();
-        let token = ops.suspend_resume.unwrap().suspend(&id, &c).await.unwrap();
-        assert!(matches!(p.inspect(&id, &c).await.unwrap().environment.state, Observation::Stopped { .. }));
-        let before = http.0.lock().unwrap().bootstraps;
-        ops.suspend_resume.unwrap().resume(&id, token, &c).await.unwrap();
-        assert_eq!(http.0.lock().unwrap().bootstraps, before + 1);
-        assert_eq!(p.capabilities().suspend_preserves_memory, Some(false));
-        let mut output = String::new();
-        ops.exec
-            .unwrap()
-            .exec(&id, ExecRequest { command: vec!["echo".into(), "one'; touch /bad".into()] }, &c)
-            .await
-            .unwrap()
-            .read_to_string(&mut output)
-            .await
-            .unwrap();
-        assert_eq!(output, "guest output");
-        assert!(http.0.lock().unwrap().executed.last().unwrap().contains("'one'\\''; touch /bad'"));
-        for expected in ["ephemeral-1", "ephemeral-2"] {
-            let Connection::Ssh { user, endpoint, reverse_forwards, .. } = p.reach(&id, &c).await.unwrap() else {
-                panic!("SSH recipe required")
-            };
-            assert_eq!(user.expose(), expected);
-            // Daytona's gateway refuses remote port forwarding.
-            assert!(!reverse_forwards);
-            assert_eq!(endpoint, "ssh.app.daytona.io:22");
-            let recipe = Reach::Ssh { user, endpoint, host_key: "key".into(), reverse_forwards };
-            assert!(!format!("{recipe:?}").contains(expected));
-        }
-        let quota = ops.quota.unwrap().quota(&c).await.unwrap();
-        assert_eq!(quota.resources[0].in_use, 2.0);
-        assert_eq!(quota.resources[0].limit, Some(10.0));
-        let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-20T00:00:00Z".parse().unwrap()).unwrap();
-        let measurements = ops.usage.unwrap().usage(period.clone(), &c).await.unwrap().measurements.unwrap();
-        assert_eq!(measurements.resources[&ResourceKind::Memory].unit, "By.s");
-        assert_eq!(measurements.resources[&ResourceKind::Memory].amount, 14400.0 * (1u64 << 30) as f64);
-        assert_eq!(measurements.resources[&ResourceKind::Disk].amount, 36000.0 * (1u64 << 30) as f64);
-        let cost = measurements.cost.unwrap();
-        assert_eq!(cost.amount, "0.0123");
-        assert_eq!(cost.currency, "USD");
-        let usage = ops.usage.unwrap().usage(period, &c).await.unwrap();
-        assert_eq!(usage.environment_hours.len(), 1);
-        assert_eq!(usage.environment_hours[0].hours, 1.0);
-        assert_eq!(usage.environment_hours[0].size.cpus, 2.0);
-        p.destroy(&id, &c).await.unwrap();
-        p.destroy(&id, &c).await.unwrap();
-        assert!(p.list(&c).await.unwrap().is_empty());
-        assert_eq!(http.0.lock().unwrap().creates, 1);
+async fn lifecycle_and_credential_rotation() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let mut c = credentials();
+    let prep = prepared(p.as_ref(), &c).await;
+    let r = request(prep, "label-a");
+    let (a, b) = tokio::join!(p.provision(r.clone(), &c), p.provision(r.clone(), &c));
+    let a = a.unwrap();
+    let (Provisioned::Created(observation) | Provisioned::Existing(observation)) = &a;
+    assert!(!observation.egress_measured, "no probe means no measured evidence");
+    let b = b.unwrap();
+    assert!(matches!((&a, &b), (Provisioned::Created(_), Provisioned::Existing(_)) | (Provisioned::Existing(_), Provisioned::Created(_))));
+    let id = row(a).id;
+    assert_eq!(id, row(b).id);
+    let p = provider(http.clone()).await;
+    assert!(matches!(p.provision(r, &c).await.unwrap(), Provisioned::Existing(_)));
+    c = Credentials::new(Some(Secret::new("key-b")));
+    let rows = p.list(&c).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label.as_deref(), Some("label-a"));
+    assert_eq!(rows[0].granted_size.as_ref().unwrap().memory_bytes, 4 << 30);
+    assert_eq!(String::from(rows[0].timestamp.clone().unwrap()), "2026-10-19T12:00:00Z");
+    let ops = p.operations();
+    let token = ops.suspend_resume.unwrap().suspend(&id, &c).await.unwrap();
+    assert!(matches!(p.inspect(&id, &c).await.unwrap().state, Observation::Stopped { .. }));
+    let before = http.0.lock().unwrap().bootstraps;
+    ops.suspend_resume.unwrap().resume(&id, token, &c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().bootstraps, before + 1);
+    assert_eq!(p.capabilities().suspend_preserves_memory, Some(false));
+    let mut output = String::new();
+    ops.exec
+        .unwrap()
+        .exec(&id, ExecRequest { command: vec!["echo".into(), "one'; touch /bad".into()] }, &c)
+        .await
+        .unwrap()
+        .read_to_string(&mut output)
+        .await
+        .unwrap();
+    assert_eq!(output, "guest output");
+    assert!(http.0.lock().unwrap().executed.last().unwrap().contains("'one'\\''; touch /bad'"));
+    for expected in ["ephemeral-1", "ephemeral-2"] {
+        let Reach::Ssh { user, endpoint, reverse_forwards, .. } = p.reach(&id, &c).await.unwrap() else { panic!("SSH recipe required") };
+        assert_eq!(user.expose(), expected);
+        // Daytona's gateway refuses remote port forwarding.
+        assert!(!reverse_forwards);
+        assert_eq!(endpoint, "ssh.app.daytona.io:22");
+        let recipe = Reach::Ssh { user, endpoint, host_key: "key".into(), reverse_forwards };
+        assert!(!format!("{recipe:?}").contains(expected));
     }
+    let quota = ops.quota.unwrap().quota(&c).await.unwrap();
+    assert_eq!(quota.resources[0].in_use, 2.0);
+    assert_eq!(quota.resources[0].limit, Some(10.0));
+    let period = Period::new("2026-10-19T00:00:00Z".parse().unwrap(), "2026-10-20T00:00:00Z".parse().unwrap()).unwrap();
+    let measurements = ops.usage.unwrap().usage(period.clone(), &c).await.unwrap().measurements.unwrap();
+    assert_eq!(measurements.resources[&ResourceKind::Memory].unit, "By.s");
+    assert_eq!(measurements.resources[&ResourceKind::Memory].amount, 14400.0 * (1u64 << 30) as f64);
+    assert_eq!(measurements.resources[&ResourceKind::Disk].amount, 36000.0 * (1u64 << 30) as f64);
+    let cost = measurements.cost.unwrap();
+    assert_eq!(cost.amount, "0.0123");
+    assert_eq!(cost.currency, "USD");
+    let usage = ops.usage.unwrap().usage(period, &c).await.unwrap();
+    assert_eq!(usage.environment_hours.len(), 1);
+    assert_eq!(usage.environment_hours[0].hours, 1.0);
+    assert_eq!(usage.environment_hours[0].size.cpus, 2.0);
+    p.destroy(&id, &c).await.unwrap();
+    p.destroy(&id, &c).await.unwrap();
+    assert!(p.list(&c).await.unwrap().is_empty());
+    assert_eq!(http.0.lock().unwrap().creates, 1);
 }
 
 // Every request failure is typed, sanitized and returned without retry. The
@@ -870,7 +859,7 @@ async fn lifecycle_and_credential_modes() {
 async fn vendor_errors() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     for (status, class) in [
         (400, "internal"),
         (401, "credential_rejected"),
@@ -901,7 +890,7 @@ async fn vendor_errors() {
 async fn egress_and_sizes() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     for (index, egress) in [
         EgressRequest::default(),
@@ -951,7 +940,7 @@ fn generated_lifecycle(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let http = Arc::new(StandIn::default());
         let mut p = provider(http.clone()).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         let mut expected: Option<String> = None;
         for op in operations {
@@ -980,8 +969,8 @@ fn generated_lifecycle(tc: hegel::TestCase) {
             let rows = p.list(&c).await.unwrap();
             assert_eq!(rows.len(), usize::from(expected.is_some()));
             if let Some(id) = &expected {
-                assert_eq!(&rows[0].environment.id, id);
-                assert!(matches!(rows[0].environment.state, Observation::Running));
+                assert_eq!(&rows[0].id, id);
+                assert!(matches!(rows[0].state, Observation::Running));
             }
         }
     });
@@ -993,7 +982,7 @@ fn generated_lifecycle(tc: hegel::TestCase) {
 async fn root_egress_claim_is_measured_each_time() {
     let http = Arc::new(StandIn::default());
     let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let mut r = request(prep, "probe");
     r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
@@ -1010,8 +999,8 @@ async fn root_egress_claim_is_measured_each_time() {
         let mut result = good.clone();
         result[key] = bad;
         http.0.lock().unwrap().probe = Some(result);
-        assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
-        assert_eq!(p.list(&c).await.unwrap()[0].environment.egress, Enforcement::Advisory);
+        assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
+        assert_eq!(p.list(&c).await.unwrap()[0].egress, Enforcement::Advisory);
     }
 }
 
@@ -1021,7 +1010,7 @@ async fn root_egress_claim_is_measured_each_time() {
 async fn observations_are_typed() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     // Published vendor wording, not a captured live-account response. Other
     // rows below are synthetic cause/refusal examples, labelled deliberately.
     let schema: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
@@ -1045,9 +1034,9 @@ async fn observations_are_typed() {
             .rows
             .insert("unlabelled".into(), json!({"id":"unlabelled","state":state,"errorReason":reason,"cpu":3,"memory":7,"disk":9}));
         let row = p.inspect("unlabelled", &c).await.unwrap();
-        assert_eq!(row.environment.state, expected);
-        assert!(row.environment.label.is_none());
-        assert_eq!(row.environment.granted_size.unwrap().cpus, 3.0);
+        assert_eq!(row.state, expected);
+        assert!(row.label.is_none());
+        assert_eq!(row.granted_size.unwrap().cpus, 3.0);
         assert!(row.timestamp.is_none());
     }
 }
@@ -1058,7 +1047,7 @@ async fn observations_are_typed() {
 async fn name_conflict_readopts_without_retrying_creation() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let r = request(prep, "same-name");
     let id = row(p.provision(r.clone(), &c).await.unwrap()).id;
@@ -1081,7 +1070,7 @@ async fn preparation_converges_by_digest_pair() {
     let http = Arc::new(StandIn::default());
     let a = provider(http.clone()).await;
     let b = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let mut r = PrepareRequest {
         platform: Some(Platform::new("linux", "amd64")),
         route: Some(ImageRouteKind::RegistryPull),
@@ -1129,7 +1118,7 @@ fn prepared_sizes_route_to_snapshots(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let http = Arc::new(StandIn::default());
         let p = provider(http.clone()).await;
-        let c = credentials(false);
+        let c = credentials();
         let base = PrepareRequest {
             platform: Some(Platform::new("linux", "amd64")),
             route: Some(ImageRouteKind::RegistryPull),
@@ -1174,7 +1163,7 @@ async fn preparation_refuses_existing_snapshot_resource_mismatch() {
     for key in ["cpu", "mem", "disk"] {
         let http = Arc::new(StandIn::default());
         let p = provider(http.clone()).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().snapshots.get_mut(&prep.id).unwrap()[key] = json!(1);
         let r = PrepareRequest {
@@ -1196,7 +1185,7 @@ async fn preparation_refuses_existing_snapshot_resource_mismatch() {
 async fn invalid_preparation_sizes_do_not_call_vendor() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let valid = request(prep.clone(), "invalid").size;
     let mut sizes = vec![];
@@ -1253,7 +1242,7 @@ async fn standin_rejects_snapshot_resources() {
 async fn inactive_snapshot_activates_once_then_polls() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!("inactive");
     let start = tokio::time::Instant::now();
@@ -1281,7 +1270,7 @@ async fn inactive_snapshot_activates_once_then_polls() {
 async fn bootstrap_budget_and_command_failure() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().require_bootstrap_budget = true;
     let env = row(p.provision(request(prep, "budget"), &c).await.unwrap());
@@ -1301,7 +1290,7 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
     for state in ["error", "build_failed", "destroyed"] {
         let http = Arc::new(StandIn::default());
         let p = provider(http.clone()).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().created_state = Some(state.into());
         let start = tokio::time::Instant::now();
@@ -1311,7 +1300,7 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
     for state in ["error", "build_failed"] {
         let http = Arc::new(StandIn::default());
         let p = provider(http.clone()).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().snapshots.values_mut().next().unwrap()["state"] = json!(state);
         assert!(matches!(
@@ -1332,29 +1321,13 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
     }
 }
 
-// A failed row-local guest probe cannot erase a healthy authoritative inventory.
-#[tokio::test]
-async fn probe_failures_surface_without_erasing_inventory() {
-    let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
-    let prep = prepared(p.as_ref(), &c).await;
-    http.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
-    let mut r = request(prep, "probe-fails");
-    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
-    let env = row(p.provision(r, &c).await.unwrap());
-    http.0.lock().unwrap().probe_exit = Some(1);
-    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { .. })));
-    assert_eq!(p.list(&c).await.unwrap().len(), 1);
-}
-
 // Bootstrap delegates to the baked binary and needs no Python, flock, or shell
 // fragment setting. Lifecycle readiness belongs to the daemon's agent hello.
 #[tokio::test]
 async fn bootstrap_uses_only_baked_tools() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     p.provision(request(prep, "tools-only"), &c).await.unwrap();
     let state = http.0.lock().unwrap();
@@ -1420,7 +1393,7 @@ async fn slow_start_does_not_queue_other_labels() {
     let vendor = Arc::new(StandIn::default());
     let http = Arc::new(Latency::new(vendor, true, false));
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let slow_p = p.clone();
     let slow_c = c.clone();
@@ -1440,7 +1413,7 @@ async fn list_never_runs_guest_probes() {
     let vendor = Arc::new(StandIn::default());
     let http = Arc::new(Latency::new(vendor.clone(), false, true));
     let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
+    let c = credentials();
     for i in 0..7 {
         vendor.0.lock().unwrap().rows.insert(
             format!("s-{i}"),
@@ -1458,7 +1431,7 @@ async fn list_never_runs_guest_probes() {
 async fn existing_labels_surface_size_and_egress_mismatches() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let r = request(prep, "mismatch");
     p.provision(r.clone(), &c).await.unwrap();
@@ -1477,7 +1450,7 @@ async fn existing_labels_surface_size_and_egress_mismatches() {
 async fn deny_all_proof_and_probe_diagnostics() {
     let http = Arc::new(StandIn::default());
     let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
     let env = row(p.provision(request(prep, "deny-all"), &c).await.unwrap());
@@ -1487,11 +1460,13 @@ async fn deny_all_proof_and_probe_diagnostics() {
     p.list(&c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before);
     http.0.lock().unwrap().probe = Some(json!({"uid":1000,"unlisted_canary":false,"raw_dns":false}));
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
     http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":true,"raw_dns":false}));
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.egress, Enforcement::Advisory);
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
     http.0.lock().unwrap().probe_exit = Some(2);
-    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { exit_code: 2, .. })));
+    let unmeasured = p.inspect(&env.id, &c).await.unwrap();
+    assert!(!unmeasured.egress_measured);
+    assert_eq!(unmeasured.egress, Enforcement::Advisory);
 }
 
 // Native host rules preserve request identity without consulting current DNS.
@@ -1500,7 +1475,7 @@ async fn deny_all_proof_and_probe_diagnostics() {
 async fn native_domains_are_idempotent_and_mixed_rules_refused() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let mut r = request(prep, "domains");
     r.egress = EgressRequest::DenyAll { direct: vec![Destination::Host { host: "dual-stack.example".parse().unwrap() }] };
@@ -1529,8 +1504,7 @@ async fn standin_enforces_vendor_wire_contract() {
         assert_eq!(network.http.execute(r, &ChannelLabel::Default).await.unwrap().status(), expected);
     }
     let p = provider(http.clone()).await;
-    let mut c = credentials(false);
-    c.value = Some(Secret::new("wrong"));
+    let c = Credentials::new(Some(Secret::new("wrong")));
     assert!(matches!(p.list(&c).await, Err(ProtocolError::CredentialRejected { .. })));
 }
 
@@ -1541,7 +1515,7 @@ async fn internal_retains_vendor_body() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     http.0.lock().unwrap().failure = Some(400);
-    let error = p.list(&credentials(false)).await.unwrap_err();
+    let error = p.list(&credentials()).await.unwrap_err();
     assert!(format!("{error:?}").contains("key-a"));
     let ProtocolError::Internal { provider_error, .. } = error else { panic!("internal error") };
     assert!(provider_error.as_str().contains("key-a must never be echoed"));
@@ -1554,7 +1528,7 @@ async fn internal_retains_vendor_body() {
 async fn lifecycle_state_checks_do_not_probe() {
     let http = Arc::new(StandIn::default());
     let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
     let env = row(p.provision(request(prep, "probe-independent-stop"), &c).await.unwrap());
@@ -1565,7 +1539,7 @@ async fn lifecycle_state_checks_do_not_probe() {
     assert_eq!(http.0.lock().unwrap().executed.len(), before);
     sr.resume(&env.id, token, &c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before + 1);
-    assert!(matches!(p.inspect(&env.id, &c).await, Err(ProtocolError::CommandFailed { .. })));
+    assert!(!p.inspect(&env.id, &c).await.unwrap().egress_measured);
 }
 
 // Retried stop/start observes operations already moving in the requested
@@ -1574,7 +1548,7 @@ async fn lifecycle_state_checks_do_not_probe() {
 async fn lifecycle_retries_wait_for_existing_transition() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let env = row(p.provision(request(prep, "transition-retry"), &c).await.unwrap());
     {
@@ -1592,7 +1566,7 @@ async fn lifecycle_retries_wait_for_existing_transition() {
     }
     sr.resume(&env.id, token, &c).await.unwrap();
     assert!(http.0.lock().unwrap().lifecycle_posts.is_empty());
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().environment.state, Observation::Running);
+    assert_eq!(p.inspect(&env.id, &c).await.unwrap().state, Observation::Running);
 }
 
 // A transport outage is retryable Unavailable, never an adaptor-bug Internal.
@@ -1606,21 +1580,21 @@ async fn transport_outages_are_unavailable() {
         }
     }
     let p = provider(Arc::new(Offline)).await;
-    let error = p.list(&credentials(false)).await.unwrap_err();
+    let error = p.list(&credentials()).await.unwrap_err();
     assert!(matches!(error, ProtocolError::Unavailable { .. }));
     assert!(error.to_string().contains("private transport detail"));
     let ProtocolError::Unavailable { provider_error: Some(detail), .. } = error else { panic!("missing protected transport diagnostic") };
     assert!(detail.as_str().contains("private transport detail"));
 }
 
-// Probe command failure and malformed proof leave successful creation/re-adoption
-// and resume enrichment Advisory. Explicit inspect still exposes the typed error.
+// Probe command failure and malformed proof leave creation, re-adoption and
+// inspect successful, Advisory and unmeasured.
 #[tokio::test]
 async fn lifecycle_success_is_independent_of_probe_failure() {
     for failure in 0..3 {
         let http = Arc::new(StandIn::default());
         let p = provider_with_probe(http.clone(), true).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         if failure == 1 {
             http.0.lock().unwrap().probe_exit = Some(1);
@@ -1633,19 +1607,18 @@ async fn lifecycle_success_is_independent_of_probe_failure() {
         for _ in 0..2 {
             let result = p.provision(request.clone(), &c).await.unwrap();
             let (Provisioned::Created(row) | Provisioned::Existing(row)) = result;
-            assert_eq!(row.environment.egress, Enforcement::Advisory);
+            assert_eq!(row.egress, Enforcement::Advisory);
             assert!(!row.egress_measured);
-            assert!(p.inspect(&row.environment.id, &c).await.is_err());
             let port = p.operations().suspend_resume.unwrap();
-            let token = port.suspend(&row.environment.id, &c).await.unwrap();
-            port.resume(&row.environment.id, token, &c).await.unwrap();
+            let token = port.suspend(&row.id, &c).await.unwrap();
+            port.resume(&row.id, token, &c).await.unwrap();
             // Failed enrichment reuses the sandbox GET; it must not list the inventory.
             let requests = http.0.lock().unwrap().requests;
-            let resumed = p.inspect_after_lifecycle(&row.environment.id, &c).await.unwrap();
+            let resumed = p.inspect(&row.id, &c).await.unwrap();
             // The probe resolves its toolbox URL with a second GET, then executes.
             assert_eq!(http.0.lock().unwrap().requests - requests, 3);
-            assert!(matches!(resumed.environment.state, Observation::Running));
-            assert_eq!(resumed.environment.egress, Enforcement::Advisory);
+            assert!(matches!(resumed.state, Observation::Running));
+            assert_eq!(resumed.egress, Enforcement::Advisory);
             assert!(!resumed.egress_measured);
         }
     }
@@ -1666,7 +1639,7 @@ async fn sandbox_usage_periods_are_clipped_and_validated() {
         {"cpu":0,"startAt":"2026-10-19T00:00:00Z"},
         {"cpu":1,"ramGB":2,"diskGB":3,"startAt":"2026-10-19T03:00:00Z"}
     ]));
-    let usage = port.usage(period.clone(), &credentials(false)).await.unwrap();
+    let usage = port.usage(period.clone(), &credentials()).await.unwrap();
     assert_eq!(usage.environment_hours.len(), 2);
     assert_eq!(usage.environment_hours.iter().map(|r| r.hours).sum::<f64>(), 2.0);
     assert_eq!(usage.environment_hours[1].size.memory_bytes, 4 << 30);
@@ -1674,7 +1647,7 @@ async fn sandbox_usage_periods_are_clipped_and_validated() {
         [json!([]), json!([{"cpu":1,"startAt":"bad"}]), json!([{"cpu":1,"startAt":"2026-10-19T01:00:00Z","endAt":"2026-10-19T00:00:00Z"}])]
     {
         http.0.lock().unwrap().usage_periods = Some(value.clone());
-        let result = port.usage(period.clone(), &credentials(false)).await;
+        let result = port.usage(period.clone(), &credentials()).await;
         if value.as_array().unwrap().is_empty() {
             assert!(result.unwrap().environment_hours.is_empty());
         } else {
@@ -1863,8 +1836,8 @@ impl Module for VendorModule {
     fn version(&self) -> &str {
         "test"
     }
-    async fn configure(&self, config: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        DaytonaModule.configure(config, self.0.clone()).await
+    async fn configure(&self, name: &str, config: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+        DaytonaModule.configure(name, config, self.0.clone()).await
     }
 }
 struct HostHarness {
@@ -1897,33 +1870,24 @@ impl HostHarness {
         })
         .await
         .unwrap();
-        // The stand-in remains the vendor HTTP boundary. Policy now runs in
-        // the main server through the real thin Rust host over a private UDS.
+        // The stand-in remains the vendor HTTP boundary. Policy runs in the
+        // main server, which reaches the real Rust host through its public API.
         let supervisor = drydock::Supervisor::new(dir.path().join("policy"), Arc::new(drydock::credentials::BuiltinCredentials::default()));
         let mut policy = supervisor
             .start(drydock::HostSpec {
                 name: "daytona-test".into(),
                 connection: drydock::HostConnection::ExternalUnix { path: dir.path().join("host.sock") },
-                configuration: HostConfiguration { modules: vec![], providers: vec![] },
+                configuration: serde_json::from_value(json!({"providers":{"daytona":{"module":"daytona","settings":{
+                    "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA",
+                    "egress_probe":{"command":["/usr/local/bin/check-egress"]}
+                }}}}))
+                .unwrap(),
                 credentials: Default::default(),
             })
             .await
             .unwrap();
         policy.ready(std::time::Duration::from_secs(5)).await.unwrap();
         let client = policy.client.clone();
-        client
-            .configure(
-                &serde_json::from_value(json!({
-                    "modules":[{"name":"daytona","entrypoint":"daytona"}],
-                    "providers":[{"name":"daytona","module":"daytona","settings":{
-                        "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA",
-                        "egress_probe":{"command":["/usr/local/bin/check-egress"]}
-                    },"credential":{"mode":"direct","credential_reference":"test"}}]
-                }))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
         client.credential("daytona", Secret::new("key-a")).await.unwrap();
         let client = public_server::client(client, dir.path().join("public.sock")).await;
         Self { _policy: policy, client, _dir: dir, task, stop: Some(stop) }
@@ -1942,7 +1906,7 @@ async fn fast_restart_invalidates_host_egress_evidence() {
     vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
     let host = HostHarness::start(vendor.clone()).await;
     let p = provider(vendor.clone()).await;
-    let prep = prepared(p.as_ref(), &credentials(false)).await;
+    let prep = prepared(p.as_ref(), &credentials()).await;
     let mut r = request(prep, "fast-restart");
     r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
     let env = host.client.provision("daytona", &r).await.unwrap().into_inner();
@@ -1967,7 +1931,7 @@ async fn conformance_waits_for_settled_billing_windows() {
         vendor.0.lock().unwrap().accounting_delay_millis = Some(2000);
         let host = HostHarness::start(vendor.clone()).await;
         let p = provider(vendor.clone()).await;
-        let prep = prepared(p.as_ref(), &credentials(false)).await;
+        let prep = prepared(p.as_ref(), &credentials()).await;
         let options = Options {
             request: request(prep, "settled-billing"),
             scenarios: vec![Scenario::Observation],
@@ -2029,55 +1993,6 @@ async fn analytics_query_formats_are_enforced() {
     assert_eq!(network.http.execute(request, &ChannelLabel::Default).await.unwrap().status(), 200);
 }
 
-// New providers inherit a lifecycle read that never attempts guest enrichment.
-struct InventoryLifecycle(Arc<dyn Provider>);
-#[async_trait]
-impl Provider for InventoryLifecycle {
-    fn capabilities(&self) -> Capabilities {
-        self.0.capabilities()
-    }
-    fn observation(&self) -> ObservationMode {
-        self.0.observation()
-    }
-    async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-        self.0.prepare(r, c).await
-    }
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        self.0.provision(r, c).await
-    }
-    async fn list(&self, c: &Credentials) -> Result<Vec<ObservedEnvironment>> {
-        self.0.list(c).await
-    }
-    async fn inspect(&self, id: &str, c: &Credentials) -> Result<ObservedEnvironment> {
-        self.0.inspect(id, c).await
-    }
-    async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        self.0.destroy(id, c).await
-    }
-    async fn reach(&self, id: &str, c: &Credentials) -> Result<Connection> {
-        self.0.reach(id, c).await
-    }
-    async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-        self.0.relay(id, c).await
-    }
-}
-#[tokio::test]
-async fn default_lifecycle_inspection_uses_inventory_without_probing() {
-    let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
-    let prep = prepared(p.as_ref(), &c).await;
-    let env = row(p.provision(request(prep, "default-lifecycle"), &c).await.unwrap());
-    let provider = InventoryLifecycle(p);
-    let probes = http.0.lock().unwrap().executed.len();
-    let row = provider.inspect_after_lifecycle(&env.id, &c).await.unwrap();
-    assert_eq!(row.environment.egress, Enforcement::Advisory);
-    assert_eq!(http.0.lock().unwrap().executed.len(), probes);
-    assert!(matches!(provider.inspect_after_lifecycle("absent", &c).await, Err(ProtocolError::NotFound { .. })));
-    http.0.lock().unwrap().failure = Some(401);
-    assert!(matches!(provider.inspect_after_lifecycle(&env.id, &c).await, Err(ProtocolError::CredentialRejected { .. })));
-}
-
 // Ongoing periods cannot bill time that has not elapsed, even in future windows.
 #[tokio::test]
 async fn ongoing_usage_does_not_bill_the_future() {
@@ -2090,7 +2005,7 @@ async fn ongoing_usage_does_not_bill_the_future() {
         {"cpu":1,"ramGB":2,"diskGB":3,"startAt": start.to_rfc3339()}
     ]));
     let period = Period::new(start.into(), end.into()).unwrap();
-    let usage = p.operations().usage.unwrap().usage(period, &credentials(false)).await.unwrap();
+    let usage = p.operations().usage.unwrap().usage(period, &credentials()).await.unwrap();
     let elapsed_hours = (chrono::Utc::now() - start).num_milliseconds() as f64 / 3_600_000.0;
     assert!((1.0..=elapsed_hours).contains(&usage.environment_hours[0].hours));
 }
@@ -2112,9 +2027,7 @@ async fn vendor_body_masking_precedes_truncation() {
         // Force a competing vendor call before the foreground host call. This
         // deterministically covers the poller's one-shot-fault consumption race.
         let p = provider(vendor.clone()).await;
-        let ProtocolError::Internal { provider_error, .. } = p.list(&credentials(false)).await.unwrap_err() else {
-            panic!("expected body")
-        };
+        let ProtocolError::Internal { provider_error, .. } = p.list(&credentials()).await.unwrap_err() else { panic!("expected body") };
         assert!(provider_error.len() > 16384);
         assert_eq!(provider_error.find("key-a"), Some(boundary - 2));
         assert!(provider_error.contains("key-a trailing"));
@@ -2134,7 +2047,7 @@ async fn vendor_body_masking_precedes_truncation() {
 async fn malformed_sensitive_responses_do_not_disclose_values() {
     let http = Arc::new(StandIn::default());
     let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let env = row(p.provision(request(prep, "malformed-sensitive"), &c).await.unwrap());
     http.0.lock().unwrap().ssh_response = Some(json!({"token":null,"sshCommand":"ssh minted-private-token@gateway"}));
@@ -2150,17 +2063,10 @@ async fn malformed_sensitive_responses_do_not_disclose_values() {
             assert!(!view.contains("guest-private-output"), "{view}");
         }
     }
-    http.0.lock().unwrap().exec_response = None;
-    http.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["networkBlockAll"] = json!(true);
-    http.0.lock().unwrap().probe = Some(json!({"private_output":"guest-private-output"}));
-    let error = p.inspect(&env.id, &c).await.unwrap_err();
-    for view in [error.to_string(), format!("{error:?}"), serde_json::to_string(&error).unwrap()] {
-        assert!(!view.contains("guest-private-output"), "{view}");
-    }
 }
 
-// Lifecycle fallback succeeds, so its module-level log must contain only the
-// category: the host never receives this error to apply credential masking.
+// Inspect's probe fallback succeeds, so its module-level log must contain only
+// the category: the host never receives this error to apply credential masking.
 #[test]
 fn lifecycle_fallback_log_does_not_disclose_provider_body() {
     struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -2183,7 +2089,7 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let http = Arc::new(StandIn::default());
         let p = provider_with_probe(http.clone(), true).await;
-        let c = credentials(false);
+        let c = credentials();
         let prep = prepared(p.as_ref(), &c).await;
         http.0.lock().unwrap().probe_http_failure = Some(502);
         http.0.lock().unwrap().probe_failure_message = Some("validation fallback-secret-xyz".into());
@@ -2192,7 +2098,7 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
         p.provision(r, &c).await.unwrap();
     });
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("lifecycle succeeded; egress measurement failed"), "{logs}");
+    assert!(logs.contains("egress measurement failed"), "{logs}");
     assert!(!logs.contains("fallback-secret-xyz"), "{logs}");
 }
 
@@ -2202,7 +2108,7 @@ fn lifecycle_fallback_log_does_not_disclose_provider_body() {
 async fn concurrent_bootstraps_after_start_and_resume() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let request = request(prep, "concurrent-bootstrap");
     let (first, second) = tokio::join!(p.provision(request.clone(), &c), p.provision(request, &c));
@@ -2225,7 +2131,7 @@ async fn concurrent_bootstraps_after_start_and_resume() {
 async fn prepare_refuses_unpublished_or_unsafe_tools() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     for tools in [
         "unpublished".into(),
         "tools:latest".into(),
@@ -2267,9 +2173,11 @@ async fn prepare_refuses_unpublished_or_unsafe_tools() {
 }
 
 async fn provider_with_settings(http: Arc<dyn HttpClient>, settings: Value) -> Arc<dyn Provider> {
-    let mut config: ProviderConfiguration = serde_json::from_value(json!({"name":"daytona","module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"},"credential":{"mode":"direct","credential_reference":"test"}})).unwrap();
+    let mut config: ProviderConfiguration =
+        serde_json::from_value(json!({"module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"}}))
+            .unwrap();
     config.settings.extend(settings.as_object().unwrap().clone());
-    DaytonaModule.configure(&config, http).await.unwrap()
+    DaytonaModule.configure("daytona", &config, http).await.unwrap()
 }
 fn push_request(image_digest: String, tools_digest: String) -> PrepareRequest {
     PrepareRequest {
@@ -2298,7 +2206,7 @@ async fn pushed_image_becomes_snapshot_by_digest() {
     };
     let chunk = 7;
     let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": chunk})).await;
-    let c = credentials(false);
+    let c = credentials();
     let prep = p.prepare(push_request(base.clone(), tools.clone()), &c).await.unwrap();
 
     {
@@ -2337,7 +2245,7 @@ async fn push_route_refusals_are_typed() {
         (arm_only, huge, seed(&mut s, lab_base(&["amd64"])).0, seed(&mut s, published_tools()).0)
     };
     let p = provider(http.clone()).await;
-    let c = credentials(false);
+    let c = credentials();
     let refusal = |result: Result<Prepared>| match result {
         Err(ProtocolError::ImageRefused { refusal, .. }) => refusal,
         other => panic!("{other:?}"),
@@ -2377,7 +2285,7 @@ async fn unverifiable_source_blobs_are_refused() {
     };
     let layer = base_manifests["amd64"]["layers"][0]["digest"].as_str().unwrap().to_owned();
     let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": 7})).await;
-    let c = credentials(false);
+    let c = credentials();
     let refused_unstored = |result: Result<Prepared>| {
         assert!(matches!(result, Err(ProtocolError::Internal { .. })), "{result:?}");
         assert!(!http.0.lock().unwrap().oci.blobs.contains_key(&(HARBOR.to_owned(), layer.clone())));

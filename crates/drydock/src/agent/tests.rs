@@ -12,12 +12,10 @@ const BUILD: &[u8] = b"current agent";
 async fn provider(agent: bool, reach: Reach) -> (Runtime, String) {
     let runtime = Runtime::new(drydock_host::reference::registry());
     let configuration = serde_json::from_value(serde_json::json!({
-        "modules": [{"name": "memory", "entrypoint": "reference"}],
-        "providers": [{"name": "a", "module": "memory", "settings": {"agent": agent, "reach": reach},
-            "credential": {"mode": "direct", "credential_reference": "test"}}]
+        "providers": {"a": {"module": "reference", "settings": {"agent": agent, "reach": reach}}}
     }))
     .unwrap();
-    runtime.configure(&configuration).await.unwrap();
+    runtime.configure(crate::api::ConfigUpdate::Replace(configuration)).await.unwrap();
     runtime.credential("a", Secret::new("reference-only-test-key")).await.unwrap();
     let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
     let request = PrepareRequest {
@@ -102,7 +100,7 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
         let connected = reach.connect(&api, &vessel).await.unwrap();
         let report = AgentReport {
             provider: "a".into(),
-            module: "memory".into(),
+            module: "reference".into(),
             environment: environment.clone(),
             endpoint: "gateway.test:22".into(),
             link,

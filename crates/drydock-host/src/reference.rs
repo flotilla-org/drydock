@@ -5,7 +5,6 @@ use drydock_protocol::*;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use tokio::io::AsyncWriteExt;
 pub fn registry() -> Registry {
@@ -17,10 +16,10 @@ impl Module for ReferenceModule {
     fn version(&self) -> &str {
         env!("CARGO_PKG_VERSION")
     }
-    async fn configure(&self, c: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+    async fn configure(&self, name: &str, c: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: ReferenceSettings = serde_json::from_value(serde_json::to_value(&c.settings).expect("settings map"))
             .map_err(|_| refused("invalid reference settings"))?;
-        Ok(Arc::new(Reference { name: c.name.clone(), state: Mutex::new(Memory::default()), settings }))
+        Ok(Arc::new(Reference { name: name.to_owned(), state: Mutex::new(Memory::default()), settings }))
     }
 }
 #[derive(serde::Deserialize)]
@@ -30,8 +29,6 @@ struct ReferenceSettings {
     fault: Option<ProtocolError>,
     #[serde(default)]
     fixture: bool,
-    #[serde(default)]
-    fixture_push: bool,
     #[serde(default)]
     fixture_bad_relay: bool,
     #[serde(default)]
@@ -102,10 +99,7 @@ impl Provider for Reference {
         self.settings.rate_limits.clone()
     }
     fn observation(&self) -> ObservationMode {
-        if self.settings.fixture && self.settings.fixture_push {
-            return ObservationMode::Push;
-        }
-        ObservationMode::Poll { interval: Duration::from_millis(self.settings.poll_interval_ms) }
+        ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
     }
     fn operations(&self) -> Operations<'_> {
         Operations { exec: Some(self), suspend_resume: Some(self), export: Some(self), usage: Some(self), quota: Some(self) }
@@ -155,7 +149,11 @@ impl Provider for Reference {
         self.check()?;
         let mut state = self.state.recover();
         if let Some(s) = state.environments.values().find(|s| s.label.as_deref() == Some(&r.label)) {
-            return Ok(Provisioned::Existing(s.clone().into()));
+            return Ok(Provisioned::Existing(Environment {
+                egress_measured: true,
+                timestamp: state.provider_timestamp.map(Into::into),
+                ..s.clone()
+            }));
         }
         if !state.prepared.values().any(|p| p == &r.prepared) {
             return Err(refused("unknown prepared form"));
@@ -172,12 +170,15 @@ impl Provider for Reference {
             granted_size: Some(r.size.clone()),
             egress: Enforcement::Advisory,
             platform: Some(r.prepared.platform.clone()),
+            egress_measured: false,
+            egress_policy: None,
+            timestamp: None,
         };
         state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());
-        Ok(Provisioned::Created(s.into()))
+        Ok(Provisioned::Created(Environment { egress_measured: true, timestamp: state.provider_timestamp.map(Into::into), ..s }))
     }
-    async fn list(&self, _: &Credentials) -> Result<Vec<ObservedEnvironment>> {
+    async fn list(&self, _: &Credentials) -> Result<Vec<Environment>> {
         self.check()?;
         let state = self.state.recover();
         if state.inventory_error {
@@ -187,19 +188,14 @@ impl Provider for Reference {
             .environments
             .values()
             .cloned()
-            .map(|environment| ObservedEnvironment {
-                egress_policy: None,
-                egress_measured: true,
-                environment,
-                timestamp: state.provider_timestamp,
-            })
+            .map(|environment| Environment { egress_measured: true, timestamp: state.provider_timestamp.map(Into::into), ..environment })
             .collect())
     }
-    async fn inspect(&self, id: &str, _: &Credentials) -> Result<ObservedEnvironment> {
+    async fn inspect(&self, id: &str, _: &Credentials) -> Result<Environment> {
         self.check()?;
         let environment = self.find(id)?;
-        let timestamp = self.state.recover().provider_timestamp;
-        Ok(ObservedEnvironment { egress_policy: None, egress_measured: true, environment, timestamp })
+        let timestamp = self.state.recover().provider_timestamp.map(Into::into);
+        Ok(Environment { egress_measured: true, timestamp, ..environment })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
@@ -210,20 +206,12 @@ impl Provider for Reference {
         state.tools_generation.remove(id);
         Ok(())
     }
-    async fn reach(&self, id: &str, _: &Credentials) -> Result<Connection> {
+    async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
         self.check()?;
         self.find(id)?;
         Ok(match &self.settings.reach {
-            Some(Reach::Ssh { endpoint, user, host_key, reverse_forwards }) => Connection::Ssh {
-                endpoint: endpoint.clone(),
-                user: user.clone(),
-                host_key: host_key.clone(),
-                reverse_forwards: *reverse_forwards,
-            },
-            Some(Reach::Dial { url, token, expires_at }) => {
-                Connection::Dial { url: url.clone(), token: token.clone(), expires_at: expires_at.clone() }
-            }
-            _ => Connection::Relay,
+            Some(reach @ (Reach::Ssh { .. } | Reach::Dial { .. })) => reach.clone(),
+            _ => Reach::relay(&self.name, id),
         })
     }
     async fn relay(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
@@ -291,6 +279,9 @@ impl Exec for Reference {
                         granted_size: None,
                         egress: Enforcement::Advisory,
                         platform: None,
+                        egress_measured: false,
+                        egress_policy: None,
+                        timestamp: None,
                     };
                     state.environments.insert(row.id.clone(), row.clone());
                     serde_json::to_value(row).expect("environment")
