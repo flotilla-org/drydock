@@ -25,4 +25,6 @@ const result = spawnSync(
     },
   },
 );
+if (result.error)
+  console.error(`Cannot start Cargo conformance: ${result.error.message}`);
 process.exit(result.status ?? 1);

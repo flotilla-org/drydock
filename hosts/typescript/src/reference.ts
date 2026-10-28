@@ -20,7 +20,19 @@ const settingsValid = compile({
   },
 });
 const digest = (value: unknown) =>
-  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  createHash("sha256")
+    .update(
+      JSON.stringify(value, (_key, item) =>
+        item !== null && typeof item === "object" && !Array.isArray(item)
+          ? Object.fromEntries(
+              Object.keys(item)
+                .sort()
+                .map((key) => [key, item[key]]),
+            )
+          : item,
+      ),
+    )
+    .digest("hex");
 const reference: ProviderModule = {
   name: "reference",
   version: "0.1.0",
@@ -136,6 +148,7 @@ class Memory implements Provider {
         egress: "advisory",
       },
       timestamp: new Date().toISOString(),
+      // This fixture measured its advisory result; it makes no enforcement claim.
       egress_measured: true,
       egress_policy: digest(request.egress),
     };
@@ -162,6 +175,7 @@ class Memory implements Provider {
   }
   async destroy(id: string, { signal }: Context) {
     signal.throwIfAborted();
+    // Destroy is idempotent; absence must not emit a second removal.
     if (this.rows.delete(id))
       this.updates.emit("update", {
         Removed: { id, timestamp: new Date().toISOString() },

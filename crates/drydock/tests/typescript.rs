@@ -27,6 +27,11 @@ async fn typescript_reference_conforms_through_main_server() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    // Drain without retaining diagnostics/credentials or risking a full child pipe.
+    let mut stdout = child.stdout.take().unwrap();
+    let stdout = tokio::spawn(async move { tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await.unwrap() });
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr = tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await.unwrap() });
     let private = Client::unix(&private_socket).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -41,6 +46,7 @@ async fn typescript_reference_conforms_through_main_server() {
     .unwrap();
     let credential = dir.path().join("credential");
     std::fs::write(&credential, "test-only-reference-token").unwrap();
+    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
     let config: Config = toml::from_str(&format!(
         r#"
 [provider.a]
@@ -114,7 +120,8 @@ settings = {{ seed_unlabelled = true }}
     let _ = stop.send(());
     tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
     child.kill().await.unwrap();
-    let output = child.wait_with_output().await.unwrap();
-    assert!(output.stdout.is_empty() && output.stderr.is_empty(), "bridge must not log requests/credentials");
+    child.wait().await.unwrap();
+    assert_eq!(stdout.await.unwrap(), 0, "bridge must not log requests/credentials");
+    assert_eq!(stderr.await.unwrap(), 0, "bridge must not log requests/credentials");
     assert!(report.passed(), "{}", serde_json::to_string_pretty(&report).unwrap());
 }
