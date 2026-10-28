@@ -9,6 +9,7 @@ export interface ProviderModule {
   name: string;
   version: string;
   smallestSize: Types["Size"];
+  // Factories own cleanup on rejection/abort; retain no call-scoped SDK work.
   configure(
     config: Types["ProviderConfiguration"],
     signal: AbortSignal,
@@ -37,6 +38,7 @@ export interface Provider {
   destroy(id: string, context: Context): Promise<void>;
   reach(id: string, context: Context): Promise<Types["Connection"]>;
   relay(id: string, context: Context): Promise<Duplex>;
+  /** Must settle pending next() on signal abort; async iterator return cannot preempt it. */
   subscribe(context: Context): AsyncIterable<Types["Update"]>;
 }
 // Optional ports are deliberately absent until drydock#85's interface lands.

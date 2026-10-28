@@ -1,7 +1,7 @@
 import http, { type IncomingMessage } from "node:http";
 import { type Socket } from "node:net";
 import { Readable } from "node:stream";
-import { chmod, stat } from "node:fs/promises";
+import { chmod, stat, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -23,6 +23,9 @@ type Instance =
   paths["/private/providers/{provider}/facts"]["post"]["parameters"]["path"];
 
 export async function serve(modules: ProviderModule[], unix: string) {
+  const { version } = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
   const directory = await stat(dirname(unix));
   if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700)
     throw Error("private directory must have mode 0700");
@@ -63,7 +66,8 @@ export async function serve(modules: ProviderModule[], unix: string) {
   });
   app.setNotFoundHandler((request, reply) => {
     const known = [...methods].some(
-      (method) => app.findRoute({ method, url: request.raw.url! }) !== null,
+      (method) =>
+        app.findRoute({ method, url: request.raw.url!.split("?")[0] }) !== null,
     );
     const result = errorResponse(
       new ProtocolFailure(
@@ -135,7 +139,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
       if (
         !app.findRoute({
           method: request.method as HTTPMethods,
-          url: request.raw.url!,
+          url: request.raw.url!.split("?")[0],
         })
       )
         return;
@@ -189,6 +193,8 @@ export async function serve(modules: ProviderModule[], unix: string) {
         );
       }
     } finally {
+      // close remains once-only: after setup the duplex bridge owns half-closes,
+      // but the operation's signal must still abort when its socket is disposed.
       raw.socket.off("end", closed);
       raw.socket.off("error", closed);
     }
@@ -206,10 +212,10 @@ export async function serve(modules: ProviderModule[], unix: string) {
     app.routing(request, response);
   });
 
-  app.get<{ Reply: Types["BridgeHello"] }>("/v1/hello", async () => ({
+  app.get<{ Reply: Types["BridgeHello"] }>("/v1/hello", async (request) => ({
     incarnation,
     protocol_version: protocolVersion,
-    host_version: "0.1.0",
+    host_version: version,
     loadable_modules: modules.map((m) => ({
       name: m.name,
       version: m.version,
@@ -222,10 +228,17 @@ export async function serve(modules: ProviderModule[], unix: string) {
         module: config.module,
         capabilities: provider.capabilities,
         rate_limits: provider.rateLimits,
-        readiness: await provider.readiness({
-          credentials: { mode: config.credential },
-          signal: stopping.signal,
-        }),
+        // Discovery has only the credential mode, not a direct value (as in Rust).
+        readiness: await Promise.resolve()
+          .then(() =>
+            provider.readiness(
+              context(request.raw, { mode: config.credential }),
+            ),
+          )
+          .catch(() => ({
+            status: "unknown" as const,
+            reason: "provider readiness failed",
+          })),
       })),
     ),
   }));

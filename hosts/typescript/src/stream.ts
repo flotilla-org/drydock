@@ -71,9 +71,9 @@ export async function upgradeBody(
       const header = (await line()).split(";")[0];
       if (!/^[0-9a-f]+$/i.test(header)) failRefused("invalid chunk size");
       const length = Number.parseInt(header, 16);
+      if (!Number.isSafeInteger(length)) failRefused("invalid chunk size");
       size += length;
-      if (!Number.isSafeInteger(length) || size > 2 * 1024 * 1024)
-        failRefused("stream body too large");
+      if (size > 2 * 1024 * 1024) failRefused("stream body too large");
       if (length === 0) {
         while (await line()) {}
         break;

@@ -1,6 +1,8 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import formats from "ajv-formats";
 import schema from "./generated/schema.json" with { type: "json" };
+// OpenAPI carries annotation/format keywords beyond JSON Schema (e.g. int64).
+// Tolerate those keywords only; never coerce/default/strip request data.
 const ajv = new Ajv2020({
   strict: false,
   coerceTypes: false,

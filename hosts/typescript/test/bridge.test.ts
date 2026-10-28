@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { PassThrough } from "node:stream";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { serve } from "../dist/server.js";
 import { ProtocolFailure } from "../dist/provider.js";
@@ -122,7 +124,7 @@ function request(
     );
   });
 }
-async function fixture(t: any, p = provider()) {
+async function fixture(t: any, p = provider(), replacement = provider()) {
   const dir = await mkdtemp(`${tmpdir()}/drydock-thin-`),
     socketPath = `${dir}/host.sock`;
   let configurations = 0,
@@ -135,7 +137,7 @@ async function fixture(t: any, p = provider()) {
     async configure(c) {
       configurations++;
       settings = c.settings;
-      return p;
+      return c.settings.replacement === true ? replacement : p;
     },
   };
   const host = await serve([module], socketPath);
@@ -168,6 +170,7 @@ async function fixture(t: any, p = provider()) {
     );
   return {
     socketPath,
+    name,
     host,
     p,
     call,
@@ -197,9 +200,14 @@ test("UDS trait routing preserves payloads, credentials and handles", async (t) 
     assert.equal(id, observed.environment.id);
     return observed;
   };
-  const f = await fixture(t, p);
+  const replacement = provider();
+  replacement.inspect = async () => ({
+    ...observed,
+    timestamp: "2026-02-01T00:00:00Z",
+  });
+  const f = await fixture(t, p, replacement);
   for (const [path, method, status, kind] of [
-    ["/v1/hello", "POST", 405, "method_not_allowed"],
+    ["/v1/hello?opaque=%3F", "POST", 405, "method_not_allowed"],
     ["/unknown", "GET", 404, "not_found"],
   ] as const) {
     const response = await request(f.socketPath, path, undefined, method);
@@ -337,6 +345,46 @@ test("UDS trait routing preserves payloads, credentials and handles", async (t) 
     ).status,
     200,
   );
+  // Replacing a binding cannot invalidate the old handles still owned by Daemon.
+  const changed = await request(
+    f.socketPath,
+    `/private/modules/${encodeURIComponent(f.name)}/configure`,
+    { ...f.config, settings: { replacement: true } },
+  );
+  assert.equal(changed.status, 200);
+  const old = await request(
+    f.socketPath,
+    `/private/providers/${repeat.body.instance}/inspect`,
+    { credentials: credentials(), argument: observed.environment.id },
+  );
+  const current = await request(
+    f.socketPath,
+    `/private/providers/${changed.body.instance}/inspect`,
+    { credentials: credentials(), argument: observed.environment.id },
+  );
+  assert.deepEqual(old.body, observed);
+  assert.equal(current.body.timestamp, "2026-02-01T00:00:00Z");
+  await request(
+    f.socketPath,
+    `/private/modules/${encodeURIComponent(f.name)}/configure`,
+    { ...f.config, name: "b" },
+  );
+  replacement.readiness = () => {
+    throw Error("test-only-two must not escape");
+  };
+  const degraded = await request(f.socketPath, "/v1/hello", undefined, "GET");
+  assert.equal(degraded.status, 200);
+  assert.equal(
+    degraded.body.providers.find((p: any) => p.provider === "a").readiness
+      .status,
+    "unknown",
+  );
+  assert.equal(
+    degraded.body.providers.find((p: any) => p.provider === "b").readiness
+      .status,
+    "ready",
+  );
+  assert.ok(!JSON.stringify(degraded).includes("test-only"));
 });
 async function upgraded(socketPath: string, path: string, chunked = false) {
   const socket = net.connect(socketPath);
@@ -378,6 +426,26 @@ test("raw relay and subscription forwarding have disconnect cleanup", async (t) 
     const echo = new Promise<Buffer>((resolve) => socket.once("data", resolve));
     socket.write("raw\0bytes");
     assert.equal((await echo).toString(), "raw\0bytes");
+    socket.destroy();
+  }
+  // Invalid hand-rolled chunk framing must return a typed refusal, not hang.
+  for (const frame of [
+    "f".repeat(8193),
+    "0\r\n" + ("x:" + "x".repeat(70) + "\r\n").repeat(1000),
+  ]) {
+    const socket = net.connect(f.socketPath);
+    const response = new Promise<string>((resolve, reject) => {
+      let text = "";
+      socket.on("data", (b) => (text += b));
+      socket.once("end", () => resolve(text));
+      socket.once("error", reject);
+    });
+    socket.write(
+      `POST /private/providers/${f.handle}/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\nTransfer-Encoding: chunked\r\n\r\n${frame}`,
+    );
+    const text = await response;
+    assert.match(text, /^HTTP\/1.1 422/);
+    assert.equal(JSON.parse(text.split("\r\n\r\n")[1]).kind, "refused");
     socket.destroy();
   }
   const req = http.request({
@@ -471,4 +539,28 @@ test("disconnect aborts pending provider calls and disposes late relay", async (
   release(stream);
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.ok(stream.destroyed);
+});
+
+// The real executable diagnoses malformed supervisor-selected exports without
+// echoing imported exceptions or starting a listener.
+test("CLI rejects invalid provider module exports before listen", async (t) => {
+  const dir = await mkdtemp(`${tmpdir()}/drydock-loader-`);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const module = `${dir}/invalid.mjs`;
+  await writeFile(module, "export default undefined;");
+  await assert.rejects(
+    promisify(execFile)(
+      process.execPath,
+      [
+        new URL("../dist/main.js", import.meta.url).pathname,
+        "--unix",
+        `${dir}/host.sock`,
+      ],
+      { env: { PATH: process.env.PATH, DRYDOCK_TYPESCRIPT_MODULES: module } },
+    ),
+    (error: any) =>
+      error.code === 1 &&
+      error.stdout === "" &&
+      /invalid default ProviderModule export/.test(error.stderr),
+  );
 });

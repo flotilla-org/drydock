@@ -43,3 +43,12 @@ there are no host cursors or retry loops. Slow readers apply stream backpressure
 Handwritten sources: `provider.ts` is the transport-independent interface;
 `server.ts` contains direct framework routes; `stream.ts` handles raw HTTP upgrade
 framing and duplex forwarding. `src/generated/**` and `dist/**` are build outputs.
+
+Provider handles follow Rust loader ownership: reconfiguration creates a new
+handle without invalidating the server's old handles; `RemoteProvider::drop`
+releases each via DELETE. A logical binding stays loaded across server reconnects
+and keeps its provider until replacement or host shutdown. DELETE does not destroy
+vendor resources. The bridge has no extra SDK disposal protocol; modules own
+call/subscription resources and must release them on abort or factory failure.
+A subscription must settle a pending `next()` when its signal aborts; an async
+iterator's `return()` cannot interrupt pending provider work. No retries occur.
