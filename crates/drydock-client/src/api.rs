@@ -178,10 +178,8 @@ impl FromRequestParts<Surface> for Api {
         Ok(Self(match parts.headers.get(CREDENTIAL_HEADER) {
             None => api,
             Some(value) => {
-                let value = value.to_str().map_err(|_| Error::InvalidRequest("Drydock-Credential is not visible ASCII".into()))?;
-                if value.is_empty() {
-                    return Err(Error::InvalidRequest("Drydock-Credential is empty".into()).into());
-                }
+                let value = value.to_str().ok().filter(|value| !value.is_empty());
+                let value = value.ok_or_else(|| Error::InvalidRequest("Drydock-Credential must be nonempty visible ASCII".into()))?;
                 api.with_credential(Secret::new(value))
             }
         }))
