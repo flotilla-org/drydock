@@ -763,7 +763,8 @@ impl Provider for Daytona {
             let row = self.environment(v)?;
             if !matches!(
                 row.state,
-                Observation::Transitioning { phase: TransitionPhase::Destroying } | Observation::Gone { cause: GoneCause::DestroyedAtProvider }
+                Observation::Transitioning { phase: TransitionPhase::Destroying }
+                    | Observation::Gone { cause: GoneCause::DestroyedAtProvider }
             ) {
                 rows.push(row);
             }
