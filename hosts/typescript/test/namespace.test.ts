@@ -22,7 +22,10 @@ const kind = (k: string) => (e: any) => e.detail?.kind === k;
 async function setup(settings: Record<string, unknown> = {}) {
   const standIn = new StandIn(),
     registries = new Registries();
-  const module = namespaceModule(() => standIn, registries.fetch as any);
+  const module = namespaceModule((token) => {
+    standIn.tokens.push(token);
+    return standIn;
+  }, registries.fetch as any);
   const abort = new AbortController();
   const provider: Provider = await module.configure(
     "ns",
@@ -203,6 +206,15 @@ test("provision creates a labelled devbox with the agent service, idempotently",
     ),
     kind("refused"),
   );
+  // An absent egress request is the protocol's default: deny all.
+  const closed = await provider.provision(
+    { label: "closed", prepared, size: SIZE },
+    context,
+  );
+  assert.deepEqual(standIn.rows.get(closed.environment.id)!.networkPolicy, {
+    allowedDomains: [],
+    advisory: false,
+  });
   // Re-adopting a stopped devbox neither starts it nor touches its guest.
   row.info.state = "stopped";
   const stopped = await provision("vessel", egress);
@@ -374,8 +386,13 @@ test("egress is enforced only on a passing probe", async () => {
     [{ uid: 1000, unlisted_canary: false, raw_dns: false }, "advisory", true],
     [{ uid: 0, unlisted_canary: true, raw_dns: false }, "advisory", true],
     [{ uid: 0 }, "advisory", false],
+    [null, "advisory", false],
   ] as const) {
-    standIn.execStdout = JSON.stringify(proof);
+    // A probe that exits non-zero proves nothing, whatever it printed.
+    standIn.execExit = proof ? 0 : 1;
+    standIn.execStdout = JSON.stringify(
+      proof ?? { uid: 0, unlisted_canary: false, raw_dns: false },
+    );
     const row = await provider.inspect(deny.id, context);
     assert.deepEqual([row.egress, row.egress_measured], [egress, measured]);
   }
@@ -431,4 +448,25 @@ test("quota reports live concurrency", async () => {
       ["environments", "linux", "{instance}", 1, 3],
     ],
   );
+});
+
+// A rotated credential gets a new SDK client; the old one closes only when
+// its last relay ends, so rotation never cuts a live agent connection.
+test("credential rotation keeps live relays open", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
+  const relay = await provider.relay!(environment.id, context);
+  const rotated = {
+    ...context,
+    credential: JSON.stringify({ bearer_token: "test-only-rotated" }),
+  };
+  await provider.list(rotated);
+  assert.deepEqual(standIn.tokens, [TOKEN, "test-only-rotated"]);
+  assert.equal(standIn.closed, 0, "the relay still holds the old client");
+  const closed = new Promise((resolve) => relay.once("close", resolve));
+  relay.destroy();
+  await closed;
+  assert.equal(standIn.closed, 1);
+  await provider.list(rotated);
+  assert.equal(standIn.tokens.length, 2, "the current client is reused");
 });

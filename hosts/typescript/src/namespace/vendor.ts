@@ -140,7 +140,9 @@ const ATTEMPTS = 3;
 /**
  * Runs one SDK call. On `Premature close`, `settled` says whether the call
  * took effect anyway (returning its result) or not (undefined), and the call
- * is repeated only if not. Every other failure becomes a protocol error.
+ * is repeated only if not. A `settled` check that itself closes early counts
+ * as not settled, so the call repeats; `ATTEMPTS` bounds both. Every other
+ * failure becomes a protocol error.
  */
 export async function call<T>(
   operation: () => Promise<T>,

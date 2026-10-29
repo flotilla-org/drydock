@@ -13,6 +13,7 @@ import {
   copyBlob,
   parseImageRef,
   Registry,
+  type ImageRef,
   type Fetch,
 } from "../oci.js";
 import {
@@ -42,6 +43,8 @@ export const SERVICE = "drydock-agent";
 export const AGENT = "/opt/drydock/drydock-agent";
 const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 const REGISTRY = "nscr.io";
+/** Concurrent `refresh` calls while listing. */
+const REFRESHES = 8;
 /** Linux machine sizes, as the SDK resolves them client-side. */
 const SIZES: Record<string, { cpus: number; memoryMB: number }> = {
   s: { cpus: 4, memoryMB: 8 * 1024 },
@@ -117,7 +120,8 @@ function machine(size: Types["Size"]) {
 }
 
 /**
- * Egress as a devbox network policy: undefined is open. Host names map to
+ * Egress as a devbox network policy, or undefined for open egress. An absent
+ * request is the protocol's default, deny all (fail closed). Host names map to
  * allowed domains; anything Namespace cannot express is refused, never widened.
  */
 export function networkPolicy(
@@ -207,9 +211,17 @@ class Namespace implements Provider {
   };
   observation: Types["ObservationMode"] = { mode: "poll", interval_ms: 30_000 };
   rateLimits: Types["RateLimit"][] = [];
-  /** Devboxes this host stopped, so their stop reads as requested. */
+  /**
+   * Devboxes this host stopped, so their stop reads as requested. Labels are
+   * fixed at create, so this is process-local: after a host restart such a stop
+   * reads as paused_by_provider, which is still resumable.
+   */
   private suspended = new Set<string>();
-  private vendors = new Map<string, Vendor>();
+  /** SDK clients by token, with the calls and relays using each. */
+  private clients = new Map<
+    string,
+    { vendor: Vendor; users: number; current: boolean }
+  >();
 
   constructor(
     private name: string,
@@ -218,17 +230,52 @@ class Namespace implements Provider {
     private fetcher: Fetch,
   ) {}
 
-  private vendor(credential: string | undefined): Vendor {
+  /**
+   * The SDK client for the credential a call carries, held until `release`.
+   * A client a newer credential replaced closes once its last call and relay
+   * end, so rotating the credential never cuts a live agent connection.
+   */
+  private acquire(credential: string | undefined) {
     const token = credentialToken(credential);
-    let vendor = this.vendors.get(token);
-    if (!vendor) {
-      // One SDK client, for the latest credential only.
-      for (const old of this.vendors.values()) old.close();
-      this.vendors.clear();
-      vendor = this.connect(token);
-      this.vendors.set(token, vendor);
+    let client = this.clients.get(token);
+    if (!client?.current) {
+      for (const other of this.clients.values()) other.current = false;
+      client ??= { vendor: this.connect(token), users: 0, current: true };
+      client.current = true;
+      this.clients.set(token, client);
     }
-    return vendor;
+    const held = client;
+    held.users++;
+    this.retire();
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      held.users--;
+      this.retire();
+    };
+    return { vendor: held.vendor, release };
+  }
+
+  /** Closes replaced clients that nothing uses any more. */
+  private retire() {
+    for (const [token, client] of this.clients)
+      if (!client.current && client.users === 0) {
+        client.vendor.close();
+        this.clients.delete(token);
+      }
+  }
+
+  private async using<T>(
+    credential: string | undefined,
+    work: (vendor: Vendor) => Promise<T>,
+  ): Promise<T> {
+    const { vendor, release } = this.acquire(credential);
+    try {
+      return await work(vendor);
+    } finally {
+      release();
+    }
   }
 
   readiness({ credential }: Context): Types["Readiness"] {
@@ -278,7 +325,21 @@ class Namespace implements Provider {
       platform,
     );
     const token = credentialToken(credential);
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) =>
+      this.prepared(vendor, request, base, tools, name, token, signal),
+    );
+  }
+
+  private async prepared(
+    vendor: Vendor,
+    request: Types["PrepareRequest"],
+    base: ImageRef,
+    tools: ImageRef,
+    name: string,
+    token: string,
+    signal: AbortSignal,
+  ): Promise<Types["Prepared"]> {
+    const platform = request.platform ?? PLATFORM;
     // Re-preparing the same inputs finds the registration, adding no version.
     let image = await this.registered(vendor, name, signal);
     if (!image) {
@@ -403,23 +464,42 @@ class Namespace implements Provider {
       refused("prepared form belongs to another provider");
     const shape = machine(request.size);
     const policy = networkPolicy(request.egress);
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) =>
+      this.provisioned(vendor, request, shape, policy, signal),
+    );
+  }
+
+  /** A devbox this label names, if its size and egress policy are the request's. */
+  private adopt(
+    box: Box,
+    shape: ReturnType<typeof machine>,
+    policy: NetworkPolicy | undefined,
+  ) {
+    if (
+      box.info.size !== shape.size ||
+      (shape.volumeSizeGB !== undefined &&
+        box.info.volumeSizeGB !== shape.volumeSizeGB) ||
+      (box.info.labels[POLICY] ?? null) !== policyIdentity(policy)
+    )
+      refused(
+        "existing Namespace label has a different size or egress policy; provision a new label",
+      );
+  }
+
+  private async provisioned(
+    vendor: Vendor,
+    request: Types["ProvisionRequest"],
+    shape: ReturnType<typeof machine>,
+    policy: NetworkPolicy | undefined,
+    signal: AbortSignal,
+  ): Promise<{ created: boolean; environment: Types["Environment"] }> {
     const existing = await this.labelled(vendor, request.label, signal);
     if (existing) {
       const box = await this.current(vendor, existing.id, signal);
-      const row = this.row(box);
-      if (
-        box.info.size !== shape.size ||
-        (shape.volumeSizeGB !== undefined &&
-          box.info.volumeSizeGB !== shape.volumeSizeGB) ||
-        row.egress_policy !== policyIdentity(policy)
-      )
-        refused(
-          "existing Namespace label has a different size or egress policy; provision a new label",
-        );
+      this.adopt(box, shape, policy);
       // Re-adoption never resumes: a stopped devbox stays as it is.
       if (box.info.state !== "running")
-        return { created: false, environment: row };
+        return { created: false, environment: this.row(box) };
       await this.ensureAgent(box, signal);
       return {
         created: false,
@@ -466,6 +546,7 @@ class Namespace implements Provider {
       // A concurrent provision of the same label created it first.
       const raced = await this.labelled(vendor, request.label, signal);
       if (!raced) throw error;
+      this.adopt(raced, shape, policy);
       box = raced;
       created = false;
     }
@@ -526,7 +607,9 @@ class Namespace implements Provider {
     const row = this.row(box);
     const probe = this.settings.egress_probe;
     const policy = row.egress_policy ?? "open";
-    // Commands start a stopped devbox: probe only one observed running.
+    // Commands start a stopped devbox: probe only one observed running. A
+    // stop landing between that observation and the exec would be undone;
+    // the SDK offers no conditional exec, so that window remains.
     if (!probe || policy === "open" || row.state.state !== "running")
       return row;
     const deny = policy.startsWith("deny-") ? "1" : "0";
@@ -543,6 +626,7 @@ class Namespace implements Provider {
           { signal },
         ),
       );
+      if (result.exitCode !== 0) return row;
       const proof = JSON.parse(result.stdout);
       const flags = ["unlisted_canary", "raw_dns"];
       if (deny === "0") flags.push("listed_direct");
@@ -568,7 +652,10 @@ class Namespace implements Provider {
   }
 
   async list({ credential, signal }: Context) {
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) => this.listed(vendor, signal));
+  }
+
+  private async listed(vendor: Vendor, signal: AbortSignal) {
     const boxes: Box[] = [];
     let cursor: string | undefined;
     do {
@@ -582,28 +669,37 @@ class Namespace implements Provider {
       boxes.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor);
-    // List reports state unknown; refresh resolves it without starting anything.
-    const rows = await Promise.all(
-      boxes.map(async (box) => {
+    // List reports state unknown; refresh resolves it without starting
+    // anything, a few devboxes at a time.
+    const rows: Types["Environment"][] = [];
+    const queue = [...boxes];
+    const worker = async () => {
+      for (let box = queue.shift(); box; box = queue.shift()) {
         try {
           await call(() => box.refresh({ signal }));
-          return this.row(box);
+          rows.push(this.row(box));
         } catch (error) {
-          if (protocolError(error).detail.kind === "not_found") return;
-          throw error;
+          if (protocolError(error).detail.kind !== "not_found") throw error;
         }
-      }),
-    );
-    return rows.filter((row) => row !== undefined);
+      }
+    };
+    await Promise.all(Array.from({ length: REFRESHES }, worker));
+    return rows;
   }
 
   async inspect(id: string, { credential, signal }: Context) {
-    const vendor = this.vendor(credential);
-    return this.observe(vendor, await this.current(vendor, id, signal), signal);
+    return this.using(credential, async (vendor) =>
+      this.observe(vendor, await this.current(vendor, id, signal), signal),
+    );
   }
 
   async destroy(id: string, { credential, signal }: Context) {
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) =>
+      this.destroyed(vendor, id, signal),
+    );
+  }
+
+  private async destroyed(vendor: Vendor, id: string, signal: AbortSignal) {
     const gone = async () => {
       try {
         await vendor.devboxes.get(id, { signal });
@@ -632,7 +728,7 @@ class Namespace implements Provider {
     id: string,
     { credential, signal }: Context,
   ): Promise<Types["Reach"]> {
-    await this.current(this.vendor(credential), id, signal);
+    await this.using(credential, (vendor) => this.current(vendor, id, signal));
     const segment = encodeURIComponent;
     return {
       kind: "relay",
@@ -641,12 +737,22 @@ class Namespace implements Provider {
   }
 
   async relay(id: string, { credential, signal }: Context): Promise<Duplex> {
-    const vendor = this.vendor(credential);
-    const box = await this.current(vendor, id, signal);
-    // Opening a channel starts a stopped devbox; reach never resumes one.
-    if (box.info.state !== "running")
-      refused("Namespace devbox is not running; resume it first");
-    return call(() => vendor.channel(box, `${AGENT} --bridge`, signal));
+    // The relay holds its SDK client until the channel closes.
+    const { vendor, release } = this.acquire(credential);
+    try {
+      const box = await this.current(vendor, id, signal);
+      // Opening a channel starts a stopped devbox; reach never resumes one.
+      if (box.info.state !== "running")
+        refused("Namespace devbox is not running; resume it first");
+      const stream = await call(() =>
+        vendor.channel(box, `${AGENT} --bridge`, signal),
+      );
+      stream.once("close", release);
+      return stream;
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   private resumeToken(id: string): Types["ResumeToken"] {
@@ -655,7 +761,10 @@ class Namespace implements Provider {
   }
 
   async suspend(id: string, { credential, signal }: Context) {
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) => this.stopped(vendor, id, signal));
+  }
+
+  private async stopped(vendor: Vendor, id: string, signal: AbortSignal) {
     const box = await this.current(vendor, id, signal);
     if (box.info.state !== "stopped")
       await call(
@@ -678,7 +787,10 @@ class Namespace implements Provider {
   ) {
     if (token.token !== this.resumeToken(id).token)
       refused("resume token belongs to another environment");
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) => this.resumed(vendor, id, signal));
+  }
+
+  private async resumed(vendor: Vendor, id: string, signal: AbortSignal) {
     let box = await this.current(vendor, id, signal);
     if (box.info.state !== "running") {
       await call(
@@ -697,7 +809,13 @@ class Namespace implements Provider {
   }
 
   async quota({ credential, signal }: Context): Promise<Types["Quota"]> {
-    const vendor = this.vendor(credential);
+    return this.using(credential, (vendor) => this.quoted(vendor, signal));
+  }
+
+  private async quoted(
+    vendor: Vendor,
+    signal: AbortSignal,
+  ): Promise<Types["Quota"]> {
     const rows: Types["ResourceQuota"][] = [];
     for (const entry of await call(() => vendor.concurrency(signal))) {
       const limits = entry.limits;

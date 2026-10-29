@@ -111,18 +111,22 @@ wait`, `ingress access` and `containerregistry *`,
   Unix-socket forwards. Exposures travel over that one agent connection.
 - Suspend and resume are devbox stop and start: files survive, memory does not.
   A devbox stopped by its lifetime cap or idling reads as `paused_by_provider`
-  and resumes; one this host stopped reads as `suspended_by_request`.
+  and resumes; one this host stopped reads as `suspended_by_request` until the
+  host restarts (devbox labels are fixed at create, so that fact is not durable).
 - Observation polls every 30 s. List reports devboxes carrying `drydock.label`,
   with state from `refresh` (list itself says `unknown`). Nothing that observes
   runs a command or opens a connection on a stopped devbox, since those start it.
 - Egress maps host names to `networkPolicy.allowedDomains` (non-advisory) and
-  refuses CIDR, port and address entries. Declared enforcement is advisory; an
+  refuses CIDR, port and address entries; an absent request is deny all. Declared enforcement is advisory; an
   environment reports enforced only when `egress_probe` passes as root.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
   platform class). Usage is undeclared.
 - SDK calls through the gateway can fail with `Premature close` after taking
   effect; `src/namespace/vendor.ts` is the one place that retries them, and it
   checks the resulting state first, so nothing is created or stopped twice.
+- One SDK client is kept per credential. One a newer credential replaces is
+  closed only after its last call and relay end, so rotation never cuts a live
+  agent connection.
 
 Module tests run against in-process stand-ins for the SDK and OCI registries
 (`test/support/namespace.ts`), never a live token.

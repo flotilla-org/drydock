@@ -40,6 +40,9 @@ export class StandIn implements Vendor {
   concurrencyRows: Concurrency[] = [];
   /** Probe output for exec; the argv is recorded in `calls`. */
   execStdout = "";
+  execExit = 0;
+  /** How often the module closed its SDK client. */
+  closed = 0;
   private faults = new Map<string, number>();
   private next = 0;
   tokens: string[] = [];
@@ -116,7 +119,7 @@ export class StandIn implements Vendor {
         standIn.calls.push(`exec ${argv.join(" ")}`);
         standIn.connect(standIn.row(id));
         return {
-          exitCode: 0,
+          exitCode: standIn.execExit,
           signal: null,
           stdout: standIn.execStdout,
           stderr: "",
@@ -255,7 +258,9 @@ export class StandIn implements Vendor {
     return this.concurrencyRows;
   }
 
-  close() {}
+  close() {
+    this.closed++;
+  }
 }
 
 /** Two connected in-memory duplex ends. */
