@@ -99,6 +99,7 @@ impl Module for DaytonaModule {
         Ok(Arc::new(Daytona { name: name.to_owned(), settings, http }))
     }
 }
+const DESTROY_ATTEMPTS: u32 = 5;
 pub struct Daytona {
     name: String,
     settings: Settings,
@@ -136,6 +137,7 @@ impl Daytona {
     ) -> Result<Option<Value>> {
         let token = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "Daytona API key not delivered".into() })?;
         let operation = format!("{method} {}", url.path());
+        let is_delete = method == Method::DELETE;
         let mut request = reqwest::Request::new(method, url);
         let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| refused("invalid Daytona API key header"))?;
@@ -167,6 +169,8 @@ impl Daytona {
                 402 => ProtocolError::QuotaExhausted { reason: reason.clone() },
                 429 => ProtocolError::RateLimited { reason: reason.clone(), retry_after },
                 408 => ProtocolError::unavailable(reason.clone(), None),
+                // A sandbox mid-transition refuses DELETE; it settles on its own.
+                409 if is_delete => ProtocolError::unavailable(reason.clone(), retry_after),
                 500..=599 => ProtocolError::unavailable(reason.clone(), retry_after),
                 _ => ProtocolError::Internal { reason: format!("unexpected Daytona {operation} HTTP {status}"), provider_error: raw },
             });
@@ -767,9 +771,18 @@ impl Provider for Daytona {
         }
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
-            Ok(_) | Err(ProtocolError::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e),
+        // Daytona answers 409 while a state change is in progress; wait it out briefly,
+        // then surface the retryable `unavailable` error.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
+                Ok(_) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
+                Err(ProtocolError::Unavailable { reason, .. }) if attempt < DESTROY_ATTEMPTS && reason.contains("HTTP 409") => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
