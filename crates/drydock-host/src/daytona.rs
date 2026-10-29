@@ -756,7 +756,22 @@ impl Provider for Daytona {
         Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
-        self.inventory(None, c).await?.into_iter().map(|v| self.environment(v)).collect()
+        // Daytona keeps a deleted sandbox listed as destroying/destroyed for a while;
+        // once destroy has returned it must not read as present. Intended contract: a
+        // sandbox mid-destroy is absent from `list`, while `inspect` still reports
+        // `Destroying`.
+        let mut rows = Vec::new();
+        for v in self.inventory(None, c).await? {
+            let row = self.environment(v)?;
+            if !matches!(
+                row.state,
+                Observation::Transitioning { phase: TransitionPhase::Destroying }
+                    | Observation::Gone { cause: GoneCause::DestroyedAtProvider }
+            ) {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         let value = self.call(Method::GET, self.sandbox_url(id, None)?, None, c).await?;

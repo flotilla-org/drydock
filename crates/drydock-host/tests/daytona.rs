@@ -2366,3 +2366,22 @@ async fn destroy_waits_out_state_change() {
     assert_eq!(e.class(), "unavailable");
     assert_eq!(http.0.lock().unwrap().requests, before + 5);
 }
+
+// Daytona keeps a deleted sandbox listed as destroying for a while; once destroy has
+// returned, inventory leaves it out.
+#[tokio::test]
+async fn list_omits_sandbox_being_destroyed() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials();
+    for (id, state) in [("live", "started"), ("going", "destroying"), ("gone", "destroyed")] {
+        http.0.lock().unwrap().rows.insert(id.into(), json!({"id":id,"state":state,"cpu":1,"memory":1,"disk":3}));
+    }
+    // A spot-evicted sandbox is a distinct Gone cause and stays listed.
+    http.0.lock().unwrap().rows.insert(
+        "evicted".into(),
+        json!({"id":"evicted","state":"destroyed","spotEvictedAt":"2026-10-29T00:00:00Z","cpu":1,"memory":1,"disk":3}),
+    );
+    let ids: Vec<_> = p.list(&c).await.unwrap().into_iter().map(|e| e.id).collect();
+    assert_eq!(ids, vec!["evicted".to_string(), "live".to_string()]);
+}
