@@ -14,6 +14,8 @@ const args = [
   "--exact",
   test,
 ];
+// The package script builds first; scripts/executable.mjs makes the
+// shebang entry point executable, so Rust can spawn it directly.
 const options = {
   cwd: new URL("../../../", import.meta.url),
   env: {

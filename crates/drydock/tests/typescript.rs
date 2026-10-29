@@ -43,7 +43,7 @@ async fn typescript_reference_conforms_through_main_server() {
         }
     })
     .await
-    .unwrap();
+    .expect("TypeScript child did not answer hello within 10s");
     let credential = dir.path().join("credential");
     std::fs::write(&credential, "test-only-reference-token").unwrap();
     std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -64,7 +64,7 @@ settings = {{ seed_unlabelled = true }}
         vec![HostOption { name: "typescript".into(), optional: false, connection: HostConnection::ExternalUnix { path: private_socket } }],
     )
     .await
-    .unwrap();
+    .expect("public server did not answer hello within 10s");
     // Embedded entry reaches the same server policy: optional ports are absent,
     // so it refuses before attempting a TypeScript optional route.
     let err = ProviderApi::quota(&*daemon, "a").await.unwrap_err();
@@ -123,7 +123,7 @@ settings = {{ seed_unlabelled = true }}
     };
     let report = conformance::run(&client, "a", &options).await;
     let _ = stop.send(());
-    tokio::time::timeout(Duration::from_secs(10), server).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), server).await.expect("public server did not stop within 10s").unwrap();
     child.kill().await.unwrap();
     child.wait().await.unwrap();
     assert_eq!(stdout.await.unwrap(), 0, "bridge must not log requests/credentials");

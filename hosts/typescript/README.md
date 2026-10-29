@@ -71,7 +71,7 @@ settings are `{seed_unlabelled: boolean}`; unknown settings are refused. It stor
 prepared forms and Environment rows, implements label idempotency, refuses reach
 until exposures land (#132), and exposes a 10ms polling declaration. It owns no event stream or replay.
 
-`corepack pnpm conformance` discovers and runs the ignored Rust integration test
+`corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration test
 against this actual child host through the main Daemon and its existing checker.
 Authentication is exercised by the shared server serving tests; private UDS uses
 filesystem authorization. Exec-based host fixtures await #85 and reach awaits #132. The test drains
