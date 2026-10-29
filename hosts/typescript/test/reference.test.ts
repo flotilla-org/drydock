@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import reference from "../dist/reference.js";
+import { serve } from "../dist/server.js";
 // Main-server conformance owns lifecycle, idempotency and polling/replay.
 // This trait-level scenario covers only reference-owned settings, canonical
 // prepared keys and clone isolation across reordered object members.
@@ -59,4 +62,13 @@ test("reference validates settings and owns deterministic prepared keys", async 
   await assert.rejects(provider.prepare(input, context), {
     name: "AbortError",
   });
+});
+// The built-in reference is always loaded, so a user module cannot shadow it.
+test("a user module named reference is refused at startup", async (t) => {
+  const dir = await mkdtemp(`${tmpdir()}/drydock-reference-`);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await assert.rejects(
+    serve([reference, { ...reference }], `${dir}/host.sock`),
+    /duplicate module/,
+  );
 });
