@@ -24,6 +24,8 @@ use tokio::{
 
 const BUILD: &[u8] = b"exposures test agent";
 const PROVIDER: &str = "vessels";
+/// A provider whose vessels run no agent.
+const PLAIN: &str = "plain";
 
 /// The registry boundary: tags are already digests here.
 struct Digests;
@@ -95,7 +97,9 @@ impl Harness {
         }
         let text = format!(
             "[providers.{PROVIDER}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nagent_link='local_forward'\n\
-             settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n",
+             settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n\
+             [providers.{PLAIN}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nsettings={{poll_interval_ms=10}}\n",
+            "a".repeat(64),
             "a".repeat(64)
         );
         let run = self.path("run");
@@ -237,6 +241,9 @@ async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
 
 /// A provision request under `label`, prepared on the reference module.
 async fn labelled(h: &Harness, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
+    labelled_on(h, PROVIDER, label, ssh_public_key).await
+}
+async fn labelled_on(h: &Harness, provider: &str, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
     let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 };
     let request = PrepareRequest {
         platform: None,
@@ -246,7 +253,7 @@ async fn labelled(h: &Harness, label: &str, ssh_public_key: Option<String>) -> P
         tools_digest: "tools".into(),
         size: size.clone(),
     };
-    let prepared = h.api.prepare(PROVIDER, &request).await.unwrap();
+    let prepared = h.api.prepare(provider, &request).await.unwrap();
     ProvisionRequest { label: label.into(), prepared, size, egress: EgressRequest::Open, ssh_public_key }
 }
 
@@ -281,6 +288,29 @@ async fn a_labelled_provision_without_a_key_takes_exposures() {
     .await;
     let inward = h.api.inward(PROVIDER, &created.id, "cleat").await.unwrap();
     round_trip(UnixStream::connect(local(&inward)).await.unwrap(), async { target.accept().await.unwrap().0 }).await;
+}
+
+// Two first provisions of one label at once share the one key drydock makes,
+// and adopt one environment.
+#[tokio::test]
+async fn concurrent_first_provisions_of_a_label_share_one_key() {
+    let h = Harness::start().await;
+    let request = labelled(&h, "raced", None).await;
+    let (a, b) = tokio::join!(h.api.provision(PROVIDER, &request), h.api.provision(PROVIDER, &request));
+    assert_eq!(a.unwrap().into_inner().id, b.unwrap().into_inner().id);
+    let held = std::fs::read_dir(h.path("run/keys")).unwrap().filter(|e| e.as_ref().unwrap().path().join("id_ed25519").is_file()).count();
+    assert_eq!(held, 2, "the harness's launch and this label");
+}
+
+// A keyless provision for a provider whose vessels run no agent is passed
+// through untouched: drydock makes no key for it.
+#[tokio::test]
+async fn a_keyless_provision_without_an_agent_gets_no_key() {
+    let h = Harness::start().await;
+    let before = std::fs::read_dir(h.path("run/keys")).unwrap().count();
+    let request = labelled_on(&h, PLAIN, "plain-vessel", None).await;
+    h.api.provision(PLAIN, &request).await.unwrap();
+    assert_eq!(std::fs::read_dir(h.path("run/keys")).unwrap().count(), before);
 }
 
 // A label already naming an environment drydock holds no key for (one

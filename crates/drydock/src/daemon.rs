@@ -99,8 +99,9 @@ pub struct Inner {
     dialer: Arc<dyn crate::agent::SshDialer>,
     builds: Arc<dyn AgentBuilds>,
     exposures: crate::exposures::Exposures,
-    /// Serializes making a label's key, so two first provisions share one.
-    keying: Mutex<()>,
+    /// One lock per label, so two first provisions of a label share one key
+    /// and provisions of other labels never wait on it.
+    keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     stopping: tokio::sync::watch::Sender<bool>,
 }
 /// The boundaries a daemon reaches beyond itself. Tests stand in for them.
@@ -265,7 +266,7 @@ impl Daemon {
             resolver,
             dialer,
             builds,
-            keying: Mutex::const_new(()),
+            keying: Default::default(),
             stopping: tokio::sync::watch::channel(false).0,
         });
         inner.exposures.restore();
@@ -491,14 +492,25 @@ impl Daemon {
     /// provision stays label-idempotent; an environment the label already names
     /// that drydock holds no key for is refused, since its key cannot be rotated.
     async fn keyed(&self, provider: &str, request: &ProvisionRequest) -> Result<Option<ProvisionRequest>, Error> {
-        let declares_agent = || async { Ok::<_, Error>(ProviderApi::provider(self, provider).await?.capabilities.agent) };
-        if request.ssh_public_key.is_some() || !declares_agent().await? {
+        if request.ssh_public_key.is_some() {
             return Ok(None);
         }
         let directory = self.key_directory(&request.label);
-        let _keying = self.keying.lock().await;
         let held = directory.join("id_ed25519");
-        let public = if held.is_file() && held.with_extension("pub").is_file() {
+        let holds = || held.is_file() && held.with_extension("pub").is_file();
+        // A key drydock already holds was made for a provider that runs the agent.
+        if !holds() && !ProviderApi::provider(self, provider).await?.capabilities.agent {
+            return Ok(None);
+        }
+        let lock = {
+            let mut locks = self.keying.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(&request.label).and_then(std::sync::Weak::upgrade).unwrap_or_default();
+            locks.insert(request.label.clone(), Arc::downgrade(&lock));
+            lock
+        };
+        let _keying = lock.lock().await;
+        let public = if holds() {
             tokio::fs::read_to_string(held.with_extension("pub"))
                 .await
                 .map_err(|e| Error::Transport(format!("read vessel SSH public key: {e}")))?
@@ -520,8 +532,13 @@ impl Daemon {
             launch::keypair(&directory).await?.1
         };
         let request = ProvisionRequest { ssh_public_key: Some(public), ..request.clone() };
-        // The agent connection reads the prepared platform from this record.
-        tokio::fs::write(directory.join("request.json"), serde_json::to_vec(&request).expect("provision request serializes"))
+        // The agent connection reads the prepared platform from this record:
+        // write it whole or not at all.
+        let staged = directory.join("request.json.new");
+        tokio::fs::write(&staged, serde_json::to_vec(&request).expect("provision request serializes"))
+            .await
+            .map_err(|e| Error::Transport(format!("record provision request: {e}")))?;
+        tokio::fs::rename(&staged, directory.join("request.json"))
             .await
             .map_err(|e| Error::Transport(format!("record provision request: {e}")))?;
         Ok(Some(request))

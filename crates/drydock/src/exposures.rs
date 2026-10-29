@@ -187,7 +187,7 @@ impl Exposures {
             return Err(refused("environment has no drydock-managed SSH key".into()));
         }
         let label = environment.label.ok_or_else(|| refused("environment has no drydock-managed SSH key".into()))?;
-        let directory = key.parent().expect("a key is in its directory").to_path_buf();
+        let directory = key.parent().ok_or_else(|| refused("environment key has no directory".into()))?.to_path_buf();
         let record = Record { provider: provider.into(), environment: id.into(), label: Some(label.clone()), ..Record::default() };
         let vessel = Vessel::start(&self.shared, directory, label, record).map_err(|e| Error::Transport(format!("exposures: {e}")))?;
         self.vessels.lock().unwrap().insert((provider.into(), id.into()), vessel.clone());
