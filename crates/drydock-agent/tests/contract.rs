@@ -1,15 +1,18 @@
 mod support;
-use drydock_agent::{Agent, Client, Configuration, Endpoint, ErrorKind, GuestForward, HostForward, Platform};
-use drydock_transport::{ByteStream, Purpose, Transport};
-use std::{path::Path, sync::Arc, time::Duration};
+use drydock_agent::{Agent, Client, Configuration, Endpoint, ErrorKind, InwardForward, OutwardForward, Platform};
+use drydock_transport::{ByteStream, Listener};
+use std::{sync::Arc, time::Duration};
 use support::*;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
 };
 
-fn forward(h: &Harness, id: &str) -> GuestForward {
-    GuestForward { id: id.into(), unix: h.dir.path().join(id), tcp: None }
+fn forward(h: &Harness, id: &str) -> OutwardForward {
+    OutwardForward { id: id.into(), unix: h.dir.path().join(id), tcp: None }
+}
+fn segment(id: &str) -> String {
+    percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 fn free_port() -> std::net::SocketAddr {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
@@ -79,8 +82,8 @@ async fn forwards_are_transparent_and_dynamic() {
         let h = harness(unix, "test-build").await;
         let path = h.dir.path().join("endpoint");
         let task = tokio::spawn(echo(UnixListener::bind(&path).unwrap()));
-        h.client.put_host_forward(HostForward { id: "active".into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
-        let mut active = h.client.forward("active").await.unwrap();
+        h.client.put_inward_forward(InwardForward { id: "active".into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
+        let mut active = h.client.open_inward("active").await.unwrap();
         let messages: &[&[u8]] = &[
             b"GET /x HTTP/1.1\r\nHost: a\r\nX-Token: keep-this\r\n\r\n",
             b"GET /socket HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
@@ -91,7 +94,7 @@ async fn forwards_are_transparent_and_dynamic() {
         let endpoint2 = h.dir.path().join("endpoint2");
         let task2 = tokio::spawn(echo(UnixListener::bind(&endpoint2).unwrap()));
         let guest = forward(&h, "reverse");
-        h.client.put_guest_forward(guest.clone(), Endpoint::Unix(endpoint2)).await.unwrap();
+        h.client.put_outward_forward(guest.clone(), Endpoint::Unix(endpoint2)).await.unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&guest.unix).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::metadata(h.dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
@@ -100,25 +103,28 @@ async fn forwards_are_transparent_and_dynamic() {
             exchange(&mut active, bytes).await;
             exchange(&mut reverse, bytes).await;
             if index == 1 {
-                h.client.put_host_forward(HostForward { id: "transient".into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
-                let mut added = h.client.forward("transient").await.unwrap();
+                h.client
+                    .put_inward_forward(InwardForward { id: "transient".into(), endpoint: Endpoint::Unix(path.clone()) })
+                    .await
+                    .unwrap();
+                let mut added = h.client.open_inward("transient").await.unwrap();
                 exchange(&mut added, b"added during live traffic").await;
             }
             if index == 2 {
-                h.client.remove_host_forward("transient").await.unwrap();
+                h.client.remove_inward_forward("transient").await.unwrap();
             }
         }
-        h.client.remove_guest_forward("reverse").await.unwrap();
+        h.client.remove_outward_forward("reverse").await.unwrap();
         assert!(!guest.unix.exists());
-        h.client.remove_host_forward("active").await.unwrap();
-        let error = h.client.forward("active").await.err().unwrap();
-        assert_error(error, std::io::ErrorKind::NotFound, "forward.open", "active");
+        h.client.remove_inward_forward("active").await.unwrap();
+        let error = h.client.open_inward("active").await.err().unwrap();
+        assert_error(error, std::io::ErrorKind::NotFound, "forward.inward.open", "active");
         task.abort();
         task2.abort();
     }
 }
 
-// One state model: each forward, guest or host, is its own resource that can
+// One state model: each forward, outward or inward, is its own resource that can
 // be read back and listed. PUT is an idempotent upsert: repeating it changes
 // nothing and keeps live streams; changing only TCP keeps the Unix binding and
 // its streams; changing a host endpoint ends the old endpoint's streams.
@@ -129,60 +135,60 @@ async fn forwards_are_resources_with_idempotent_upserts() {
         let target = h.dir.path().join("target");
         let echo_task = tokio::spawn(echo(UnixListener::bind(&target).unwrap()));
         let f = forward(&h, "changing");
-        h.client.put_guest_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
-        assert_eq!(h.client.guest_forward("changing").await.unwrap(), f);
+        h.client.put_outward_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
+        assert_eq!(h.client.outward_forward("changing").await.unwrap(), f);
         let mut unix: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
         exchange(&mut unix, b"before").await;
-        h.client.put_guest_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
+        h.client.put_outward_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
         exchange(&mut unix, b"identical upsert keeps the stream").await;
         let mut changed = f.clone();
         changed.tcp = Some(free_port());
-        h.client.put_guest_forward(changed.clone(), Endpoint::Unix(target.clone())).await.unwrap();
-        assert_eq!(h.client.guest_forwards().await.unwrap(), vec![changed.clone()]);
+        h.client.put_outward_forward(changed.clone(), Endpoint::Unix(target.clone())).await.unwrap();
+        assert_eq!(h.client.outward_forwards().await.unwrap(), vec![changed.clone()]);
         let mut tcp: ByteStream = Box::new(tokio::net::TcpStream::connect(changed.tcp.unwrap()).await.unwrap());
         exchange(&mut tcp, b"added TCP").await;
         exchange(&mut unix, b"Unix survives a TCP change").await;
-        h.client.put_guest_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
+        h.client.put_outward_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
         assert!(tokio::net::TcpStream::connect(changed.tcp.unwrap()).await.is_err());
         let mut retained: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
         exchange(&mut retained, b"retained Unix").await;
-        h.client.remove_guest_forward("changing").await.unwrap();
-        let error = h.client.guest_forward("changing").await.unwrap_err();
-        assert_error(error, std::io::ErrorKind::NotFound, "forward.guest.read", "changing");
-        assert!(h.client.guest_forwards().await.unwrap().is_empty());
+        h.client.remove_outward_forward("changing").await.unwrap();
+        let error = h.client.outward_forward("changing").await.unwrap_err();
+        assert_error(error, std::io::ErrorKind::NotFound, "forward.outward.read", "changing");
+        assert!(h.client.outward_forwards().await.unwrap().is_empty());
 
         let other = h.dir.path().join("other-target");
         let other_task = tokio::spawn(echo(UnixListener::bind(&other).unwrap()));
-        let first = HostForward { id: "service".into(), endpoint: Endpoint::Unix(target.clone()) };
-        h.client.put_host_forward(first.clone()).await.unwrap();
-        assert_eq!(h.client.host_forward("service").await.unwrap(), first);
-        let mut live = h.client.forward("service").await.unwrap();
+        let first = InwardForward { id: "service".into(), endpoint: Endpoint::Unix(target.clone()) };
+        h.client.put_inward_forward(first.clone()).await.unwrap();
+        assert_eq!(h.client.inward_forward("service").await.unwrap(), first);
+        let mut live = h.client.open_inward("service").await.unwrap();
         exchange(&mut live, b"host to guest").await;
-        h.client.put_host_forward(first.clone()).await.unwrap();
+        h.client.put_inward_forward(first.clone()).await.unwrap();
         exchange(&mut live, b"identical upsert keeps the stream").await;
         // An ID may contain `/`; it still names one forward.
-        let slashed = HostForward { id: "a/b".into(), endpoint: Endpoint::Unix(target.clone()) };
-        h.client.put_host_forward(slashed.clone()).await.unwrap();
-        assert_eq!(h.client.host_forward("a/b").await.unwrap(), slashed);
-        h.client.remove_host_forward("a/b").await.unwrap();
-        let moved = HostForward { id: "service".into(), endpoint: Endpoint::Unix(other) };
-        h.client.put_host_forward(moved.clone()).await.unwrap();
-        assert_eq!(h.client.host_forwards().await.unwrap(), vec![moved]);
+        let slashed = InwardForward { id: "a/b".into(), endpoint: Endpoint::Unix(target.clone()) };
+        h.client.put_inward_forward(slashed.clone()).await.unwrap();
+        assert_eq!(h.client.inward_forward("a/b").await.unwrap(), slashed);
+        h.client.remove_inward_forward("a/b").await.unwrap();
+        let moved = InwardForward { id: "service".into(), endpoint: Endpoint::Unix(other) };
+        h.client.put_inward_forward(moved.clone()).await.unwrap();
+        assert_eq!(h.client.inward_forwards().await.unwrap(), vec![moved]);
         let mut byte = [0];
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), live.read(&mut byte)).await.unwrap().unwrap(),
             0,
             "moved endpoint ends old streams"
         );
-        let mut fresh = h.client.forward("service").await.unwrap();
+        let mut fresh = h.client.open_inward("service").await.unwrap();
         exchange(&mut fresh, b"new endpoint").await;
         echo_task.abort();
         other_task.abort();
     }
 }
 
-// The host resolves only IDs registered in the arriving vessel's client. A
-// guessed ID/path from another vessel is closed, and a host endpoint cannot be
+// The host resolves only IDs registered in the announcing vessel's client. A
+// guessed ID/path from another vessel is never claimed, and a host endpoint cannot be
 // shared between clients (including a symlink alias).
 #[tokio::test]
 async fn isolation_and_endpoint_ownership() {
@@ -190,23 +196,23 @@ async fn isolation_and_endpoint_ownership() {
     let b = harness(false, "test-build").await;
     let endpoint = a.dir.path().join("endpoint");
     let listener = UnixListener::bind(&endpoint).unwrap();
-    a.client.put_guest_forward(forward(&a, "private"), Endpoint::Unix(endpoint.clone())).await.unwrap();
-    assert_refused(b.client.put_guest_forward(forward(&b, "private"), Endpoint::Unix(endpoint.clone())).await);
+    a.client.put_outward_forward(forward(&a, "private"), Endpoint::Unix(endpoint.clone())).await.unwrap();
+    assert_refused(b.client.put_outward_forward(forward(&b, "private"), Endpoint::Unix(endpoint.clone())).await);
     let alias = b.dir.path().join("alias");
     std::os::unix::fs::symlink(&endpoint, &alias).unwrap();
     assert_refused(b.client.register_host_endpoint("alias".into(), Endpoint::Unix(alias)));
     let hardlink = b.dir.path().join("hardlink");
     std::fs::hard_link(&endpoint, &hardlink).unwrap();
     assert_refused(b.client.register_host_endpoint("hardlink".into(), Endpoint::Unix(hardlink)));
-    for id in ["private".to_owned(), endpoint.display().to_string()] {
-        let mut attack = b.guest_opener.open(Purpose::Forward { id }).await.unwrap();
-        let length = attack.read_u32().await.unwrap();
-        let mut bytes = vec![0; length as usize];
-        attack.read_exact(&mut bytes).await.unwrap();
-        let result: Result<(), drydock_agent::AgentError> = serde_json::from_slice(&bytes).unwrap();
-        let error = result.unwrap_err();
-        assert_eq!(error.kind, ErrorKind::NotFound);
-        assert_eq!(error.operation, "forward.open");
+    // Vessel b names a's forward, and a's endpoint path, for its own
+    // listeners, bypassing its client. Its connections are announced to b's
+    // client, which claims none of them: those IDs are not in its registry.
+    for (index, id) in ["private".to_owned(), endpoint.display().to_string()].into_iter().enumerate() {
+        let unix = b.dir.path().join(format!("attack-{index}"));
+        let body = serde_json::to_vec(&OutwardForward { id: id.clone(), unix: unix.clone(), tcp: None }).unwrap();
+        let uri = format!("/forwards/outward/{}", segment(&id));
+        assert_eq!(raw(&b, "PUT", &uri, &[("content-type", "application/json")], body).await.0, 201);
+        let _attack = UnixStream::connect(&unix).await.unwrap();
     }
     assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
     let mut legitimate = UnixStream::connect(a.dir.path().join("private")).await.unwrap();
@@ -256,37 +262,37 @@ fn forward_operation_sequences(tc: hegel::TestCase) {
             let unix = h.dir.path().join(format!("guest-{index}-{op}"));
             let result = match op {
                 0 | 1 => {
-                    let f = GuestForward { id: id.clone(), unix, tcp: None };
-                    let result = h.client.put_guest_forward(f.clone(), endpoint(index)).await;
+                    let f = OutwardForward { id: id.clone(), unix, tcp: None };
+                    let result = h.client.put_outward_forward(f.clone(), endpoint(index)).await;
                     if result.is_ok() {
                         model.insert(id, f);
                     }
                     result
                 }
                 2 => {
-                    let result = h.client.remove_guest_forward(&id).await;
+                    let result = h.client.remove_outward_forward(&id).await;
                     assert_eq!(result.is_ok(), model.remove(&id).is_some());
                     if let Err(error) = &result {
                         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
                     }
                     continue;
                 }
-                3 => h.client.put_guest_forward(GuestForward { id: String::new(), unix, tcp: None }, endpoint(index)).await,
-                4 => h.client.put_guest_forward(GuestForward { id: "x".repeat(1025), unix, tcp: None }, endpoint(index)).await,
-                5 => h.client.put_guest_forward(GuestForward { id: "a\nb".into(), unix, tcp: None }, endpoint(index)).await,
+                3 => h.client.put_outward_forward(OutwardForward { id: String::new(), unix, tcp: None }, endpoint(index)).await,
+                4 => h.client.put_outward_forward(OutwardForward { id: "x".repeat(1025), unix, tcp: None }, endpoint(index)).await,
+                5 => h.client.put_outward_forward(OutwardForward { id: "a\nb".into(), unix, tcp: None }, endpoint(index)).await,
                 6 => {
-                    let f = GuestForward { id: id.clone(), unix, tcp: Some("0.0.0.0:0".parse().unwrap()) };
-                    h.client.put_guest_forward(f, endpoint(index)).await
+                    let f = OutwardForward { id: id.clone(), unix, tcp: Some("0.0.0.0:0".parse().unwrap()) };
+                    h.client.put_outward_forward(f, endpoint(index)).await
                 }
                 _ => {
                     let body = serde_json::json!({"id": "elsewhere", "unix": unix, "tcp": null}).to_string();
-                    let error = refused(&h, "PUT", "/forwards/guest/x", &[("content-type", "application/json")], body, 400).await;
+                    let error = refused(&h, "PUT", "/forwards/outward/x", &[("content-type", "application/json")], body, 400).await;
                     assert!(error.message.contains("elsewhere"), "{error}");
                     continue;
                 }
             };
             assert_eq!(result.is_ok(), matches!(op, 0 | 1), "op {op}: {result:?}");
-            let listed = h.client.guest_forwards().await.unwrap();
+            let listed = h.client.outward_forwards().await.unwrap();
             assert_eq!(listed, model.values().cloned().collect::<Vec<_>>());
             for forward in listed {
                 UnixStream::connect(&forward.unix).await.unwrap();
@@ -317,7 +323,7 @@ async fn tcp_endpoints_and_refused_upserts() {
         let alias = std::net::SocketAddr::from(([127, 0, 0, 2], endpoint.port()));
         let mut f = forward(&h, "configured");
         f.tcp = Some(free_port());
-        h.client.put_guest_forward(f.clone(), Endpoint::Tcp(endpoint)).await.unwrap();
+        h.client.put_outward_forward(f.clone(), Endpoint::Tcp(endpoint)).await.unwrap();
         assert_refused(other.client.register_host_endpoint("alias".into(), Endpoint::Tcp(alias)));
         let mut socket: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
         let mut loopback: ByteStream = Box::new(tokio::net::TcpStream::connect(f.tcp.unwrap()).await.unwrap());
@@ -325,17 +331,17 @@ async fn tcp_endpoints_and_refused_upserts() {
         exchange(&mut loopback, b"TCP in forward").await;
         let occupied = h.dir.path().join("occupied");
         std::fs::write(&occupied, b"do not replace").unwrap();
-        let bad = GuestForward { id: "configured".into(), unix: occupied.clone(), tcp: f.tcp };
-        let error = h.client.put_guest_forward(bad, Endpoint::Tcp(endpoint)).await.unwrap_err();
+        let bad = OutwardForward { id: "configured".into(), unix: occupied.clone(), tcp: f.tcp };
+        let error = h.client.put_outward_forward(bad, Endpoint::Tcp(endpoint)).await.unwrap_err();
         assert_error(error, std::io::ErrorKind::AddrInUse, "forward.listen", "occupied");
-        assert_eq!(h.client.guest_forward("configured").await.unwrap(), f);
+        assert_eq!(h.client.outward_forward("configured").await.unwrap(), f);
         assert_eq!(std::fs::read(occupied).unwrap(), b"do not replace");
         exchange(&mut socket, b"survived refused upsert").await;
         exchange(&mut loopback, b"TCP survived too").await;
-        h.client.put_host_forward(HostForward { id: "tcp-target".into(), endpoint: Endpoint::Tcp(endpoint) }).await.unwrap();
-        let mut host = h.client.forward("tcp-target").await.unwrap();
+        h.client.put_inward_forward(InwardForward { id: "tcp-target".into(), endpoint: Endpoint::Tcp(endpoint) }).await.unwrap();
+        let mut host = h.client.open_inward("tcp-target").await.unwrap();
         exchange(&mut host, b"host to guest TCP").await;
-        h.client.remove_guest_forward("configured").await.unwrap();
+        h.client.remove_outward_forward("configured").await.unwrap();
         assert!(!f.unix.exists());
         // The freed port is ephemeral, so connect may pick it as its own source
         // and reach itself (TCP simultaneous open); only a listener is a failure.
@@ -348,7 +354,7 @@ async fn tcp_endpoints_and_refused_upserts() {
         // A crash leaves a Unix socket inode behind without a listener.
         drop(UnixListener::bind(&f.unix).unwrap());
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while let Err(error) = h.client.put_guest_forward(f.clone(), Endpoint::Tcp(endpoint)).await {
+        while let Err(error) = h.client.put_outward_forward(f.clone(), Endpoint::Tcp(endpoint)).await {
             assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
             assert!(std::time::Instant::now() < deadline, "closed streams must release their claim");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -357,33 +363,6 @@ async fn tcp_endpoints_and_refused_upserts() {
         exchange(&mut recovered, b"after crash").await;
         task.abort();
     }
-}
-
-// A later control connection cannot take over the first controller's reverse
-// opener, even when it registers the same ID and repeats the same forward.
-#[tokio::test]
-async fn later_control_cannot_replace_reverse_opener() {
-    let dir = tempfile::tempdir().unwrap();
-    let (host1, guest1) = pair(false, dir.path()).await;
-    let (host2, guest2) = pair(false, dir.path()).await;
-    let mut agent = Agent::new(guest1, "test-build".into(), dir.path().join("agent"));
-    agent.add_transport(guest2);
-    let task = tokio::spawn(agent.run());
-    let first = Client::connect(host1, "test-build").await.unwrap();
-    let target1 = dir.path().join("target1");
-    let listener1 = UnixListener::bind(&target1).unwrap();
-    let f = GuestForward { id: "same".into(), unix: dir.path().join("forward"), tcp: None };
-    first.put_guest_forward(f.clone(), Endpoint::Unix(target1)).await.unwrap();
-    let second = Client::connect(host2, "test-build").await.unwrap();
-    let target2 = dir.path().join("target2");
-    let listener2 = UnixListener::bind(&target2).unwrap();
-    second.put_guest_forward(f.clone(), Endpoint::Unix(target2)).await.unwrap();
-    let echo_task = tokio::spawn(echo(listener1));
-    let mut guest: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
-    exchange(&mut guest, b"original host session").await;
-    assert!(tokio::time::timeout(Duration::from_millis(50), listener2.accept()).await.is_err());
-    task.abort();
-    echo_task.abort();
 }
 
 // A port owned by another forward is deliberately not stolen. A refused port
@@ -398,16 +377,16 @@ async fn occupied_port_swap_refuses_without_changing_forwards() {
         echo_tasks.push(tokio::spawn(echo(UnixListener::bind(&target).unwrap())));
         let mut f = forward(&h, id);
         f.tcp = Some(free_port());
-        h.client.put_guest_forward(f.clone(), Endpoint::Unix(target)).await.unwrap();
+        h.client.put_outward_forward(f.clone(), Endpoint::Unix(target)).await.unwrap();
         forwards.push(f);
     }
-    let before = h.client.guest_forwards().await.unwrap();
+    let before = h.client.outward_forwards().await.unwrap();
     let mut swapped = forwards[0].clone();
     swapped.tcp = forwards[1].tcp;
     let endpoint = Endpoint::Unix(h.dir.path().join("target-port-a"));
-    let error = h.client.put_guest_forward(swapped, endpoint).await.unwrap_err();
+    let error = h.client.put_outward_forward(swapped, endpoint).await.unwrap_err();
     assert_error(error, std::io::ErrorKind::AddrInUse, "forward.listen", "port-a");
-    assert_eq!(h.client.guest_forwards().await.unwrap(), before);
+    assert_eq!(h.client.outward_forwards().await.unwrap(), before);
     for f in forwards {
         let mut stream: ByteStream = Box::new(tokio::net::TcpStream::connect(f.tcp.unwrap()).await.unwrap());
         exchange(&mut stream, f.id.as_bytes()).await;
@@ -422,17 +401,18 @@ async fn occupied_port_swap_refuses_without_changing_forwards() {
 #[tokio::test]
 async fn forward_targets_reject_zero_ports_and_allow_late_socket_creation() {
     let h = harness(false, "test-build").await;
-    let error = h.client.put_host_forward(HostForward { id: "zero".into(), endpoint: Endpoint::Tcp("127.0.0.1:0".parse().unwrap()) }).await;
-    assert_error(error.unwrap_err(), std::io::ErrorKind::InvalidInput, "forward.host.put", "zero");
+    let error =
+        h.client.put_inward_forward(InwardForward { id: "zero".into(), endpoint: Endpoint::Tcp("127.0.0.1:0".parse().unwrap()) }).await;
+    assert_error(error.unwrap_err(), std::io::ErrorKind::InvalidInput, "forward.inward.put", "zero");
     let target = h.dir.path().join("later");
-    h.client.put_host_forward(HostForward { id: "later".into(), endpoint: Endpoint::Unix(target.clone()) }).await.unwrap();
+    h.client.put_inward_forward(InwardForward { id: "later".into(), endpoint: Endpoint::Unix(target.clone()) }).await.unwrap();
     let task = tokio::spawn(echo(UnixListener::bind(target).unwrap()));
-    let mut stream = h.client.forward("later").await.unwrap();
+    let mut stream = h.client.open_inward("later").await.unwrap();
     exchange(&mut stream, b"late service").await;
     task.abort();
 }
 
-// Forward errors cross both real control transports with the original kind
+// Forward errors cross both real connections with the original kind
 // and enough context to tell unknown IDs, dead targets and refusals apart.
 #[tokio::test]
 async fn forward_errors_name_the_failed_operation_and_subject() {
@@ -440,34 +420,39 @@ async fn forward_errors_name_the_failed_operation_and_subject() {
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         let path = h.dir.path().join("absent");
-        h.client.put_host_forward(HostForward { id: "dead".into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
-        let detail = assert_error(h.client.forward("dead").await.err().unwrap(), ErrorKind::NotFound, "forward.open", "absent");
+        h.client.put_inward_forward(InwardForward { id: "dead".into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
+        let detail = assert_error(h.client.open_inward("dead").await.err().unwrap(), ErrorKind::NotFound, "forward.inward.open", "absent");
         assert!(detail.causes.iter().any(|c| c.contains("os error")), "{detail}");
         let refused_path = h.dir.path().join("refused");
         drop(UnixListener::bind(&refused_path).unwrap());
-        h.client.put_host_forward(HostForward { id: "refused".into(), endpoint: Endpoint::Unix(refused_path) }).await.unwrap();
-        assert_error(h.client.forward("refused").await.err().unwrap(), ErrorKind::ConnectionRefused, "forward.open", "refused");
-        assert_error(h.client.forward("unknown").await.err().unwrap(), ErrorKind::NotFound, "forward.open", "unknown");
-        assert_error(h.client.remove_host_forward("unknown").await.unwrap_err(), ErrorKind::NotFound, "forward.host.remove", "unknown");
-        assert_error(h.client.remove_guest_forward("unknown").await.unwrap_err(), ErrorKind::NotFound, "forward.guest.remove", "unknown");
+        h.client.put_inward_forward(InwardForward { id: "refused".into(), endpoint: Endpoint::Unix(refused_path) }).await.unwrap();
+        assert_error(h.client.open_inward("refused").await.err().unwrap(), ErrorKind::ConnectionRefused, "forward.inward.open", "refused");
+        assert_error(h.client.open_inward("unknown").await.err().unwrap(), ErrorKind::NotFound, "forward.inward.open", "unknown");
+        assert_error(h.client.remove_inward_forward("unknown").await.unwrap_err(), ErrorKind::NotFound, "forward.inward.remove", "unknown");
+        assert_error(
+            h.client.remove_outward_forward("unknown").await.unwrap_err(),
+            ErrorKind::NotFound,
+            "forward.outward.remove",
+            "unknown",
+        );
     }
 }
 
-// Removal closes a live host-to-guest bridge before returning, while another
-// route remains usable. Guest listener removal already has the same contract.
+// Removal closes a live inward stream before returning, while another route
+// remains usable. Outward listener removal already has the same contract.
 #[tokio::test]
-async fn removing_host_forward_closes_its_live_streams() {
+async fn removing_an_inward_forward_closes_its_live_streams() {
     for unix in [false, true] {
         let h = harness(unix, "test-build").await;
         let path = h.dir.path().join("target");
         let task = tokio::spawn(echo(UnixListener::bind(&path).unwrap()));
         for id in ["remove", "keep"] {
-            h.client.put_host_forward(HostForward { id: id.into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
+            h.client.put_inward_forward(InwardForward { id: id.into(), endpoint: Endpoint::Unix(path.clone()) }).await.unwrap();
         }
-        let mut removed = h.client.forward("remove").await.unwrap();
-        let mut kept = h.client.forward("keep").await.unwrap();
+        let mut removed = h.client.open_inward("remove").await.unwrap();
+        let mut kept = h.client.open_inward("keep").await.unwrap();
         exchange(&mut removed, b"live").await;
-        h.client.remove_host_forward("remove").await.unwrap();
+        h.client.remove_inward_forward("remove").await.unwrap();
         let mut byte = [0];
         assert_eq!(tokio::time::timeout(Duration::from_secs(2), removed.read(&mut byte)).await.unwrap().unwrap(), 0);
         exchange(&mut kept, b"still live").await;
@@ -485,9 +470,9 @@ async fn forward_eof_propagates_in_each_direction() {
                 let path = h.dir.path().join("endpoint");
                 let listener = UnixListener::bind(&path).unwrap();
                 if reverse {
-                    h.client.put_guest_forward(forward(&h, "eof"), Endpoint::Unix(path)).await.unwrap();
+                    h.client.put_outward_forward(forward(&h, "eof"), Endpoint::Unix(path)).await.unwrap();
                 } else {
-                    h.client.put_host_forward(HostForward { id: "eof".into(), endpoint: Endpoint::Unix(path) }).await.unwrap();
+                    h.client.put_inward_forward(InwardForward { id: "eof".into(), endpoint: Endpoint::Unix(path) }).await.unwrap();
                 }
                 let endpoint = tokio::spawn(async move {
                     let (mut stream, _) = listener.accept().await.unwrap();
@@ -506,7 +491,7 @@ async fn forward_eof_propagates_in_each_direction() {
                 let mut stream: ByteStream = if reverse {
                     Box::new(UnixStream::connect(h.dir.path().join("eof")).await.unwrap())
                 } else {
-                    h.client.forward("eof").await.unwrap()
+                    h.client.open_inward("eof").await.unwrap()
                 };
                 let mut bytes = vec![];
                 if server_first {
@@ -531,7 +516,7 @@ fn assert_refused(result: std::io::Result<()>) {
 }
 
 // The egress forward belongs to this vessel's client registry, just like other
-// guest-to-host forwards. Unknown IDs must be rejected before any guest changes.
+// outward forwards. Unknown IDs must be rejected before any guest changes.
 #[tokio::test]
 async fn egress_requires_registered_vessel_upstream() {
     let h = harness(false, "test-build").await;
@@ -542,20 +527,20 @@ async fn egress_requires_registered_vessel_upstream() {
     }
 }
 
-// Guest TCP listeners require a concrete loopback address. Wildcard and public
+// Outward TCP listeners require a concrete loopback address. Wildcard and public
 // binds must fail before publishing any listener or exemption.
 #[tokio::test]
-async fn guest_forwards_reject_unspecified_and_nonloopback_addresses() {
+async fn outward_forwards_reject_unspecified_and_nonloopback_addresses() {
     let h = harness(false, "test-build").await;
     let endpoint = h.dir.path().join("host-endpoint");
     let _listener = UnixListener::bind(&endpoint).unwrap();
     for address in ["0.0.0.0:9000", "[::]:9000", "192.0.2.1:9000", "[2001:db8::1]:9000"] {
         let unix = h.dir.path().join("guest-listener");
-        let f = GuestForward { id: "concrete".into(), unix: unix.clone(), tcp: Some(address.parse().unwrap()) };
-        let error = h.client.put_guest_forward(f, Endpoint::Unix(endpoint.clone())).await.unwrap_err();
+        let f = OutwardForward { id: "concrete".into(), unix: unix.clone(), tcp: Some(address.parse().unwrap()) };
+        let error = h.client.put_outward_forward(f, Endpoint::Unix(endpoint.clone())).await.unwrap_err();
         let detail = assert_error(error, std::io::ErrorKind::InvalidInput, "forward.listen", "guest-listener");
         assert!(detail.message.contains("loopback"), "{detail}");
-        assert!(h.client.guest_forwards().await.unwrap().is_empty());
+        assert!(h.client.outward_forwards().await.unwrap().is_empty());
         assert!(!unix.exists());
     }
 }
@@ -598,7 +583,7 @@ async fn refusals_are_structured() {
     let error = refused(&h, "DELETE", "/entries/tmp/absent?colour=blue", &[], "", 400).await;
     assert_eq!(error.operation, "request");
     assert!(error.message.contains("unknown field `colour`"), "{error}");
-    let error = refused(&h, "GET", "/forwards/guest/%FF", &[], "", 400).await;
+    let error = refused(&h, "GET", "/forwards/outward/%FF", &[], "", 400).await;
     assert_eq!(error.operation, "request");
     assert!(error.message.to_lowercase().contains("utf-8") || error.message.contains("decode"), "{error}");
     // Nothing above changed the configuration.
@@ -608,9 +593,9 @@ async fn refusals_are_structured() {
 // Guest stand-in at the HTTP boundary: serves a fixed hello body and records
 // upgrade bodies and confirmations, so a test observes exactly what the host
 // sent.
-async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+async fn hello_only_guest(hello: serde_json::Value) -> (ByteStream, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
     use axum::routing::{get, post, put};
-    let (host, mut guest) = pair(false, Path::new("")).await;
+    let (dialer, mut guest) = drydock_transport::memory();
     let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (recorded, confirmed) = (pushes.clone(), pushes.clone());
     let router = axum::Router::new()
@@ -630,11 +615,11 @@ async fn hello_only_guest(hello: serde_json::Value) -> (Transport, Arc<std::sync
             }),
         );
     tokio::spawn(async move {
-        while let Ok(Some(incoming)) = guest.accept().await {
-            tokio::spawn(drydock_transport::http2::serve(incoming, router.clone()));
+        while let Ok(stream) = guest.accept().await {
+            tokio::spawn(drydock_transport::http::serve(stream, router.clone()));
         }
     });
-    (host, pushes)
+    (dialer.connect().await.unwrap(), pushes)
 }
 
 // An agent that predates platform reporting sends no platform. The host
@@ -658,4 +643,158 @@ async fn hello_without_platform_gets_the_prepared_platforms_build() {
     .expect("the fake guest never reports the pushed build");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert_eq!(*pushes.lock().unwrap(), [b"linux amd64 build".to_vec()]);
+}
+
+type EventLines =
+    tokio::io::Lines<tokio_util::io::StreamReader<futures_util::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>, bytes::Bytes>>;
+/// `/events` from the start, as lines, on the harness's raw connection.
+async fn events(h: &Harness) -> EventLines {
+    events_from(h, "/events").await
+}
+async fn events_from(h: &Harness, uri: &str) -> EventLines {
+    use futures_util::{StreamExt, TryStreamExt};
+    use http_body_util::BodyExt;
+    use tokio::io::AsyncBufReadExt;
+    let request = http::Request::get(uri).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+    let response = h.raw.clone().send_request(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/x-ndjson");
+    let body = response.into_body().into_data_stream().map_err(std::io::Error::other).boxed();
+    tokio_util::io::StreamReader::new(body).lines()
+}
+async fn next_event(lines: &mut EventLines) -> drydock_agent::events::Event {
+    next_record(lines).await.event
+}
+async fn next_record(lines: &mut EventLines) -> drydock_agent::events::Record {
+    let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.expect("no event arrived").unwrap().unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+// A reader whose /events connection drops resumes from its cursor: an
+// announcement made while it was away is the next line it reads, and
+// nothing it already read comes again.
+#[tokio::test]
+async fn a_reader_resumes_from_its_cursor_after_a_dropped_stream() {
+    use drydock_agent::events::Event;
+    let h = harness(false, "test-build").await;
+    let mut lines = events(&h).await;
+    let unix = unclaimed_forward(&h, "gap").await;
+    let _first = UnixStream::connect(&unix).await.unwrap();
+    let seen = next_record(&mut lines).await;
+    drop(lines);
+    let _second = UnixStream::connect(&unix).await.unwrap();
+    let mut resumed = events_from(&h, &format!("/events?since={}", segment(&seen.cursor))).await;
+    let Event::OutwardConnection { connection, .. } = next_event(&mut resumed).await else { panic!("the announcement in the gap") };
+    let Event::OutwardConnection { connection: first, .. } = seen.event else { panic!("an announcement first") };
+    assert_eq!(connection, first + 1);
+}
+/// An outward forward set straight on the agent, so no client claims its
+/// connections.
+async fn unclaimed_forward(h: &Harness, id: &str) -> std::path::PathBuf {
+    let unix = h.dir.path().join(id);
+    let body = serde_json::to_vec(&OutwardForward { id: id.into(), unix: unix.clone(), tcp: None }).unwrap();
+    let (status, _, _) = raw(h, "PUT", &format!("/forwards/outward/{}", segment(id)), &[("content-type", "application/json")], body).await;
+    assert_eq!(status, 201);
+    unix
+}
+/// A claim of an outward connection as an HTTP/1.1 client makes it: GET with
+/// `Upgrade: drydock-forward` on a connection of its own.
+async fn claim_over_http1(h: &Harness, id: &str, connection: u64) -> http::Response<hyper::body::Incoming> {
+    let stream = h.dial.connect().await.unwrap();
+    let (mut sender, link) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(link.with_upgrades());
+    let request = http::Request::get(format!("/forwards/outward/{}/connections/{connection}", segment(id)))
+        .header("host", "agent")
+        .header("connection", "upgrade")
+        .header("upgrade", drydock_transport::http::BYTE_STREAM)
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+    sender.send_request(request).await.unwrap()
+}
+
+// Outward: the agent accepts a vessel connection, announces it on /events and
+// holds it, bytes the guest already sent included, until drydockd claims it;
+// the claim's stream is then that connection. A connection is claimed once.
+// The claim here is HTTP/1.1's GET with Upgrade; the client uses CONNECT.
+#[tokio::test]
+async fn an_outward_connection_waits_on_events_for_its_claim() {
+    use drydock_agent::events::Event;
+    let h = harness(true, "test-build").await;
+    let mut lines = events(&h).await;
+    let unix = unclaimed_forward(&h, "held").await;
+    let mut guest = UnixStream::connect(&unix).await.unwrap();
+    guest.write_all(b"sent before the claim").await.unwrap();
+    let Event::OutwardConnection { forward, connection } = next_event(&mut lines).await else { panic!("an announcement first") };
+    assert_eq!(forward, "held");
+    assert_eq!(claim_over_http1(&h, "other", connection).await.status(), 404, "a connection is claimed under its own forward");
+    let response = claim_over_http1(&h, "held", connection).await;
+    assert_eq!(response.status(), 101);
+    let mut claimed = drydock_transport::http::upgraded(hyper::upgrade::on(response)).await.unwrap();
+    let mut early = [0; 21];
+    claimed.read_exact(&mut early).await.unwrap();
+    assert_eq!(&early, b"sent before the claim");
+    claimed.write_all(b"reply").await.unwrap();
+    let mut reply = [0; 5];
+    guest.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply, b"reply");
+
+    let again = claim_over_http1(&h, "held", connection).await;
+    assert_eq!(again.status(), 404);
+    let body = http_body_util::BodyExt::collect(again.into_body()).await.unwrap().to_bytes();
+    let error: drydock_agent::AgentError = serde_json::from_slice(&body).unwrap();
+    assert_eq!((error.operation.as_str(), error.kind), ("forward.outward.claim", ErrorKind::NotFound));
+}
+
+// A connection nobody claims within the deadline is closed, and the forward's
+// failure is reported on /events. A claim after that finds nothing.
+#[tokio::test]
+async fn an_unclaimed_outward_connection_is_closed_at_its_deadline() {
+    use drydock_agent::events::Event;
+    let deadline = Duration::from_millis(200);
+    let h = harness_with(false, "test-build", |listener, dir| {
+        Agent::new(listener, "test-build".into(), dir.join("agent")).with_claim_deadline(deadline)
+    })
+    .await;
+    let mut lines = events(&h).await;
+    let unix = unclaimed_forward(&h, "ignored").await;
+    let started = std::time::Instant::now();
+    let mut guest = UnixStream::connect(&unix).await.unwrap();
+    let Event::OutwardConnection { connection, .. } = next_event(&mut lines).await else { panic!("an announcement first") };
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), guest.read_to_end(&mut rest)).await.expect("closed at the deadline").unwrap();
+    assert!(rest.is_empty());
+    assert!(started.elapsed() >= deadline, "closed after {:?}", started.elapsed());
+    let Event::ForwardFailed { forward, reason } = next_event(&mut lines).await else { panic!("a failure next") };
+    assert_eq!(forward, "ignored");
+    assert!(reason.contains(&format!("connection {connection} was not claimed")), "{reason}");
+    assert_eq!(claim_over_http1(&h, "ignored", connection).await.status(), 404);
+}
+
+// Plain HTTP on the agent's socket: curl, with no drydock code, reaches
+// /hello over HTTP/1.1 and follows /events over HTTP/2 by prior knowledge,
+// where a process the agent ran has reported its exit.
+#[tokio::test]
+async fn curl_reaches_hello_and_events_on_the_socket() {
+    use drydock_agent::events::{Event, Record};
+    let h = harness(true, "test-build").await;
+    let process = h.client.spawn(shell("exit 3")).await.unwrap();
+    let id = process.id().to_owned();
+    assert_eq!(output(process.output().await.unwrap()).await.2.code, Some(3));
+    let curl =
+        |args: &[&str]| tokio::process::Command::new("curl").arg("--unix-socket").arg(h.dial.socket()).arg("-sS").args(args).output();
+    let hello = curl(&["--http1.1", "http://agent/hello"]).await.expect("curl is required by this test");
+    assert!(hello.status.success(), "{}", String::from_utf8_lossy(&hello.stderr));
+    let hello: drydock_agent::Hello = serde_json::from_slice(&hello.stdout).unwrap();
+    assert_eq!(hello.fingerprint, "test-build");
+    // /events stays open; curl gives up after a second with what arrived.
+    let events = curl(&["--http2-prior-knowledge", "--max-time", "1", "http://agent/events"]).await.unwrap();
+    assert_eq!(events.status.code(), Some(28), "held open until curl's deadline: {}", String::from_utf8_lossy(&events.stderr));
+    let records: Vec<Record> = String::from_utf8(events.stdout).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(&record.event, Event::ProcessExited { id: exited, status } if *exited == id && status.code == Some(3))),
+        "{records:?}"
+    );
+    assert!(records.iter().all(|record| record.cursor.starts_with(&format!("{}:", hello.boot_id))));
 }

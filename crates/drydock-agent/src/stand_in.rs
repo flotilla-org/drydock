@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use drydock_transport::Transport;
+use drydock_transport::Listener;
 use futures_util::StreamExt;
 use std::{io, sync::Arc};
 
@@ -35,12 +35,12 @@ pub struct ScriptedOutput {
     pub ending: Ending,
 }
 
-/// Serve the stand-in on `transport`'s host-facing links until it closes,
+/// Serve the stand-in on `listener`'s connections until it closes,
 /// reporting `fingerprint` in its hello. `script` is asked for the output each
 /// time a process's output is read, so a test can change it between processes.
 /// Every process is `stand-in`: the stand-in tells processes apart by nothing.
 pub async fn serve(
-    mut transport: Transport,
+    mut listener: impl Listener,
     fingerprint: String,
     script: impl Fn() -> ScriptedOutput + Send + Sync + 'static,
 ) -> io::Result<()> {
@@ -97,17 +97,20 @@ pub async fn serve(
                 }
             }),
         );
-    while let Some(incoming) = transport.accept().await.map_err(|error| io::Error::new(error.kind(), error.to_string()))? {
-        tokio::spawn(drydock_transport::http2::serve(incoming, router.clone()));
+    loop {
+        match listener.accept().await {
+            Ok(stream) => drop(tokio::spawn(drydock_transport::http::serve(stream, router.clone()))),
+            // Every dialer is gone: nobody can connect again.
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => return Ok(()),
+            Err(error) => return Err(error),
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Client, Exec, ExecEvent};
-    use drydock_transport::Limits;
     use std::sync::Mutex;
 
     // A host reading a scripted process sees exactly the scripted output; a stream
@@ -116,19 +119,15 @@ mod tests {
     // pushes on connecting is accepted.
     #[tokio::test]
     async fn scripted_output_reaches_the_real_client() {
-        let (host, guest) = tokio::io::duplex(64 * 1024);
-        let (host, guest) = tokio::join!(
-            Transport::yamux(Box::new(host), true, Limits::default()),
-            Transport::yamux(Box::new(guest), false, Limits::default())
-        );
+        let (dialer, listener) = drydock_transport::memory();
         let ending = Arc::new(Mutex::new(Ending::Exit(ExitStatus { code: Some(0), signal: None, timed_out: false })));
         let scripted = ending.clone();
-        let server = tokio::spawn(serve(guest.unwrap(), "stand-in-test".into(), move || ScriptedOutput {
+        let server = tokio::spawn(serve(listener, "stand-in-test".into(), move || ScriptedOutput {
             stdout: Bytes::from_static(b"out"),
             stderr: Bytes::from_static(b"err"),
             ending: scripted.lock().unwrap().clone(),
         }));
-        let client = Client::connect(host.unwrap(), "stand-in-test").await.unwrap();
+        let client = Client::connect(dialer.connect().await.unwrap(), "stand-in-test").await.unwrap();
         let etag = client.configure(crate::Configuration::default()).await.unwrap();
         assert_eq!(client.configuration().await.unwrap().etag, etag);
         let (stdout, stderr, status) = client.exec(Exec::new("anything", ["at", "all"])).await.unwrap().collect(1024).await.unwrap();

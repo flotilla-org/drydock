@@ -457,13 +457,7 @@ impl Daemon {
         let identity = self.key_for(environment)?;
         let client = &self.runtime(provider)?;
         let vessel = crate::agent::Vessel { provider, environment: &environment.id, identity: &identity, platform, build };
-        let link = self
-            .config
-            .providers
-            .get(provider)
-            .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))?
-            .agent_link;
-        let reach = crate::agent::AgentReach::new(link).with_dialer(self.dialer.clone()).with_timeout(timeout);
+        let reach = crate::agent::AgentReach::new().with_dialer(self.dialer.clone()).with_timeout(timeout);
         Ok(reach.connect(client, &vessel).await?.client)
     }
     /// Connect to the agent of a vessel drydock launched, for the platform

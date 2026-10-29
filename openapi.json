@@ -4175,7 +4175,7 @@
               },
               "reverse_forwards": {
                 "type": "boolean",
-                "description": "Whether this SSH server accepts remote (reverse) Unix-socket forwards.\nWhen it does, guest-to-host streams get their own SSH channels; when it\ndoesn't (Daytona's gateway), they share a link through the local forward."
+                "description": "Whether this SSH server accepts remote (reverse) Unix-socket forwards.\nDrydock reaches the agent through a local forward alone, so it does\nnot depend on this."
               },
               "user": {
                 "$ref": "#/components/schemas/Secret",

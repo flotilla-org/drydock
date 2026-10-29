@@ -9,7 +9,7 @@
 //! file per environment beside its key. Clients see only names, endpoints,
 //! `ready` and a typed error; never SSH, keys, tokens or how bytes travel.
 use crate::{api::ProviderApi, client::Error, daemon::Daemon};
-use drydock_agent::{Endpoint, Exec, GuestForward, HostForward};
+use drydock_agent::{Endpoint, Exec, InwardForward, OutwardForward};
 use drydock_protocol::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -356,8 +356,8 @@ impl Exposures {
         if let Some(client) = state.connected.clone() {
             // A vessel that misses this is pruned when it is next re-established.
             let _ = match direction {
-                Direction::Inward => client.remove_host_forward(&agent_id(&key)).await,
-                Direction::Outward => client.remove_guest_forward(&agent_id(&key)).await,
+                Direction::Inward => client.remove_inward_forward(&agent_id(&key)).await,
+                Direction::Outward => client.remove_outward_forward(&agent_id(&key)).await,
             };
             if hosts_line {
                 // On failure the stale mark stays, and the next connection clears the line.
@@ -520,7 +520,7 @@ impl Vessel {
                 let Some(client) = agent.borrow().clone() else { continue };
                 let id = id.clone();
                 tokio::spawn(async move {
-                    if let Ok(mut stream) = client.forward(&id).await {
+                    if let Ok(mut stream) = client.open_inward(&id).await {
                         let _ = tokio::io::copy_bidirectional(&mut viewer, &mut stream).await;
                     }
                 });
@@ -654,7 +654,7 @@ impl Vessel {
             return Outcome::Pending;
         }
         if let Some(client) = state.connected.clone() {
-            if tokio::time::timeout(shared.timing.connect, client.host_forwards()).await.is_ok_and(|r| r.is_ok()) {
+            if tokio::time::timeout(shared.timing.connect, client.inward_forwards()).await.is_ok_and(|r| r.is_ok()) {
                 // Retry only what is not ready; what works is left alone.
                 let pending: Vec<Key> = keys.into_iter().filter(|key| !matches!(state.status.get(key), Some(Ok(())))).collect();
                 let hosts = pending.iter().any(|key| key.0 == Direction::Outward && named(state, &key.1)) || state.record.stale_hosts;
@@ -780,7 +780,7 @@ async fn apply(client: &drydock_agent::Client, state: &State, guest: &GuestLayou
                 InwardTarget::Unix(path) => Endpoint::Unix(path.into()),
                 InwardTarget::Tcp(address) => Endpoint::Tcp(*address),
             };
-            client.put_host_forward(HostForward { id: agent_id(key), endpoint }).await.map_err(refused)
+            client.put_inward_forward(InwardForward { id: agent_id(key), endpoint }).await.map_err(refused)
         }
         Direction::Outward => {
             let Some(entry) = state.record.outward.get(&key.1) else { return Ok(()) };
@@ -792,15 +792,15 @@ async fn apply(client: &drydock_agent::Client, state: &State, guest: &GuestLayou
                 }
             };
             let forward = match (&entry.request.guest, entry.address) {
-                (Guest::Unix { unix }, _) => GuestForward { id: agent_id(key), unix: unix.into(), tcp: None },
-                (Guest::Name { port, .. }, Some(address)) => GuestForward {
+                (Guest::Unix { unix }, _) => OutwardForward { id: agent_id(key), unix: unix.into(), tcp: None },
+                (Guest::Name { port, .. }, Some(address)) => OutwardForward {
                     id: agent_id(key),
                     unix: guest.sockets.join(format!("{}.sock", key.1)),
                     tcp: Some(SocketAddr::new(address, port.get())),
                 },
                 (Guest::Name { .. }, None) => return Err(error(ExposureErrorCode::Refused, "guest name has no address")),
             };
-            client.put_shared_guest_forward(forward, destination).await.map_err(refused)
+            client.put_shared_outward_forward(forward, destination).await.map_err(refused)
         }
     }
 }
@@ -808,14 +808,14 @@ async fn apply(client: &drydock_agent::Client, state: &State, guest: &GuestLayou
 /// Remove forwards an earlier drydock left for exposures that no longer exist.
 async fn prune(client: &drydock_agent::Client, state: &State) {
     let wanted: BTreeSet<String> = Vessel::keys(state).iter().map(agent_id).collect();
-    if let Ok(forwards) = client.host_forwards().await {
+    if let Ok(forwards) = client.inward_forwards().await {
         for forward in forwards.into_iter().filter(|f| f.id.starts_with(AGENT_ID_PREFIX) && !wanted.contains(&f.id)) {
-            let _ = client.remove_host_forward(&forward.id).await;
+            let _ = client.remove_inward_forward(&forward.id).await;
         }
     }
-    if let Ok(forwards) = client.guest_forwards().await {
+    if let Ok(forwards) = client.outward_forwards().await {
         for forward in forwards.into_iter().filter(|f| f.id.starts_with(AGENT_ID_PREFIX) && !wanted.contains(&f.id)) {
-            let _ = client.remove_guest_forward(&forward.id).await;
+            let _ = client.remove_outward_forward(&forward.id).await;
         }
     }
 }

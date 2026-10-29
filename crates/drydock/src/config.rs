@@ -27,10 +27,6 @@ pub struct Provider {
     #[serde(default)]
     pub size: SizeDefaults,
     pub egress: Option<Egress>,
-    /// The preferred link to this provider's vessel agents, used where its SSH
-    /// server allows it. Defaults to reverse forwards.
-    #[serde(default)]
-    pub agent_link: crate::agent::AgentLink,
 }
 impl Config {
     /// The configuration document, without the launch defaults.
@@ -218,23 +214,6 @@ settings = {{
             p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 9 }).unwrap(),
             Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 9 }
         );
-    }
-    // A provider's agent link preference defaults to reverse forwards, names
-    // either link, and refuses anything else.
-    #[test]
-    fn agent_link_parses_with_a_default() {
-        let parse = |line: &str| Config::parse(&format!("[providers.demo]\nmodule = \"m\"\ncredential = {{env=\"PATH\"}}\n{line}\n"));
-        assert_eq!(parse("").unwrap().providers["demo"].agent_link, crate::agent::AgentLink::ReverseForward);
-        assert_eq!(
-            parse("agent_link = \"reverse_forward\"").unwrap().providers["demo"].agent_link,
-            crate::agent::AgentLink::ReverseForward
-        );
-        assert_eq!(parse("agent_link = \"local_forward\"").unwrap().providers["demo"].agent_link, crate::agent::AgentLink::LocalForward);
-        assert!(parse("agent_link = \"over_the_rainbow\"").is_err());
-        // The names a report shows are the configured ones.
-        for link in [crate::agent::AgentLink::ReverseForward, crate::agent::AgentLink::LocalForward] {
-            assert_eq!(serde_json::to_value(link).unwrap(), link.as_str());
-        }
     }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]

@@ -1,6 +1,6 @@
 //! Guest capture only: destination policy belongs to the upstream and the kind.
+use crate::streams::Outward;
 use crate::{ByteStream, invalid};
-use drydock_transport::{Opener, Purpose};
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     rr::{RData, Record, RecordType, rdata::A},
@@ -15,7 +15,6 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
-    sync::Mutex as AsyncMutex,
     task::JoinSet,
 };
 
@@ -136,15 +135,10 @@ impl FakeDns {
     }
 }
 
-pub(crate) async fn upstream(opener: &Arc<AsyncMutex<Opener>>, id: String) -> io::Result<ByteStream> {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let opener = opener.lock().await.clone();
-        let mut stream = opener.open(Purpose::Forward { id }).await?;
-        crate::forward::opened(&mut stream).await?;
-        Ok(stream)
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "egress upstream opening timed out"))?
+/// A connection to the egress upstream: an outward connection drydockd
+/// claims, closed if it is not claimed within the claim deadline.
+pub(crate) async fn upstream(outward: &Outward, id: String) -> io::Result<ByteStream> {
+    outward.open(&id).await
 }
 
 /// Why an upstream refused a CONNECT: its status line, and its
@@ -214,7 +208,7 @@ async fn bridge(mut stream: ByteStream, mut remote: ByteStream, authority: Optio
 
 #[derive(Clone)]
 struct CaptureState {
-    opener: Arc<AsyncMutex<Opener>>,
+    outward: Arc<Outward>,
     id: Arc<Mutex<String>>,
     map: Arc<Mutex<FakeDns>>,
     slots: Arc<tokio::sync::Semaphore>,
@@ -241,7 +235,7 @@ async fn serve_connection(stream: TcpStream, passthrough: bool, state: CaptureSt
     let authority =
         if passthrough { None } else { Some(state.map.lock().unwrap().authority(original_destination(&stream)?, Instant::now())?) };
     let id = state.id.lock().unwrap().clone();
-    let remote = upstream(&state.opener, id).await?;
+    let remote = upstream(&state.outward, id).await?;
     bridge(Box::new(stream), remote, authority.as_deref()).await
 }
 
@@ -359,16 +353,10 @@ pub(crate) struct Capture {
 impl Capture {
     /// Bind all listeners before changing global guest state. Dropping a refused
     /// preparation releases every listener and connection task.
-    pub(crate) async fn prepare(opener: Arc<AsyncMutex<Opener>>, id: String) -> io::Result<Self> {
-        Self::prepare_at(opener, id, CAPTURE_PORT, PROXY_PORT, DNS_PORT).await
+    pub(crate) async fn prepare(outward: Arc<Outward>, id: String) -> io::Result<Self> {
+        Self::prepare_at(outward, id, CAPTURE_PORT, PROXY_PORT, DNS_PORT).await
     }
-    async fn prepare_at(
-        opener: Arc<AsyncMutex<Opener>>,
-        id: String,
-        capture_port: u16,
-        proxy_port: u16,
-        dns_port: u16,
-    ) -> io::Result<Self> {
+    async fn prepare_at(outward: Arc<Outward>, id: String, capture_port: u16, proxy_port: u16, dns_port: u16) -> io::Result<Self> {
         if !cfg!(target_os = "linux") {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"));
         }
@@ -388,7 +376,7 @@ impl Capture {
         let map = Arc::new(Mutex::new(FakeDns::default()));
         let id = Arc::new(Mutex::new(id));
         let state = CaptureState {
-            opener,
+            outward,
             id: id.clone(),
             map: map.clone(),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
@@ -622,18 +610,16 @@ mod tests {
     #[tokio::test]
     async fn redirected_and_explicit_proxy_use_vessel_forward() {
         use crate::{Agent, Client, Endpoint};
-        use drydock_transport::{Limits, Transport};
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
-        let (host, guest) = (host.unwrap(), guest.unwrap());
-        let opener = Arc::new(AsyncMutex::new(guest.opener.clone()));
+        let (dialer, listener) = drydock_transport::memory();
         let dir = tempfile::tempdir().unwrap();
-        let agent = tokio::spawn(Agent::new(guest, "test".into(), dir.path().join("agent")).run());
-        let client = Client::connect(host, "test").await.unwrap();
+        let agent = Agent::new(listener, "test".into(), dir.path().join("agent"));
+        // The agent's own outward connections, which the client below claims.
+        let outward = agent.shared.outward.clone();
+        let agent = tokio::spawn(agent.run());
+        let client = Client::connect(dialer.connect().await.unwrap(), "test").await.unwrap();
         let proxy = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
         client.register_host_endpoint("egress".into(), Endpoint::Tcp(proxy.local_addr().unwrap())).unwrap();
-        let capture = Capture::prepare_at(opener.clone(), "egress".into(), 0, 0, 0).await.unwrap();
+        let capture = Capture::prepare_at(outward.clone(), "egress".into(), 0, 0, 0).await.unwrap();
         let mut query = Message::new();
         query.set_id(123).add_query(Query::query(Name::from_ascii("original.example.").unwrap(), RecordType::A));
         let query_bytes = query.to_vec().unwrap();
@@ -687,7 +673,7 @@ mod tests {
                 (Box::new(TcpStream::connect(capture.proxy_address).await.unwrap()), None)
             } else {
                 let (tool, agent_stream) = tokio::io::duplex(4096);
-                let remote = upstream(&opener, "egress".into()).await.unwrap();
+                let remote = upstream(&outward, "egress".into()).await.unwrap();
                 let authority = authority.clone();
                 (
                     Box::new(tool),
@@ -726,16 +712,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires tools/test-agent-egress.sh (root, nftables and isolated namespaces)"]
     async fn kernel_redirect() {
-        use crate::{Agent, Client, Configuration, Egress, Endpoint, Exec, HostForward};
-        use drydock_transport::{Limits, Transport};
+        use crate::{Agent, Client, Configuration, Egress, Endpoint, Exec, InwardForward};
         assert!(std::env::var_os("DRYDOCK_EGRESS_NETNS").is_some(), "use tools/test-agent-egress.sh");
         assert_ne!(std::fs::read_link("/proc/self/ns/net").unwrap(), std::fs::read_link("/proc/1/ns/net").unwrap());
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
+        let (dialer, listener) = drydock_transport::memory();
         let dir = tempfile::tempdir().unwrap();
-        let agent = tokio::spawn(Agent::new(guest.unwrap(), "test".into(), dir.path().join("agent")).run());
-        let client = Client::connect(host.unwrap(), "test").await.unwrap();
+        let agent = tokio::spawn(Agent::new(listener, "test".into(), dir.path().join("agent")).run());
+        let client = Client::connect(dialer.connect().await.unwrap(), "test").await.unwrap();
         let proxy = tokio::net::UnixListener::bind(dir.path().join("proxy")).unwrap();
         client.register_host_endpoint("egress".into(), Endpoint::Unix(dir.path().join("proxy"))).unwrap();
         client
@@ -797,14 +780,17 @@ mod tests {
         // Agent-originated TCP sockets must escape capture, even though the
         // child's sockets (same process UID) did not.
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        client.put_host_forward(HostForward { id: "agent-tcp".into(), endpoint: Endpoint::Tcp(echo.local_addr().unwrap()) }).await.unwrap();
+        client
+            .put_inward_forward(InwardForward { id: "agent-tcp".into(), endpoint: Endpoint::Tcp(echo.local_addr().unwrap()) })
+            .await
+            .unwrap();
         let echo_task = tokio::spawn(async move {
             let (mut stream, _) = echo.accept().await.unwrap();
             let mut b = [0; 1];
             stream.read_exact(&mut b).await.unwrap();
             stream.write_all(&b).await.unwrap();
         });
-        let mut stream = client.forward("agent-tcp").await.unwrap();
+        let mut stream = client.open_inward("agent-tcp").await.unwrap();
         stream.write_all(b"x").await.unwrap();
         assert_eq!(stream.read_u8().await.unwrap(), b'x');
         echo_task.await.unwrap();
@@ -883,12 +869,9 @@ mod tests {
     // DNS sockets cannot grow an unbounded set of proxy or capture streams.
     #[tokio::test]
     async fn capture_connection_budget_is_shared_and_released() {
-        use drydock_transport::{Limits, Transport};
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
-        let (_host, guest) = (host.unwrap(), guest.unwrap());
-        let capture = Capture::prepare_at(Arc::new(AsyncMutex::new(guest.opener.clone())), "proxy".into(), 0, 0, 0).await.unwrap();
+        let events = Arc::new(crate::events::Events::new("test".into()));
+        let outward = Arc::new(Outward::new(events, crate::streams::CLAIM_DEADLINE));
+        let capture = Capture::prepare_at(outward, "proxy".into(), 0, 0, 0).await.unwrap();
         let mut held = Vec::new();
         for _ in 0..MAX_CONNECTIONS {
             held.push(TcpStream::connect(capture.dns_address).await.unwrap());
@@ -925,24 +908,6 @@ mod tests {
         stream.read_exact(&mut answer).await.unwrap();
         assert_eq!(Message::from_vec(&answer).unwrap().answers().len(), 1);
         capture.stop().await;
-    }
-
-    // A host endpoint that never acknowledges its forward opening must release
-    // the guest's pending stream after the opening deadline, not pin it forever.
-    #[tokio::test(start_paused = true)]
-    async fn upstream_opening_has_a_deadline() {
-        use drydock_transport::{Limits, Transport};
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
-        let (mut host, guest) = (host.unwrap(), guest.unwrap());
-        let opener = Arc::new(AsyncMutex::new(guest.opener.clone()));
-        let pending = tokio::spawn(async move { upstream(&opener, "never-acknowledges".into()).await });
-        // Network-boundary stand-in: accept the real forward but never ack it.
-        let _hung_endpoint = host.accept().await.unwrap().unwrap();
-        tokio::time::advance(Duration::from_secs(31)).await;
-        let result = tokio::time::timeout(Duration::from_secs(1), pending).await.unwrap().unwrap();
-        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::TimedOut);
     }
 
     // Reject over-limit DNS frames from their length prefix, before allocating

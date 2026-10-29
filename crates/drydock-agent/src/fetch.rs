@@ -1,20 +1,20 @@
 //! Downloads by digest into the digest-named staging: an upstream URL or an
 //! OCI registry blob. Requests leave through the agent's configured egress
 //! like any other guest traffic: with egress, each connection is a CONNECT on
-//! a fresh stream of the egress upstream forward, trusting the configured CA
+//! a fresh outward connection of the egress upstream forward, trusting the configured CA
 //! bundle; without it, the agent connects directly and trusts the system's
 //! roots. Bytes stream to disk as they arrive and are hashed on the way; an
 //! interrupted body resumes from the staged length with `Range` when the
 //! source honours it, and restarts otherwise.
 use crate::{ErrorKind, RegistryCredential, egress, store::free_space};
 use bytes::Bytes;
-use drydock_transport::{ByteStream, Opener};
+use drydock_transport::ByteStream;
 use http::{StatusCode, header};
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Incoming;
 use sha2::{Digest, Sha256};
 use std::{io, path::Path, sync::Arc, time::Duration};
-use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 /// Connecting, including any CONNECT and TLS handshake.
@@ -32,7 +32,7 @@ pub(crate) enum Network {
     /// Through the configured egress upstream forward, as captured guest
     /// traffic goes; `ca` is the configured trust bundle.
     Upstream {
-        opener: Arc<AsyncMutex<Opener>>,
+        outward: Arc<crate::streams::Outward>,
         id: String,
         ca: String,
     },
@@ -193,8 +193,8 @@ impl Fetcher {
                     .map_err(|e| Failure::new("connect", e.kind().into(), format!("{authority}: {e}")))?;
                 Box::new(stream)
             }
-            Network::Upstream { opener, id, .. } => {
-                let mut remote = egress::upstream(opener, id.clone())
+            Network::Upstream { outward, id, .. } => {
+                let mut remote = egress::upstream(outward, id.clone())
                     .await
                     .map_err(|e| Failure { message: format!("egress upstream {id} unavailable: {e}"), ..Failure::io("egress", e) })?;
                 match egress::connect(&mut remote, &authority).await {
@@ -584,14 +584,13 @@ fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::Endpoint;
-    use drydock_transport::{Limits, Purpose, Transport};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The egress upstream's policy: a CONNECT proxy (the host side of the
     /// vessel's egress forward) that refuses `blocked.test` with an RFC 9209
     /// Proxy-Status naming the policy, and tunnels `origin.test:443` to a TLS
     /// origin whose certificate only the test CA vouches for.
-    async fn egress(dir: &Path) -> (Transport, Network) {
+    async fn egress(dir: &Path) -> Network {
         let proxy = dir.join("proxy");
         let listener = tokio::net::UnixListener::bind(&proxy).unwrap();
         let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -640,25 +639,11 @@ mod tests {
                 });
             }
         });
-        // The vessel's transport: the agent opens the egress forward by ID,
-        // and the host serves it to the proxy, as `Client` does.
-        let (a, b) = tokio::io::duplex(1 << 16);
-        let (host, guest) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
-        let mut host = host.unwrap();
-        let guest = guest.unwrap();
-        let endpoint = Endpoint::Unix(proxy);
-        tokio::spawn(async move {
-            while let Ok(Some(incoming)) = host.accept().await {
-                if let Purpose::Forward { id } = incoming.purpose {
-                    let endpoint = endpoint.clone();
-                    tokio::spawn(async move { crate::forward::serve(incoming.stream, &id, Some(&endpoint)).await });
-                }
-            }
-        });
+        // The agent announces each egress connection, and the host claims
+        // it to the proxy, as `Client` does.
+        let outward = crate::streams::tests::claimed(Endpoint::Unix(proxy));
         let ca = String::from_utf8(include_bytes!("../tests/fixtures/egress-ca.pem").to_vec()).unwrap();
-        let opener = Arc::new(AsyncMutex::new(guest.opener.clone()));
-        (guest, Network::Upstream { opener, id: "egress".into(), ca })
+        Network::Upstream { outward, id: "egress".into(), ca }
     }
 
     // With egress configured, a fetch goes out through the egress upstream
@@ -668,7 +653,7 @@ mod tests {
     #[tokio::test]
     async fn fetches_leave_through_egress_and_a_blocked_source_names_the_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let (_guest, network) = egress(dir.path()).await;
+        let network = egress(dir.path()).await;
         let mut fetcher = Fetcher::new(network);
         let staging = dir.path().join("staging");
         let digest = format!("{:x}", Sha256::digest(b"harness"));

@@ -1,478 +1,128 @@
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::Request,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use bytes::Bytes;
-use drydock_transport::{Limits, Purpose, Transport, http2, native::UnixConnections, ssh};
-use http_body_util::{BodyExt, Full};
-use std::{io, sync::Arc, time::Duration};
+use drydock_transport::{ByteStream, Listener, http, ssh};
+use http_body_util::{BodyExt, Empty, Full};
+use std::{io, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
-    task::{JoinHandle, JoinSet},
+    net::UnixListener,
 };
-
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Unix,
-    Ssh,
-    SshGateway,
-    Yamux,
-}
-struct Pair {
-    host: Transport,
-    guest: Transport,
-    _dir: tempfile::TempDir,
-    tasks: Vec<JoinHandle<()>>,
-}
-impl Drop for Pair {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-async fn pair(kind: Kind) -> Pair {
-    let dir = tempfile::tempdir().unwrap();
-    let mut tasks = Vec::new();
-    let (host, guest) = match kind {
-        Kind::Yamux => {
-            let (a, b) = tokio::io::duplex(4096);
-            let (a, b) = tokio::join!(
-                Transport::yamux(Box::new(a), true, Limits::default()),
-                Transport::yamux(Box::new(b), false, Limits::default())
-            );
-            (a.unwrap(), b.unwrap())
-        }
-        Kind::Unix => {
-            let hp = dir.path().join("host");
-            let gp = dir.path().join("guest");
-            let hl = UnixListener::bind(&hp).unwrap();
-            let gl = UnixListener::bind(&gp).unwrap();
-            (
-                Transport::native(Arc::new(UnixConnections::new(hl, &gp)), Limits::default()).unwrap(),
-                Transport::native(Arc::new(UnixConnections::new(gl, &hp)), Limits::default()).unwrap(),
-            )
-        }
-        Kind::Ssh => {
-            let gp = dir.path().join("guest").to_str().unwrap().to_owned();
-            let rp = dir.path().join("reverse").to_str().unwrap().to_owned();
-            let listener = UnixListener::bind(&gp).unwrap();
-            let (config, child) = ssh_server(dir.path(), &gp, &rp).await;
-            tasks.push(tokio::spawn(async move {
-                let mut child = child;
-                let _ = child.wait().await;
-            }));
-            let host = ssh::connect(config, Limits::default()).await.unwrap();
-            assert!(std::path::Path::new(&rp).exists(), "connect must confirm the remote forward before returning");
-            let guest = Transport::native(Arc::new(UnixConnections::new(listener, rp)), Limits::default()).unwrap();
-            (host, guest)
-        }
-        Kind::SshGateway => {
-            // The agent's native listener, with a guest-to-host socket that
-            // never exists: the gateway cannot create it.
-            let gp = dir.path().join("guest");
-            let listener = UnixListener::bind(&gp).unwrap();
-            let guest = Transport::native(Arc::new(UnixConnections::new(listener, dir.path().join("absent"))), Limits::default()).unwrap();
-            let (config, child) = sshd::start(dir.path(), &gp, ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
-            tasks.push(tokio::spawn(async move {
-                let mut child = child;
-                let _ = child.wait().await;
-            }));
-            let host = ssh::connect(config, Limits::default()).await.unwrap();
-            let mut guest = guest;
-            // Guest-to-host streams ride the host's link, so they can start only
-            // once the guest has accepted it, as the agent does after a request.
-            transfer(&host, &mut guest, Purpose::Control, b"link").await;
-            (host, guest)
-        }
-    };
-    Pair { host, guest, _dir: dir, tasks }
-}
 #[path = "support/sshd.rs"]
 mod sshd;
-async fn ssh_server(dir: &std::path::Path, guest: &str, reverse: &str) -> (ssh::SshConfig, tokio::process::Child) {
-    sshd::start(dir, guest.as_ref(), ssh::GuestStreams::ReverseForward(reverse.into()), sshd::Forwarding::Both).await
-}
-fn purposes() -> Vec<Purpose> {
-    vec![Purpose::Control, Purpose::Forward { id: "crew/α".into() }, Purpose::Forward { id: "service".into() }]
-}
-async fn transfer(from: &Transport, to: &mut Transport, purpose: Purpose, payload: &[u8]) {
-    let mut outgoing = from.open(purpose.clone()).await.unwrap();
-    let mut incoming = to.accept().await.unwrap().unwrap();
-    assert_eq!(incoming.purpose, purpose);
-    outgoing.write_all(payload).await.unwrap();
-    outgoing.shutdown().await.unwrap();
+
+/// Raw bytes in both directions with a half-close each way.
+async fn exchange(mut near: ByteStream, mut far: ByteStream, payload: &[u8]) {
+    near.write_all(payload).await.unwrap();
+    near.shutdown().await.unwrap();
     let mut bytes = Vec::new();
-    incoming.stream.read_to_end(&mut bytes).await.unwrap();
+    far.read_to_end(&mut bytes).await.unwrap();
     assert_eq!(bytes, payload);
     // Half-close preserves traffic in the reverse direction.
-    incoming.stream.write_all(b"reply").await.unwrap();
-    incoming.stream.shutdown().await.unwrap();
+    far.write_all(b"reply").await.unwrap();
+    far.shutdown().await.unwrap();
     bytes.clear();
-    outgoing.read_to_end(&mut bytes).await.unwrap();
+    near.read_to_end(&mut bytes).await.unwrap();
     assert_eq!(bytes, b"reply");
 }
 
-// ADR 0070: every purpose routes in both directions, preserving arbitrary raw
-// bytes and half-close. Duplicate purposes are separate streams.
-async fn routing_contract(kind: Kind) {
-    let mut p = pair(kind).await;
-    for purpose in purposes().into_iter().chain(purposes()) {
-        transfer(&p.host, &mut p.guest, purpose.clone(), b"\0arbitrary\xffpayload").await;
-        transfer(&p.guest, &mut p.host, purpose, b"").await;
-    }
-}
-
-// ADR 0070: a slow raw stream must not hold up either long-lived link. This
-// contract also checks yamux's per-stream flow control and concurrent HTTP/2 calls.
-async fn isolation_contract(kind: Kind) {
-    for reverse in [false, true] {
-        let mut p = pair(kind).await;
-        let purpose = Purpose::Forward { id: "slow".into() };
-        let mut raw = if reverse { p.guest.open(purpose).await.unwrap() } else { p.host.open(purpose).await.unwrap() };
-        let _unread = if reverse { p.host.accept().await.unwrap().unwrap() } else { p.guest.accept().await.unwrap().unwrap() };
-        let writer = tokio::spawn(async move { raw.write_all(&vec![7; 16 * 1024 * 1024]).await });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!writer.is_finished(), "fixture must actually backpressure the raw stream");
-        let host_opener = p.host.opener.clone();
-        let guest_opener = p.guest.opener.clone();
-        for (from, to, purpose) in [(host_opener, &mut p.guest, Purpose::Control), (guest_opener, &mut p.host, Purpose::Control)] {
-            let (client, driver) = http2::connect(&from, purpose).await.unwrap();
-            let incoming = to.accept().await.unwrap().unwrap();
-            let server = tokio::spawn(http2::serve(incoming, Router::new().route("/hello", get(|| async { "hello" }))));
-            let mut calls = JoinSet::new();
-            for _ in 0..12 {
-                let mut client = client.clone();
-                calls.spawn(async move {
-                    let response = client
-                        .send_request(hyper::Request::builder().uri("http://agent/hello").body(Full::new(Bytes::new())).unwrap())
-                        .await
-                        .unwrap();
-                    assert_eq!(response.version(), hyper::Version::HTTP_2);
-                    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "hello");
-                });
-            }
-            while let Some(call) = calls.join_next().await {
-                call.unwrap();
-            }
-            driver.abort();
-            server.abort();
-        }
-        assert!(!writer.is_finished());
-        writer.abort();
-    }
-}
-macro_rules! contract {
-    ($name:ident, $kind:expr, $contract:ident) => {
-        #[tokio::test]
-        async fn $name() {
-            tokio::time::timeout(Duration::from_secs(20), $contract($kind)).await.expect("contract timed out");
-        }
-    };
-}
-contract!(unix_routes, Kind::Unix, routing_contract);
-contract!(ssh_routes, Kind::Ssh, routing_contract);
-contract!(ssh_gateway_routes, Kind::SshGateway, routing_contract);
-contract!(yamux_routes, Kind::Yamux, routing_contract);
-contract!(unix_isolation, Kind::Unix, isolation_contract);
-contract!(ssh_isolation, Kind::Ssh, isolation_contract);
-contract!(ssh_gateway_isolation, Kind::SshGateway, isolation_contract);
-contract!(yamux_isolation, Kind::Yamux, isolation_contract);
-
-// Generated operation sequences exercise both opening directions and every
-// purpose; the routing and byte conservation invariants hold after every step.
-#[hegel::test]
-fn generated_bidirectional_routes(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(10));
-    let operations: Vec<_> = (0..count)
-        .map(|_| {
-            (
-                tc.draw(gs::booleans()),
-                tc.draw(gs::integers::<usize>().min_value(0).max_value(purposes().len() - 1)),
-                tc.draw(gs::integers::<usize>().min_value(0).max_value(4096)),
-            )
-        })
-        .collect();
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            for kind in [Kind::Unix, Kind::Ssh, Kind::SshGateway, Kind::Yamux] {
-                let mut p = pair(kind).await;
-                for &(reverse, tag, length) in &operations {
-                    let purpose = purposes()[tag].clone();
-                    let data: Vec<_> = (0..length).map(|i| i as u8).collect();
-                    if reverse {
-                        transfer(&p.guest, &mut p.host, purpose, &data).await;
-                    } else {
-                        transfer(&p.host, &mut p.guest, purpose, &data).await;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
-    });
-}
-
-// Native negotiation is per connection: an unfinished or malformed preface
-// cannot block a valid subsequent stream. A cancelled accept loses no stream.
-#[tokio::test]
-async fn native_partial_header_and_cancelled_accept() {
-    let mut p = pair(Kind::Unix).await;
-    let _partial = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(10), p.guest.accept()).await.is_err());
-    tokio::time::timeout(Duration::from_secs(2), transfer(&p.host, &mut p.guest, Purpose::Control, b"ok")).await.unwrap();
-    let mut invalid = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
-    invalid.write_all(b"wrong").await.unwrap();
-    let error = p.guest.accept().await.err().unwrap();
-    assert_eq!(error.scope, drydock_transport::ErrorScope::Connection);
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    transfer(&p.host, &mut p.guest, Purpose::Control, b"still healthy").await;
-}
-
-// Every native kind can carry the yamux fallback, using the same connection
-// preface detection and purpose routing as direct single-stream connections.
-async fn fallback_contract() {
-    let mut p = pair(Kind::Unix).await;
-    let stream = UnixStream::connect(p._dir.path().join("guest")).await.unwrap();
-    let mut mux = Transport::yamux(Box::new(stream), true, Limits::default()).await.unwrap();
-    for purpose in purposes() {
-        transfer(&mux, &mut p.guest, purpose.clone(), b"fallback").await;
-        transfer(&p.guest, &mut mux, purpose, b"reverse fallback").await;
-    }
-}
-
-// Both sides may open many streams at once; each target and payload remains
-// attached to its own stream, including duplicate purpose headers.
-async fn concurrent_contract(kind: Kind) {
-    let mut p = pair(kind).await;
-    let mut tasks = JoinSet::new();
-    for opener in [p.host.opener.clone(), p.guest.opener.clone()] {
-        tasks.spawn(async move {
-            let mut writers = JoinSet::new();
-            for i in 0..16u8 {
-                let opener = opener.clone();
-                writers.spawn(async move {
-                    let mut stream = opener.open(Purpose::Forward { id: format!("service-{i}") }).await.unwrap();
-                    stream.write_all(&[i]).await.unwrap();
-                    stream.shutdown().await.unwrap();
-                });
-            }
-            while let Some(result) = writers.join_next().await {
-                result.unwrap();
-            }
-        });
-    }
-    for peer in [&mut p.host, &mut p.guest] {
-        let mut seen = Vec::new();
-        for _ in 0..16 {
-            let mut incoming = peer.accept().await.unwrap().unwrap();
+/// A route that turns its request into a byte stream echoing what it reads,
+/// as the agent's stream routes do: 200 to an extended CONNECT, 101 to an
+/// HTTP/1.1 upgrade.
+fn echo_router() -> Router {
+    async fn stream(mut request: Request) -> Response {
+        let Some(upgrade) = request.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        tokio::spawn(async move {
+            let mut stream = http::upgraded(upgrade).await.unwrap();
             let mut bytes = Vec::new();
-            incoming.stream.read_to_end(&mut bytes).await.unwrap();
-            assert_eq!(bytes.len(), 1);
-            assert_eq!(incoming.purpose, Purpose::Forward { id: format!("service-{}", bytes[0]) });
-            seen.push(bytes[0]);
-        }
-        seen.sort();
-        assert_eq!(seen, (0..16).collect::<Vec<_>>());
-    }
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap();
-    }
-}
-contract!(unix_concurrent, Kind::Unix, concurrent_contract);
-contract!(ssh_concurrent, Kind::Ssh, concurrent_contract);
-contract!(ssh_gateway_concurrent, Kind::SshGateway, concurrent_contract);
-contract!(yamux_concurrent, Kind::Yamux, concurrent_contract);
-
-// The reach recipe pins the host key and the vessel identity key. An unknown
-// host or a rejected identity never yields a usable transport.
-#[tokio::test]
-async fn ssh_rejects_wrong_host_and_identity_keys() {
-    for wrong_host in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let guest = dir.path().join("guest");
-        let reverse = dir.path().join("reverse");
-        let (mut config, mut child) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
-        if wrong_host {
-            config.host_key = std::fs::read_to_string(dir.path().join("user_key.pub")).unwrap().trim().into();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        if request.method() == axum::http::Method::CONNECT {
+            StatusCode::OK.into_response()
         } else {
-            config.identity_file = dir.path().join("host_key");
+            (StatusCode::SWITCHING_PROTOCOLS, [(header::CONNECTION, "upgrade"), (header::UPGRADE, http::BYTE_STREAM)]).into_response()
         }
-        let result = ssh::connect(config, Limits::default()).await;
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::ConnectionAborted);
-        child.kill().await.unwrap();
     }
+    Router::new().route("/hello", get(|| async { "hello" })).route("/stream", get(stream).connect(stream))
 }
 
-// Dropping the transport terminates its owned SSH session, closing the remote
-// listener. No forwarding process survives its vessel transport.
+// One socket serves HTTP/1.1 and HTTP/2 by prior knowledge, as curl and
+// drydock speak them, and either turns a request into a raw byte stream:
+// extended CONNECT on HTTP/2, GET with Upgrade on HTTP/1.1.
 #[tokio::test]
-async fn ssh_transport_drop_closes_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let reverse = dir.path().join("reverse");
-    let (config, mut child) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
-    let transport = ssh::connect(config, Limits::default()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !reverse.exists() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+async fn one_socket_serves_both_http_versions_and_their_byte_streams() {
+    let (dialer, mut listener) = drydock_transport::memory();
+    tokio::spawn(async move {
+        while let Ok(stream) = listener.accept().await {
+            tokio::spawn(http::serve(stream, echo_router()));
         }
-    })
-    .await
-    .unwrap();
-    assert!(UnixStream::connect(&reverse).await.is_ok());
-    drop(transport);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if UnixStream::connect(&reverse).await.is_err() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("SSH remote listener must close after transport drop");
-    child.kill().await.unwrap();
-}
+    });
 
-// Invalid limits are refused before any driver/socket task can start.
-#[tokio::test]
-async fn refuses_zero_limits() {
-    for limits in [
-        Limits { queue: 0, ..Limits::default() },
-        Limits { pending_headers: 0, ..Limits::default() },
-        Limits { max_sessions: 0, ..Limits::default() },
-        Limits { header_timeout: Duration::ZERO, ..Limits::default() },
-    ] {
-        let (a, _b) = tokio::io::duplex(8);
-        let result = Transport::yamux(Box::new(a), true, limits).await;
-        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidInput);
-    }
-}
+    let (mut client, driver) = http::connect::<Empty<Bytes>>(dialer.connect().await.unwrap()).await.unwrap();
+    let hello = client.send_request(hyper::Request::get("/hello").body(Empty::new()).unwrap()).await.unwrap();
+    assert_eq!(hello.into_body().collect().await.unwrap().to_bytes(), "hello");
+    let mut connect = hyper::Request::connect("http://agent/stream").body(Empty::new()).unwrap();
+    connect.extensions_mut().insert(hyper::ext::Protocol::from_static(http::BYTE_STREAM));
+    let mut response = client.send_request(connect).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let upgrade = response.extensions_mut().remove::<hyper::upgrade::OnUpgrade>().unwrap();
+    let (near, far) = tokio::io::duplex(1024);
+    let echoed = tokio::spawn(async move {
+        let mut stream = http::upgraded(upgrade).await.unwrap();
+        let mut far: ByteStream = Box::new(far);
+        tokio::io::copy_bidirectional(&mut stream, &mut far).await.unwrap();
+    });
+    let mut near: ByteStream = Box::new(near);
+    near.write_all(b"over h2\0\xff").await.unwrap();
+    near.shutdown().await.unwrap();
+    let mut bytes = Vec::new();
+    near.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"over h2\0\xff");
+    echoed.await.unwrap();
+    driver.abort();
 
-#[tokio::test]
-async fn yamux_fallback_on_native_listener() {
-    tokio::time::timeout(Duration::from_secs(2), fallback_contract()).await.expect("native listener must use yamux for reverse opens");
-}
-
-// Socket-boundary fault injection: all successful accepts still use the real
-// Unix listener. Transient accept failures must be reported as retrying and
-// must not prevent a later connection from reaching the public accept API.
-struct FaultyAccept {
-    native: UnixConnections,
-    failures: tokio::sync::Mutex<std::collections::VecDeque<io::Error>>,
-}
-#[async_trait::async_trait]
-impl drydock_transport::Connections for FaultyAccept {
-    async fn connect(&self) -> io::Result<drydock_transport::ByteStream> {
-        self.native.connect().await
-    }
-    async fn accept(&self) -> io::Result<drydock_transport::ByteStream> {
-        if let Some(error) = self.failures.lock().await.pop_front() {
-            return Err(error);
-        }
-        self.native.accept().await
-    }
-}
-#[tokio::test]
-async fn transient_accept_errors_recover_and_terminal_errors_end() {
-    use drydock_transport::ErrorScope;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("listen");
-    let errors = vec![
-        io::Error::from(io::ErrorKind::ConnectionAborted),
-        io::Error::from_raw_os_error(libc::EMFILE),
-        io::Error::from_raw_os_error(libc::ENFILE),
-    ];
-    let source = FaultyAccept {
-        native: UnixConnections::new(UnixListener::bind(&path).unwrap(), dir.path().join("peer")),
-        failures: tokio::sync::Mutex::new(errors.into()),
-    };
-    let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
-    for _ in 0..3 {
-        let error = transport.accept().await.err().unwrap();
-        assert_eq!(error.scope, ErrorScope::Retrying);
-    }
-    let mut stream = UnixStream::connect(&path).await.unwrap();
-    stream.write_all(b"DDT\x01\x00\x00").await.unwrap();
-    let incoming = tokio::time::timeout(Duration::from_secs(2), transport.accept()).await.unwrap().unwrap().unwrap();
-    assert_eq!(incoming.purpose, Purpose::Control);
-    let fatal_path = dir.path().join("fatal");
-    let fatal = FaultyAccept {
-        native: UnixConnections::new(UnixListener::bind(fatal_path).unwrap(), path),
-        failures: tokio::sync::Mutex::new(vec![io::Error::from(io::ErrorKind::BrokenPipe)].into()),
-    };
-    let mut transport = Transport::native(Arc::new(fatal), Limits::default()).unwrap();
-    assert_eq!(transport.accept().await.err().unwrap().scope, ErrorScope::Terminal);
-    assert!(transport.accept().await.unwrap().is_none());
-}
-
-// Established yamux sessions have a separate bound. Even with one pending
-// header slot, multiple established sessions must not block new native streams.
-#[tokio::test]
-async fn established_yamux_sessions_release_header_slots() {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("listen");
-        let mut transport = Transport::native(
-            Arc::new(UnixConnections::new(UnixListener::bind(&path).unwrap(), dir.path().join("unreachable"))),
-            Limits { pending_headers: 1, ..Limits::default() },
-        )
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(hyper_util::rt::TokioIo::new(dialer.connect().await.unwrap()))
+            .await
+            .unwrap();
+    tokio::spawn(connection.with_upgrades());
+    let hello = sender.send_request(hyper::Request::get("/hello").header("host", "agent").body(Empty::new()).unwrap()).await.unwrap();
+    assert_eq!(hello.into_body().collect().await.unwrap().to_bytes(), "hello");
+    let upgrade = hyper::Request::get("/stream")
+        .header("host", "agent")
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, http::BYTE_STREAM)
+        .body(Empty::new())
         .unwrap();
-        let mut sessions = Vec::new();
-        for _ in 0..3 {
-            let stream = UnixStream::connect(&path).await.unwrap();
-            let mux = Transport::yamux(Box::new(stream), true, Limits::default()).await.unwrap();
-            let _stream = mux.open(Purpose::Control).await.unwrap();
-            assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-            sessions.push(mux);
-        }
-        let mut raw = UnixStream::connect(&path).await.unwrap();
-        raw.write_all(b"DDT\x01\x00\x00").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-    })
-    .await
-    .expect("live mux sessions must not consume unfinished-header slots");
+    let response = sender.send_request(upgrade).await.unwrap();
+    assert_eq!(response.status(), 101);
+    let mut stream = http::upgraded(hyper::upgrade::on(response)).await.unwrap();
+    stream.write_all(b"over h1").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, b"over h1");
 }
 
-// With sshd's documented StreamLocalBindUnlink setting, a stale reverse path
-// from an earlier session can be reused. The forward is ready immediately.
-#[tokio::test]
-async fn ssh_reconnect_replaces_stale_remote_socket() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let reverse = dir.path().join("reverse");
-    let (config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
-    for _ in 0..2 {
-        if reverse.exists() {
-            std::fs::remove_file(&reverse).unwrap();
-        }
-        drop(UnixListener::bind(&reverse).unwrap());
-        let transport = ssh::connect(config.clone(), Limits::default()).await.unwrap();
-        assert!(UnixStream::connect(&reverse).await.is_ok());
-        drop(transport);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while UnixStream::connect(&reverse).await.is_ok() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-    server.kill().await.unwrap();
-}
-
-// Link clients accept streaming request bodies; both chunks must arrive intact
+// Clients accept streaming request bodies; both chunks must arrive intact
 // through the same HTTP/2 connection rather than requiring a fully buffered body.
 #[tokio::test]
 async fn http2_streaming_request_body() {
-    let mut p = pair(Kind::Yamux).await;
-    let (mut client, driver) = http2::connect_with_body(&p.host.opener, Purpose::Control).await.unwrap();
-    let incoming = p.guest.accept().await.unwrap().unwrap();
+    let (near, far) = tokio::io::duplex(4096);
     let server =
-        tokio::spawn(http2::serve(incoming, Router::new().route("/upload", axum::routing::post(|body: Bytes| async move { body }))));
+        tokio::spawn(http::serve(Box::new(far), Router::new().route("/upload", axum::routing::post(|body: Bytes| async move { body }))));
     let frames = ["first", "second"].map(|s| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from_static(s.as_bytes()))));
     let body = http_body_util::StreamBody::new(futures::stream::iter(frames));
+    let (mut client, driver) = http::connect(Box::new(near)).await.unwrap();
     let response =
         client.send_request(hyper::Request::builder().method("POST").uri("http://agent/upload").body(body).unwrap()).await.unwrap();
     assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "firstsecond");
@@ -481,16 +131,15 @@ async fn http2_streaming_request_body() {
 }
 
 // A link whose peer stops polling must fail via HTTP/2 keepalive, even when the
-// underlying yamux and byte stream remain open. Paused time avoids wall-clock waits.
+// underlying byte stream remains open. Paused time avoids wall-clock waits.
 #[tokio::test(start_paused = true)]
 async fn http2_keepalive_detects_silent_peer() {
-    let mut p = pair(Kind::Yamux).await;
-    let (mut client, driver) = http2::connect(&p.host.opener, Purpose::Control).await.unwrap();
-    let incoming = p.guest.accept().await.unwrap().unwrap();
+    let (near, far) = tokio::io::duplex(4096);
+    let (mut client, driver) = http::connect::<Full<Bytes>>(Box::new(near)).await.unwrap();
     let (pause, paused) = tokio::sync::oneshot::channel();
     let (ack, received) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let serve = http2::serve(incoming, Router::new().route("/hello", get(|| async { "hello" })));
+        let serve = http::serve(Box::new(far), Router::new().route("/hello", get(|| async { "hello" })));
         tokio::pin!(serve);
         tokio::select! {
             result = &mut serve => { result.unwrap(); }
@@ -511,104 +160,45 @@ async fn http2_keepalive_detects_silent_peer() {
     server.abort();
 }
 
-// Bounding fallback session count must refuse only the excess session while
-// keeping the native listener and the earlier session usable.
+// Through a real OpenSSH server that grants only local forwards, as Daytona's
+// gateway does, the connection reaches the agent socket and carries raw
+// bytes both ways with half-close. Dropping it ends the session, closing
+// the agent's end too.
 #[tokio::test]
-async fn fallback_session_limit_preserves_native_accepts() {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("listen");
-        let mut transport = Transport::native(
-            Arc::new(UnixConnections::new(UnixListener::bind(&path).unwrap(), dir.path().join("peer"))),
-            Limits { max_sessions: 1, ..Limits::default() },
-        )
-        .unwrap();
-        let first = Transport::yamux(Box::new(UnixStream::connect(&path).await.unwrap()), true, Limits::default()).await.unwrap();
-        let _stream = first.open(Purpose::Control).await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-        let _excess = Transport::yamux(Box::new(UnixStream::connect(&path).await.unwrap()), true, Limits::default()).await.unwrap();
-        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Connection);
-        let mut raw = UnixStream::connect(&path).await.unwrap();
-        raw.write_all(b"DDT\x01\x00\x00").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-        let _stream = first.open(Purpose::Control).await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-    })
-    .await
-    .unwrap();
-}
-
-// Scripted socket boundary: queue one valid stream, then a transient failure.
-// A full application queue must not prevent the listener from requesting the
-// next connection; dropping a transient diagnostic is safe under overload.
-struct ScriptedAccept {
-    incoming: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<io::Result<drydock_transport::ByteStream>>>,
-    attempts: std::sync::atomic::AtomicUsize,
-}
-#[async_trait::async_trait]
-impl drydock_transport::Connections for ScriptedAccept {
-    async fn connect(&self) -> io::Result<drydock_transport::ByteStream> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-    async fn accept(&self) -> io::Result<drydock_transport::ByteStream> {
-        self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.incoming.lock().await.recv().await.unwrap_or_else(|| Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-    }
-}
-#[tokio::test]
-async fn full_queue_does_not_block_transient_accept_recovery() {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let (send, incoming) = tokio::sync::mpsc::channel(4);
-        let source =
-            Arc::new(ScriptedAccept { incoming: tokio::sync::Mutex::new(incoming), attempts: std::sync::atomic::AtomicUsize::new(0) });
-        let mut transport = Transport::native(source.clone(), Limits { queue: 1, pending_headers: 1, ..Limits::default() }).unwrap();
-        let (mut client, accepted) = tokio::io::duplex(32);
-        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream)).await.ok().unwrap();
-        client.write_all(b"DDT\x01\x00\x00").await.unwrap();
-        while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        // pending_headers=1 means the first stream is already queued here.
-        send.send(Err(io::Error::from_raw_os_error(libc::EMFILE))).await.ok().unwrap();
-        while source.attempts.load(std::sync::atomic::Ordering::SeqCst) < 3 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-        let (mut next, accepted) = tokio::io::duplex(32);
-        send.send(Ok(Box::new(accepted) as drydock_transport::ByteStream)).await.ok().unwrap();
-        next.write_all(b"DDT\x01\x00\x00").await.unwrap();
-        assert_eq!(transport.accept().await.unwrap().unwrap().purpose, Purpose::Control);
-    })
-    .await
-    .expect("a dropped transient notice must not stall a full incoming queue");
-}
-
-// Resource exhaustion backs off exponentially up to one second. Aborted/reset
-// peer connections yield cooperatively without sleeping or throttling admission.
-#[tokio::test(start_paused = true)]
-async fn accept_backoff_distinguishes_resource_exhaustion_and_churn() {
+async fn ssh_reaches_the_agent_socket_and_drop_ends_the_session() {
     let dir = tempfile::tempdir().unwrap();
-    let mut errors: Vec<_> = (0..6).map(|_| io::Error::from_raw_os_error(libc::EMFILE)).collect();
-    errors.extend([
-        io::Error::from(io::ErrorKind::ConnectionAborted),
-        io::Error::from(io::ErrorKind::ConnectionReset),
-        io::Error::from_raw_os_error(libc::ENFILE),
-    ]);
-    let source = FaultyAccept {
-        native: UnixConnections::new(UnixListener::bind(dir.path().join("listen")).unwrap(), dir.path().join("peer")),
-        failures: tokio::sync::Mutex::new(errors.into()),
-    };
-    let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
-    let mut previous = tokio::time::Instant::now();
-    for delay in [0, 100, 200, 400, 800, 1000, 1000, 0, 0] {
-        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Retrying);
-        assert_eq!(previous.elapsed(), Duration::from_millis(delay));
-        previous = tokio::time::Instant::now();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (config, mut server) = sshd::start(dir.path(), &socket).await;
+    let near = ssh::connect(config.clone()).await.unwrap();
+    let (far, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    exchange(near, Box::new(far), b"through ssh\0\xff").await;
+
+    let near = ssh::connect(config).await.unwrap();
+    let (mut far, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+    drop(near);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), far.read_to_end(&mut rest)).await.expect("SSH session must end after drop").ok();
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn ssh_rejects_wrong_host_and_identity_keys() {
+    for wrong_host in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let (mut config, mut child) = sshd::start(dir.path(), &socket).await;
+        if wrong_host {
+            config.host_key = std::fs::read_to_string(dir.path().join("user_key.pub")).unwrap().trim().into();
+        } else {
+            config.identity_file = dir.path().join("host_key");
+        }
+        let error = ssh::connect(config).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        child.kill().await.unwrap();
     }
 }
 
-// Raw host-key validation refuses known-hosts directives, certificates and bad
-// key blobs before starting an SSH process, even with no usable identity file.
 #[tokio::test]
 async fn ssh_rejects_host_key_options_and_markers() {
     for key in [
@@ -627,107 +217,25 @@ async fn ssh_rejects_host_key_options_and_markers() {
             host_key: key.into(),
             identity_file: "/nonexistent-drydock-identity".into(),
             agent_socket: "/tmp/unused-agent".into(),
-            guest_streams: ssh::GuestStreams::ReverseForward("/tmp/unused-reverse".into()),
         };
-        let error = ssh::connect(config, Limits { header_timeout: Duration::from_millis(20), ..Limits::default() }).await.err().unwrap();
+        let error = ssh::connect(config).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }
 
-// A rejected remote forward must fail setup, and the same server remains usable
-// for a subsequent valid setup without changing its configuration or credentials.
+// SSH bootstrap has its own budget: a zero budget is refused and a silent
+// TCP endpoint obeys it.
 #[tokio::test]
-async fn ssh_rejected_forward_fails_setup_and_allows_retry() {
+async fn ssh_setup_obeys_its_connect_budget() {
     let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let reverse = dir.path().join("reverse");
-    let (mut config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
-    config.guest_streams = ssh::GuestStreams::ReverseForward(dir.path().join("missing-directory/reverse"));
-    assert_eq!(ssh::connect(config.clone(), Limits::default()).await.err().unwrap().kind(), io::ErrorKind::ConnectionAborted);
-    config.guest_streams = ssh::GuestStreams::ReverseForward(reverse.clone());
-    let transport = ssh::connect(config, Limits::default()).await.unwrap();
-    assert!(UnixStream::connect(reverse).await.is_ok());
-    drop(transport);
-    server.kill().await.unwrap();
-}
-
-// A persistently failing listener must eventually sleep rather than burning a
-// worker core. Short bursts retain the zero-delay connection-churn path.
-#[tokio::test(start_paused = true)]
-async fn persistent_connection_churn_has_a_floor_delay() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = FaultyAccept {
-        native: UnixConnections::new(UnixListener::bind(dir.path().join("listen")).unwrap(), dir.path().join("peer")),
-        failures: tokio::sync::Mutex::new((0..10).map(|_| io::Error::from(io::ErrorKind::ConnectionReset)).collect()),
-    };
-    let mut transport = Transport::native(Arc::new(source), Limits::default()).unwrap();
-    let start = tokio::time::Instant::now();
-    for _ in 0..10 {
-        assert_eq!(transport.accept().await.err().unwrap().scope, drydock_transport::ErrorScope::Retrying);
-    }
-    assert_eq!(start.elapsed(), Duration::from_millis(2));
-}
-
-// SSH bootstrap has its own budget. A tiny raw-header deadline must not abort
-// authentication; a silent TCP endpoint must obey the explicit connect budget.
-#[tokio::test]
-async fn ssh_setup_timeout_is_independent_of_raw_headers() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let reverse = dir.path().join("reverse");
-    let (mut config, mut server) = ssh_server(dir.path(), guest.to_str().unwrap(), reverse.to_str().unwrap()).await;
+    let (mut config, mut server) = sshd::start(dir.path(), &dir.path().join("agent.sock")).await;
     let mut invalid = config.clone();
     invalid.connect_timeout = Duration::ZERO;
-    assert_eq!(ssh::connect(invalid, Limits::default()).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
-    let transport = ssh::connect(config.clone(), Limits { header_timeout: Duration::from_nanos(1), ..Limits::default() }).await.unwrap();
-    assert!(reverse.exists());
-    drop(transport);
+    assert_eq!(ssh::connect(invalid).await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
     let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     config.port = silent.local_addr().unwrap().port();
     config.connect_timeout = Duration::from_millis(50);
-    let error = tokio::time::timeout(Duration::from_secs(2), ssh::connect(config, Limits::default())).await.unwrap().err().unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), ssh::connect(config)).await.unwrap().err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    server.kill().await.unwrap();
-}
-
-// A gateway that refuses remote Unix-socket forwards (Daytona's) rejects the
-// reverse-forward arrangement with OpenSSH's own reason, never the SSH user,
-// which can be a minted access token. The same reach works without one.
-#[tokio::test]
-async fn ssh_gateway_refuses_reverse_forward_with_a_redacted_reason() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let reverse = dir.path().join("reverse");
-    let _listener = UnixListener::bind(&guest).unwrap();
-    let (mut config, mut server) =
-        sshd::start(dir.path(), &guest, ssh::GuestStreams::ReverseForward(reverse.clone()), sshd::Forwarding::Gateway).await;
-    let error = ssh::connect(config.clone(), Limits::default()).await.err().unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
-    let message = error.to_string();
-    assert!(message.contains("remote port forwarding failed for listen path"), "{message}");
-    assert!(!message.contains(&config.user), "{message}");
-    assert!(!reverse.exists());
-    config.guest_streams = ssh::GuestStreams::OverLocalForward;
-    drop(ssh::connect(config, Limits::default()).await.unwrap());
-    server.kill().await.unwrap();
-}
-
-// Without a reverse forward the link's one connection owns the SSH session:
-// dropping the transport ends the session, closing the guest's end of the link.
-#[tokio::test]
-async fn ssh_gateway_transport_drop_closes_session() {
-    let dir = tempfile::tempdir().unwrap();
-    let guest = dir.path().join("guest");
-    let listener = UnixListener::bind(&guest).unwrap();
-    let (config, mut server) = sshd::start(dir.path(), &guest, ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
-    let transport = ssh::connect(config, Limits::default()).await.unwrap();
-    let (mut link, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
-    assert_eq!(drydock_transport::read_connection_kind(&mut link).await.unwrap(), drydock_transport::ConnectionKind::Yamux);
-    drop(transport);
-    let mut rest = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), link.read_to_end(&mut rest))
-        .await
-        .expect("SSH session must end after transport drop")
-        .ok();
     server.kill().await.unwrap();
 }

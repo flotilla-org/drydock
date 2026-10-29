@@ -1,9 +1,7 @@
 use drydock_agent::Agent;
-use drydock_transport::{Limits, Transport, native::UnixConnections};
-use std::{io, path::PathBuf, sync::Arc};
+use std::{io, path::PathBuf};
 use tokio::net::UnixListener;
 mod supervisor;
-const HOST_SOCKET: &str = "/run/drydock/host.sock";
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
@@ -65,21 +63,17 @@ async fn main() -> io::Result<()> {
     let listener =
         UnixListener::bind(&socket).map_err(|e| io::Error::new(e.kind(), format!("bind agent socket {}: {e}", socket.display())))?;
     drydock_agent::socket::protect(&socket)?;
-    let transport = Transport::native(Arc::new(UnixConnections::new(listener, HOST_SOCKET)), Limits::default())?;
     let current = std::env::current_exe()?;
     let fingerprint = drydock_agent::fingerprint()?;
     let executable = drydock_agent::upgrade::startup(&current)
         .map_err(|e| io::Error::new(e.kind(), format!("recover agent {}: {e}", current.display())))?;
-    let mut agent = Agent::new(transport, fingerprint, executable.clone());
+    let mut agent = Agent::new(listener, fingerprint, executable.clone());
     if let Some(store) = store {
         agent = agent.with_store(store);
     }
     #[cfg(target_os = "linux")]
     if let Some(port) = vsock {
-        let listener = tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port))?;
-        let peer = tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_HOST, port);
-        let transport = Transport::native(Arc::new(drydock_transport::native::VsockConnections::new(listener, peer)), Limits::default())?;
-        agent.add_transport(transport);
+        agent.add_listener(tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port))?);
     }
     #[cfg(not(target_os = "linux"))]
     if vsock.is_some() {

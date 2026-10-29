@@ -38,7 +38,5 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.hyper]
 opt-level = 3
-[profile.dev.package.yamux]
-opt-level = 3
 [profile.dev.package.miniz_oxide]
 opt-level = 3

@@ -20,18 +20,21 @@ The agent creates its dedicated run directory with mode 0700 and protects its
 Unix sockets with mode 0600, correcting existing owned directory permissions.
 Symlink, foreign-owned and sticky run directories are refused. The provider
 protects vsock access where used. There is no token or per-vessel startup configuration.
-The Unix listener accepts native connections or a host-initiated yamux session;
-the latter also carries reverse streams without a second guest socket. vsock is
-Linux-only. Both listeners share one control state. Native Unix reverse connections use
-the fixed host socket `/run/drydock/host.sock` (`HOST_SOCKET` in the binary);
-host-initiated yamux requires no reverse socket. Live provider isolation and
-startup/supervision are verified in the provider integration work (#54).
+Every connection to the socket (and to vsock, Linux-only) is plain HTTP/1.1 or
+HTTP/2 without TLS, from its first byte, so `curl --unix-socket
+/run/drydock/agent.sock http://agent/hello` works as well as drydock's client.
+All listeners share one state. The agent never opens a connection towards the
+host: it tells drydockd what happens through `/events`, and drydockd claims
+the vessel's outward connections from there. Agents from before plain HTTP
+(the `DDT` framing) cannot be reached; such a vessel is reported unreachable
+and its operator restarts it. Live provider isolation and startup/supervision
+are verified in the provider integration work (#54).
 
-The host normally calls `Client::connect_current(open_transport, platform,
-executable, timeout)`, passing the platform recorded in the vessel's prepared
+The host normally calls `Client::connect_current(open, platform, executable,
+timeout)`, where `open` returns a fresh connection to the agent's socket, passing the platform recorded in the vessel's prepared
 form and the agent build for it. The tools image pin is a bootstrap reference
 and may contain an older agent. This handshake reads hello, hashes the build,
-and pushes the binary plus re-execs when fingerprints differ. It reconnects through the supplied provider transport
+and pushes the binary plus re-execs when fingerprints differ. It reconnects through the supplied
 factory and returns only after verifying the current fingerprint. A matching
 hello avoids an unnecessary upgrade. It confirms a candidate on probation once
 its fingerprint matches. Push configuration after this handshake.
@@ -46,12 +49,12 @@ hello with no `platform` comes from an agent older than platform reporting; the
 check is skipped and the prepared platform's build is pushed. An empty build is
 also `Unsupported`. These failures are final: retrying cannot help until the
 vessel or the host's builds change.
-The first transport/hello failure returns immediately: provider startup readiness
+The first connection/hello failure returns immediately: provider startup readiness
 is the caller's responsibility. Only reconnects after an accepted upgrade are
 retried until the deadline. A timeout includes the last observed fingerprint or
-transport/hello error to distinguish rollback from reconnect failures.
+connection/hello error to distinguish rollback from reconnect failures.
 
-Low-level `Client::connect(transport, expected_fingerprint)` remains available
+Low-level `Client::connect(stream, expected_fingerprint)` remains available
 for explicit hello/upgrade tooling. Until fingerprints match, its client refuses
 every operation except hello and upgrade: generation-specific routes have no
 cross-generation compatibility promise. A mismatch is an upgrade trigger for the
@@ -59,17 +62,21 @@ normal handshake, not a reason to refuse an older tools pin.
 
 ## Control contract
 
-The host-facing `Purpose::Control` stream carries HTTP/2 through
-`drydock_transport::http2`. These routes are private to that link. File
-paths in a route are absolute vessel paths, percent-encoded byte by byte, so
-any Unix path can be named; relative paths and `.`/`..` components are refused.
+Every route is served on every connection, over HTTP/1.1 or HTTP/2, through
+`drydock_transport::http`; the client keeps one HTTP/2 connection per vessel.
+File paths in a route are absolute vessel paths, percent-encoded byte by byte,
+so any Unix path can be named; relative paths and `.`/`..` components are
+refused. Forward IDs are one percent-encoded route segment.
 
 | Method | Route | Body / result |
 | --- | --- | --- |
 | GET | `/hello` | `Hello { fingerprint, features, platform, boot_id, probation }`; changes nothing |
+| GET | `/events?since=<cursor>` | NDJSON `{ cursor, event }` lines from after `since`, held open for new ones |
 | GET / PUT | `/configuration` | Read / replace `Configuration`, with an `ETag`; PUT honours `If-Match` |
-| GET / PUT / DELETE | `/forwards/guest/{id}` | Read / upsert / remove one `GuestForward`; GET `/forwards/guest` lists them |
-| GET / PUT / DELETE | `/forwards/host/{id}` | Read / upsert / remove one `HostForward`; GET `/forwards/host` lists them |
+| GET / PUT / DELETE | `/forwards/inward/{id}` | Read / upsert / remove one `InwardForward { id, endpoint }`; GET `/forwards/inward` lists them |
+| CONNECT | `/forwards/inward/{id}/stream` | One byte stream to the forward's target; 200 once it is reached |
+| GET / PUT / DELETE | `/forwards/outward/{id}` | Read / upsert / remove one `OutwardForward { id, unix, tcp }`; GET `/forwards/outward` lists them |
+| CONNECT | `/forwards/outward/{id}/connections/{n}` | Claim connection `n`, announced on `/events`, as a byte stream |
 | POST / GET | `/processes` | Start an `Exec` (201, `ProcessInfo`) / list processes |
 | GET / DELETE | `/processes/{id}` | `ProcessInfo` / kill the group if running and forget the handle |
 | GET | `/processes/{id}/output?stdout=N&stderr=M` | Become the reader; framed output from those offsets, then the exit |
@@ -336,27 +343,51 @@ configuration (412 otherwise); any tag in the list may match, and an
 
 Each forward is its own resource. Its ID is one route segment, percent-encoded
 by the client, so an ID may contain `/`. `PUT` is an idempotent upsert: an unchanged
-forward with a live listener is left alone, streams and all. A changed guest
+forward with a live listener is left alone, streams and all. A changed outward
 forward is rebound before the old listener stops; a TCP-only change reuses the
-Unix binding, and live guest streams survive the rebind. A changed host
-endpoint ends the old endpoint's streams. `DELETE` has no body and ends the
-forward's streams. Every forward, guest and host, can be read back and
+Unix binding, and its live connections survive the rebind. A changed inward
+target ends the old target's streams. `DELETE` has no body and ends the
+forward's streams. Every forward, inward and outward, can be read back and
 listed. The body's `id` must equal the route's. An address held by a
 different forward is not transferred (409); move it by removing the old owner
 first. Transient accept errors back off; a finished listener is rebuilt by
 the next upsert. Refused upserts release anything they bound before
 returning, so an immediate retry cannot race socket removal.
 
-The first Control connection binds the reverse opener; later Control
-connections cannot replace it. The transport may reconnect its own native
-carrier. Every guest forward must have a host endpoint registered in that
-client. The feature list remains descriptive configuration. `egress: null`
-disables capture; `egress: {"upstream": "proxy-forward-id"}` activates it. The
-client must first register that forward ID against this vessel's dedicated host
-endpoint (`register_host_endpoint`); the agent opens it directly and needs no
-`GuestForward` for it. While capture is enabled, adding, changing or removing
-a guest TCP forward reinstalls the capture table with the new exemptions in
-the same call.
+Every outward forward needs a host endpoint registered in the client that sets
+it, and the client follows `/events` from then on to claim its connections.
+The feature list remains descriptive configuration. `egress: null` disables
+capture; `egress: {"upstream": "proxy-forward-id"}` activates it. The client
+must first register that forward ID against this vessel's dedicated host
+endpoint (`register_host_endpoint`); the agent announces each egress
+connection on that ID like any outward connection, and needs no
+`OutwardForward` for it. While capture is enabled, adding, changing or
+removing an outward TCP forward reinstalls the capture table with the new
+exemptions in the same call.
+
+### Events
+
+`GET /events` answers `application/x-ndjson`: one `{"cursor": ..., "event":
+...}` per line, held open, each new event written as it happens, as drydock's
+own `/v1/events` does. Events are tagged by `kind`:
+
+```text
+{"cursor":"<boot>:17","event":{"kind":"outward_connection","forward":"crew","connection":4}}
+{"cursor":"<boot>:18","event":{"kind":"process_exited","id":"3-812","status":{"code":0,"signal":null,"timed_out":false}}}
+{"cursor":"<boot>:19","event":{"kind":"forward_failed","forward":"crew","reason":"connection 5 was not claimed within 30s"}}
+```
+
+A cursor is `<boot_id>:<serial>`. `?since=` resumes after that event while
+the agent still retains it (the last 1024). A cursor from another agent
+process, one older than what is retained, or none, reads everything retained,
+so a reader that reconnects after a restart sees what the new agent has said.
+A live reader that falls more than 1024 events behind likewise skips to the
+oldest retained event; what fell out is gone. Over HTTP/2 both ends' keepalive
+pings notice a dead peer on an idle `/events`; over HTTP/1.1 an idle stream
+carries no bytes, so a debugging client such as curl cannot tell an idle agent
+from a dead one.
+`forward_failed` reports an outward listener that stopped, or a connection
+closed because nobody claimed it.
 
 ### Upgrade
 
@@ -367,7 +398,7 @@ push resumes, and the completed upload survives an agent restart.
 without one), copying it out of the store beside the
 installed binary and hashing it again as it goes, so a blob changed on disk
 is refused (422) and discarded rather than executed. It then re-execs with
-the original flags; the host reconnects with a fresh provider transport and
+the original flags; the host reconnects with a fresh connection and
 verifies the new fingerprint. `/hello`, `/upgrade` and the upload routes are
 the routes every generation keeps. Agents from before the blob store (their
 hello lacks `uploads`, as in published tools images) still take the image
@@ -390,7 +421,7 @@ activation keeps its upload and the existing rollback until a new backup is
 ready. The activation acknowledgement is advisory: a lost response means
 reconnecting and checking hello.
 
-Re-exec drops control and forward streams, removes owned guest sockets,
+Re-exec drops connections and byte streams, removes owned outward sockets,
 clears the capture table and resets configuration. Stale socket inodes from a
 crash are reclaimed only when they refuse a connection; live listeners and
 ordinary files are preserved.
@@ -440,11 +471,11 @@ The guest/provider must supply:
   layer; tools-image packaging is #53. The agent does not install packages.
 - `CAP_NET_ADMIN` for the agent to install its vessel-local nft table and mark
   its own outbound TCP sockets. This is not a UID exemption: launched processes
-  with the same UID are still redirected. Native host-facing transports use
-  Unix/vsock; yamux multiplexes these existing streams. All TCP sockets dialed by
-  agent host-to-guest forwards use `SO_MARK` while capture is enabled. The shipped
-  binary has no TCP host-link connector. A future agent-side TCP carrier must
-  apply the same marking before connect to avoid capture recursion.
+  with the same UID are still redirected. Host-facing connections use
+  Unix/vsock. All TCP sockets dialed by inward forwards use `SO_MARK` while
+  capture is enabled. The agent never dials the host: drydock connects in,
+  over Unix or vsock. A future agent-side TCP connection must apply the same
+  marking before connect to avoid capture recursion.
 - A writable `/opt/drydock` for the pushed trust bundle, and a resolver entry in
   `/etc/resolv.conf`. UDP/TCP port 53 goes to fake DNS regardless of the named
   resolver. DNS libraries must have a nameserver to contact in the first place.
@@ -488,7 +519,7 @@ letters/digits, hyphens, underscores and dots (including punycode names); URL
 delimiters and DNS label escapes cannot become CONNECT authorities.
 
 `cargo test -p drydock-agent` covers DNS allocation/expiry and wire replies,
-real UDP/TCP DNS listeners, CONNECT forwarding through a vessel-scoped transport,
+real UDP/TCP DNS listeners, CONNECT forwarding through claimed outward connections,
 explicit proxy transparency, refused/truncated CONNECT responses and half-closes.
 `tools/test-agent-egress.sh` additionally exercises nftables and SO_ORIGINAL_DST,
 a launched process without proxy variables, the same-UID capture invariant, CA
@@ -498,29 +529,37 @@ namespaces. The live Docker `--network none` operator check remains #3487.
 
 ## Byte forwards and endpoint ownership
 
-`Purpose::Forward { id }` begins with an opening result: a big-endian u32
-JSON length and `Result<(), AgentError>`. The client waits for success before
-returning the stream; unknown IDs and dead targets retain their kind and reason.
-After that acknowledgement it carries raw bytes. The agent performs no HTTP parsing,
+A byte stream is an upgraded request: an extended CONNECT (RFC 8441) with
+`:protocol drydock-forward` on HTTP/2, or on HTTP/1.1 a `GET` with `Connection:
+upgrade` and `Upgrade: drydock-forward`, answered 101. Anything else on a
+stream route is refused (400). After the 200 or 101 the stream carries raw
+bytes, half-close included. The agent performs no HTTP parsing of them, no
 header rewriting, token checking, terminal handling or destination policy.
-Cleat attach is an ordinary host-to-guest forward to a Unix socket.
+Cleat attach is an ordinary inward forward to a Unix socket.
 
-Guest forwards grant vessel-level reach, not per-UID authorization. Unix sockets
-use mode 0600 within an agent-owned 0700 directory; the optional
-loopback TCP listener is reachable by every guest UID. Providers that need guest
-UID separation must omit loopback TCP.
-Host endpoints apply their own policy (for example per-terminal hook tokens);
-the agent inspects no forwarded bytes and holds no token.
-
-* Guest to host: `put_guest_forward` reserves a host endpoint in this client's
-  registry, then creates a guest Unix listener and optional loopback TCP listener.
-  `register_host_endpoint` reserves endpoints without a guest listener, as for
-  the egress upstream. The guest receives only IDs; it never receives a host
-  target. An arriving ID resolves only in the client for that vessel.
-* Host to guest: `put_host_forward` configures a guest Unix/TCP target;
-  `forward(id)` opens a raw stream. TCP port zero is rejected. Unix endpoints
-  connect lazily, allowing the host to register services before their sockets exist. `remove_*_forward` removes a route at runtime.
-  Removal closes the route’s live streams in both directions and guest listeners;
+* Inward (host to vessel): `put_inward_forward` configures a target in the
+  vessel, Unix or TCP; TCP port zero is rejected. drydockd opens one
+  `CONNECT /forwards/inward/{id}/stream` per client connection
+  (`Client::open_inward`). The agent replies 200 only after reaching the
+  target, within 10 seconds (`CONNECT_DEADLINE`); otherwise the reply is the structured error of that attempt, its
+  kind kept (an unknown ID or a missing socket is 404, a refused connection
+  `ConnectionRefused`). Unix targets connect lazily, so the host can register
+  a service before its socket exists.
+* Outward (vessel to host): `put_outward_forward` reserves a host endpoint in
+  this client's registry, then creates a vessel Unix listener and an optional
+  loopback TCP listener. The agent accepts each connection, announces it on
+  `/events` as `outward_connection` with a number, and holds it, bytes the
+  vessel already sent included, until drydockd claims it with `CONNECT
+  /forwards/outward/{id}/connections/{n}`. The claim's stream is then that
+  connection. A connection is claimed once, under its own forward ID; one not
+  claimed within 30 seconds (`CLAIM_DEADLINE`, `Agent::with_claim_deadline`)
+  is closed and reported as `forward_failed`. The client claims a connection
+  only when the forward ID is in its registry, then dials the endpoint; an
+  endpoint it cannot reach closes the connection at once. The vessel sends
+  only IDs; it never names a host target.
+* `register_host_endpoint` reserves an endpoint without a vessel listener, as
+  for the egress upstream. `remove_*_forward` removes a route at runtime,
+  closing its live streams in both directions and its vessel listeners;
   unknown IDs return NotFound. Unrelated forwards continue.
 * Host Unix endpoints are claimed by stable path and device/inode, including symlink/hardlink
   aliases. Host TCP endpoints require dedicated loopback ports; claims reserve
@@ -528,16 +567,24 @@ the agent inspects no forwarded bytes and holds no token.
   Claims are shared across clients in one controller process and retained by
   active streams. Different controller processes must allocate separate host
   endpoints. Shared endpoints and direct multi-controller connections are not
-  part of the current contract.
-* Native forwards are arranged by the provider/controller, outside this agent's
-  data path. The same rule applies there: one host endpoint serves one vessel.
+  part of the current contract: every client following `/events` with a
+  forward ID registered may claim its connections.
+
+Outward forwards grant vessel-level reach, not per-UID authorization. Unix sockets
+use mode 0600 within an agent-owned 0700 directory; the optional
+loopback TCP listener is reachable by every guest UID. Providers that need guest
+UID separation must omit loopback TCP.
+Host endpoints apply their own policy (for example per-terminal hook tokens);
+the agent inspects no forwarded bytes and holds no token.
 
 ## Verification
 
-`cargo test -p drydock-agent` covers the control contract over in-memory yamux
-and Unix connections: tagged configuration, forward resources and generated
+`cargo test -p drydock-agent` covers the control contract over in-memory and
+Unix-socket connections: tagged configuration, forward resources and generated
 upsert/removal sequences, byte-transparent HTTP/1.1, WebSocket upgrade frames,
-chunked bodies, TCP and Unix endpoints, and isolation (`tests/contract.rs`);
+chunked bodies, TCP and Unix endpoints, isolation, an outward connection held
+until its HTTP/1.1 claim, an unclaimed one closed at its deadline, and `curl`
+reaching `/hello` and following `/events` on the socket (`tests/contract.rs`);
 processes with stdin, separate streams, exit codes, signals, kill, timeout,
 reattach and bounded output (`tests/processes.rs`); file operations, ranges,
 modes, digests, resumable uploads and tree unpacks (`tests/files.rs`);
@@ -549,12 +596,10 @@ and every refusal as a structured error. Subprocess tests push a distinct ELF
 and verify real re-exec, the new hello and boot ID, explicit confirmation,
 rollback of an unconfirmed candidate, a durable upgrade upload, forward socket cleanup,
 fingerprint gating and survival/reaping of a child. No cloud provider or cleat
-installation is required. `examples/link_throughput.rs` measures transfers over
-a shaped high-latency link; the HTTP/2 windows in `drydock-transport` were sized
-with it.
+installation is required; `curl` is. `examples/link_throughput.rs` measures
+transfers over a shaped high-latency link; the HTTP/2 windows in
+`drydock-transport` were sized with it.
 
-The first host-facing Control link supplies the reverse opener for the agent
-lifetime. Later connections cannot retarget it.
-Forward and transport failures emit `tracing` warnings, without logging process
+Forward and connection failures emit `tracing` warnings, without logging process
 environment or request bodies. Embedders supply their subscriber. The standalone
 binary logs warnings to stderr by default and honors standard `RUST_LOG`.

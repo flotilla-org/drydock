@@ -1,14 +1,14 @@
-//! Drydock's vessel control API and host client. The transport is the trust boundary:
-//! only its host-facing side may serve control; guest forwards carry opaque IDs.
+//! Drydock's vessel control API and host client. The agent's socket is the
+//! trust boundary: only drydock may reach it; outward forwards carry opaque IDs.
 mod artifacts;
 mod client;
 mod durable;
 mod egress;
 mod error;
 pub use egress::{CA_PATH, Egress, PROXY_PORT};
+pub mod events;
 mod fetch;
 mod files;
-mod forward;
 mod frames;
 mod process;
 mod query;
@@ -18,6 +18,8 @@ mod server;
 pub mod socket;
 pub mod stand_in;
 mod store;
+mod streams;
+pub use streams::{CLAIM_DEADLINE, CONNECT_DEADLINE};
 pub mod upgrade;
 pub use client::{Client, Download, ExecOutput, Process};
 use drydock_transport::ByteStream;
@@ -72,25 +74,27 @@ pub struct Tagged<T> {
     pub value: T,
     pub etag: String,
 }
-/// A guest listener whose connections reach the host endpoint registered
-/// under the same ID.
+/// A listener in the vessel whose connections drydockd claims, reaching the
+/// host endpoint registered under the same ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct GuestForward {
+pub struct OutwardForward {
     pub id: String,
     pub unix: PathBuf,
     /// Concrete loopback bind address; wildcard and non-loopback binds are refused.
     pub tcp: Option<SocketAddr>,
 }
-/// A guest endpoint the host may open streams to under this ID.
+/// A target in the vessel the host may open byte streams to under this ID.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct HostForward {
+pub struct InwardForward {
     pub id: String,
     pub endpoint: Endpoint,
 }
 /// TCP addresses are numeric, so host ownership cannot change through DNS.
+/// On the wire: `{"unix": "/path"}` or `{"tcp": "127.0.0.1:80"}`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum Endpoint {
     Unix(PathBuf),
     Tcp(SocketAddr),
