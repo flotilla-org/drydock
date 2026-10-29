@@ -179,6 +179,9 @@ whose provider declares the agent: one it launched, or one a client provisioned
 through the server under its own label without an `ssh_public_key`. Drydock
 makes that label's key once and reuses it, so provision stays label-idempotent;
 it refuses a label that already names an environment it holds no key for.
+A client label's key directory is named by the label's SHA-256, so it never
+becomes a path; like a launch's, it is kept after destroy until a retention
+policy (#61) prunes it, and a later provision under the label reuses its key.
 
 Drydock keeps one connection to each such vessel's agent and carries every
 exposure on it: the agent opens inward streams to the target and listens in

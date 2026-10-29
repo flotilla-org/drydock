@@ -515,6 +515,11 @@ impl Daemon {
                 .await
                 .map_err(|e| Error::Transport(format!("read vessel SSH public key: {e}")))?
         } else {
+            // The host's list is the provider's whole inventory, unpaged and
+            // unfiltered, so a label naming an environment is found here. A client
+            // provisioning the label with its own key between this check and the
+            // provision below is adopted without drydock's key: labels are the
+            // client's, and drydock does not arbitrate between two clients of one.
             let existing = self.runtime(provider)?.list(provider).await?;
             if existing.iter().any(|environment| environment.label.as_deref() == Some(request.label.as_str())) {
                 return Err(Error::Protocol(ProtocolError::Refused {
