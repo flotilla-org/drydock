@@ -1,3 +1,4 @@
+use drydock_client::api as openapi;
 use drydock_protocol::*;
 use serde_json::json;
 
@@ -11,7 +12,7 @@ fn generated_destinations_share_schema_rules(tc: hegel::TestCase) {
     let tail = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
     let v6 = format!("2001:db8::{tail:x}");
     let port = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
-    let schema = serde_json::to_value(openapi::document()).unwrap();
+    let schema = serde_json::to_value(openapi::openapi()).unwrap();
     let host_schema = &schema["components"]["schemas"]["HostAddress"];
     let host_regex = regex::Regex::new(host_schema["pattern"].as_str().unwrap()).unwrap();
     for host in [
@@ -69,7 +70,7 @@ fn every_route_carries_typed_error_statuses() {
         ProtocolError::CommandFailed { reason: "r".into(), exit_code: 7, output: Secret::new("sensitive") },
     ];
     assert_eq!(errors.iter().map(ProtocolError::status).collect::<Vec<_>>(), [404, 405, 422, 503, 429, 402, 502, 500, 424]);
-    let document = serde_json::to_value(openapi::document()).unwrap();
+    let document = serde_json::to_value(openapi::openapi()).unwrap();
     for path in document["paths"].as_object().unwrap().values() {
         for operation in path.as_object().unwrap().values() {
             for error in &errors {
@@ -93,7 +94,7 @@ fn every_route_carries_typed_error_statuses() {
 fn instants_and_shared_constraints() {
     assert_eq!("2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap(), "2026-01-01T01:00:00+01:00".parse::<Timestamp>().unwrap());
     assert!(serde_json::from_value::<Reach>(json!({"kind":"dial","url":"x","token":"x","expires_at":"bad"})).is_err());
-    let schemas = serde_json::to_value(openapi::document()).unwrap()["components"]["schemas"].clone();
+    let schemas = serde_json::to_value(openapi::openapi()).unwrap()["components"]["schemas"].clone();
     assert_eq!(schemas["Port"]["minimum"], 1);
     assert_eq!(schemas["Port"]["maximum"], 65535);
     assert_eq!(schemas["Cidr"]["pattern"], drydock_protocol::validation::cidr_pattern());

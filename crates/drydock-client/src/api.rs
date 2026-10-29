@@ -9,8 +9,8 @@ use axum::{
     http::{StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
 };
+use drydock_protocol::openapi::ErrorResponses;
 use drydock_protocol::*;
 pub use drydock_provider::Provisioned;
 use drydock_provider::rest::{ApiJson, ApiPath, ApiQuery, Refusal, switch, upgrade};
@@ -18,6 +18,7 @@ use rigging_stream::ByteStream;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::watch;
+use utoipa_axum::{router::OpenApiRouter, routes};
 pub type ObservationStream = futures::stream::BoxStream<'static, Result<ObserveRecord, Error>>;
 
 /// A whole configuration document, or an RFC 7396 merge patch of the current one.
@@ -187,13 +188,22 @@ impl FromRequestParts<Surface> for Api {
 }
 /// The routes common to the server and hosts. Stream upgrades end when `stopping` becomes true.
 pub fn router(api: Arc<dyn ProviderApi>, stopping: watch::Receiver<bool>) -> Router {
-    routes().with_state(Surface { api, stopping }).layer(middleware::from_fn(trace_request)).layer(sensitive())
+    routes()
+        .split_for_parts()
+        .0
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .with_state(Surface { api, stopping })
+        .layer(middleware::from_fn(trace_request))
+        .layer(sensitive())
 }
 /// The common routes plus the server-only extensions: credential delivery and events.
 pub fn server_router(api: Arc<dyn ProviderApi>, stopping: watch::Receiver<bool>) -> Router {
-    routes()
-        .route("/v1/events", get(events))
-        .route("/v1/providers/{provider}/credential", put(credential))
+    server_routes()
+        .split_for_parts()
+        .0
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(Surface { api, stopping })
         .layer(middleware::from_fn(trace_request))
         .layer(sensitive())
@@ -204,26 +214,35 @@ fn sensitive() -> tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer
         header::AUTHORIZATION,
     ])
 }
-fn routes() -> Router<Surface> {
-    Router::new()
-        .route("/v1/hello", get(hello))
-        .route("/v1/config", put(configure).patch(patch_configuration))
-        .route("/v1/providers", get(providers))
-        .route("/v1/providers/{provider}", get(provider))
-        .route("/v1/providers/{provider}/prepare", post(prepare))
-        .route("/v1/providers/{provider}/environments", get(list).post(provision))
-        .route("/v1/providers/{provider}/environments/{id}", get(inspect).delete(destroy))
-        .route("/v1/providers/{provider}/environments/{id}/reach", post(reach))
-        .route("/v1/providers/{provider}/environments/{id}/relay", get(relay))
-        .route("/v1/providers/{provider}/environments/{id}/exec", post(exec))
-        .route("/v1/providers/{provider}/environments/{id}/suspend", post(suspend))
-        .route("/v1/providers/{provider}/environments/{id}/resume", post(resume))
-        .route("/v1/providers/{provider}/environments/{id}/export", post(export))
-        .route("/v1/providers/{provider}/usage", get(usage))
-        .route("/v1/providers/{provider}/quota", get(quota))
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed)
+fn routes() -> OpenApiRouter<Surface> {
+    OpenApiRouter::new()
+        .routes(routes!(hello))
+        .routes(routes!(configure, patch_configuration))
+        .routes(routes!(providers))
+        .routes(routes!(provider))
+        .routes(routes!(prepare))
+        .routes(routes!(list, provision))
+        .routes(routes!(inspect, destroy))
+        .routes(routes!(reach))
+        .routes(routes!(relay))
+        .routes(routes!(exec))
+        .routes(routes!(suspend))
+        .routes(routes!(resume))
+        .routes(routes!(export))
+        .routes(routes!(usage))
+        .routes(routes!(quota))
 }
+fn server_routes() -> OpenApiRouter<Surface> {
+    routes().routes(routes!(events)).routes(routes!(credential))
+}
+/// Canonical shared API, with only the credential/events extensions server-only.
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    drydock_protocol::openapi::document(server_routes().split_for_parts().1)
+}
+pub fn openapi_json() -> String {
+    format!("{}\n", openapi().to_pretty_json().expect("OpenAPI serializes"))
+}
+
 pub async fn not_found() -> ApiError {
     ApiError(ProtocolError::NotFound { reason: "unknown route".into() }.into())
 }
@@ -253,66 +272,140 @@ impl IntoResponse for ApiError {
 }
 type ApiResult<T> = Result<T, ApiError>;
 
+#[utoipa::path(get, tag = "host", path = "/v1/hello",
+responses((status = 200, description = "Protocol and module discovery", body = Hello), ErrorResponses)
+)]
 async fn hello(Api(api): Api) -> ApiResult<Json<Hello>> {
     Ok(Json(api.hello().await?))
 }
+#[utoipa::path(put, tag = "host", path = "/v1/config",
+request_body = Configuration,
+responses((status = 204, description = "Success"), ErrorResponses)
+)]
 async fn configure(Api(api): Api, ApiJson(document): ApiJson<Configuration>) -> ApiResult<StatusCode> {
     api.configure(ConfigUpdate::Replace(document)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(patch, tag = "host", path = "/v1/config",
+request_body(content = Object, content_type = "application/merge-patch+json", description = "RFC 7396 JSON merge patch of the configuration document"),
+responses((status = 204, description = "Success"), ErrorResponses)
+)]
 async fn patch_configuration(Api(api): Api, ApiJson(patch): ApiJson<serde_json::Value>) -> ApiResult<StatusCode> {
     api.configure(ConfigUpdate::MergePatch(patch)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers",
+responses((status = 200, description = "Configured providers", body = Vec<ProviderDeclaration>), ErrorResponses)
+)]
 async fn providers(Api(api): Api) -> ApiResult<Json<Vec<ProviderDeclaration>>> {
     Ok(Json(api.providers().await?))
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}",
+params(("provider" = String, Path, description = "Opaque provider")),
+responses((status = 200, description = "Provider declaration", body = ProviderDeclaration), ErrorResponses)
+)]
 async fn provider(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<ProviderDeclaration>> {
     Ok(Json(api.provider(&p).await?))
 }
+#[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}/credential",
+params(("provider" = String, Path, description = "Opaque provider")),
+request_body = CredentialRefresh,
+responses((status = 204, description = "Success"), ErrorResponses)
+)]
 async fn credential(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<CredentialRefresh>) -> ApiResult<StatusCode> {
     api.credential(&p, r.value).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/prepare",
+params(("provider" = String, Path, description = "Opaque provider")),
+request_body = PrepareRequest,
+responses((status = 200, description = "Prepared provider form", body = Prepared), ErrorResponses)
+)]
 async fn prepare(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<PrepareRequest>) -> ApiResult<Json<Prepared>> {
     Ok(Json(api.prepare(&p, &r).await?))
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments",
+params(("provider" = String, Path, description = "Opaque provider")),
+request_body = ProvisionRequest,
+responses((status = 200, description = "Environment", body = Environment), (status = 201, description = "Created; repeats by label return 200", body = Environment), ErrorResponses)
+)]
 async fn provision(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<ProvisionRequest>) -> ApiResult<Response> {
     Ok(match api.provision(&p, &r).await? {
         Provisioned::Created(environment) => (StatusCode::CREATED, Json(environment)).into_response(),
         Provisioned::Existing(environment) => Json(environment).into_response(),
     })
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments",
+params(("provider" = String, Path, description = "Opaque provider")),
+responses((status = 200, description = "Environment inventory", body = Vec<Environment>), ErrorResponses)
+)]
 async fn list(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Vec<Environment>>> {
     Ok(Json(api.list(&p).await?))
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments/{id}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "Environment", body = Environment), ErrorResponses)
+)]
 async fn inspect(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Environment>> {
     Ok(Json(api.inspect(&p, &id).await?))
 }
+#[utoipa::path(delete, tag = "host", path = "/v1/providers/{provider}/environments/{id}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 204, description = "Success; destroying an already absent resource succeeds"), ErrorResponses)
+)]
 async fn destroy(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<StatusCode> {
     api.destroy(&p, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments/{id}/reach",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "Reach recipe", body = Reach), ErrorResponses)
+)]
 async fn reach(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Reach>> {
     Ok(Json(api.reach(&p, &id).await?))
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments/{id}/suspend",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "Resume token", body = ResumeToken), ErrorResponses)
+)]
 async fn suspend(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<ResumeToken>> {
     Ok(Json(api.suspend(&p, &id).await?))
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments/{id}/resume",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+request_body = ResumeToken,
+responses((status = 204, description = "Success"), ErrorResponses)
+)]
 async fn resume(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>, ApiJson(token): ApiJson<ResumeToken>) -> ApiResult<StatusCode> {
     api.resume(&p, &id, &token).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments/{id}/export",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "Export reference", body = Export), ErrorResponses)
+)]
 async fn export(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Export>> {
     Ok(Json(api.export(&p, &id).await?))
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/usage",
+params(("provider" = String, Path, description = "Opaque provider"),("start" = Timestamp, Query, description = "RFC 3339 period start"),("end" = Timestamp, Query, description = "RFC 3339 period end")),
+responses((status = 200, description = "Usage for the requested period", body = Usage), ErrorResponses)
+)]
 async fn usage(Api(api): Api, ApiPath(p): ApiPath<String>, ApiQuery(period): ApiQuery<Period>) -> ApiResult<Json<Usage>> {
     Ok(Json(api.usage(&p, &period).await?))
 }
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/quota",
+params(("provider" = String, Path, description = "Opaque provider")),
+responses((status = 200, description = "Quota", body = Quota), ErrorResponses)
+)]
 async fn quota(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Quota>> {
     Ok(Json(api.quota(&p).await?))
 }
 
+#[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments/{id}/relay",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-relay", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-relay"))), ErrorResponses)
+)]
 async fn relay(
     State(s): State<Surface>,
     Api(api): Api,
@@ -323,6 +416,11 @@ async fn relay(
     let stream = api.relay(&p, &id).await?;
     Ok(switch(on, "drydock-relay", stream, s.stopping))
 }
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/environments/{id}/exec",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+request_body = ExecRequest,
+responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
+)]
 async fn exec(
     State(s): State<Surface>,
     Api(api): Api,
@@ -339,6 +437,10 @@ async fn exec(
 struct EventQuery {
     since: Option<String>,
 }
+#[utoipa::path(get, tag = "server", path = "/v1/events",
+params(("since" = Option<String>, Query, description = "Exclusive last-seen cursor; absent starts with a snapshot")),
+responses((status = 200, description = "NDJSON stream: one ObserveRecord JSON value per line", body = ObserveRecord, content_type = "application/x-ndjson"), ErrorResponses)
+)]
 async fn events(Api(api): Api, ApiQuery(query): ApiQuery<EventQuery>) -> ApiResult<Response> {
     use futures::StreamExt;
     // A failed observation ends the body; readers resume from their last cursor.

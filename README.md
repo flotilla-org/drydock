@@ -158,7 +158,7 @@ no HTTP server or client implementation. Language hosts should generate their
 models from [`openapi.json`](openapi.json).
 
 ```sh
-cargo run -p drydock-protocol --bin generate-openapi > openapi.json
+cargo run --locked -p drydock-client --bin generate-openapi > openapi.json
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
