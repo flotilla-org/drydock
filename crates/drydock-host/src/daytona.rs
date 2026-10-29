@@ -104,6 +104,10 @@ pub struct Daytona {
     settings: Settings,
     http: Arc<dyn HttpClient>,
 }
+/// Bounds destroy's wait for an in-progress state change to about 8s (4 sleeps), long
+/// enough for a just-resumed sandbox to settle without stalling the caller.
+const DESTROY_ATTEMPTS: u32 = 5;
+const DESTROY_RETRY_DELAY: Duration = Duration::from_secs(2);
 impl Daytona {
     fn path(&self, base: &str, segments: &[&str]) -> Result<Url> {
         let mut url = Url::parse(base).map_err(|_| refused("invalid Daytona URL"))?;
@@ -767,10 +771,18 @@ impl Provider for Daytona {
         }
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
-            Ok(_) | Err(ProtocolError::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e),
+        // Daytona answers 409 while a state change is in progress; wait it out briefly,
+        // then surface the retryable `unavailable` error.
+        for attempt in 1..=DESTROY_ATTEMPTS {
+            let url = self.sandbox_url(id, None)?;
+            match self.request(Method::DELETE, url, None, c, true, ResponseFormat::Json).await {
+                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
+                Ok(None) if attempt < DESTROY_ATTEMPTS => tokio::time::sleep(DESTROY_RETRY_DELAY).await,
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            }
         }
+        Err(ProtocolError::unavailable("Daytona sandbox state change still in progress; retry destroy", None))
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
         let mut url = self.sandbox_url(id, Some("ssh-access"))?;

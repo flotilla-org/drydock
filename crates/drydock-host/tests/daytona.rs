@@ -2349,3 +2349,20 @@ async fn standin_enforces_push_contract() {
     http.0.lock().unwrap().violations.clear();
     http.0.lock().unwrap().snapshot_requests.clear();
 }
+
+// Daytona answers DELETE with 409 while a state change is in progress; destroy
+// waits for it to settle, and a persistent 409 is retryable, never internal.
+#[tokio::test(start_paused = true)]
+async fn destroy_waits_out_state_change() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials();
+    http.0.lock().unwrap().failure = Some(409);
+    p.destroy("sbx-1", &c).await.unwrap();
+    assert!(http.0.lock().unwrap().failure.is_none());
+    http.0.lock().unwrap().outage = Some((409, "Sandbox state change in progress".into()));
+    let before = http.0.lock().unwrap().requests;
+    let e = p.destroy("sbx-1", &c).await.unwrap_err();
+    assert_eq!(e.class(), "unavailable");
+    assert_eq!(http.0.lock().unwrap().requests, before + 5);
+}
