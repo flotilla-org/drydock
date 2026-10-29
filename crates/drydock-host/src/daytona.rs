@@ -757,7 +757,9 @@ impl Provider for Daytona {
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         // Daytona keeps a deleted sandbox listed as destroying/destroyed for a while;
-        // once destroy has returned it must not read as present.
+        // once destroy has returned it must not read as present. Intended contract: a
+        // sandbox mid-destroy is absent from `list`, while `inspect` still reports
+        // `Destroying`.
         let mut rows = Vec::new();
         for v in self.inventory(None, c).await? {
             let row = self.environment(v)?;
