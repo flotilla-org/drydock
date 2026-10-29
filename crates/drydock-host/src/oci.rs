@@ -430,6 +430,12 @@ impl Registry {
         if response.status() == 404 {
             return Ok(false);
         }
+        // Registries that keep blobs in object storage answer HEAD with a
+        // redirect to it; the redirect itself says the blob exists, and we
+        // never follow it so our authorization stays on this origin.
+        if response.status().is_redirection() {
+            return Ok(true);
+        }
         self.check(&response, &[200], "blob")?;
         Ok(true)
     }
@@ -693,6 +699,37 @@ mod tests {
         assert!(!trusted("ghcr.io", "https://auth.docker.io/token"));
         assert!(!trusted("docker.io", "https://auth.docker.io.evil.test/token"));
         assert!(!trusted("lab.test", "https://lab.test:8443/token"));
+    }
+
+    /// Answers every request with a fixed status and optional Location,
+    /// recording the methods it saw.
+    struct Canned(u16, Option<&'static str>, std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl HttpClient for Canned {
+        async fn execute(
+            &self,
+            request: reqwest::Request,
+            _: &rigging_http_client::ChannelLabel,
+        ) -> std::result::Result<http::Response<Bytes>, String> {
+            self.2.lock().unwrap().push(format!("{} {}", request.method(), request.url().path()));
+            let mut response = http::Response::builder().status(self.0);
+            if let Some(location) = self.1 {
+                response = response.header(header::LOCATION, location);
+            }
+            Ok(response.body(Bytes::new()).unwrap())
+        }
+    }
+
+    // Registries that keep blobs in object storage answer a blob HEAD with a
+    // redirect (#142). That means the blob exists: the upload is skipped and
+    // the redirect is not followed.
+    #[tokio::test]
+    async fn redirected_blob_head_counts_as_present() {
+        let digest = sha256(b"layer");
+        let canned = Arc::new(Canned(307, Some("https://blobs.example/signed"), Default::default()));
+        let registry = Registry::new(canned.clone(), "harbor.test", None, None).unwrap();
+        registry.put_blob("proj/repo", &digest, Bytes::from_static(b"layer")).await.unwrap();
+        assert_eq!(*canned.2.lock().unwrap(), [format!("HEAD /v2/proj/repo/blobs/{digest}")]);
     }
 
     // Challenge parameters may be quoted (and contain commas) or bare.
