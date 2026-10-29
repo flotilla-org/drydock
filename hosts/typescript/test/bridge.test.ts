@@ -1,8 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import net from "node:net";
-import { PassThrough } from "node:stream";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
@@ -62,7 +60,6 @@ function provider(): Provider {
     inspect: async () => environment,
     destroy: async () => {},
     reach: async () => ({ kind: "relay", path: "/opaque" }),
-    relay: async () => new PassThrough(),
   };
 }
 function request(
@@ -270,8 +267,21 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     ).status,
     404,
   );
+  // Unsigned 64-bit sizes accept values beyond 2^53 but not past their width.
+  assert.equal(
+    (
+      await request(f.socketPath, "/v1/providers/a/prepare", {
+        ...prepare,
+        size: { ...size, memory_bytes: 2 ** 60 },
+      })
+    ).status,
+    200,
+  );
   for (const body of [
     { ...prepare, size: { ...size, cpus: "1" } },
+    { ...prepare, size: { ...size, memory_bytes: -1 } },
+    { ...prepare, size: { ...size, memory_bytes: 2 ** 64 } },
+    { ...prepare, size: { ...size, memory_bytes: 1.5 } },
     { ...prepare, image_digest: "" },
   ])
     assert.equal(
@@ -370,48 +380,19 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     [],
   );
 });
-// A real raw upgrade retains bytes after the HTTP headers and closes both ends.
-test("GET relay forwards raw bytes and host stop closes upgrades", async (t) => {
-  const f = await fixture(t);
-  const socket = net.connect(f.socketPath);
-  t.after(() => socket.destroy());
-  socket.write(
-    "GET /v1/providers/a/environments/opaque/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\nround-trip",
-  );
-  let received = "";
-  await new Promise<void>((resolve, reject) => {
-    socket.on("error", reject);
-    socket.on("data", (chunk) => {
-      received += chunk;
-      if (received.endsWith("round-trip")) resolve();
-    });
-  });
-  assert.match(received, /^HTTP\/1.1 101 /);
-  const closed = new Promise<void>((resolve) => socket.once("close", resolve));
-  await f.host.close();
-  await closed;
-});
-// Client disconnect cancels awaited trait work; a late duplex must be disposed.
-test("disconnect aborts inspect and disposes late relay setup", async (t) => {
+// Client disconnect cancels awaited trait work.
+test("disconnect aborts inspect", async (t) => {
   const p = provider();
-  let inspectStarted!: () => void,
-    relayStarted!: () => void,
-    release!: (stream: PassThrough) => void;
-  const inspectReady = new Promise<void>((r) => (inspectStarted = r)),
-    relayReady = new Promise<void>((r) => (relayStarted = r));
-  let inspectSignal!: AbortSignal, relaySignal!: AbortSignal;
+  let started!: () => void;
+  const ready = new Promise<void>((r) => (started = r));
+  let signal!: AbortSignal;
   p.inspect = async (_id, ctx) => {
-    inspectSignal = ctx.signal;
-    inspectStarted();
+    signal = ctx.signal;
+    started();
     await new Promise<void>((resolve) =>
       ctx.signal.addEventListener("abort", () => resolve(), { once: true }),
     );
     return environment;
-  };
-  p.relay = async (_id, ctx) => {
-    relaySignal = ctx.signal;
-    relayStarted();
-    return new Promise((r) => (release = r));
   };
   const f = await fixture(t, p);
   const req = http.request({
@@ -421,28 +402,12 @@ test("disconnect aborts inspect and disposes late relay setup", async (t) => {
   });
   req.on("error", () => {});
   req.end();
-  await inspectReady;
+  await ready;
   req.destroy();
   await new Promise<void>((r) => {
-    if (inspectSignal.aborted) r();
-    else inspectSignal.addEventListener("abort", () => r(), { once: true });
+    if (signal.aborted) r();
+    else signal.addEventListener("abort", () => r(), { once: true });
   });
-  const socket = net.connect(f.socketPath);
-  socket.on("error", () => {});
-  socket.write(
-    "GET /v1/providers/a/environments/x/relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\n",
-  );
-  await relayReady;
-  socket.destroy();
-  await new Promise<void>((r) => {
-    if (relaySignal.aborted) r();
-    else relaySignal.addEventListener("abort", () => r(), { once: true });
-  });
-  const late = new PassThrough(),
-    disposed = new Promise<void>((r) => late.once("close", r));
-  release(late);
-  await disposed;
-  assert.equal(late.destroyed, true);
 });
 test("CLI rejects invalid provider module exports before listen", async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/drydock-loader-`);

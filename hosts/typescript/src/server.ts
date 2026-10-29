@@ -1,10 +1,14 @@
-import http, { type IncomingMessage } from "node:http";
-import { type Socket } from "node:net";
+import type { IncomingMessage } from "node:http";
 import { chmod, stat, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import Fastify, { type HTTPMethods } from "fastify";
-import mergePatch from "tiny-merge-patch";
+import Fastify, {
+  type FastifyError,
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+  type HTTPMethods,
+} from "fastify";
 import {
   absentPorts,
   ProtocolFailure,
@@ -16,47 +20,97 @@ import {
 } from "./provider.js";
 import { bodySchema, compile, protocolVersion } from "./validation.js";
 import { errorResponse } from "./errors.js";
-import { bridge } from "./stream.js";
 type Instance = { provider: string; id: string };
 type Binding = { config: Types["ProviderConfiguration"]; provider: Provider };
-// Preserve arbitrary JSON member names through a library implemented with JS
-// property assignment. Prefixing is reversible and avoids prototype setters.
-function keys(value: unknown, encode: boolean): unknown {
-  if (Array.isArray(value)) return value.map((v) => keys(v, encode));
-  if (value !== null && typeof value === "object")
-    return Object.fromEntries(
-      Object.entries(value).map(([k, v]) => [
-        encode ? "$" + k : k.slice(1),
-        keys(v, encode),
-      ]),
-    );
+type Configuration = Types["Configuration"];
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * RFC 7396 JSON merge patch. `Object.fromEntries` defines own data properties,
+ * so opaque member names such as `__proto__` and `constructor` stay plain keys.
+ */
+export function mergePatch(target: unknown, patch: unknown): unknown {
+  if (!isObject(patch)) return patch;
+  const base = isObject(target) ? target : {};
+  const entries: [string, unknown][] = [];
+  for (const [key, value] of Object.entries(base)) {
+    if (!Object.hasOwn(patch, key)) entries.push([key, value]);
+    else if (patch[key] !== null)
+      entries.push([key, mergePatch(value, patch[key])]);
+  }
+  for (const [key, value] of Object.entries(patch)) {
+    if (Object.hasOwn(base, key) || value === null) continue;
+    entries.push([key, mergePatch(undefined, value)]);
+  }
+  return Object.fromEntries(entries);
+}
+
+function sendError(reply: FastifyReply, error: unknown) {
+  const result = errorResponse(error);
+  return reply.code(result.status).headers(result.headers).send(result.detail);
+}
+
+function isUnreadableBody(error: FastifyError) {
+  const codes = Fastify.errorCodes;
+  return (
+    error instanceof codes.FST_ERR_CTP_INVALID_JSON_BODY ||
+    error instanceof codes.FST_ERR_CTP_BODY_TOO_LARGE ||
+    error instanceof codes.FST_ERR_CTP_EMPTY_JSON_BODY ||
+    error instanceof codes.FST_ERR_CTP_INVALID_MEDIA_TYPE
+  );
+}
+
+function invalidRequest() {
+  return new ProtocolFailure({ kind: "refused", reason: "invalid request" });
+}
+
+// Rust's HeaderMap::get selects the first value; Node's joined view would not.
+function credential(request: IncomingMessage): string | undefined {
+  const value = request.headersDistinct["drydock-credential"]?.[0];
+  if (value === undefined) return undefined;
+  if (!/^[\x20-\x7e]+$/.test(value))
+    refused("Drydock-Credential must be nonempty visible ASCII");
   return value;
 }
-export async function serve(modules: ProviderModule[], unix: string) {
-  const { version } = JSON.parse(
-    await readFile(new URL("../package.json", import.meta.url), "utf8"),
-  );
+
+async function requirePrivateDirectory(unix: string) {
   const directory = await stat(dirname(unix));
   if (!directory.isDirectory() || (directory.mode & 0o777) !== 0o700)
     throw Error("private directory must have mode 0700");
-  const validConfiguration = compile(bodySchema("Configuration"));
-  const registry = new Map(modules.map((m) => [m.name, m]));
+}
+
+async function hostVersion(): Promise<string> {
+  const manifest = new URL("../package.json", import.meta.url);
+  return JSON.parse(await readFile(manifest, "utf8")).version;
+}
+
+function moduleRegistry(modules: ProviderModule[]) {
+  const registry = new Map(modules.map((module) => [module.name, module]));
   if (registry.size !== modules.length) throw Error("duplicate module");
-  let bindings = new Map<string, Binding>();
-  let configuring: Promise<unknown> = Promise.resolve();
-  const stopping = new AbortController();
-  const sockets = new Set<Socket>();
-  const calls = new WeakMap<IncomingMessage, AbortSignal>();
-  const upgrades = new WeakMap<
-    IncomingMessage,
-    { socket: Socket; head: Buffer }
-  >();
+  return registry;
+}
+
+async function readiness(
+  provider: Provider,
+  context: Context,
+): Promise<Types["Readiness"]> {
+  try {
+    return await provider.readiness(context);
+  } catch {
+    return { status: "unknown", reason: "provider readiness failed" };
+  }
+}
+
+function createApp(): FastifyInstance {
   const app = Fastify({
     logger: false,
     exposeHeadRoutes: true,
+    forceCloseConnections: true,
     bodyLimit: 2 * 1024 * 1024,
-    schemaErrorFormatter: () =>
-      new ProtocolFailure({ kind: "refused", reason: "invalid request" }),
+    schemaErrorFormatter: invalidRequest,
     onProtoPoisoning: "ignore",
     onConstructorPoisoning: "ignore",
     routerOptions: { maxParamLength: 16 * 1024 },
@@ -66,42 +120,48 @@ export async function serve(modules: ProviderModule[], unix: string) {
     { parseAs: "string" },
     app.getDefaultJsonParser("ignore", "ignore"),
   );
+  app.setValidatorCompiler(({ schema }) => compile(schema as object));
+  // Never expose parser text, credential values or unexpected SDK exceptions.
+  app.setErrorHandler((error: FastifyError, _request, reply) =>
+    sendError(reply, isUnreadableBody(error) ? invalidRequest() : error),
+  );
+  // An unknown method on a known path is 405; anything else is 404.
   const methods = new Set<HTTPMethods>();
   app.addHook("onRoute", (route) => {
     for (const method of [route.method].flat()) methods.add(method);
   });
   app.setNotFoundHandler((request, reply) => {
+    const url = request.raw.url!.split("?")[0];
     const known = [...methods].some(
-      (method) =>
-        app.findRoute({ method, url: request.raw.url!.split("?")[0] }) !== null,
+      (method) => app.findRoute({ method, url }) !== null,
     );
-    const result = errorResponse(
-      new ProtocolFailure(
-        known
-          ? { kind: "method_not_allowed", reason: "method not allowed" }
-          : { kind: "not_found", reason: "unknown route" },
-      ),
+    if (known)
+      return sendError(
+        reply,
+        new ProtocolFailure({
+          kind: "method_not_allowed",
+          reason: "method not allowed",
+        }),
+      );
+    return sendError(
+      reply,
+      new ProtocolFailure({ kind: "not_found", reason: "unknown route" }),
     );
-    reply.code(result.status).headers(result.headers).send(result.detail);
   });
-  app.setValidatorCompiler(({ schema }) => compile(schema as object));
-  app.setErrorHandler((error, _request, reply) => {
-    const codes = Fastify.errorCodes;
-    if (
-      error instanceof codes.FST_ERR_CTP_INVALID_JSON_BODY ||
-      error instanceof codes.FST_ERR_CTP_BODY_TOO_LARGE ||
-      error instanceof codes.FST_ERR_CTP_EMPTY_JSON_BODY ||
-      error instanceof codes.FST_ERR_CTP_INVALID_MEDIA_TYPE
-    )
-      error = new ProtocolFailure({
-        kind: "refused",
-        reason: "invalid request",
-      });
-    // Never expose parser text, credential values or unexpected SDK exceptions.
-    const result = errorResponse(error);
-    reply.code(result.status).headers(result.headers).send(result.detail);
-  });
-  const binding = (name: string) => {
+  return app;
+}
+
+export async function serve(modules: ProviderModule[], unix: string) {
+  await requirePrivateDirectory(unix);
+  const version = await hostVersion();
+  const registry = moduleRegistry(modules);
+  const validConfiguration = compile(bodySchema("Configuration"));
+  const stopping = new AbortController();
+  const signals = new WeakMap<IncomingMessage, AbortSignal>();
+  let bindings = new Map<string, Binding>();
+  let configuring: Promise<unknown> = Promise.resolve();
+
+  function binding(name: string): Binding {
     const value = bindings.get(name);
     if (!value)
       throw new ProtocolFailure({
@@ -109,16 +169,19 @@ export async function serve(modules: ProviderModule[], unix: string) {
         reason: "unknown provider",
       });
     return value;
-  };
-  function context(request: IncomingMessage): Context {
-    const credential = request.headersDistinct["drydock-credential"]?.[0];
-    if (
-      credential !== undefined &&
-      (typeof credential !== "string" || !/^[\x20-\x7e]+$/.test(credential))
-    )
-      refused("Drydock-Credential must be nonempty visible ASCII");
-    return { credential, signal: calls.get(request)! };
   }
+
+  function provider(request: FastifyRequest<{ Params: Instance }>) {
+    return binding(request.params.provider).provider;
+  }
+
+  function context(request: FastifyRequest): Context {
+    return {
+      credential: credential(request.raw),
+      signal: signals.get(request.raw)!,
+    };
+  }
+
   async function declaration(
     name: string,
     ctx: Context,
@@ -131,196 +194,143 @@ export async function serve(modules: ProviderModule[], unix: string) {
       capabilities: provider.capabilities,
       observation: provider.observation,
       rate_limits: provider.rateLimits,
-      readiness: await Promise.resolve()
-        .then(() => provider.readiness(ctx))
-        .catch(() => ({
-          status: "unknown" as const,
-          reason: "provider readiness failed",
-        })),
+      readiness: await readiness(provider, ctx),
     };
   }
+
+  function currentConfiguration(): Configuration {
+    const providers = [...bindings].map(([name, b]) => [name, b.config]);
+    return { providers: Object.fromEntries(providers) };
+  }
+
+  // Build every binding before swapping, so a failure keeps the old document.
+  async function commit(document: unknown, signal: AbortSignal) {
+    if (!validConfiguration(document)) refused("invalid configuration");
+    const next = new Map<string, Binding>();
+    const entries = Object.entries((document as Configuration).providers ?? {});
+    for (const [name, entry] of entries) {
+      signal.throwIfAborted();
+      if (entry.credential != null)
+        refused("credential is a server-only configuration key");
+      const module = registry.get(entry.module);
+      if (!module) refused("unknown module");
+      const old = bindings.get(name);
+      const provider =
+        old && isDeepStrictEqual(old.config, entry)
+          ? old.provider
+          : await module.configure(name, structuredClone(entry), signal);
+      next.set(name, { config: structuredClone(entry), provider });
+    }
+    signal.throwIfAborted();
+    bindings = next;
+  }
+
+  // Configuration changes run one at a time against the latest committed state.
+  function configure(
+    update: (current: Configuration) => unknown,
+    signal: AbortSignal,
+  ) {
+    const action = configuring.then(() =>
+      commit(update(currentConfiguration()), signal),
+    );
+    configuring = action.catch(() => {});
+    return action;
+  }
+
+  const app = createApp();
   app.addHook("onRequest", async (request, reply) => {
     const abort = new AbortController();
     reply.raw.once("close", () => abort.abort());
     request.raw.once("aborted", () => abort.abort());
-    calls.set(request.raw, AbortSignal.any([abort.signal, stopping.signal]));
-    if (!request.is404) context(request.raw);
-    const raw = upgrades.get(request.raw);
-    if (!raw) return;
-    if (!(request.routeOptions.config as { relay?: boolean }).relay) {
-      if (
-        !app.findRoute({
-          method: request.method as HTTPMethods,
-          url: request.raw.url!.split("?")[0],
-        })
-      )
-        return;
-      refused("not a stream route");
-    }
-    reply.hijack();
-    const signal = calls.get(request.raw)!;
-    const closed = () => abort.abort();
-    raw.socket.once("close", closed);
-    raw.socket.once("end", closed);
-    raw.socket.once("error", closed);
-    try {
-      if (
-        request.headers.upgrade?.toLowerCase() !== "drydock-relay" ||
-        !request.headers.connection
-          ?.toLowerCase()
-          .split(",")
-          .some((part) => part.trim() === "upgrade")
-      )
-        refused("missing relay upgrade headers");
-      const params = request.params as Instance;
-      const stream = await binding(params.provider).provider.relay(
-        params.id,
-        context(request.raw),
-      );
-      if (signal.aborted || raw.socket.destroyed) {
-        stream.destroy();
-        return;
-      }
-      raw.socket.write(
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\n",
-      );
-      bridge(raw.socket, stream, raw.head);
-    } catch (error) {
-      if (!raw.socket.destroyed && !signal.aborted) {
-        const result = errorResponse(error),
-          body = JSON.stringify(result.detail);
-        raw.socket.end(
-          `HTTP/1.1 ${result.status} Error\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
-        );
-      }
-    } finally {
-      // Keep once-only close cancellation for the established stream lifetime;
-      // bridge owns half-closes and errors after setup.
-      raw.socket.off("end", closed);
-      raw.socket.off("error", closed);
-    }
+    signals.set(request.raw, AbortSignal.any([abort.signal, stopping.signal]));
+    // Like Rust, routing precedes the credential extractor.
+    if (!request.is404) credential(request.raw);
   });
-  app.server.on("connection", (socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-  });
-  app.server.on("upgrade", (request, socket, head) => {
-    const response = new http.ServerResponse(request);
-    response.assignSocket(socket as Socket);
-    socket.on("error", () => socket.destroy());
-    response.once("finish", () => socket.destroy());
-    upgrades.set(request, { socket: socket as Socket, head });
-    app.routing(request, response);
-  });
+
   app.get<{ Reply: Types["Hello"] }>("/v1/hello", async () => ({
     protocol_version: protocolVersion,
     host_version: version,
-    loadable_modules: modules.map((m) => ({
-      name: m.name,
-      version: m.version,
-      smallest_size: m.smallestSize,
+    loadable_modules: modules.map((module) => ({
+      name: module.name,
+      version: module.version,
+      smallest_size: module.smallestSize,
     })),
   }));
-  for (const method of ["PUT", "PATCH"] as const)
-    app.route<{ Body: unknown }>({
-      method,
-      url: "/v1/config",
-      ...(method === "PUT"
-        ? { schema: { body: bodySchema("Configuration") } }
-        : {}),
-      async handler(request, reply) {
-        const action = configuring.then(async () => {
-          const current = {
-            providers: Object.fromEntries(
-              [...bindings].map(([name, b]) => [name, b.config]),
-            ),
-          };
-          // Validate the merged document, not a partial patch with null deletions.
-          const document =
-            method === "PUT"
-              ? request.body
-              : keys(
-                  mergePatch(keys(current, true), keys(request.body, true)),
-                  false,
-                );
-          if (!validConfiguration(document)) refused("invalid configuration");
-          const next = new Map<string, Binding>();
-          const signal = calls.get(request.raw)!;
-          for (const [name, entry] of Object.entries(
-            (document as Types["Configuration"]).providers ?? {},
-          )) {
-            signal.throwIfAborted();
-            if (entry.credential != null)
-              refused("credential is a server-only configuration key");
-            const old = bindings.get(name),
-              module = registry.get(entry.module);
-            if (!module) refused("unknown module");
-            const provider =
-              old && isDeepStrictEqual(old.config, entry)
-                ? old.provider
-                : await module.configure(name, structuredClone(entry), signal);
-            next.set(name, { config: structuredClone(entry), provider });
-          }
-          signal.throwIfAborted();
-          bindings = next;
-        });
-        configuring = action.catch(() => {});
-        await action;
-        return reply.code(204).send();
-      },
-    });
-  app.get("/v1/providers", (r) =>
-    Promise.all(
-      [...bindings.keys()].map((name) => declaration(name, context(r.raw))),
-    ),
+
+  app.put<{ Body: Configuration }>(
+    "/v1/config",
+    { schema: { body: bodySchema("Configuration") } },
+    async (request, reply) => {
+      await configure(() => request.body, context(request).signal);
+      return reply.code(204).send();
+    },
   );
-  app.get<{ Params: Instance }>("/v1/providers/:provider", (r) =>
-    declaration(r.params.provider, context(r.raw)),
+
+  // Validation applies to the merged document: patches use null for deletion.
+  app.patch<{ Body: unknown }>("/v1/config", async (request, reply) => {
+    await configure(
+      (current) => mergePatch(current, request.body),
+      context(request).signal,
+    );
+    return reply.code(204).send();
+  });
+
+  app.get("/v1/providers", (request) => {
+    const ctx = context(request);
+    return Promise.all([...bindings.keys()].map((n) => declaration(n, ctx)));
+  });
+
+  app.get<{ Params: Instance }>("/v1/providers/:provider", (request) =>
+    declaration(request.params.provider, context(request)),
   );
+
   app.post<{ Params: Instance; Body: Types["PrepareRequest"] }>(
     "/v1/providers/:provider/prepare",
     { schema: { body: bodySchema("PrepareRequest") } },
-    (r) => binding(r.params.provider).provider.prepare(r.body, context(r.raw)),
+    (request) => provider(request).prepare(request.body, context(request)),
   );
+
   const environments = "/v1/providers/:provider/environments";
-  app.get<{ Params: Instance }>(environments, (r) =>
-    binding(r.params.provider).provider.list(context(r.raw)),
+
+  app.get<{ Params: Instance }>(environments, (request) =>
+    provider(request).list(context(request)),
   );
+
   app.post<{ Params: Instance; Body: Types["ProvisionRequest"] }>(
     environments,
     { schema: { body: bodySchema("ProvisionRequest") } },
-    async (r, reply) => {
-      const result = await binding(r.params.provider).provider.provision(
-        r.body,
-        context(r.raw),
+    async (request, reply) => {
+      const result = await provider(request).provision(
+        request.body,
+        context(request),
       );
       return reply.code(result.created ? 201 : 200).send(result.environment);
     },
   );
-  app.get<{ Params: Instance }>(environments + "/:id", (r) =>
-    binding(r.params.provider).provider.inspect(r.params.id, context(r.raw)),
+
+  app.get<{ Params: Instance }>(`${environments}/:id`, (request) =>
+    provider(request).inspect(request.params.id, context(request)),
   );
-  app.delete<{ Params: Instance }>(environments + "/:id", async (r, reply) => {
-    await binding(r.params.provider).provider.destroy(
-      r.params.id,
-      context(r.raw),
-    );
-    return reply.code(204).send();
-  });
-  app.post<{ Params: Instance }>(environments + "/:id/reach", (r) =>
-    binding(r.params.provider).provider.reach(r.params.id, context(r.raw)),
+
+  app.delete<{ Params: Instance }>(
+    `${environments}/:id`,
+    async (request, reply) => {
+      await provider(request).destroy(request.params.id, context(request));
+      return reply.code(204).send();
+    },
   );
-  app.get(environments + "/:id/relay", { config: { relay: true } }, () =>
-    refused("missing relay upgrade headers"),
+
+  app.post<{ Params: Instance }>(`${environments}/:id/reach`, (request) =>
+    provider(request).reach(request.params.id, context(request)),
   );
+
   await app.listen({ path: unix });
-  // The verified0700 parent controls access during bind-to-chmod.
+  // The verified 0700 parent controls access during bind-to-chmod.
   await chmod(unix, 0o600);
   return {
     app,
     async close() {
       stopping.abort();
-      for (const socket of sockets) socket.destroy();
       await app.close();
       bindings.clear();
     },

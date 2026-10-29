@@ -1,4 +1,3 @@
-import type { Duplex } from "node:stream";
 import type { components } from "./generated/protocol.js";
 export type Types = components["schemas"];
 export type Context = {
@@ -34,7 +33,6 @@ export interface Provider {
   inspect(id: string, context: Context): Promise<Types["Environment"]>;
   destroy(id: string, context: Context): Promise<void>;
   reach(id: string, context: Context): Promise<Types["Reach"]>;
-  relay(id: string, context: Context): Promise<Duplex>;
 }
 // Optional ports are deliberately absent until drydock#85's interface lands.
 export const absentPorts: Types["Ports"] = {

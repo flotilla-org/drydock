@@ -19,7 +19,8 @@ in `crates/drydock-client/src/api.rs` own the document; export it with
 Generated outputs are untracked, marked GENERATED and verified by
 `check:generated`. Rust's drift test verifies the canonical document. The package
 includes compiled bindings and runtime schemas; no repository files are needed at
-runtime. AJV never coerces values, inserts defaults or strips fields.
+runtime. AJV uses the generated schema as-is, declares the `int32`/`int64` width
+formats, and never coerces values, inserts defaults or strips fields.
 
 The root `package.json` repeats the pnpm pin so Corepack selects the same version
 when CI invokes `corepack pnpm --dir hosts/typescript ...` from the repository root.
@@ -43,7 +44,7 @@ Entries are comma-separated; use a file URL with `%2C` for a comma in a path.
 Each exports a default `ProviderModule` from handwritten `src/provider.ts`.
 Configuration selects only these modules by name; settings cannot import code.
 PUT `/v1/config` replaces `{providers: {instance: {module, settings}}}`; PATCH uses
-RFC7396 merge patch. Unchanged configurations reuse their provider; failed
+RFC7396 merge patch and validates the merged document. Unchanged configurations reuse their provider; failed
 configuration leaves the previous document intact. Credential configuration is
 server-only and rejected by the host. The optional `Drydock-Credential` header is
 an opaque per-call string, never retained in configuration or provider bindings.
@@ -54,10 +55,10 @@ facts; observation is polling performed by the main server. There are no host
 handles, push subscriptions, cursors, credential refresh routes or policy loops.
 Modules validate opaque settings and honor cancellation; cancellation does not
 prove rollback. Factories own cleanup on rejection/abort, and modules own their
-SDK resources. Raw relay upgrades use GET and backpressured Node duplex pipes;
-disconnect aborts setup and disposes a stream returned after disconnect.
+SDK resources. Client disconnect aborts the call's signal. The relay route is
+not served; vessel connections are being redesigned as exposures (#132).
 
-`server.ts` contains direct Fastify routes; `stream.ts` forwards raw duplex bytes.
+`server.ts` contains direct Fastify routes and a small RFC7396 merge.
 `provider.ts` is handwritten and free of framework types. `src/generated/**` and
 `dist/**` are generated outputs, including JSON. Rust types → canonical OpenAPI →
 TypeScript bindings and packaged AJV schema form one generation chain.
