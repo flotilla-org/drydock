@@ -1,0 +1,35 @@
+{
+  "name": "@flotilla/drydock-host-typescript",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "packageManager": "pnpm@12.15.0",
+  "bin": {
+    "drydock-host-typescript": "dist/main.js"
+  },
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "check:generated": "node scripts/generate.mjs --check",
+    "build": "corepack pnpm generate && rm -rf dist && tsc && node scripts/executable.mjs",
+    "typecheck": "corepack pnpm generate && tsc --noEmit",
+    "test": "corepack pnpm build && node --test --test-timeout=10000 test/*.test.ts",
+    "format": "prettier --write src/*.ts scripts/*.mjs test/*.ts *.json README.md",
+    "format:check": "prettier --check src/*.ts scripts/*.mjs test/*.ts *.json README.md",
+    "check": "corepack pnpm test && corepack pnpm check:generated && corepack pnpm format:check && corepack pnpm typecheck",
+    "pack:companion": "corepack pnpm build && node scripts/package.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1",
+    "fastify": "5.12.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.0",
+    "openapi-typescript": "7.10.1",
+    "prettier": "3.6.2",
+    "typescript": "5.9.3"
+  }
+}
