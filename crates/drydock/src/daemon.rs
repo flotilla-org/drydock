@@ -97,7 +97,11 @@ pub struct Inner {
     keys: PathBuf,
     resolver: Arc<dyn ImageResolver>,
     dialer: Arc<dyn crate::agent::SshDialer>,
+    builds: Arc<dyn AgentBuilds>,
     exposures: crate::exposures::Exposures,
+    /// One lock per label, so two first provisions of a label share one key
+    /// and provisions of other labels never wait on it.
+    keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     stopping: tokio::sync::watch::Sender<bool>,
 }
 /// The boundaries a daemon reaches beyond itself. Tests stand in for them.
@@ -106,13 +110,38 @@ pub struct Seams {
     pub resolver: Arc<dyn ImageResolver>,
     /// The SSH link to a vessel's agent.
     pub dialer: Arc<dyn crate::agent::SshDialer>,
+    /// The agent build a vessel's older agent is upgraded to.
+    pub builds: Arc<dyn AgentBuilds>,
     /// Where exposures put things in a vessel.
     pub guest: crate::exposures::GuestLayout,
     pub timing: crate::exposures::Timing,
 }
 impl Seams {
     pub fn new(resolver: Arc<dyn ImageResolver>) -> Self {
-        Self { resolver, dialer: Arc::new(crate::agent::OpenSsh), guest: Default::default(), timing: Default::default() }
+        Self {
+            resolver,
+            dialer: Arc::new(crate::agent::OpenSsh),
+            builds: Arc::new(InstalledBuilds),
+            guest: Default::default(),
+            timing: Default::default(),
+        }
+    }
+}
+
+/// Where the daemon finds the agent build for a vessel's platform. An embedding
+/// daemon that ships its own agent gives it here, so the daemon and the
+/// embedder never upgrade a vessel's agent to two different builds.
+#[async_trait::async_trait]
+pub trait AgentBuilds: Send + Sync {
+    async fn build(&self, platform: &Platform) -> Result<Vec<u8>, String>;
+}
+/// The installed companion beside this executable, or its override variable.
+pub struct InstalledBuilds;
+#[async_trait::async_trait]
+impl AgentBuilds for InstalledBuilds {
+    async fn build(&self, platform: &Platform) -> Result<Vec<u8>, String> {
+        let path = crate::local::agent_build(platform)?;
+        tokio::fs::read(&path).await.map_err(|error| format!("{}: {error}", path.display()))
     }
 }
 impl Daemon {
@@ -139,7 +168,7 @@ impl Daemon {
         options: Vec<HostOption>,
         seams: Seams,
     ) -> Result<Arc<Self>, String> {
-        let Seams { resolver, dialer, guest, timing } = seams;
+        let Seams { resolver, dialer, builds, guest, timing } = seams;
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
@@ -236,6 +265,8 @@ impl Daemon {
             keys,
             resolver,
             dialer,
+            builds,
+            keying: Default::default(),
             stopping: tokio::sync::watch::channel(false).0,
         });
         inner.exposures.restore();
@@ -402,7 +433,7 @@ impl Daemon {
         // The provider declares whether its vessels run the agent; the module name does not.
         let agent = host.handle.status.borrow().providers.iter().any(|d| d.provider == provider && d.capabilities.agent);
         // Find the agent build for the prepared platform before creating anything.
-        let agent_build = if agent { Some(agent_build(&platform).await?) } else { None };
+        let agent_build = if agent { Some(self.agent_build(&platform).await?) } else { None };
         let client = host.handle.client.credentialed(self.credential.clone());
         let environment = self.invalidating(provider, client.provision(provider, &request).await).await?.into_inner();
         if let Some(build) = agent_build {
@@ -445,18 +476,103 @@ impl Daemon {
         let request: ProvisionRequest =
             serde_json::from_slice(&request).map_err(|e| Error::InvalidResponse(format!("launch record: {e}")))?;
         let platform = request.prepared.platform;
-        let build = agent_build(&platform).await?;
+        let build = self.agent_build(&platform).await?;
         self.agent(provider, &environment, &platform, &build, timeout).await
     }
+    async fn agent_build(&self, platform: &Platform) -> Result<Vec<u8>, Error> {
+        self.builds
+            .build(platform)
+            .await
+            .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason: format!("no vessel agent build for {platform}: {reason}") }))
+    }
 
+    /// A provision that names no public key, for a provider whose vessels run
+    /// the agent: drydock holds the vessel's key, as for a launch, under the
+    /// client's label. The label's key is made once and reused, so the
+    /// provision stays label-idempotent; an environment the label already names
+    /// that drydock holds no key for is refused, since its key cannot be rotated.
+    async fn keyed(&self, provider: &str, request: &ProvisionRequest) -> Result<Option<ProvisionRequest>, Error> {
+        if request.ssh_public_key.is_some() {
+            return Ok(None);
+        }
+        let directory = self.client_key_directory(&request.label);
+        let held = directory.join("id_ed25519");
+        let holds = || held.is_file() && held.with_extension("pub").is_file();
+        // A key drydock already holds was made for a provider that runs the agent.
+        if !holds() && !ProviderApi::provider(self, provider).await?.capabilities.agent {
+            return Ok(None);
+        }
+        let lock = {
+            let mut locks = self.keying.lock().unwrap();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(&request.label).and_then(std::sync::Weak::upgrade).unwrap_or_default();
+            locks.insert(request.label.clone(), Arc::downgrade(&lock));
+            lock
+        };
+        let _keying = lock.lock().await;
+        let public = if holds() {
+            tokio::fs::read_to_string(held.with_extension("pub"))
+                .await
+                .map_err(|e| Error::Transport(format!("read vessel SSH public key: {e}")))?
+        } else {
+            // The host's list is the provider's whole inventory, unpaged and
+            // unfiltered, so a label naming an environment is found here. A client
+            // provisioning the label with its own key between this check and the
+            // provision below is adopted without drydock's key: labels are the
+            // client's, and drydock does not arbitrate between two clients of one.
+            let existing = self.runtime(provider)?.list(provider).await?;
+            if existing.iter().any(|environment| environment.label.as_deref() == Some(request.label.as_str())) {
+                return Err(Error::Protocol(ProtocolError::Refused {
+                    reason: "drydock holds no SSH key for the environment this label names".into(),
+                }));
+            }
+            for file in [held.clone(), held.with_extension("pub")] {
+                match tokio::fs::remove_file(&file).await {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Error::Transport(format!("remove partial vessel SSH key: {error}")));
+                    }
+                    _ => {}
+                }
+            }
+            launch::keypair(&directory).await?.1
+        };
+        let request = ProvisionRequest { ssh_public_key: Some(public), ..request.clone() };
+        // The agent connection reads the prepared platform from this record. The
+        // first one stands, as the environment it made does; it is written whole
+        // or not at all.
+        if directory.join("request.json").is_file() {
+            return Ok(Some(request));
+        }
+        let staged = directory.join("request.json.new");
+        tokio::fs::write(&staged, serde_json::to_vec(&request).expect("provision request serializes"))
+            .await
+            .map_err(|e| Error::Transport(format!("record provision request: {e}")))?;
+        tokio::fs::rename(&staged, directory.join("request.json"))
+            .await
+            .map_err(|e| Error::Transport(format!("record provision request: {e}")))?;
+        Ok(Some(request))
+    }
+
+    /// The directory holding a client label's key, named by the label's
+    /// digest: a label never selects a filesystem path, nor a launch's key.
+    fn client_key_directory(&self, label: &str) -> PathBuf {
+        self.keys.join(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(label.as_bytes())))
+    }
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
         let label = environment
             .label
             .as_deref()
             .ok_or_else(|| Error::Protocol(ProtocolError::Refused { reason: "environment has no drydock-managed SSH key".into() }))?;
-        // Never use an arbitrary client label as a filesystem path.
-        uuid::Uuid::parse_str(label).map_err(|e| Error::InvalidRequest(format!("environment label is not a drydock key: {e}")))?;
-        Ok(self.keys.join(label).join("id_ed25519"))
+        // A launch's own UUID label names its key directory directly.
+        if let Ok(uuid) = uuid::Uuid::parse_str(label)
+            && uuid.hyphenated().to_string() == label
+        {
+            let launched = self.keys.join(label).join("id_ed25519");
+            if launched.is_file() {
+                return Ok(launched);
+            }
+        }
+        Ok(self.client_key_directory(label).join("id_ed25519"))
     }
 }
 // Routing between per-host runtimes. Policy stays in each host's Runtime;
@@ -500,7 +616,8 @@ impl ProviderApi for Daemon {
         self.runtime(p)?.prepare(p, request).await
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
-        self.invalidating(p, self.runtime(p)?.provision(p, request).await).await
+        let keyed = self.keyed(p, request).await?;
+        self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await
     }
     async fn list(&self, p: &str) -> Result<Vec<Environment>, Error> {
         if self.credential.is_some() {
@@ -752,12 +869,6 @@ impl Daemon {
 
 /// The host's agent build for a prepared platform. A missing build refuses the
 /// launch, naming the file or variable that would supply it.
-async fn agent_build(platform: &Platform) -> Result<Vec<u8>, Error> {
-    let refused = |reason: String| Error::Protocol(ProtocolError::Refused { reason });
-    let path = crate::local::agent_build(platform).map_err(|reason| refused(format!("no vessel agent build for {platform}: {reason}")))?;
-    tokio::fs::read(&path).await.map_err(|error| refused(format!("vessel agent build {}: {error}", path.display())))
-}
-
 // No unknown operation or platform is advertised as supported. BootstrapRoute
 // has no unknown variant; Upload is inert while readiness is unavailable.
 fn conservative_capabilities() -> Capabilities {

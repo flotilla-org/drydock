@@ -76,6 +76,10 @@ const SUN_PATH_MAX: usize = 107;
 struct Record {
     provider: String,
     environment: String,
+    /// The environment's label. Records from before it was kept are named by
+    /// their directory, which is a launch's label.
+    #[serde(default)]
+    label: Option<String>,
     #[serde(default)]
     inward: BTreeMap<String, InwardRequest>,
     #[serde(default)]
@@ -141,13 +145,13 @@ impl Exposures {
     pub(crate) fn restore(&self) {
         let Ok(entries) = std::fs::read_dir(&self.shared.keys) else { return };
         for entry in entries.flatten() {
-            let label = entry.file_name().to_string_lossy().into_owned();
             let file = entry.path().join(STORE_FILE);
             let Ok(bytes) = std::fs::read(&file) else { continue };
             match serde_json::from_slice::<Record>(&bytes) {
                 Ok(record) => {
                     let key = (record.provider.clone(), record.environment.clone());
-                    match Vessel::start(&self.shared, label, record) {
+                    let label = record.label.clone().unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+                    match Vessel::start(&self.shared, entry.path(), label, record) {
                         Ok(vessel) => {
                             self.vessels.lock().unwrap().insert(key, vessel);
                         }
@@ -183,8 +187,9 @@ impl Exposures {
             return Err(refused("environment has no drydock-managed SSH key".into()));
         }
         let label = environment.label.ok_or_else(|| refused("environment has no drydock-managed SSH key".into()))?;
-        let record = Record { provider: provider.into(), environment: id.into(), ..Record::default() };
-        let vessel = Vessel::start(&self.shared, label, record).map_err(|e| Error::Transport(format!("exposures: {e}")))?;
+        let directory = key.parent().ok_or_else(|| refused("environment key has no directory".into()))?.to_path_buf();
+        let record = Record { provider: provider.into(), environment: id.into(), label: Some(label.clone()), ..Record::default() };
+        let vessel = Vessel::start(&self.shared, directory, label, record).map_err(|e| Error::Transport(format!("exposures: {e}")))?;
         self.vessels.lock().unwrap().insert((provider.into(), id.into()), vessel.clone());
         Ok(vessel)
     }
@@ -438,7 +443,8 @@ impl Drop for Listener {
 }
 
 impl Vessel {
-    fn start(shared: &Arc<Shared>, label: String, record: Record) -> io::Result<Arc<Self>> {
+    /// `directory` holds the vessel's key, and its record beside it.
+    fn start(shared: &Arc<Shared>, directory: PathBuf, label: String, record: Record) -> io::Result<Arc<Self>> {
         let digest = format!("{:x}", Sha256::digest(format!("{}\0{}", record.provider, record.environment)));
         let local = shared.local.join(&digest[..16]);
         crate::local::private_dir(&shared.local).map_err(io::Error::other)?;
@@ -453,7 +459,7 @@ impl Vessel {
         let vessel = Arc::new(Self {
             provider: record.provider.clone(),
             id: record.environment.clone(),
-            file: shared.keys.join(&label).join(STORE_FILE),
+            file: directory.join(STORE_FILE),
             label,
             local,
             state: tokio::sync::Mutex::new(State { record, status, listeners: BTreeMap::new(), connected: None }),

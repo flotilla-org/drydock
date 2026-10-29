@@ -24,6 +24,8 @@ use tokio::{
 
 const BUILD: &[u8] = b"exposures test agent";
 const PROVIDER: &str = "vessels";
+/// A provider whose vessels run no agent.
+const PLAIN: &str = "plain";
 
 /// The registry boundary: tags are already digests here.
 struct Digests;
@@ -34,17 +36,13 @@ impl drydock::launch::ImageResolver for Digests {
     }
 }
 
-/// The agent build every daemon here pushes: one file for the whole process,
-/// since the variable naming it is process-wide.
-fn agent_build() {
-    static BUILD_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BUILD_FILE.get_or_init(|| {
-        let path = tempfile::tempdir().unwrap().keep().join("drydock-agent-linux-amd64");
-        std::fs::write(&path, BUILD).unwrap();
-        // SAFETY: set once, before any daemon in this process reads it.
-        unsafe { std::env::set_var("DRYDOCK_AGENT_BIN_LINUX_AMD64", &path) };
-        path
-    });
+/// The agent build every daemon here pushes, given through its seam.
+struct Build;
+#[async_trait::async_trait]
+impl drydock::daemon::AgentBuilds for Build {
+    async fn build(&self, _: &Platform) -> Result<Vec<u8>, String> {
+        Ok(BUILD.to_vec())
+    }
 }
 
 struct Harness {
@@ -69,7 +67,6 @@ impl Harness {
     async fn start() -> Self {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        agent_build();
         std::fs::write(dir.path().join("hosts"), "127.0.0.1 localhost\n").unwrap();
         let vessel = dir.path().join("vessel");
         std::fs::create_dir(&vessel).unwrap();
@@ -100,12 +97,15 @@ impl Harness {
         }
         let text = format!(
             "[providers.{PROVIDER}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nagent_link='local_forward'\n\
-             settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n",
+             settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n\
+             [providers.{PLAIN}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nsettings={{poll_interval_ms=10}}\n",
+            "a".repeat(64),
             "a".repeat(64)
         );
         let run = self.path("run");
         let seams = Seams {
             dialer: self.gateway.clone(),
+            builds: Arc::new(Build),
             guest: GuestLayout { hosts: self.path("hosts"), sockets: self.path("guest") },
             timing: Timing { connect: Duration::from_secs(3), retry: Duration::from_millis(100), heartbeat: Duration::from_millis(200) },
             ..Seams::new(Arc::new(Digests))
@@ -237,6 +237,105 @@ async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
     let transport = drydock_transport::Transport::yamux(Box::new(stream), true, Default::default()).await.unwrap();
     let agent = drydock_agent::Client::connect(transport, String::new()).await.unwrap();
     assert!(!agent.hello().boot_id.is_empty());
+}
+
+/// A provision request under `label`, prepared on the reference module.
+async fn labelled(h: &Harness, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
+    labelled_on(h, PROVIDER, label, ssh_public_key).await
+}
+async fn labelled_on(h: &Harness, provider: &str, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
+    let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 };
+    let request = PrepareRequest {
+        platform: None,
+        route: None,
+        image_pull: None,
+        image_digest: format!("image@sha256:{}", "a".repeat(64)),
+        tools_digest: "tools".into(),
+        size: size.clone(),
+    };
+    let prepared = h.api.prepare(provider, &request).await.unwrap();
+    ProvisionRequest { label: label.into(), prepared, size, egress: EgressRequest::Open, ssh_public_key }
+}
+
+// A client that provisions under its own label and names no key gets one drydock
+// holds, as a launch does: its vessel takes exposures, a repeated provision
+// adopts it with the same key, and its exposures come back after a restart.
+#[tokio::test]
+async fn a_labelled_provision_without_a_key_takes_exposures() {
+    let mut h = Harness::start().await;
+    let request = labelled(&h, "client/vessel", None).await;
+    let drydock::api::Provisioned::Created(created) = h.api.provision(PROVIDER, &request).await.unwrap() else {
+        panic!("a first provision creates")
+    };
+    let cleat = h.path("labelled-cleat.sock");
+    let target = UnixListener::bind(&cleat).unwrap();
+    let set = h.api.put_inward(PROVIDER, &created.id, "cleat", &InwardRequest { target: InwardTarget::Unix(unix(&cleat)) }).await.unwrap();
+    assert!(set.into_inner().ready);
+    let drydock::api::Provisioned::Existing(adopted) = h.api.provision(PROVIDER, &request).await.unwrap() else {
+        panic!("the label adopts")
+    };
+    assert_eq!(adopted.id, created.id);
+    // The label names no path: its key directory is its digest.
+    let keys: Vec<_> = std::fs::read_dir(h.path("run/keys")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(keys.iter().all(|name| !name.contains("client")), "{keys:?}");
+    h.restart_daemon().await;
+    let api = h.api.clone();
+    let id = created.id.clone();
+    eventually(|| {
+        let (api, id) = (api.clone(), id.clone());
+        async move { api.inward(PROVIDER, &id, "cleat").await.is_ok_and(|inward| inward.ready) }
+    })
+    .await;
+    let inward = h.api.inward(PROVIDER, &created.id, "cleat").await.unwrap();
+    round_trip(UnixStream::connect(local(&inward)).await.unwrap(), async { target.accept().await.unwrap().0 }).await;
+}
+
+// Two first provisions of one label at once share the one key drydock makes,
+// and adopt one environment.
+#[tokio::test]
+async fn concurrent_first_provisions_of_a_label_share_one_key() {
+    let h = Harness::start().await;
+    let request = labelled(&h, "raced", None).await;
+    let (a, b) = tokio::join!(h.api.provision(PROVIDER, &request), h.api.provision(PROVIDER, &request));
+    assert_eq!(a.unwrap().into_inner().id, b.unwrap().into_inner().id);
+    let held = std::fs::read_dir(h.path("run/keys")).unwrap().filter(|e| e.as_ref().unwrap().path().join("id_ed25519").is_file()).count();
+    assert_eq!(held, 2, "the harness's launch and this label");
+}
+
+// A client label equal to a launch's UUID gets no share of that launch's key:
+// it names an environment drydock holds no client key for, so it is refused.
+#[tokio::test]
+async fn a_client_label_never_takes_a_launchs_key() {
+    let h = Harness::start().await;
+    let launched = h.api.inspect(PROVIDER, &h.id).await.unwrap().label.unwrap();
+    let request = labelled(&h, &launched, None).await;
+    let refused = h.api.provision(PROVIDER, &request).await.map(drop);
+    assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
+    let launch = std::fs::read(h.path("run/keys").join(&launched).join("request.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&launch).contains("\"tools\""), "the launch's record is its own");
+}
+
+// A keyless provision for a provider whose vessels run no agent is passed
+// through untouched: drydock makes no key for it.
+#[tokio::test]
+async fn a_keyless_provision_without_an_agent_gets_no_key() {
+    let h = Harness::start().await;
+    let before = std::fs::read_dir(h.path("run/keys")).unwrap().count();
+    let request = labelled_on(&h, PLAIN, "plain-vessel", None).await;
+    h.api.provision(PLAIN, &request).await.unwrap();
+    assert_eq!(std::fs::read_dir(h.path("run/keys")).unwrap().count(), before);
+}
+
+// A label already naming an environment drydock holds no key for (one
+// provisioned with the client's own key) is refused: its key cannot be rotated.
+#[tokio::test]
+async fn a_label_drydock_holds_no_key_for_is_refused() {
+    let h = Harness::start().await;
+    let own = labelled(&h, "own-key", Some("ssh-ed25519 AAAA client".into())).await;
+    h.api.provision(PROVIDER, &own).await.unwrap();
+    let keyless = ProvisionRequest { ssh_public_key: None, ..own };
+    let refused = h.api.provision(PROVIDER, &keyless).await.map(drop);
+    assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
 }
 
 // Flotilla case 2, crew talks back: an outward exposure gives a Unix socket in
