@@ -2361,6 +2361,8 @@ async fn destroy_waits_out_state_change() {
     p.destroy("sbx-1", &c).await.unwrap();
     assert!(http.0.lock().unwrap().failure.is_none());
     http.0.lock().unwrap().outage = Some((409, "Sandbox state change in progress".into()));
+    let before = http.0.lock().unwrap().requests;
     let e = p.destroy("sbx-1", &c).await.unwrap_err();
     assert_eq!(e.class(), "unavailable");
+    assert_eq!(http.0.lock().unwrap().requests, before + 5);
 }

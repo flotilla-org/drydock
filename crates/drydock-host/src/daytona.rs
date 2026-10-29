@@ -99,12 +99,15 @@ impl Module for DaytonaModule {
         Ok(Arc::new(Daytona { name: name.to_owned(), settings, http }))
     }
 }
-const DESTROY_ATTEMPTS: u32 = 5;
 pub struct Daytona {
     name: String,
     settings: Settings,
     http: Arc<dyn HttpClient>,
 }
+/// Bounds destroy's wait for an in-progress state change to about 8s (4 sleeps), long
+/// enough for a just-resumed sandbox to settle without stalling the caller.
+const DESTROY_ATTEMPTS: u32 = 5;
+const DESTROY_RETRY_DELAY: Duration = Duration::from_secs(2);
 impl Daytona {
     fn path(&self, base: &str, segments: &[&str]) -> Result<Url> {
         let mut url = Url::parse(base).map_err(|_| refused("invalid Daytona URL"))?;
@@ -137,7 +140,6 @@ impl Daytona {
     ) -> Result<Option<Value>> {
         let token = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "Daytona API key not delivered".into() })?;
         let operation = format!("{method} {}", url.path());
-        let is_delete = method == Method::DELETE;
         let mut request = reqwest::Request::new(method, url);
         let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.expose()))
             .map_err(|_| refused("invalid Daytona API key header"))?;
@@ -169,8 +171,6 @@ impl Daytona {
                 402 => ProtocolError::QuotaExhausted { reason: reason.clone() },
                 429 => ProtocolError::RateLimited { reason: reason.clone(), retry_after },
                 408 => ProtocolError::unavailable(reason.clone(), None),
-                // A sandbox mid-transition refuses DELETE; it settles on its own.
-                409 if is_delete => ProtocolError::unavailable(reason.clone(), retry_after),
                 500..=599 => ProtocolError::unavailable(reason.clone(), retry_after),
                 _ => ProtocolError::Internal { reason: format!("unexpected Daytona {operation} HTTP {status}"), provider_error: raw },
             });
@@ -773,17 +773,16 @@ impl Provider for Daytona {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         // Daytona answers 409 while a state change is in progress; wait it out briefly,
         // then surface the retryable `unavailable` error.
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match self.call(Method::DELETE, self.sandbox_url(id, None)?, None, c).await {
-                Ok(_) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
-                Err(ProtocolError::Unavailable { reason, .. }) if attempt < DESTROY_ATTEMPTS && reason.contains("HTTP 409") => {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
+        for attempt in 1..=DESTROY_ATTEMPTS {
+            let url = self.sandbox_url(id, None)?;
+            match self.request(Method::DELETE, url, None, c, true, ResponseFormat::Json).await {
+                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
+                Ok(None) if attempt < DESTROY_ATTEMPTS => tokio::time::sleep(DESTROY_RETRY_DELAY).await,
+                Ok(None) => break,
                 Err(e) => return Err(e),
             }
         }
+        Err(ProtocolError::unavailable("Daytona sandbox state change still in progress; retry destroy", None))
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
         let mut url = self.sandbox_url(id, Some("ssh-access"))?;
