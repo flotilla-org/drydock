@@ -19,7 +19,7 @@ pub mod socket;
 pub mod stand_in;
 mod store;
 mod streams;
-pub use streams::CLAIM_DEADLINE;
+pub use streams::{CLAIM_DEADLINE, CONNECT_DEADLINE};
 pub mod upgrade;
 pub use client::{Client, Download, ExecOutput, Process};
 use drydock_transport::ByteStream;

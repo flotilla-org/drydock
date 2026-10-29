@@ -381,6 +381,11 @@ A cursor is `<boot_id>:<serial>`. `?since=` resumes after that event while
 the agent still retains it (the last 1024). A cursor from another agent
 process, one older than what is retained, or none, reads everything retained,
 so a reader that reconnects after a restart sees what the new agent has said.
+A live reader that falls more than 1024 events behind likewise skips to the
+oldest retained event; what fell out is gone. Over HTTP/2 both ends' keepalive
+pings notice a dead peer on an idle `/events`; over HTTP/1.1 an idle stream
+carries no bytes, so a debugging client such as curl cannot tell an idle agent
+from a dead one.
 `forward_failed` reports an outward listener that stopped, or a connection
 closed because nobody claimed it.
 
@@ -536,7 +541,7 @@ Cleat attach is an ordinary inward forward to a Unix socket.
   vessel, Unix or TCP; TCP port zero is rejected. drydockd opens one
   `CONNECT /forwards/inward/{id}/stream` per client connection
   (`Client::open_inward`). The agent replies 200 only after reaching the
-  target; otherwise the reply is the structured error of that attempt, its
+  target, within 10 seconds (`CONNECT_DEADLINE`); otherwise the reply is the structured error of that attempt, its
   kind kept (an unknown ID or a missing socket is 404, a refused connection
   `ConnectionRefused`). Unix targets connect lazily, so the host can register
   a service before its socket exists.

@@ -864,9 +864,16 @@ async fn follow(link: Control, targets: Targets) {
                                 }
                             };
                             cursor = Some(record.cursor);
+                            if let crate::events::Event::ForwardFailed { forward, reason } = &record.event {
+                                tracing::warn!(forward = %forward, %reason, "agent reports a forward failed");
+                            }
                             if let crate::events::Event::OutwardConnection { forward, connection } = record.event {
                                 let target = targets.lock().unwrap().get(&forward).cloned();
-                                let Some(target) = target else { continue };
+                                let Some(target) = target else {
+                                    // Left for the agent to close at its claim deadline.
+                                    tracing::debug!(forward = %forward, connection, "no host endpoint registered for this outward connection");
+                                    continue;
+                                };
                                 let link = link.clone();
                                 streams.spawn(async move {
                                     let uri = format!("/forwards/outward/{}/connections/{connection}", encode_segment(&forward));

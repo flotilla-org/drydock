@@ -649,10 +649,13 @@ type EventLines =
     tokio::io::Lines<tokio_util::io::StreamReader<futures_util::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>, bytes::Bytes>>;
 /// `/events` from the start, as lines, on the harness's raw connection.
 async fn events(h: &Harness) -> EventLines {
+    events_from(h, "/events").await
+}
+async fn events_from(h: &Harness, uri: &str) -> EventLines {
     use futures_util::{StreamExt, TryStreamExt};
     use http_body_util::BodyExt;
     use tokio::io::AsyncBufReadExt;
-    let request = http::Request::get("/events").body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
+    let request = http::Request::get(uri).body(http_body_util::Full::new(bytes::Bytes::new())).unwrap();
     let response = h.raw.clone().send_request(request).await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "application/x-ndjson");
@@ -660,8 +663,30 @@ async fn events(h: &Harness) -> EventLines {
     tokio_util::io::StreamReader::new(body).lines()
 }
 async fn next_event(lines: &mut EventLines) -> drydock_agent::events::Event {
+    next_record(lines).await.event
+}
+async fn next_record(lines: &mut EventLines) -> drydock_agent::events::Record {
     let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.expect("no event arrived").unwrap().unwrap();
-    serde_json::from_str::<drydock_agent::events::Record>(&line).unwrap().event
+    serde_json::from_str(&line).unwrap()
+}
+
+// A reader whose /events connection drops resumes from its cursor: an
+// announcement made while it was away is the next line it reads, and
+// nothing it already read comes again.
+#[tokio::test]
+async fn a_reader_resumes_from_its_cursor_after_a_dropped_stream() {
+    use drydock_agent::events::Event;
+    let h = harness(false, "test-build").await;
+    let mut lines = events(&h).await;
+    let unix = unclaimed_forward(&h, "gap").await;
+    let _first = UnixStream::connect(&unix).await.unwrap();
+    let seen = next_record(&mut lines).await;
+    drop(lines);
+    let _second = UnixStream::connect(&unix).await.unwrap();
+    let mut resumed = events_from(&h, &format!("/events?since={}", segment(&seen.cursor))).await;
+    let Event::OutwardConnection { connection, .. } = next_event(&mut resumed).await else { panic!("the announcement in the gap") };
+    let Event::OutwardConnection { connection: first, .. } = seen.event else { panic!("an announcement first") };
+    assert_eq!(connection, first + 1);
 }
 /// An outward forward set straight on the agent, so no client claims its
 /// connections.

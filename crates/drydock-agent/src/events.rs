@@ -53,7 +53,7 @@ impl Events {
         Self { boot_id, log: Mutex::default(), changed: watch::channel(0).0 }
     }
     pub(crate) fn push(&self, event: Event) {
-        let mut log = self.log.lock().unwrap();
+        let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         log.serial += 1;
         let cursor = format!("{}:{}", self.boot_id, log.serial);
         log.records.push_back(Record { cursor, event });
@@ -63,9 +63,11 @@ impl Events {
         self.changed.send_replace(log.serial);
     }
     /// Records after `since`. A cursor this process did not issue, or one
-    /// older than what is retained, reads everything retained.
+    /// older than what is retained, reads everything retained. The same holds
+    /// for a live reader that falls more than [`RETAINED`] events behind: it
+    /// skips to the oldest retained event, and what fell out is gone.
     pub(crate) fn after(&self, since: Option<u64>) -> (Vec<Record>, u64) {
-        let log = self.log.lock().unwrap();
+        let log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let oldest = log.serial - log.records.len() as u64;
         let skip = since.filter(|serial| (oldest..=log.serial).contains(serial)).map_or(0, |serial| serial - oldest);
         (log.records.iter().skip(skip as usize).cloned().collect(), log.serial)

@@ -160,9 +160,8 @@ impl Agent {
     }
     /// Close an outward connection nobody claims within `deadline`, instead
     /// of [`crate::CLAIM_DEADLINE`].
-    pub fn with_claim_deadline(mut self, deadline: std::time::Duration) -> Self {
-        let shared = Arc::get_mut(&mut self.shared).expect("the deadline is chosen before the agent runs");
-        shared.outward = Arc::new(crate::streams::Outward::new(shared.events.clone(), deadline));
+    pub fn with_claim_deadline(self, deadline: std::time::Duration) -> Self {
+        self.shared.outward.set_deadline(deadline);
         self
     }
     /// Keep the digest store at `root` instead of beside the executable.

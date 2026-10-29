@@ -25,18 +25,23 @@ use tokio::sync::oneshot;
 
 /// How long an outward connection waits to be claimed before it is closed.
 pub const CLAIM_DEADLINE: Duration = Duration::from_secs(30);
+/// How long an inward stream may take to reach its target.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The request's upgrade, and the reply that completes it. Anything other
 /// than a byte-stream request is refused.
 fn upgrade(operation: &str, subject: &str, request: &mut Request) -> Result<(hyper::upgrade::OnUpgrade, Response), AgentError> {
     let connect = request.method() == Method::CONNECT
         && request.extensions().get::<hyper::ext::Protocol>().is_some_and(|protocol| protocol.as_str() == BYTE_STREAM);
-    let upgrade = request.method() == Method::GET
-        && request
+    let has_token = |name, token: &str| {
+        request
             .headers()
-            .get(header::UPGRADE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case(BYTE_STREAM)));
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.split(',').any(|item| item.trim().eq_ignore_ascii_case(token)))
+    };
+    let upgrade = request.method() == Method::GET && has_token(header::CONNECTION, "upgrade") && has_token(header::UPGRADE, BYTE_STREAM);
     let refused = || {
         AgentError::new(
             operation,
@@ -84,7 +89,11 @@ pub(crate) async fn open_inward(
         // The stream belongs to its forward: removing or changing it ends the
         // stream, including while it is still connecting.
         target.streams.spawn(async move {
-            let mut destination = match endpoint.connect_marked(marked).await {
+            let connected = tokio::time::timeout(CONNECT_DEADLINE, endpoint.connect_marked(marked)).await;
+            let connected = connected.unwrap_or_else(|_| {
+                Err(io::Error::new(io::ErrorKind::TimedOut, format!("target not reached within {CONNECT_DEADLINE:?}")))
+            });
+            let mut destination = match connected {
                 Ok(destination) => destination,
                 Err(error) => {
                     let _ = reached.send(Err(AgentError::io(OP, format!("{id}: {endpoint:?}"), error)));
@@ -110,7 +119,7 @@ pub(crate) struct Outward {
     events: Arc<Events>,
     next: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
-    deadline: Duration,
+    deadline: Mutex<Duration>,
 }
 struct Pending {
     forward: String,
@@ -123,12 +132,20 @@ struct Waiting<'a> {
 }
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        self.outward.pending.lock().unwrap().remove(&self.connection);
+        self.outward.pending().remove(&self.connection);
     }
 }
 impl Outward {
     pub(crate) fn new(events: Arc<Events>, deadline: Duration) -> Self {
-        Self { events, next: AtomicU64::new(1), pending: Mutex::default(), deadline }
+        Self { events, next: AtomicU64::new(1), pending: Mutex::default(), deadline: Mutex::new(deadline) }
+    }
+    /// Close connections announced from now on that nobody claims within `deadline`.
+    pub(crate) fn set_deadline(&self, deadline: Duration) {
+        *self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
+    }
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Pending>> {
+        // A panic elsewhere must not stop every later announcement and claim.
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Announce a connection to `forward` on `/events` and wait for drydockd
     /// to claim it. The claim's stream is the connection's other end. One not
@@ -136,23 +153,24 @@ impl Outward {
     pub(crate) async fn open(&self, forward: &str) -> io::Result<ByteStream> {
         let connection = self.next.fetch_add(1, Ordering::Relaxed);
         let (claim, claimed) = oneshot::channel();
-        self.pending.lock().unwrap().insert(connection, Pending { forward: forward.into(), claim });
+        self.pending().insert(connection, Pending { forward: forward.into(), claim });
         let _waiting = Waiting { outward: self, connection };
         self.events.push(Event::OutwardConnection { forward: forward.into(), connection });
-        match tokio::time::timeout(self.deadline, claimed).await {
+        let deadline = *self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tokio::time::timeout(deadline, claimed).await {
             Ok(Ok(stream)) => Ok(stream),
             Ok(Err(_)) => {
                 Err(io::Error::new(io::ErrorKind::ConnectionAborted, format!("claim of {forward} connection {connection} failed")))
             }
             Err(_) => {
-                let reason = format!("connection {connection} was not claimed within {:?}", self.deadline);
+                let reason = format!("connection {connection} was not claimed within {deadline:?}");
                 self.events.push(Event::ForwardFailed { forward: forward.into(), reason: reason.clone() });
                 Err(io::Error::new(io::ErrorKind::TimedOut, format!("{forward}: {reason}")))
             }
         }
     }
     fn claim(&self, forward: &str, connection: u64) -> Option<oneshot::Sender<ByteStream>> {
-        let mut pending = self.pending.lock().unwrap();
+        let mut pending = self.pending();
         pending.get(&connection).filter(|waiting| waiting.forward == forward)?;
         pending.remove(&connection).map(|waiting| waiting.claim)
     }
