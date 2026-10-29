@@ -235,34 +235,28 @@ async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
     assert!(!agent.hello().boot_id.is_empty());
 }
 
+/// A provision request under `label`, prepared on the reference module.
+async fn labelled(h: &Harness, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
+    let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 };
+    let request = PrepareRequest {
+        platform: None,
+        route: None,
+        image_pull: None,
+        image_digest: format!("image@sha256:{}", "a".repeat(64)),
+        tools_digest: "tools".into(),
+        size: size.clone(),
+    };
+    let prepared = h.api.prepare(PROVIDER, &request).await.unwrap();
+    ProvisionRequest { label: label.into(), prepared, size, egress: EgressRequest::Open, ssh_public_key }
+}
+
 // A client that provisions under its own label and names no key gets one drydock
 // holds, as a launch does: its vessel takes exposures, a repeated provision
 // adopts it with the same key, and its exposures come back after a restart.
 #[tokio::test]
 async fn a_labelled_provision_without_a_key_takes_exposures() {
     let mut h = Harness::start().await;
-    let prepared = h
-        .api
-        .prepare(
-            PROVIDER,
-            &PrepareRequest {
-                platform: None,
-                route: None,
-                image_pull: None,
-                image_digest: format!("image@sha256:{}", "a".repeat(64)),
-                tools_digest: "tools".into(),
-                size: Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 },
-            },
-        )
-        .await
-        .unwrap();
-    let request = ProvisionRequest {
-        label: "client/vessel".into(),
-        prepared,
-        size: Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 },
-        egress: EgressRequest::Open,
-        ssh_public_key: None,
-    };
+    let request = labelled(&h, "client/vessel", None).await;
     let drydock::api::Provisioned::Created(created) = h.api.provision(PROVIDER, &request).await.unwrap() else {
         panic!("a first provision creates")
     };
@@ -287,6 +281,18 @@ async fn a_labelled_provision_without_a_key_takes_exposures() {
     .await;
     let inward = h.api.inward(PROVIDER, &created.id, "cleat").await.unwrap();
     round_trip(UnixStream::connect(local(&inward)).await.unwrap(), async { target.accept().await.unwrap().0 }).await;
+}
+
+// A label already naming an environment drydock holds no key for (one
+// provisioned with the client's own key) is refused: its key cannot be rotated.
+#[tokio::test]
+async fn a_label_drydock_holds_no_key_for_is_refused() {
+    let h = Harness::start().await;
+    let own = labelled(&h, "own-key", Some("ssh-ed25519 AAAA client".into())).await;
+    h.api.provision(PROVIDER, &own).await.unwrap();
+    let keyless = ProvisionRequest { ssh_public_key: None, ..own };
+    let refused = h.api.provision(PROVIDER, &keyless).await.map(drop);
+    assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
 }
 
 // Flotilla case 2, crew talks back: an outward exposure gives a Unix socket in
