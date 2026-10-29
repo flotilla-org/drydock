@@ -174,8 +174,11 @@ and a typed `error` (`not_running`, `vessel_unreachable`, `refused`,
 on a stopped one it is recorded as `not_running` and set up on resume. Removing
 an absent exposure succeeds. `/v1/events` carries an `exposure` event kind,
 live only, on every set, on removal (`"removed": true`) and on every change in
-`ready`. These routes are server-only and need a vessel drydock launched (it
-holds the key) whose provider declares the agent.
+`ready`. These routes are server-only and need a vessel whose key drydock holds,
+whose provider declares the agent: one it launched, or one a client provisioned
+through the server under its own label without an `ssh_public_key`. Drydock
+makes that label's key once and reuses it, so provision stays label-idempotent;
+it refuses a label that already names an environment it holds no key for.
 
 Drydock keeps one connection to each such vessel's agent and carries every
 exposure on it: the agent opens inward streams to the target and listens in

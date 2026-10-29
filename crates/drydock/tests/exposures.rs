@@ -34,17 +34,13 @@ impl drydock::launch::ImageResolver for Digests {
     }
 }
 
-/// The agent build every daemon here pushes: one file for the whole process,
-/// since the variable naming it is process-wide.
-fn agent_build() {
-    static BUILD_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BUILD_FILE.get_or_init(|| {
-        let path = tempfile::tempdir().unwrap().keep().join("drydock-agent-linux-amd64");
-        std::fs::write(&path, BUILD).unwrap();
-        // SAFETY: set once, before any daemon in this process reads it.
-        unsafe { std::env::set_var("DRYDOCK_AGENT_BIN_LINUX_AMD64", &path) };
-        path
-    });
+/// The agent build every daemon here pushes, given through its seam.
+struct Build;
+#[async_trait::async_trait]
+impl drydock::daemon::AgentBuilds for Build {
+    async fn build(&self, _: &Platform) -> Result<Vec<u8>, String> {
+        Ok(BUILD.to_vec())
+    }
 }
 
 struct Harness {
@@ -69,7 +65,6 @@ impl Harness {
     async fn start() -> Self {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        agent_build();
         std::fs::write(dir.path().join("hosts"), "127.0.0.1 localhost\n").unwrap();
         let vessel = dir.path().join("vessel");
         std::fs::create_dir(&vessel).unwrap();
@@ -106,6 +101,7 @@ impl Harness {
         let run = self.path("run");
         let seams = Seams {
             dialer: self.gateway.clone(),
+            builds: Arc::new(Build),
             guest: GuestLayout { hosts: self.path("hosts"), sockets: self.path("guest") },
             timing: Timing { connect: Duration::from_secs(3), retry: Duration::from_millis(100), heartbeat: Duration::from_millis(200) },
             ..Seams::new(Arc::new(Digests))
@@ -237,6 +233,60 @@ async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
     let transport = drydock_transport::Transport::yamux(Box::new(stream), true, Default::default()).await.unwrap();
     let agent = drydock_agent::Client::connect(transport, String::new()).await.unwrap();
     assert!(!agent.hello().boot_id.is_empty());
+}
+
+// A client that provisions under its own label and names no key gets one drydock
+// holds, as a launch does: its vessel takes exposures, a repeated provision
+// adopts it with the same key, and its exposures come back after a restart.
+#[tokio::test]
+async fn a_labelled_provision_without_a_key_takes_exposures() {
+    let mut h = Harness::start().await;
+    let prepared = h
+        .api
+        .prepare(
+            PROVIDER,
+            &PrepareRequest {
+                platform: None,
+                route: None,
+                image_pull: None,
+                image_digest: format!("image@sha256:{}", "a".repeat(64)),
+                tools_digest: "tools".into(),
+                size: Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 },
+            },
+        )
+        .await
+        .unwrap();
+    let request = ProvisionRequest {
+        label: "client/vessel".into(),
+        prepared,
+        size: Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 },
+        egress: EgressRequest::Open,
+        ssh_public_key: None,
+    };
+    let drydock::api::Provisioned::Created(created) = h.api.provision(PROVIDER, &request).await.unwrap() else {
+        panic!("a first provision creates")
+    };
+    let cleat = h.path("labelled-cleat.sock");
+    let target = UnixListener::bind(&cleat).unwrap();
+    let set = h.api.put_inward(PROVIDER, &created.id, "cleat", &InwardRequest { target: InwardTarget::Unix(unix(&cleat)) }).await.unwrap();
+    assert!(set.into_inner().ready);
+    let drydock::api::Provisioned::Existing(adopted) = h.api.provision(PROVIDER, &request).await.unwrap() else {
+        panic!("the label adopts")
+    };
+    assert_eq!(adopted.id, created.id);
+    // The label names no path: its key directory is its digest.
+    let keys: Vec<_> = std::fs::read_dir(h.path("run/keys")).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert!(keys.iter().all(|name| !name.contains("client")), "{keys:?}");
+    h.restart_daemon().await;
+    let api = h.api.clone();
+    let id = created.id.clone();
+    eventually(|| {
+        let (api, id) = (api.clone(), id.clone());
+        async move { api.inward(PROVIDER, &id, "cleat").await.is_ok_and(|inward| inward.ready) }
+    })
+    .await;
+    let inward = h.api.inward(PROVIDER, &created.id, "cleat").await.unwrap();
+    round_trip(UnixStream::connect(local(&inward)).await.unwrap(), async { target.accept().await.unwrap().0 }).await;
 }
 
 // Flotilla case 2, crew talks back: an outward exposure gives a Unix socket in
