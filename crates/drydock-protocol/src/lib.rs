@@ -1,7 +1,9 @@
 //! JSON wire contract shared by the server and language hosts. No provider or HTTP runtime lives here.
 //! Provider IDs are opaque; labels identify a client's environment for idempotent creation.
 mod diagnostic;
+mod exposure;
 pub use diagnostic::DiagnosticMasker;
+pub use exposure::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use utoipa::ToSchema;
@@ -11,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "9";
+pub const PROTOCOL_VERSION: &str = "10";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -642,6 +644,18 @@ pub enum EventKind {
     Resumed,
     Gone {
         cause: GoneCause,
+    },
+    /// Server only: an exposure was set or removed, or its `ready` changed.
+    /// Live only: a replay from `since` does not repeat it, so read the
+    /// exposure routes for the current state.
+    Exposure {
+        direction: Direction,
+        name: String,
+        ready: bool,
+        #[serde(default)]
+        error: Option<ExposureError>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        removed: bool,
     },
 }
 /// Hosts unable to replay emit a snapshot marking the gap. Inventory is complete

@@ -32,6 +32,8 @@ pub struct Gateway {
     reverse_forwards: bool,
     links: Mutex<Vec<AgentLink>>,
     agent: Mutex<Option<JoinHandle<()>>>,
+    /// Bumped when the agent dies, cutting every local-forward link it served.
+    cut: tokio::sync::watch::Sender<u64>,
 }
 
 impl Drop for Gateway {
@@ -60,6 +62,7 @@ impl Gateway {
             reverse_forwards,
             links: Mutex::default(),
             agent: Mutex::default(),
+            cut: tokio::sync::watch::channel(0).0,
         });
         gateway.restart()?;
         Ok(gateway)
@@ -70,6 +73,7 @@ impl Gateway {
         if let Some(agent) = self.agent.lock().unwrap().take() {
             agent.abort();
         }
+        self.cut.send_modify(|generation| *generation += 1);
     }
 
     /// A new agent serves the vessel, as its supervisor restarts it: it has
@@ -118,7 +122,19 @@ impl SshDialer for Gateway {
             }
             GuestStreams::OverLocalForward => {
                 self.links.lock().unwrap().push(AgentLink::LocalForward);
-                Transport::yamux(Box::new(UnixStream::connect(&self.agent_socket).await?), true, Limits::default()).await
+                // The link runs through a pair this gateway can cut, as a dying
+                // agent process closes its end of every connection.
+                let agent = UnixStream::connect(&self.agent_socket).await?;
+                let (near, far) = UnixStream::pair()?;
+                let mut cut = self.cut.subscribe();
+                tokio::spawn(async move {
+                    let (mut far, mut agent) = (far, agent);
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut far, &mut agent) => {}
+                        _ = cut.changed() => {}
+                    }
+                });
+                Transport::yamux(Box::new(near), true, Limits::default()).await
             }
         }
     }

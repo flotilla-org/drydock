@@ -43,6 +43,20 @@ impl ConfigUpdate {
     }
 }
 
+/// The outcome of setting an exposure: a first `PUT` creates it (201), a later one replaces it (200).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Exposed<T> {
+    Created(T),
+    Replaced(T),
+}
+impl<T> Exposed<T> {
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Created(value) | Self::Replaced(value) => value,
+        }
+    }
+}
+
 /// Provider operations. Server-only extensions (credential delivery and the
 /// event stream) default to NotFound, so hosts implement only the common API.
 #[async_trait::async_trait]
@@ -73,6 +87,38 @@ pub trait ProviderApi: Send + Sync {
     }
     /// Server only: billing events and inventory snapshots.
     async fn observe(&self, _since: Option<&str>) -> Result<ObservationStream, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only: set an inward exposure, reporting whether it replaced one.
+    async fn put_inward(&self, _provider: &str, _id: &str, _name: &str, _request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only.
+    async fn inward(&self, _provider: &str, _id: &str, _name: &str) -> Result<Inward, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only.
+    async fn inwards(&self, _provider: &str, _id: &str) -> Result<Vec<Inward>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only: removing an absent exposure succeeds.
+    async fn remove_inward(&self, _provider: &str, _id: &str, _name: &str) -> Result<(), Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only: set an outward exposure, reporting whether it replaced one.
+    async fn put_outward(&self, _provider: &str, _id: &str, _name: &str, _request: &OutwardRequest) -> Result<Exposed<Outward>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only.
+    async fn outward(&self, _provider: &str, _id: &str, _name: &str) -> Result<Outward, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only.
+    async fn outwards(&self, _provider: &str, _id: &str) -> Result<Vec<Outward>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only: removing an absent exposure succeeds.
+    async fn remove_outward(&self, _provider: &str, _id: &str, _name: &str) -> Result<(), Error> {
         Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
     }
 }
@@ -160,6 +206,40 @@ impl ProviderApi for Client {
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error> {
         self.upgrade(provider, id, "exec", "drydock-stream", Some(command)).await
     }
+    async fn put_inward(&self, provider: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
+        let request =
+            self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "inward", name])?.json(request);
+        Ok(match self.execute_response(request).await? {
+            (201, exposure) => Exposed::Created(exposure),
+            (_, exposure) => Exposed::Replaced(exposure),
+        })
+    }
+    async fn inward(&self, provider: &str, id: &str, name: &str) -> Result<Inward, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "exposures", "inward", name], None).await
+    }
+    async fn inwards(&self, provider: &str, id: &str) -> Result<Vec<Inward>, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "exposures", "inward"], None).await
+    }
+    async fn remove_inward(&self, provider: &str, id: &str, name: &str) -> Result<(), Error> {
+        self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider, "environments", id, "exposures", "inward", name], None).await
+    }
+    async fn put_outward(&self, provider: &str, id: &str, name: &str, request: &OutwardRequest) -> Result<Exposed<Outward>, Error> {
+        let request =
+            self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "outward", name])?.json(request);
+        Ok(match self.execute_response(request).await? {
+            (201, exposure) => Exposed::Created(exposure),
+            (_, exposure) => Exposed::Replaced(exposure),
+        })
+    }
+    async fn outward(&self, provider: &str, id: &str, name: &str) -> Result<Outward, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "exposures", "outward", name], None).await
+    }
+    async fn outwards(&self, provider: &str, id: &str) -> Result<Vec<Outward>, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "exposures", "outward"], None).await
+    }
+    async fn remove_outward(&self, provider: &str, id: &str, name: &str) -> Result<(), Error> {
+        self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider, "environments", id, "exposures", "outward", name], None).await
+    }
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi> {
         Arc::new(self.clone().credentialed(Some(credential)))
     }
@@ -233,7 +313,13 @@ fn routes() -> OpenApiRouter<Surface> {
         .routes(routes!(quota))
 }
 fn server_routes() -> OpenApiRouter<Surface> {
-    routes().routes(routes!(events)).routes(routes!(credential))
+    routes()
+        .routes(routes!(events))
+        .routes(routes!(credential))
+        .routes(routes!(inwards))
+        .routes(routes!(inward, put_inward, remove_inward))
+        .routes(routes!(outwards))
+        .routes(routes!(outward, put_outward, remove_outward))
 }
 /// Canonical shared API, with only the credential/events extensions server-only.
 pub fn openapi() -> utoipa::openapi::OpenApi {
@@ -402,6 +488,80 @@ async fn quota(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<Quo
     Ok(Json(api.quota(&p).await?))
 }
 
+#[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/inward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+request_body = InwardRequest,
+responses((status = 201, description = "Set; the outcome is in ready and error", body = Inward), (status = 200, description = "Replaced; the outcome is in ready and error", body = Inward), ErrorResponses)
+)]
+async fn put_inward(
+    Api(api): Api,
+    ApiPath((p, id, name)): ApiPath<(String, String, String)>,
+    ApiJson(r): ApiJson<InwardRequest>,
+) -> ApiResult<Response> {
+    Ok(match api.put_inward(&p, &id, &name, &r).await? {
+        Exposed::Created(exposure) => (StatusCode::CREATED, Json(exposure)).into_response(),
+        Exposed::Replaced(exposure) => Json(exposure).into_response(),
+    })
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/inward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+responses((status = 200, description = "The exposure as it stands", body = Inward), ErrorResponses)
+)]
+async fn inward(Api(api): Api, ApiPath((p, id, name)): ApiPath<(String, String, String)>) -> ApiResult<Json<Inward>> {
+    Ok(Json(api.inward(&p, &id, &name).await?))
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/inward",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "The environment's exposures", body = Vec<Inward>), ErrorResponses)
+)]
+async fn inwards(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Vec<Inward>>> {
+    Ok(Json(api.inwards(&p, &id).await?))
+}
+#[utoipa::path(delete, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/inward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+responses((status = 204, description = "Success; removing an absent exposure succeeds"), ErrorResponses)
+)]
+async fn remove_inward(Api(api): Api, ApiPath((p, id, name)): ApiPath<(String, String, String)>) -> ApiResult<StatusCode> {
+    api.remove_inward(&p, &id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+#[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/outward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+request_body = OutwardRequest,
+responses((status = 201, description = "Set; the outcome is in ready and error", body = Outward), (status = 200, description = "Replaced; the outcome is in ready and error", body = Outward), ErrorResponses)
+)]
+async fn put_outward(
+    Api(api): Api,
+    ApiPath((p, id, name)): ApiPath<(String, String, String)>,
+    ApiJson(r): ApiJson<OutwardRequest>,
+) -> ApiResult<Response> {
+    Ok(match api.put_outward(&p, &id, &name, &r).await? {
+        Exposed::Created(exposure) => (StatusCode::CREATED, Json(exposure)).into_response(),
+        Exposed::Replaced(exposure) => Json(exposure).into_response(),
+    })
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/outward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+responses((status = 200, description = "The exposure as it stands", body = Outward), ErrorResponses)
+)]
+async fn outward(Api(api): Api, ApiPath((p, id, name)): ApiPath<(String, String, String)>) -> ApiResult<Json<Outward>> {
+    Ok(Json(api.outward(&p, &id, &name).await?))
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/outward",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "The environment's exposures", body = Vec<Outward>), ErrorResponses)
+)]
+async fn outwards(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Vec<Outward>>> {
+    Ok(Json(api.outwards(&p, &id).await?))
+}
+#[utoipa::path(delete, tag = "server", path = "/v1/providers/{provider}/environments/{id}/exposures/outward/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+responses((status = 204, description = "Success; removing an absent exposure succeeds"), ErrorResponses)
+)]
+async fn remove_outward(Api(api): Api, ApiPath((p, id, name)): ApiPath<(String, String, String)>) -> ApiResult<StatusCode> {
+    api.remove_outward(&p, &id, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 #[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments/{id}/relay",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
 responses((status = 101, description = "Raw byte-stream upgrade; request Connection: Upgrade and Upgrade: drydock-relay", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-relay"))), ErrorResponses)

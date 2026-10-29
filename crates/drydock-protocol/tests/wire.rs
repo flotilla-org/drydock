@@ -58,6 +58,30 @@ fn tagged_wire_fixtures() {
         fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"usage","provider":"p","label":null,
             "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"provider","event":event}}));
     }
+    // Exposures: the agreed request and response layouts (drydock#132), with
+    // nothing that names SSH, keys, tokens or how the bytes travel.
+    for event in [
+        json!({"kind":"exposure","direction":"inward","name":"cleat","ready":false,
+            "error":{"code":"vessel_unreachable","reason":"r"}}),
+        json!({"kind":"exposure","direction":"outward","name":"lab","ready":false,"error":null,"removed":true}),
+        json!({"kind":"exposure","direction":"inward","name":"cleat","ready":true,"error":null}),
+    ] {
+        fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"e","provider":"p","label":"l",
+            "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"adaptor","event":event}}));
+    }
+    fixture::<InwardRequest>(json!({"target":{"unix":"/run/cleat/cleat.sock"}}));
+    fixture::<InwardRequest>(json!({"target":{"tcp":"127.0.0.1:8080"}}));
+    fixture::<Inward>(json!({"name":"cleat","target":{"unix":"/run/cleat/cleat.sock"},
+        "local":{"unix":"/run/drydock/exposures/e/cleat.sock"},"ready":true,"error":null}));
+    fixture::<OutwardRequest>(json!({"guest":{"unix":"/run/flotilla/crew.sock"},"destination":{"unix":"/srv/crew.sock"}}));
+    fixture::<OutwardRequest>(json!({"guest":{"name":"forgejo.lab.flotilla.work","port":443},
+        "destination":{"tcp":"forgejo.lab.flotilla.work:443"}}));
+    fixture::<Outward>(json!({"name":"lab","guest":{"name":"forgejo.lab.flotilla.work","port":443},
+        "destination":{"tcp":"forgejo.lab.flotilla.work:443"},"address":"127.77.0.1:443","resolved":"10.0.0.5:443",
+        "ready":false,"error":{"code":"not_running","reason":"r"}}));
+    for code in ["not_running", "vessel_unreachable", "refused", "unresolved"] {
+        fixture::<ExposureError>(json!({"code":code,"reason":""}));
+    }
 }
 
 // Secret Debug must redact through enclosing types; JSON must retain the transport value.

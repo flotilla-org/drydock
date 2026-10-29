@@ -150,6 +150,40 @@ trait works against the embedded `Daemon` or a Unix-socket `Client`. `/v1/events
 merges host streams with an opaque vector cursor; partial snapshots explicitly
 mark other hosts' providers unavailable so they cannot imply deletion.
 
+### Exposures
+
+A client reaches into a vessel through standing exposures the daemon makes on
+its own machine, without SSH, keys or tokens. Each is named, lives with the
+vessel until removed, and is set, read back and removed under
+`/v1/providers/{p}/environments/{id}/exposures/{inward,outward}/{name}`:
+
+- **Inward:** `PUT …/inward/cleat` with `{"target":{"unix":"/run/cleat/cleat.sock"}}`
+  (or `{"tcp":"127.0.0.1:8080"}`) answers with `local`, a Unix socket under
+  `run/exposures/` on drydock's machine that reaches the target.
+- **Outward:** `PUT …/outward/crew` with
+  `{"guest":{"unix":"/run/flotilla/crew.sock"},"destination":{"unix":"/path/crew.sock"}}`
+  makes a socket in the vessel that reaches the destination. A guest
+  `{"name":"forgejo.lab.flotilla.work","port":443}` gets a free loopback address
+  in the vessel (from 127.77.0.0/16, reported as `address`) and a marked line in
+  its `/etc/hosts`; a `{"tcp":"host:port"}` destination is resolved once, when
+  set, and reported as `resolved`.
+
+A first `PUT` answers 201 and a replacing one 200, with the outcome in `ready`
+and a typed `error` (`not_running`, `vessel_unreachable`, `refused`,
+`unresolved`). On a running vessel the exposure is set up within the request;
+on a stopped one it is recorded as `not_running` and set up on resume. Removing
+an absent exposure succeeds. `/v1/events` carries an `exposure` event kind,
+live only, on every set, on removal (`"removed": true`) and on every change in
+`ready`. These routes are server-only and need a vessel drydock launched (it
+holds the key) whose provider declares the agent.
+
+Drydock keeps one connection to each such vessel's agent and carries every
+exposure on it: the agent opens inward streams to the target and listens in
+the vessel for outward ones. It records exposures in `exposures.json` beside
+the vessel's key, re-establishes them after its own restart, a resume or a
+lost connection, and removes them when the environment is destroyed. While a
+vessel has exposures, drydock expects to be its agent's only link holder.
+
 ## Protocol workspace
 
 `drydock-protocol` contains the JSON types and OpenAPI route descriptions for
@@ -168,6 +202,9 @@ uvx --from openapi-spec-validator==0.7.2 openapi-spec-validator openapi.json
 The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
+
+Protocol version 10 adds exposures: the server-only `exposures` routes and
+the `exposure` event kind, which older clients cannot decode.
 
 Protocol version 9 makes hosts serve the server's API. A language host serves
 the same `/v1` routes and types as the server; only the server adds

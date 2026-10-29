@@ -1,7 +1,7 @@
 //! Long-lived provider routing shared by drydockd and an embedding daemon.
 use crate::{
     HostConnection, HostHandle, HostSpec, Supervisor,
-    api::{ApiError, ApiJson, ApiPath},
+    api::{ApiError, ApiJson, ApiPath, Exposed},
     client::{Client, Error, StatusCache},
     config::{Config, Egress},
     credentials::BuiltinCredentials,
@@ -96,7 +96,24 @@ pub struct Inner {
     unavailable: BTreeMap<String, Readiness>,
     keys: PathBuf,
     resolver: Arc<dyn ImageResolver>,
+    dialer: Arc<dyn crate::agent::SshDialer>,
+    exposures: crate::exposures::Exposures,
     stopping: tokio::sync::watch::Sender<bool>,
+}
+/// The boundaries a daemon reaches beyond itself. Tests stand in for them.
+pub struct Seams {
+    /// Image tags to digests.
+    pub resolver: Arc<dyn ImageResolver>,
+    /// The SSH link to a vessel's agent.
+    pub dialer: Arc<dyn crate::agent::SshDialer>,
+    /// Where exposures put things in a vessel.
+    pub guest: crate::exposures::GuestLayout,
+    pub timing: crate::exposures::Timing,
+}
+impl Seams {
+    pub fn new(resolver: Arc<dyn ImageResolver>) -> Self {
+        Self { resolver, dialer: Arc::new(crate::agent::OpenSsh), guest: Default::default(), timing: Default::default() }
+    }
 }
 impl Daemon {
     pub async fn start(config: Config, run: &FsPath, keys: PathBuf, options: Vec<HostOption>) -> Result<Arc<Self>, String> {
@@ -112,6 +129,17 @@ impl Daemon {
         options: Vec<HostOption>,
         resolver: Arc<dyn ImageResolver>,
     ) -> Result<Arc<Self>, String> {
+        Self::start_with_seams(config, run, keys, options, Seams::new(resolver)).await
+    }
+    /// Start with every outside boundary given. Stored exposures are taken up again.
+    pub async fn start_with_seams(
+        config: Config,
+        run: &FsPath,
+        keys: PathBuf,
+        options: Vec<HostOption>,
+        seams: Seams,
+    ) -> Result<Arc<Self>, String> {
+        let Seams { resolver, dialer, guest, timing } = seams;
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
@@ -198,9 +226,23 @@ impl Daemon {
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
-        let inner =
-            Inner { config, modules, hosts, placements, unavailable, keys, resolver, stopping: tokio::sync::watch::channel(false).0 };
-        Ok(Arc::new(Self { inner: Arc::new(inner), credential: None }))
+        let inner = Arc::new_cyclic(|weak| Inner {
+            config,
+            modules,
+            hosts,
+            placements,
+            unavailable,
+            exposures: crate::exposures::Exposures::new(weak.clone(), run, keys.clone(), guest, timing),
+            keys,
+            resolver,
+            dialer,
+            stopping: tokio::sync::watch::channel(false).0,
+        });
+        inner.exposures.restore();
+        Ok(Arc::new(Self { inner, credential: None }))
+    }
+    pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
+        Self { inner, credential: None }
     }
     fn host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let placement = self.placements.get(provider).ok_or_else(|| {
@@ -368,6 +410,16 @@ impl Daemon {
     /// Wait for the vessel agent's current hello, pushing `build` (the agent for
     /// the prepared `platform`) to an older one.
     async fn agent_ready(&self, provider: &str, environment: &Environment, platform: &Platform, build: &[u8]) -> Result<(), Error> {
+        self.agent(provider, environment, platform, build, Duration::from_secs(60)).await.map(drop)
+    }
+    async fn agent(
+        &self,
+        provider: &str,
+        environment: &Environment,
+        platform: &Platform,
+        build: &[u8],
+        timeout: Duration,
+    ) -> Result<drydock_agent::Client, Error> {
         let identity = self.key_for(environment)?;
         let client = &self.runtime(provider)?;
         let vessel = crate::agent::Vessel { provider, environment: &environment.id, identity: &identity, platform, build };
@@ -377,7 +429,21 @@ impl Daemon {
             .get(provider)
             .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))?
             .agent_link;
-        crate::agent::AgentReach::new(link).connect(client, &vessel).await.map(drop)
+        let reach = crate::agent::AgentReach::new(link).with_dialer(self.dialer.clone()).with_timeout(timeout);
+        Ok(reach.connect(client, &vessel).await?.client)
+    }
+    /// Connect to the agent of a vessel drydock launched, for the platform
+    /// it was prepared for (recorded at launch).
+    pub(crate) async fn connect_agent(&self, provider: &str, id: &str, timeout: Duration) -> Result<drydock_agent::Client, Error> {
+        let environment = ProviderApi::inspect(self, provider, id).await?;
+        let identity = self.key_for(&environment)?;
+        let launch = identity.with_file_name("request.json");
+        let request = tokio::fs::read(&launch).await.map_err(|e| Error::Transport(format!("launch record {}: {e}", launch.display())))?;
+        let request: ProvisionRequest =
+            serde_json::from_slice(&request).map_err(|e| Error::InvalidResponse(format!("launch record: {e}")))?;
+        let platform = request.prepared.platform;
+        let build = agent_build(&platform).await?;
+        self.agent(provider, &environment, &platform, &build, timeout).await
     }
 
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
@@ -446,16 +512,22 @@ impl ProviderApi for Daemon {
         self.cache(p).await?.inspect(p, id).await
     }
     async fn destroy(&self, p: &str, id: &str) -> Result<(), Error> {
-        self.invalidating(p, self.runtime(p)?.destroy(p, id).await).await
+        self.invalidating(p, self.runtime(p)?.destroy(p, id).await).await?;
+        self.exposures.forget(p, id).await;
+        Ok(())
     }
     async fn reach(&self, p: &str, id: &str) -> Result<Reach, Error> {
         self.runtime(p)?.reach(p, id).await
     }
     async fn suspend(&self, p: &str, id: &str) -> Result<ResumeToken, Error> {
-        self.invalidating(p, self.runtime(p)?.suspend(p, id).await).await
+        let result = self.invalidating(p, self.runtime(p)?.suspend(p, id).await).await;
+        self.exposures.poke(p, id);
+        result
     }
     async fn resume(&self, p: &str, id: &str, token: &ResumeToken) -> Result<(), Error> {
-        self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await
+        let result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
+        self.exposures.poke(p, id);
+        result
     }
     async fn export(&self, p: &str, id: &str) -> Result<Export, Error> {
         self.invalidating(p, self.runtime(p)?.export(p, id).await).await
@@ -471,6 +543,32 @@ impl ProviderApi for Daemon {
     }
     async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
         self.runtime(p)?.exec(p, id, command).await
+    }
+    async fn put_inward(&self, p: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
+        let (existed, exposure) = self.exposures.put_inward(self, p, id, name, request).await?;
+        Ok(if existed { Exposed::Replaced(exposure) } else { Exposed::Created(exposure) })
+    }
+    async fn inward(&self, p: &str, id: &str, name: &str) -> Result<Inward, Error> {
+        self.exposures.inward(self, p, id, name).await
+    }
+    async fn inwards(&self, p: &str, id: &str) -> Result<Vec<Inward>, Error> {
+        self.exposures.inwards(self, p, id).await
+    }
+    async fn remove_inward(&self, p: &str, id: &str, name: &str) -> Result<(), Error> {
+        self.exposures.remove(self, p, id, Direction::Inward, name).await
+    }
+    async fn put_outward(&self, p: &str, id: &str, name: &str, request: &OutwardRequest) -> Result<Exposed<Outward>, Error> {
+        let (existed, exposure) = self.exposures.put_outward(self, p, id, name, request).await?;
+        Ok(if existed { Exposed::Replaced(exposure) } else { Exposed::Created(exposure) })
+    }
+    async fn outward(&self, p: &str, id: &str, name: &str) -> Result<Outward, Error> {
+        self.exposures.outward(self, p, id, name).await
+    }
+    async fn outwards(&self, p: &str, id: &str) -> Result<Vec<Outward>, Error> {
+        self.exposures.outwards(self, p, id).await
+    }
+    async fn remove_outward(&self, p: &str, id: &str, name: &str) -> Result<(), Error> {
+        self.exposures.remove(self, p, id, Direction::Outward, name).await
     }
 }
 async fn discover(option: &HostOption, run: &FsPath) -> Result<Hello, String> {
@@ -599,10 +697,34 @@ impl Daemon {
         let providers: BTreeMap<String, Option<usize>> =
             self.config.providers.keys().map(|name| (name.clone(), self.placements.get(name).map(|p| p.host))).collect();
         let mut stopping = self.stopping.subscribe();
+        let mut exposures = self.exposures.subscribe();
         Box::pin(async_stream::stream! {
             let mut streams=futures::stream::select_all(streams);
             loop {
-                let next=tokio::select! {value=streams.next()=>value,_=stopping.wait_for(|s|*s)=>None};
+                enum Next<T> { Host(T), Exposure(crate::exposures::Notice), Skip, End }
+                let next=tokio::select! {
+                    value=streams.next()=>value.map_or(Next::End, Next::Host),
+                    notice=exposures.recv()=>match notice {
+                        Ok(notice)=>Next::Exposure(notice),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))=>Next::Skip,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed)=>Next::End,
+                    },
+                    _=stopping.wait_for(|s|*s)=>Next::End,
+                };
+                let next=match next {
+                    Next::Host(value)=>Some(value),
+                    // Exposure events are live: they take the cursor as it stands.
+                    Next::Exposure(notice)=>{
+                        let cursor=serde_json::to_string(&cursors).expect("cursor map serializes");
+                        yield Ok(ObserveRecord::Event{event:Event{
+                            cursor,id:notice.id,provider:notice.provider,label:Some(notice.label),
+                            timestamp:chrono::Utc::now().into(),timestamp_source:TimestampSource::Adaptor,event:notice.kind,
+                        }});
+                        continue;
+                    }
+                    Next::Skip=>continue,
+                    Next::End=>None,
+                };
                 let Some((index,record))=next else {break};
                 let mut record=match record {Ok(record)=>record,Err(error)=>{yield Err(error);break;}};
                 let cursor=match &record {ObserveRecord::Event{event}=>&event.cursor,ObserveRecord::Snapshot{cursor,..}=>cursor};
