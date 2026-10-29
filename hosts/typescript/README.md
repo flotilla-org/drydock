@@ -4,6 +4,8 @@ Node >=24.18.0 on Linux/Unix, with pinned pnpm via Corepack. Daemon owns all
 admission, rate, credential-state, inventory, billing and replay policy. This
 companion loads modules and delegates the common `/v1` API to provider methods.
 Exec, suspend/resume, export, usage and quota are absent until drydock#85.
+Workspace validation (`check`/`conformance`) requires the pinned Rust toolchain and
+Cargo; an installed production companion only needs Node and its dependencies.
 
 ```sh
 export COREPACK_HOME="$(mktemp -d)" # private writable directory
@@ -62,3 +64,18 @@ not served; vessel connections are being redesigned as exposures (#132).
 `provider.ts` is handwritten and free of framework types. `src/generated/**` and
 `dist/**` are generated outputs, including JSON. Rust types → canonical OpenAPI →
 TypeScript bindings and packaged AJV schema form one generation chain.
+
+The built-in `reference` module is always loadable in every companion, and used
+only when selected by provider configuration; it creates no vendor resources. Its optional
+settings are `{seed_unlabelled: boolean}`; unknown settings are refused. It stores
+prepared forms and Environment rows, implements label idempotency, refuses reach
+until exposures land (#132), and exposes a 10ms polling declaration. It owns no event stream or replay.
+
+`corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration test
+against this actual child host through the main Daemon and its existing checker.
+Authentication is exercised by the shared server serving tests; private UDS uses
+filesystem authorization. Exec-based host fixtures await #85 and reach awaits #132. The test drains
+and counts child output without retaining credentials, checks optional-operation
+admission in the embedded server, and requires the shared conformance report to
+pass. The script fails if its named test is missing, rather than silently running
+zero tests. The existing CI check command includes this test without another job.
