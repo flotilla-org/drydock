@@ -184,6 +184,15 @@ the vessel's key, re-establishes them after its own restart, a resume or a
 lost connection, and removes them when the environment is destroyed. While a
 vessel has exposures, drydock expects to be its agent's only link holder.
 
+An outward destination is whatever the API client names, so a vessel's code
+can reach it, `docker.sock` or an internal service included. The API is trusted
+(the daemon's socket admits only its own user), and nothing narrows that further
+yet. A guest name that a line drydock did not write already gives is refused,
+since that line would shadow drydock's. Exposures sharing a guest name share its
+address. An environment destroyed while drydock was down is forgotten when
+drydock next finds it gone. Re-establishing a vessel holds its exposures, so
+reading them waits for at most the connect budget (20s).
+
 ## Protocol workspace
 
 `drydock-protocol` contains the JSON types and OpenAPI route descriptions for

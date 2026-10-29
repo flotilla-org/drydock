@@ -290,9 +290,89 @@ async fn named_outward_exposures_get_loopback_addresses_and_hosts_lines() {
     far.read_exact(&mut ping).await.unwrap();
     assert_eq!(&ping, b"ping");
 
+    // One guest name on a second port shares its address and its one line.
+    let mut second = request("forge.test");
+    second.guest = Guest::Name { name: HostAddress::try_from("forge.test".to_owned()).unwrap(), port: Port::new(8444).unwrap() };
+    let forge_ssh = h.api.put_outward(PROVIDER, &h.id, "forge-ssh", &second).await.unwrap().into_inner();
+    assert!(forge_ssh.ready, "{forge_ssh:?}");
+    assert_eq!(forge_ssh.address.unwrap().ip(), forge_at.ip());
+    assert_eq!(std::fs::read_to_string(h.path("hosts")).unwrap().matches("forge.test").count(), 1);
+    // A name another line already gives would be shadowed, so it is refused.
+    let shadowed = h.api.put_outward(PROVIDER, &h.id, "local", &request("localhost")).await.unwrap().into_inner();
+    assert_eq!(shadowed.error.map(|e| e.code), Some(ExposureErrorCode::Refused));
+
     h.api.remove_outward(PROVIDER, &h.id, "cache").await.unwrap();
     let hosts = std::fs::read_to_string(h.path("hosts")).unwrap();
     assert!(hosts.contains("forge.test") && !hosts.contains("cache.test") && hosts.starts_with("127.0.0.1 localhost\n"), "{hosts}");
+}
+
+// A guest name removed while the vessel is stopped loses its hosts line
+// when the vessel runs again, even when no exposure is left.
+// Stand-in vessels share this host's loopback, so this test's guest port is its own.
+#[tokio::test]
+async fn a_guest_name_removed_while_stopped_loses_its_hosts_line_on_resume() {
+    let h = Harness::start().await;
+    let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let request = OutwardRequest {
+        guest: Guest::Name { name: HostAddress::try_from("forge.test".to_owned()).unwrap(), port: Port::new(8453).unwrap() },
+        destination: OutwardDestination::Tcp(service.local_addr().unwrap().to_string()),
+    };
+    assert!(h.api.put_outward(PROVIDER, &h.id, "forge", &request).await.unwrap().into_inner().ready);
+    let token = h.api.suspend(PROVIDER, &h.id).await.unwrap();
+    h.api.remove_outward(PROVIDER, &h.id, "forge").await.unwrap();
+    assert!(std::fs::read_to_string(h.path("hosts")).unwrap().contains("forge.test"), "unreachable while stopped");
+    h.api.resume(PROVIDER, &h.id, &token).await.unwrap();
+    let hosts = h.path("hosts");
+    eventually(|| {
+        let hosts = hosts.clone();
+        async move { !std::fs::read_to_string(&hosts).unwrap().contains("forge.test") }
+    })
+    .await;
+    assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "127.0.0.1 localhost\n");
+}
+
+// What a PUT reports is what drydock stored: when the record cannot be
+// saved, the request fails and nothing is set.
+#[tokio::test]
+async fn an_exposure_that_cannot_be_recorded_is_not_set() {
+    let h = Harness::start().await;
+    let keys = std::fs::read_dir(h.path("run/keys")).unwrap().flatten().map(|e| e.path()).next().unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let request = InwardRequest { target: InwardTarget::Unix(unix(&h.path("cleat.sock"))) };
+    let result = h.api.put_inward(PROVIDER, &h.id, "cleat", &request).await;
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err(), "{result:?}");
+    assert!(h.api.inwards(PROVIDER, &h.id).await.unwrap().is_empty());
+    assert!(
+        std::fs::read_dir(h.path("run/exposures")).unwrap().flatten().all(|dir| std::fs::read_dir(dir.path()).unwrap().next().is_none())
+    );
+}
+
+// An environment destroyed while drydock was down is forgotten when drydock
+// starts again and finds it gone: its record and local sockets go.
+#[tokio::test]
+async fn an_environment_destroyed_while_drydock_was_down_is_forgotten() {
+    let mut h = Harness::start().await;
+    let set = h
+        .api
+        .put_inward(PROVIDER, &h.id, "cleat", &InwardRequest { target: InwardTarget::Unix(unix(&h.path("cleat.sock"))) })
+        .await
+        .unwrap()
+        .into_inner();
+    let (daemon, server) = h.daemon.take().unwrap();
+    server.abort();
+    let _ = server.await;
+    drop(daemon);
+    let host = Client::unix(&h.reference).unwrap().credentialed(Some(Secret::new(std::env::var("PATH").unwrap())));
+    host.destroy(PROVIDER, &h.id).await.unwrap();
+    h.start_daemon().await;
+    let keys = h.path("run/keys");
+    eventually(|| {
+        let keys = keys.clone();
+        async move { std::fs::read_dir(&keys).unwrap().flatten().all(|e| !e.path().join("exposures.json").exists()) }
+    })
+    .await;
+    assert!(!local(&set).exists());
 }
 
 // A PUT on a vessel that is not running records the exposure and returns

@@ -241,6 +241,9 @@ impl Daemon {
         inner.exposures.restore();
         Ok(Arc::new(Self { inner, credential: None }))
     }
+    pub(crate) fn exposures(&self) -> &crate::exposures::Exposures {
+        &self.exposures
+    }
     pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
         Self { inner, credential: None }
     }

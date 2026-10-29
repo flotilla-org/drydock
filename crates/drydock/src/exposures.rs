@@ -80,6 +80,10 @@ struct Record {
     inward: BTreeMap<String, InwardRequest>,
     #[serde(default)]
     outward: BTreeMap<String, OutwardEntry>,
+    /// A guest name was removed while its hosts line could not be: the next
+    /// connection clears it, even when no exposure is left.
+    #[serde(default)]
+    stale_hosts: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OutwardEntry {
@@ -178,7 +182,7 @@ impl Exposures {
         if !key.exists() {
             return Err(refused("environment has no drydock-managed SSH key".into()));
         }
-        let label = environment.label.expect("a keyed environment has a label");
+        let label = environment.label.ok_or_else(|| refused("environment has no drydock-managed SSH key".into()))?;
         let record = Record { provider: provider.into(), environment: id.into(), ..Record::default() };
         let vessel = Vessel::start(&self.shared, label, record).map_err(|e| Error::Transport(format!("exposures: {e}")))?;
         self.vessels.lock().unwrap().insert((provider.into(), id.into()), vessel.clone());
@@ -218,9 +222,18 @@ impl Exposures {
             }));
         }
         let mut state = vessel.state.lock().await;
+        let listening = state.listeners.contains_key(name);
         vessel.listen(&mut state, name).map_err(|e| Error::Transport(format!("exposure listener {}: {e}", local.display())))?;
-        let existed = state.record.inward.insert(name.into(), request.clone()).is_some();
-        vessel.save(&state).await?;
+        // What is stored is what stands: memory changes only once the record is saved.
+        let mut record = state.record.clone();
+        let existed = record.inward.insert(name.into(), request.clone()).is_some();
+        if let Err(failure) = vessel.save(&record).await {
+            if !listening {
+                state.listeners.remove(name);
+            }
+            return Err(failure);
+        }
+        state.record = record;
         let key = (Direction::Inward, name.to_owned());
         vessel.establish(&self.shared, &mut state, &key).await;
         vessel.announce(&self.shared, &state, &key);
@@ -265,16 +278,15 @@ impl Exposures {
         let previous = state.record.outward.get(name).cloned();
         let address = match &request.guest {
             Guest::Unix { .. } => None,
-            Guest::Name { .. } => match previous.as_ref().and_then(|entry| entry.address) {
-                Some(address) => Some(address),
-                None => Some(free_loopback(&state.record, name).ok_or_else(|| {
-                    Error::Protocol(ProtocolError::Refused { reason: "no free loopback address for another guest name".into() })
-                })?),
-            },
+            Guest::Name { name: guest, .. } => Some(guest_address(&state.record, name, guest, previous.as_ref()).ok_or_else(|| {
+                Error::Protocol(ProtocolError::Refused { reason: "no free loopback address for another guest name".into() })
+            })?),
         };
         let entry = OutwardEntry { request: request.clone(), address, resolved, unresolved };
-        state.record.outward.insert(name.into(), entry);
-        vessel.save(&state).await?;
+        let mut record = state.record.clone();
+        record.outward.insert(name.into(), entry);
+        vessel.save(&record).await?;
+        state.record = record;
         let key = (Direction::Outward, name.to_owned());
         vessel.establish(&self.shared, &mut state, &key).await;
         vessel.announce(&self.shared, &state, &key);
@@ -311,14 +323,18 @@ impl Exposures {
     pub(crate) async fn remove(&self, daemon: &Daemon, p: &str, id: &str, direction: Direction, name: &str) -> Result<(), Error> {
         let Some(vessel) = self.existing(daemon, p, id).await? else { return Ok(()) };
         let mut state = vessel.state.lock().await;
+        let mut record = state.record.clone();
         let removed = match direction {
-            Direction::Inward => state.record.inward.remove(name).is_some(),
-            Direction::Outward => state.record.outward.remove(name).is_some(),
+            Direction::Inward => record.inward.remove(name).is_some(),
+            Direction::Outward => record.outward.remove(name).is_some(),
         };
         if !removed {
             return Ok(());
         }
-        vessel.save(&state).await?;
+        let hosts_line = direction == Direction::Outward && named(&state, name);
+        record.stale_hosts |= hosts_line;
+        vessel.save(&record).await?;
+        state.record = record;
         if direction == Direction::Inward {
             state.listeners.remove(name);
         }
@@ -328,11 +344,12 @@ impl Exposures {
             // A vessel that misses this is pruned when it is next re-established.
             let _ = match direction {
                 Direction::Inward => client.remove_host_forward(&agent_id(&key)).await,
-                Direction::Outward => {
-                    let _ = client.remove_guest_forward(&agent_id(&key)).await;
-                    sync_hosts(&client, &self.shared.guest, &state.record).await.map_err(io::Error::other)
-                }
+                Direction::Outward => client.remove_guest_forward(&agent_id(&key)).await,
             };
+            if hosts_line {
+                // On failure the stale mark stays, and the next connection clears the line.
+                let _ = vessel.sync_hosts(&self.shared, &mut state, &client).await;
+            }
         }
         vessel.notify(&self.shared, &key, false, None, true);
         Ok(())
@@ -475,7 +492,17 @@ impl Vessel {
         let id = agent_id(&(Direction::Inward, name.to_owned()));
         let agent = self.agent.subscribe();
         let task = tokio::spawn(async move {
-            while let Ok((mut viewer, _)) = listener.accept().await {
+            loop {
+                // Accept errors (EMFILE, ECONNABORTED) are transient: the
+                // socket stays bound, so keep serving it.
+                let mut viewer = match listener.accept().await {
+                    Ok((viewer, _)) => viewer,
+                    Err(error) => {
+                        tracing::warn!(%error, "exposure listener accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let Some(client) = agent.borrow().clone() else { continue };
                 let id = id.clone();
                 tokio::spawn(async move {
@@ -490,9 +517,9 @@ impl Vessel {
         Ok(())
     }
 
-    async fn save(&self, state: &State) -> Result<(), Error> {
+    async fn save(&self, record: &Record) -> Result<(), Error> {
         let failed = |e: io::Error| Error::Transport(format!("record exposures {}: {e}", self.file.display()));
-        let bytes = serde_json::to_vec_pretty(&state.record).expect("exposure record serializes");
+        let bytes = serde_json::to_vec_pretty(record).expect("exposure record serializes");
         let temporary = self.file.with_extension("json.new");
         {
             use tokio::io::AsyncWriteExt;
@@ -578,23 +605,31 @@ impl Vessel {
         self.reconcile(shared, state).await;
     }
 
-    /// Bring every exposure to the vessel's state; true when all are ready.
-    async fn reconcile(&self, shared: &Shared, state: &mut State) -> bool {
+    /// Bring every exposure to the vessel's state.
+    async fn reconcile(&self, shared: &Shared, state: &mut State) -> Outcome {
         let keys = Self::keys(state);
-        if keys.is_empty() {
+        if keys.is_empty() && !state.record.stale_hosts {
             self.disconnect(state);
-            return true;
+            return Outcome::Ready;
         }
-        let Some(daemon) = shared.daemon() else { return false };
-        let running = match daemon.inspect(&self.provider, &self.id).await {
-            Ok(environment) => match environment.state {
+        let Some(daemon) = shared.daemon() else { return Outcome::Pending };
+        let inspected = tokio::time::timeout(shared.timing.connect, daemon.inspect(&self.provider, &self.id)).await;
+        let running = match inspected {
+            Err(_) => Err(error(ExposureErrorCode::VesselUnreachable, "the provider did not report the vessel's state in time")),
+            Ok(Ok(environment)) => match environment.state {
                 Observation::Running | Observation::Unknown { .. } => Ok(()),
                 other => Err(error(ExposureErrorCode::NotRunning, format!("the vessel is {}", describe(&other)))),
             },
-            Err(Error::Protocol(ProtocolError::NotFound { reason })) => {
+            Ok(Err(Error::Protocol(ProtocolError::NotFound { reason }))) => {
+                // Destroyed while drydock was not watching: forget it, unless
+                // it is the provider that is unknown (its configuration changed).
+                if daemon.provider(&self.provider).await.is_ok() {
+                    self.disconnect(state);
+                    return Outcome::Gone;
+                }
                 Err(error(ExposureErrorCode::NotRunning, format!("the environment is not found: {reason}")))
             }
-            Err(other) => Err(error(ExposureErrorCode::VesselUnreachable, other.to_string())),
+            Ok(Err(other)) => Err(error(ExposureErrorCode::VesselUnreachable, other.to_string())),
         };
         // A connection that still answers outlives a failed status read.
         if let Err(status) = running
@@ -602,13 +637,14 @@ impl Vessel {
         {
             self.disconnect(state);
             self.report_all(shared, state, status);
-            return false;
+            return Outcome::Pending;
         }
         if let Some(client) = state.connected.clone() {
             if tokio::time::timeout(shared.timing.connect, client.host_forwards()).await.is_ok_and(|r| r.is_ok()) {
                 // Retry only what is not ready; what works is left alone.
-                let pending = keys.into_iter().filter(|key| !matches!(state.status.get(key), Some(Ok(())))).collect();
-                return self.apply_all(shared, state, &client, pending).await;
+                let pending: Vec<Key> = keys.into_iter().filter(|key| !matches!(state.status.get(key), Some(Ok(())))).collect();
+                let hosts = pending.iter().any(|key| key.0 == Direction::Outward && named(state, &key.1)) || state.record.stale_hosts;
+                return self.apply_all(shared, state, &client, pending, hosts).await;
             }
             self.disconnect(state);
         }
@@ -616,48 +652,81 @@ impl Vessel {
             Ok(client) => Arc::new(client),
             Err(failure) => {
                 self.report_all(shared, state, error(ExposureErrorCode::VesselUnreachable, failure.to_string()));
-                return false;
+                return Outcome::Pending;
             }
         };
         state.connected = Some(client.clone());
         self.agent.send_replace(Some(client.clone()));
         prune(&client, state).await;
-        self.apply_all(shared, state, &client, keys).await
+        // A fresh connection always brings the hosts file to the record.
+        self.apply_all(shared, state, &client, keys, true).await
     }
 
-    /// Set `keys` up on the connected agent, with the hosts file when a guest
-    /// name is among them; true when all are ready.
-    async fn apply_all(&self, shared: &Shared, state: &mut State, client: &drydock_agent::Client, keys: Vec<Key>) -> bool {
-        let hosts = if keys.iter().any(|key| key.0 == Direction::Outward && named(state, &key.1)) {
-            sync_hosts(client, &shared.guest, &state.record).await
-        } else {
-            Ok(())
-        };
-        let mut ready = true;
+    /// Set `keys` up on the connected agent, first bringing the hosts file to
+    /// the record when `hosts`.
+    async fn apply_all(&self, shared: &Shared, state: &mut State, client: &drydock_agent::Client, keys: Vec<Key>, hosts: bool) -> Outcome {
+        let hosts = if hosts { self.sync_hosts(shared, state, client).await } else { Ok(BTreeSet::new()) };
+        let mut ready = !state.record.stale_hosts;
         for key in keys {
             let mut status = apply(client, state, &shared.guest, &key).await;
-            if let (Ok(()), Err(reason)) = (&status, &hosts)
-                && key.0 == Direction::Outward
-                && named(state, &key.1)
-            {
-                status = Err(error(ExposureErrorCode::Refused, reason.clone()));
+            if let (Ok(()), Some(guest)) = (&status, guest_name(state, &key)) {
+                match &hosts {
+                    Err(reason) => status = Err(error(ExposureErrorCode::Refused, reason.clone())),
+                    Ok(taken) if taken.contains(&guest) => {
+                        status = Err(error(ExposureErrorCode::Refused, format!("{guest} is already named in the vessel's hosts file")));
+                    }
+                    Ok(_) => {}
+                }
             }
             ready &= status.is_ok();
             self.report(shared, state, &key, status);
         }
-        ready
+        if ready { Outcome::Ready } else { Outcome::Pending }
     }
+
+    /// Bring the hosts file to the record, clearing a stale mark once it does.
+    /// Returns the guest names another line already holds.
+    async fn sync_hosts(&self, shared: &Shared, state: &mut State, client: &drydock_agent::Client) -> Result<BTreeSet<String>, String> {
+        let taken = sync_hosts(client, &shared.guest, &state.record).await?;
+        if state.record.stale_hosts {
+            let mut record = state.record.clone();
+            record.stale_hosts = false;
+            if self.save(&record).await.is_ok() {
+                state.record = record;
+            }
+        }
+        Ok(taken)
+    }
+}
+
+/// What a reconcile found.
+#[derive(PartialEq)]
+enum Outcome {
+    /// Every exposure is ready.
+    Ready,
+    /// Something is not ready yet; try again soon.
+    Pending,
+    /// The environment no longer exists.
+    Gone,
 }
 
 /// Re-establish the vessel's exposures whenever they need it, until it is forgotten.
 async fn supervise(vessel: Weak<Vessel>, shared: Arc<Shared>) {
     loop {
         let Some(current) = vessel.upgrade() else { return };
-        let ready = {
+        let outcome = {
             let mut state = current.state.lock().await;
             current.reconcile(&shared, &mut state).await
         };
-        let wait = if ready { shared.timing.heartbeat } else { shared.timing.retry };
+        if outcome == Outcome::Gone {
+            // Forgetting aborts this task, so it runs on its own.
+            if let Some(daemon) = shared.daemon() {
+                let (provider, id) = (current.provider.clone(), current.id.clone());
+                tokio::spawn(async move { daemon.exposures().forget(&provider, &id).await });
+            }
+            return;
+        }
+        let wait = if outcome == Outcome::Ready { shared.timing.heartbeat } else { shared.timing.retry };
         tokio::select! {
             _ = current.poke.notified() => {}
             _ = tokio::time::sleep(wait) => {}
@@ -675,6 +744,14 @@ fn agent_id(key: &Key) -> String {
 
 fn named(state: &State, name: &str) -> bool {
     state.record.outward.get(name).is_some_and(|entry| matches!(entry.request.guest, Guest::Name { .. }))
+}
+
+/// The guest name of a named outward exposure.
+fn guest_name(state: &State, key: &Key) -> Option<String> {
+    match (key.0, &state.record.outward.get(&key.1)?.request.guest) {
+        (Direction::Outward, Guest::Name { name, .. }) => Some(name.as_str().to_owned()),
+        _ => None,
+    }
 }
 
 /// Set one exposure up on a connected agent.
@@ -729,8 +806,9 @@ async fn prune(client: &drydock_agent::Client, state: &State) {
 
 /// Make the vessel's hosts file name exactly the current guest names. Only
 /// lines drydock marked are touched, and an unchanged file is not written.
-async fn sync_hosts(client: &drydock_agent::Client, guest: &GuestLayout, record: &Record) -> Result<(), String> {
-    let lines: Vec<String> = record
+async fn sync_hosts(client: &drydock_agent::Client, guest: &GuestLayout, record: &Record) -> Result<BTreeSet<String>, String> {
+    // Exposures sharing a guest name share its address, so one line serves them.
+    let lines: BTreeSet<String> = record
         .outward
         .values()
         .filter_map(|entry| match (&entry.request.guest, entry.address) {
@@ -742,17 +820,35 @@ async fn sync_hosts(client: &drydock_agent::Client, guest: &GuestLayout, record:
     let script = format!(
         r#"f=$1; shift; t=$(mktemp) || exit 1
 {{ grep -v '{HOSTS_MARKER}$' "$f" 2>/dev/null || true; }} > "$t"
-for l in "$@"; do printf '%s{HOSTS_MARKER}\n' "$l" >> "$t"; done
+for l in "$@"; do
+  n=${{l#* }}
+  # A name another line already gives would shadow ours: report it instead.
+  if awk -v n="$n" '$1 !~ /^#/ {{ for (i = 2; i <= NF; i++) if ($i == n) found = 1 }} END {{ exit !found }}' "$t"; then
+    printf '%s\n' "$n"
+  else
+    printf '%s{HOSTS_MARKER}\n' "$l" >> "$t"
+  fi
+done
 if cmp -s "$t" "$f"; then s=0; else cat "$t" > "$f"; s=$?; fi
 rm -f "$t"; exit $s"#
     );
     let mut args = vec!["-c".to_owned(), script, "sh".into(), guest.hosts.to_string_lossy().into_owned()];
     args.extend(lines);
-    let (_, stderr, status) = client.run(Exec::new("sh", args), 4096).await.map_err(|e| format!("hosts file: {e}"))?;
+    let (stdout, stderr, status) = client.run(Exec::new("sh", args), 64 * 1024).await.map_err(|e| format!("hosts file: {e}"))?;
     if !status.success() {
         return Err(format!("hosts file {}: {}", guest.hosts.display(), String::from_utf8_lossy(&stderr).trim()));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&stdout).lines().map(str::to_owned).collect())
+}
+
+/// The address for exposure `name` with guest name `guest`: the one another
+/// exposure already gave that guest name, else its own earlier one unless
+/// another name holds it, else a free one.
+fn guest_address(record: &Record, name: &str, guest: &HostAddress, previous: Option<&OutwardEntry>) -> Option<IpAddr> {
+    let others = || record.outward.iter().filter(|(other, _)| other.as_str() != name).map(|(_, entry)| entry);
+    let shared = others().find(|entry| matches!(&entry.request.guest, Guest::Name { name, .. } if name == guest)).and_then(|e| e.address);
+    let own = previous.and_then(|entry| entry.address).filter(|address| !others().any(|entry| entry.address == Some(*address)));
+    shared.or(own).or_else(|| free_loopback(record, name))
 }
 
 /// The lowest loopback address in drydock's block that no other guest name has.
@@ -764,8 +860,14 @@ fn free_loopback(record: &Record, name: &str) -> Option<IpAddr> {
         .find(|address| !used.contains(address))
 }
 
-fn describe(observation: &Observation) -> String {
-    serde_json::to_value(observation).ok().and_then(|v| v.get("state").and_then(|s| s.as_str()).map(str::to_owned)).unwrap_or_default()
+fn describe(observation: &Observation) -> &'static str {
+    match observation {
+        Observation::Running => "running",
+        Observation::Stopped { .. } => "stopped",
+        Observation::Gone { .. } => "gone",
+        Observation::Transitioning { .. } => "changing state",
+        Observation::Unknown { .. } => "in an unknown state",
+    }
 }
 
 /// Names become file and agent IDs: a letter or digit, then letters, digits, `_`, `.` or `-`.
