@@ -1,3 +1,4 @@
+import type { Duplex } from "node:stream";
 import type { components } from "./generated/protocol.js";
 export type Types = components["schemas"];
 export type Context = {
@@ -33,15 +34,27 @@ export interface Provider {
   inspect(id: string, context: Context): Promise<Types["Environment"]>;
   destroy(id: string, context: Context): Promise<void>;
   reach(id: string, context: Context): Promise<Types["Reach"]>;
+  /** The connection behind a relay reach; without it relay is refused. */
+  relay?(id: string, context: Context): Promise<Duplex>;
+  // Optional ports: a provider declares the ones it implements. Exec, export
+  // and usage stay absent until drydock#85 reshapes them.
+  suspend?(id: string, context: Context): Promise<Types["ResumeToken"]>;
+  resume?(
+    id: string,
+    token: Types["ResumeToken"],
+    context: Context,
+  ): Promise<void>;
+  quota?(context: Context): Promise<Types["Quota"]>;
 }
-// Optional ports are deliberately absent until drydock#85's interface lands.
-export const absentPorts: Types["Ports"] = {
-  exec: false,
-  suspend_resume: false,
-  export: false,
-  usage: false,
-  quota: false,
-};
+export function ports(provider: Provider): Types["Ports"] {
+  return {
+    exec: false,
+    suspend_resume: !!provider.suspend && !!provider.resume,
+    export: false,
+    usage: false,
+    quota: !!provider.quota,
+  };
+}
 export class ProtocolFailure extends Error {
   constructor(readonly detail: Types["ProtocolError"]) {
     super(detail.kind);

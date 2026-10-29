@@ -1,4 +1,5 @@
-import type { IncomingMessage } from "node:http";
+import { createServer, STATUS_CODES, type IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 import { chmod, stat, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -10,7 +11,7 @@ import Fastify, {
   type HTTPMethods,
 } from "fastify";
 import {
-  absentPorts,
+  ports,
   ProtocolFailure,
   refused,
   type Context,
@@ -104,8 +105,56 @@ async function readiness(
   }
 }
 
+const relayProtocol = "drydock-relay";
+const relayRoute = /^\/v1\/providers\/([^/]+)\/environments\/([^/]+)\/relay$/;
+
+/**
+ * The relay a request upgrades to: a GET of a relay route carrying both upgrade
+ * headers. Any other request, a relay without them included, stays in Fastify.
+ */
+function relayTarget(request: IncomingMessage): Instance | undefined {
+  const match = relayRoute.exec(request.url!.split("?")[0]);
+  const upgrade = request.headers.upgrade?.toLowerCase() === relayProtocol;
+  const connection = String(request.headers.connection ?? "")
+    .split(",")
+    .some((value) => value.trim().toLowerCase() === "upgrade");
+  if (request.method !== "GET" || !match || !upgrade || !connection) return;
+  try {
+    return {
+      provider: decodeURIComponent(match[1]),
+      id: decodeURIComponent(match[2]),
+    };
+  } catch {
+    return;
+  }
+}
+
+/** A protocol error as a raw HTTP response on a socket that never upgraded. */
+function rawError(socket: Duplex, error: unknown) {
+  const result = errorResponse(error);
+  const body = JSON.stringify(result.detail);
+  const headers = {
+    ...result.headers,
+    "content-length": String(Buffer.byteLength(body)),
+    connection: "close",
+  };
+  socket.end(
+    [
+      `HTTP/1.1 ${result.status} ${STATUS_CODES[result.status]}`,
+      ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+      "",
+      body,
+    ].join("\r\n"),
+  );
+}
+
 function createApp(): FastifyInstance {
   const app = Fastify({
+    serverFactory: (handler) =>
+      createServer(
+        { shouldUpgradeCallback: (request) => !!relayTarget(request) },
+        handler,
+      ),
     logger: false,
     exposeHeadRoutes: true,
     forceCloseConnections: true,
@@ -190,7 +239,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
     return {
       provider: name,
       module: config.module,
-      ports: { ...absentPorts },
+      ports: ports(provider),
       capabilities: provider.capabilities,
       observation: provider.observation,
       rate_limits: provider.rateLimits,
@@ -324,6 +373,83 @@ export async function serve(modules: ProviderModule[], unix: string) {
     provider(request).reach(request.params.id, context(request)),
   );
 
+  // A relay with both upgrade headers never reaches Fastify (see relayTarget).
+  app.get<{ Params: Instance }>(`${environments}/:id/relay`, () =>
+    refused(`missing ${relayProtocol} upgrade headers`),
+  );
+
+  function port<T>(method: T | undefined): T {
+    if (!method) refused("operation port unavailable");
+    return method;
+  }
+
+  app.post<{ Params: Instance }>(`${environments}/:id/suspend`, (request) => {
+    const p = provider(request);
+    return port(p.suspend).call(p, request.params.id, context(request));
+  });
+
+  app.post<{ Params: Instance; Body: Types["ResumeToken"] }>(
+    `${environments}/:id/resume`,
+    { schema: { body: bodySchema("ResumeToken") } },
+    async (request, reply) => {
+      const p = provider(request);
+      await port(p.resume).call(
+        p,
+        request.params.id,
+        request.body,
+        context(request),
+      );
+      return reply.code(204).send();
+    },
+  );
+
+  app.get<{ Params: Instance }>("/v1/providers/:provider/quota", (request) => {
+    const p = provider(request);
+    return port(p.quota).call(p, context(request));
+  });
+
+  // Like Rust, the provider is called before switching protocols, so its
+  // refusals are ordinary error responses; then bytes pass both ways, and
+  // either side's end half-closes the other.
+  const relays = new Set<Duplex>();
+  async function relay(request: IncomingMessage, socket: Duplex, head: Buffer) {
+    relays.add(socket);
+    const abort = new AbortController();
+    socket.once("close", () => {
+      relays.delete(socket);
+      abort.abort();
+    });
+    socket.on("error", () => socket.destroy());
+    const signal = AbortSignal.any([abort.signal, stopping.signal]);
+    let stream: Duplex;
+    try {
+      const target = relayTarget(request)!;
+      const ctx = { credential: credential(request), signal };
+      const p = binding(target.provider).provider;
+      stream = await port(p.relay).call(p, target.id, ctx);
+    } catch (error) {
+      if (!socket.destroyed) rawError(socket, error);
+      return;
+    }
+    if (signal.aborted) {
+      stream.destroy();
+      socket.destroy();
+      return;
+    }
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: ${relayProtocol}\r\n\r\n`,
+    );
+    if (head.length) stream.write(head);
+    stream.on("error", () => socket.destroy());
+    socket.once("close", () => stream.destroy());
+    stream.once("close", () => socket.end(() => socket.destroy()));
+    socket.pipe(stream);
+    stream.pipe(socket);
+  }
+  app.server.on("upgrade", (request, socket, head) => {
+    void relay(request, socket, head);
+  });
+
   await app.listen({ path: unix });
   // The verified 0700 parent controls access during bind-to-chmod.
   await chmod(unix, 0o600);
@@ -331,6 +457,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
     app,
     async close() {
       stopping.abort();
+      for (const socket of relays) socket.destroy();
       await app.close();
       bindings.clear();
     },

@@ -16,13 +16,17 @@
     "build": "corepack pnpm generate && rm -rf dist && tsc && node scripts/executable.mjs",
     "typecheck": "corepack pnpm generate && tsc --noEmit",
     "test": "corepack pnpm build && node --test --test-timeout=10000 test/*.test.ts",
-    "format": "prettier --write src/*.ts scripts/*.mjs test/*.ts *.json README.md",
-    "format:check": "prettier --check src/*.ts scripts/*.mjs test/*.ts *.json README.md",
+    "format": "prettier --write 'src/**/*.ts' scripts/*.mjs 'test/**/*.ts' *.json README.md",
+    "format:check": "prettier --check 'src/**/*.ts' scripts/*.mjs 'test/**/*.ts' *.json README.md",
     "check": "corepack pnpm test && corepack pnpm check:generated && corepack pnpm format:check && corepack pnpm typecheck && corepack pnpm conformance",
     "pack:companion": "corepack pnpm build && node scripts/package.mjs",
     "conformance": "corepack pnpm build && node scripts/conformance.mjs"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "2.16.0",
+    "@connectrpc/connect": "2.3.0",
+    "@connectrpc/connect-node": "2.3.0",
+    "@namespacelabs/sdk": "1.5.2",
     "ajv": "8.17.1",
     "ajv-formats": "3.0.1",
     "fastify": "5.12.7"

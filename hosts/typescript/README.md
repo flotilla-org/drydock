@@ -3,7 +3,9 @@
 Node >=24.18.0 on Linux/Unix, with pinned pnpm via Corepack. Daemon owns all
 admission, rate, credential-state, inventory, billing and replay policy. This
 companion loads modules and delegates the common `/v1` API to provider methods.
-Exec, suspend/resume, export, usage and quota are absent until drydock#85.
+Suspend/resume and quota are optional ports: a provider declares the ones whose
+methods it implements, and the host refuses the others. Exec, export and usage
+are absent until drydock#85.
 Workspace validation (`check`/`conformance`) requires the pinned Rust toolchain and
 Cargo; an installed production companion only needs Node and its dependencies.
 
@@ -49,7 +51,9 @@ PUT `/v1/config` replaces `{providers: {instance: {module, settings}}}`; PATCH u
 RFC7396 merge patch and validates the merged document. Unchanged configurations reuse their provider; failed
 configuration leaves the previous document intact. Credential configuration is
 server-only and rejected by the host. The optional `Drydock-Credential` header is
-an opaque per-call string, never retained in configuration or provider bindings.
+an opaque per-call string, never retained in configuration. A module may keep an
+SDK client for the credential its calls carry, when the SDK holds connections
+that outlive one call (a relay does).
 
 Providers return generated Environment values; provision's internal `created`
 flag chooses HTTP201 or200 without a wire wrapper. Provider declarations expose
@@ -57,8 +61,14 @@ facts; observation is polling performed by the main server. There are no host
 handles, push subscriptions, cursors, credential refresh routes or policy loops.
 Modules validate opaque settings and honor cancellation; cancellation does not
 prove rollback. Factories own cleanup on rejection/abort, and modules own their
-SDK resources. Client disconnect aborts the call's signal. The relay route is
-not served; vessel connections are being redesigned as exposures (#132).
+SDK resources. Client disconnect aborts the call's signal.
+
+A provider whose reach is `relay` implements `relay(id)`, returning a Node
+`Duplex` to its vessel's agent socket. Only a GET of the relay route carrying
+`Connection: upgrade` and `Upgrade: drydock-relay` leaves Fastify (Node's
+`shouldUpgradeCallback`); one without them is refused. The provider is called
+before protocols switch, so its refusals are ordinary error responses; after the
+101, bytes pass both ways and either side's end half-closes the other.
 
 `server.ts` contains direct Fastify routes and a small RFC7396 merge.
 `provider.ts` is handwritten and free of framework types. `src/generated/**` and
@@ -70,6 +80,52 @@ only when selected by provider configuration; it creates no vendor resources. It
 settings are `{seed_unlabelled: boolean}`; unknown settings are refused. It stores
 prepared forms and Environment rows, implements label idempotency, refuses reach
 until exposures land (#132), and exposes a 10ms polling declaration. It owns no event stream or replay.
+
+The built-in `namespace` module drives Namespace devboxes through
+`@namespacelabs/sdk/devbox` (`src/namespace/`). Settings: `workspace` (required:
+images go to `nscr.io/<workspace>/<repository>`), `repository` (default
+`drydock-vessel`), `site` (default the SDK's `iad`), `push_chunk_bytes` and
+`egress_probe` (`{command: [...]}`, run as root on inspect). The credential is
+`{"bearer_token": …}`, handed to the SDK through a TokenSource, never its
+defaults or token files, and used as the `nscr.io` push password (user `token`)
+without touching any docker configuration. It needs the grants `devbox *`,
+`devbox/image *`, `instance create, dial_host, ssh, exec, get, list, refresh,
+wait`, `ingress access` and `containerregistry *`,
+`containerregistry/repository *`, `containerregistry/image *`.
+
+- Prepare layers the tools image onto the base by digest here (no build),
+  pushes it to the workspace registry tagged with the key's name, and registers
+  it by digest. The key is both digests and the platform (linux/amd64); the
+  prepared form's ID is the registered reference. A registration with the key's
+  name is reused, so re-preparing adds no version. Optimize is never called.
+- Provision creates a devbox from it with the client's label in
+  `drydock.label`, a named size (s, m, l, xl: 4/8/16/32 CPUs with 2 GiB per
+  CPU; disk is whole GiB of volume), the egress policy, no tenant checkout and
+  never `ephemeral`. PID 1 is Namespace's agent and the image's entrypoint
+  never runs, so drydock's agent is the service `drydock-agent`
+  (`/opt/drydock/drydock-agent`, on boot, always restarted, keeping the devbox
+  awake). A label finds its devbox again; a running one gets the service if it
+  is missing, a stopped one is returned untouched.
+- Reach is this host's relay route; the relay is an SSH exec channel over the
+  SDK's gateway running `drydock-agent --bridge`, since the gateway refuses
+  Unix-socket forwards. Exposures travel over that one agent connection.
+- Suspend and resume are devbox stop and start: files survive, memory does not.
+  A devbox stopped by its lifetime cap or idling reads as `paused_by_provider`
+  and resumes; one this host stopped reads as `suspended_by_request`.
+- Observation polls every 30 s. List reports devboxes carrying `drydock.label`,
+  with state from `refresh` (list itself says `unknown`). Nothing that observes
+  runs a command or opens a connection on a stopped devbox, since those start it.
+- Egress maps host names to `networkPolicy.allowedDomains` (non-advisory) and
+  refuses CIDR, port and address entries. Declared enforcement is advisory; an
+  environment reports enforced only when `egress_probe` passes as root.
+- Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
+  platform class). Usage is undeclared.
+- SDK calls through the gateway can fail with `Premature close` after taking
+  effect; `src/namespace/vendor.ts` is the one place that retries them, and it
+  checks the resulting state first, so nothing is created or stopped twice.
+
+Module tests run against in-process stand-ins for the SDK and OCI registries
+(`test/support/namespace.ts`), never a live token.
 
 `corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration test
 against this actual child host through the main Daemon and its existing checker.

@@ -2,6 +2,7 @@
 import { pathToFileURL } from "node:url";
 import { serve } from "./server.js";
 import reference from "./reference.js";
+import namespace from "./namespace/index.js";
 import { compile, bodySchema } from "./validation.js";
 import type { ProviderModule } from "./provider.js";
 
@@ -38,7 +39,7 @@ async function loadModules(): Promise<ProviderModule[]> {
 async function main() {
   if (process.argv.length !== 4 || process.argv[2] !== "--unix")
     throw Error("usage: drydock-host-typescript --unix PATH");
-  const modules = [reference, ...(await loadModules())];
+  const modules = [reference, namespace, ...(await loadModules())];
   const host = await serve(modules, process.argv[3]);
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
