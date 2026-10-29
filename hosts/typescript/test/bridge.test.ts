@@ -168,7 +168,7 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     id = encodeURIComponent(environment.id);
   assert.equal((await stat(f.socketPath)).mode & 0o777, 0o600);
   const hello = await request(f.socketPath, "/v1/hello", undefined, "GET");
-  assert.equal(hello.body.protocol_version, "9");
+  assert.equal(hello.body.protocol_version, "10");
   assert.equal(hello.body.loadable_modules[0].name, f.name);
   assert.equal(
     (await request(f.socketPath, "/v1/hello", undefined, "HEAD")).status,
