@@ -235,7 +235,11 @@ impl Exposures {
         }
         state.record = record;
         let key = (Direction::Inward, name.to_owned());
-        vessel.establish(&self.shared, &mut state, &key).await;
+        if vessel.establish(&self.shared, &mut state, &key).await == Outcome::Gone {
+            drop(state);
+            self.forget(p, id).await;
+            return Err(Error::Protocol(ProtocolError::NotFound { reason: "the environment no longer exists".into() }));
+        }
         vessel.announce(&self.shared, &state, &key);
         Ok((existed, vessel.inward(&state, name).expect("just set")))
     }
@@ -288,7 +292,11 @@ impl Exposures {
         vessel.save(&record).await?;
         state.record = record;
         let key = (Direction::Outward, name.to_owned());
-        vessel.establish(&self.shared, &mut state, &key).await;
+        if vessel.establish(&self.shared, &mut state, &key).await == Outcome::Gone {
+            drop(state);
+            self.forget(p, id).await;
+            return Err(Error::Protocol(ProtocolError::NotFound { reason: "the environment no longer exists".into() }));
+        }
         vessel.announce(&self.shared, &state, &key);
         Ok((previous.is_some(), vessel.outward(&state, name).expect("just set")))
     }
@@ -600,9 +608,9 @@ impl Vessel {
     /// Set one exposure up within a request, as the supervisor would: on the
     /// open connection, or by opening one (which sets every exposure up). Its
     /// first outcome fires no event of its own, since setting it announces it.
-    async fn establish(&self, shared: &Shared, state: &mut State, key: &Key) {
+    async fn establish(&self, shared: &Shared, state: &mut State, key: &Key) -> Outcome {
         state.status.remove(key);
-        self.reconcile(shared, state).await;
+        self.reconcile(shared, state).await
     }
 
     /// Bring every exposure to the vessel's state.
@@ -691,8 +699,10 @@ impl Vessel {
         if state.record.stale_hosts {
             let mut record = state.record.clone();
             record.stale_hosts = false;
-            if self.save(&record).await.is_ok() {
-                state.record = record;
+            // The mark stays until saved cleared, so exposures read not ready meanwhile.
+            match self.save(&record).await {
+                Ok(()) => state.record = record,
+                Err(error) => tracing::warn!(%error, "hosts file is current but its stale mark could not be cleared"),
             }
         }
         Ok(taken)

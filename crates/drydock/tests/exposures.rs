@@ -492,3 +492,23 @@ async fn invalid_exposures_are_refused() {
     ));
     assert!(h.api.inwards(PROVIDER, &h.id).await.unwrap().is_empty() && h.api.outwards(PROVIDER, &h.id).await.unwrap().is_empty());
 }
+
+// A PUT that finds its environment destroyed behind drydock's back answers
+// NotFound, and drydock forgets the environment's exposures at once.
+#[tokio::test]
+async fn a_put_on_an_environment_destroyed_behind_drydock_is_not_found() {
+    let h = Harness::start().await;
+    let request = InwardRequest { target: InwardTarget::Unix(unix(&h.path("cleat.sock"))) };
+    let set = h.api.put_inward(PROVIDER, &h.id, "cleat", &request).await.unwrap().into_inner();
+    let host = Client::unix(&h.reference).unwrap().credentialed(Some(Secret::new(std::env::var("PATH").unwrap())));
+    host.destroy(PROVIDER, &h.id).await.unwrap();
+    let (api, id) = (h.api.clone(), h.id.clone());
+    eventually(|| {
+        let (api, id) = (api.clone(), id.clone());
+        async move { api.inspect(PROVIDER, &id).await.is_err() }
+    })
+    .await;
+    let again = h.api.put_inward(PROVIDER, &h.id, "agent", &request).await;
+    assert!(matches!(again, Err(drydock::client::Error::Protocol(ProtocolError::NotFound { .. }))), "{again:?}");
+    assert!(!local(&set).exists());
+}
