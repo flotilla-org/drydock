@@ -104,15 +104,20 @@ settings = {{ seed_unlabelled = true }}
             ssh_public_key: None,
         },
         // Managed private UDS is filesystem-authorized; network authentication is
-        // covered by main serving tests. Exec-based host fixtures wait for #85.
-        scenarios: Scenario::ALL.iter().copied().filter(|s| !matches!(s, Scenario::Authentication | Scenario::HostFixtures)).collect(),
+        // covered by main serving tests. Exec-based host fixtures wait for #85, and
+        // reach waits for the exposure redesign in #132.
+        scenarios: Scenario::ALL
+            .iter()
+            .copied()
+            .filter(|s| !matches!(s, Scenario::Authentication | Scenario::HostFixtures | Scenario::Reach))
+            .collect(),
         fixture_configuration: None,
         null_environment_id: Some("unlabelled".into()),
         auth_audit: None,
         billing_sample_millis: 25,
         billing_settle_millis: 0,
         timeouts: Default::default(),
-        echo_relay: true,
+        echo_relay: false,
         reach_probe: None,
         egress_probe: None,
     };

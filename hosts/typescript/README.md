@@ -68,13 +68,13 @@ TypeScript bindings and packaged AJV schema form one generation chain.
 The built-in `reference` module is always loadable in every companion, and used
 only when selected by provider configuration; it creates no vendor resources. Its optional
 settings are `{seed_unlabelled: boolean}`; unknown settings are refused. It stores
-prepared forms and Environment rows, implements label idempotency and a raw echo
-relay, and exposes a 10ms polling declaration. It owns no event stream or replay.
+prepared forms and Environment rows, implements label idempotency, refuses reach
+until exposures land (#132), and exposes a 10ms polling declaration. It owns no event stream or replay.
 
 `corepack pnpm conformance` discovers and runs the ignored Rust integration test
 against this actual child host through the main Daemon and its existing checker.
 Authentication is exercised by the shared server serving tests; private UDS uses
-filesystem authorization. Exec-based host fixtures await #85. The test drains
+filesystem authorization. Exec-based host fixtures await #85 and reach awaits #132. The test drains
 and counts child output without retaining credentials, checks optional-operation
 admission in the embedded server, and requires the shared conformance report to
 pass. The script fails if its named test is missing, rather than silently running

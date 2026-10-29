@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import reference from "../dist/reference.js";
-// Main-server conformance owns lifecycle, idempotency, polling/replay and relay.
+// Main-server conformance owns lifecycle, idempotency and polling/replay.
 // This trait-level scenario covers only reference-owned settings, canonical
 // prepared keys and clone isolation across reordered object members.
 test("reference validates settings and owns deterministic prepared keys", async () => {

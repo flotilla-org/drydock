@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { PassThrough } from "node:stream";
 import {
   ProtocolFailure,
   refused,
@@ -168,15 +167,10 @@ class Memory implements Provider {
     // Destroy is idempotent: an already absent environment is a successful no-op.
     this.rows.delete(id);
   }
+  // Vessel connections are being redesigned as exposures (#132); the
+  // in-memory reference has nothing to connect to.
   async reach(id: string, context: Context): Promise<Types["Reach"]> {
     await this.inspect(id, context);
-    return {
-      kind: "relay",
-      path: `/v1/providers/${encodeURIComponent(this.name)}/environments/${encodeURIComponent(id)}/relay`,
-    };
-  }
-  async relay(id: string, context: Context) {
-    await this.inspect(id, context);
-    return new PassThrough();
+    refused("reference environments have no reach");
   }
 }
