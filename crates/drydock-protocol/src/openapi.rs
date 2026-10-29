@@ -33,7 +33,7 @@ pub enum ErrorResponses {
     info(
         title = "Drydock adaptor protocol",
         version = "1.0.0",
-        description = "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets use private directory/socket permissions; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams."
+        description = "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets use private directory/socket permissions; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams. Exposures are standing connections the server makes between its machine and a vessel."
     )
 )]
 struct Document;
@@ -75,7 +75,7 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
         path::{ParameterBuilder, ParameterIn},
     };
     for (route, path) in document.paths.paths.iter_mut() {
-        let server_only = route == "/v1/events" || route.ends_with("/credential");
+        let server_only = route == "/v1/events" || route.ends_with("/credential") || route.contains("/exposures/");
         for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
             if server_only {
                 operation.extensions = Some(ExtensionsBuilder::new().add("x-drydock-server-only", true).build());

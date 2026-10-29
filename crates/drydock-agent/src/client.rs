@@ -88,6 +88,15 @@ fn claim(endpoint: Endpoint) -> io::Result<Claim> {
         _inode: inode,
     })
 }
+/// A destination the caller named explicitly, which several vessels may share.
+fn unclaimed(endpoint: Endpoint) -> Claim {
+    Claim {
+        endpoint,
+        keys: vec![],
+        #[cfg(target_os = "linux")]
+        _inode: None,
+    }
+}
 type Targets = Arc<Mutex<HashMap<String, Arc<Claim>>>>;
 type RequestBody = UnsyncBoxBody<Bytes, io::Error>;
 
@@ -752,6 +761,21 @@ impl Client {
         if let Some(fresh) = fresh {
             self.targets.lock().unwrap().insert(forward.id, fresh);
         }
+        Ok(())
+    }
+    /// As [`Self::put_guest_forward`], to a destination the caller chose
+    /// explicitly: it is not claimed, so other vessels may reach it too, and a
+    /// TCP destination need not be loopback. The destination is dialled as
+    /// given for each guest connection; it need not exist yet.
+    pub async fn put_shared_guest_forward(&self, forward: GuestForward, destination: Endpoint) -> io::Result<()> {
+        self.require_compatible()?;
+        check_id(&forward.id)?;
+        if matches!(&destination, Endpoint::Tcp(address) if address.port() == 0) {
+            return Err(invalid("destination TCP port must be nonzero"));
+        }
+        let uri = format!("/forwards/guest/{}", encode_segment(&forward.id));
+        self.link.empty("PUT", &uri, json_body(&forward)?).await?;
+        self.targets.lock().unwrap().insert(forward.id, Arc::new(unclaimed(destination)));
         Ok(())
     }
     pub async fn guest_forward(&self, id: &str) -> io::Result<GuestForward> {

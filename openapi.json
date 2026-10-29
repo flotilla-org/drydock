@@ -2,12 +2,12 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Drydock adaptor protocol",
-    "description": "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets use private directory/socket permissions; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams.",
+    "description": "One API for the drydock server and language hosts. Hosts serve every route except those marked x-drydock-server-only. Managed Unix sockets use private directory/socket permissions; external loopback hosts use bearer token files. The optional Drydock-Credential header carries an opaque provider credential for that request only: the server sends it on every call to a host, and on the public API it overrides the held credential without storing or logging it. Provider labels are idempotency keys; all subsequent operations use opaque IDs. Optional routes are declared by ports. Observe is NDJSON; relay and exec upgrade to raw streams. Exposures are standing connections the server makes between its machine and a vessel.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "9"
+    "version": "10"
   },
   "paths": {
     "/v1/config": {
@@ -944,6 +944,652 @@
         }
       }
     },
+    "/v1/providers/{provider}/environments/{id}/exposures/inward": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "inwards",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's exposures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Inward"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/exposures/inward/{name}": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "inward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The exposure as it stands",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inward"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "put": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "put_inward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InwardRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced; the outcome is in ready and error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inward"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Set; the outcome is in ready and error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inward"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "delete": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "remove_inward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success; removing an absent exposure succeeds"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/exposures/outward": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "outwards",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The environment's exposures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Outward"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/exposures/outward/{name}": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "outward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The exposure as it stands",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Outward"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "put": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "put_outward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OutwardRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Replaced; the outcome is in ready and error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Outward"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Set; the outcome is in ready and error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Outward"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "delete": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "remove_outward",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Exposure name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success; removing an absent exposure succeeds"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
     "/v1/providers/{provider}/environments/{id}/reach": {
       "post": {
         "tags": [
@@ -1767,6 +2413,14 @@
           }
         ]
       },
+      "Direction": {
+        "type": "string",
+        "description": "Which way an exposure's connections go.",
+        "enum": [
+          "inward",
+          "outward"
+        ]
+      },
       "EgressCapability": {
         "type": "object",
         "required": [
@@ -2054,6 +2708,46 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "Server only: an exposure was set or removed, or its `ready` changed.\nLive only: a replay from `since` does not repeat it, so read the\nexposure routes for the current state.",
+            "required": [
+              "direction",
+              "name",
+              "ready",
+              "kind"
+            ],
+            "properties": {
+              "direction": {
+                "$ref": "#/components/schemas/Direction"
+              },
+              "error": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExposureError"
+                  }
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "exposure"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "ready": {
+                "type": "boolean"
+              },
+              "removed": {
+                "type": "boolean"
+              }
+            }
           }
         ]
       },
@@ -2088,6 +2782,31 @@
             "type": "string"
           }
         }
+      },
+      "ExposureError": {
+        "type": "object",
+        "description": "Why an exposure is not working.",
+        "required": [
+          "code",
+          "reason"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ExposureErrorCode"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "ExposureErrorCode": {
+        "type": "string",
+        "enum": [
+          "not_running",
+          "vessel_unreachable",
+          "refused",
+          "unresolved"
+        ]
       },
       "GoneCause": {
         "oneOf": [
@@ -2212,6 +2931,39 @@
             }
           }
         ]
+      },
+      "Guest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An absolute Unix socket path in the vessel.",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A DNS name in the vessel: drydock gives it a free loopback address and\nits hosts-file line, and listens there on `port`.",
+            "required": [
+              "name",
+              "port"
+            ],
+            "properties": {
+              "name": {
+                "$ref": "#/components/schemas/HostAddress"
+              },
+              "port": {
+                "$ref": "#/components/schemas/Port"
+              }
+            }
+          }
+        ],
+        "description": "The endpoint an outward exposure makes in the vessel."
       },
       "Hello": {
         "type": "object",
@@ -2411,6 +3163,85 @@
           "remote_build"
         ]
       },
+      "Inward": {
+        "type": "object",
+        "description": "An inward exposure as it stands.",
+        "required": [
+          "name",
+          "target",
+          "local",
+          "ready"
+        ],
+        "properties": {
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExposureError",
+                "description": "Why the exposure is not working, when `ready` is false."
+              }
+            ]
+          },
+          "local": {
+            "$ref": "#/components/schemas/Local",
+            "description": "The endpoint on drydock's machine, under drydock's runtime directory."
+          },
+          "name": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "target": {
+            "$ref": "#/components/schemas/InwardTarget"
+          }
+        }
+      },
+      "InwardRequest": {
+        "type": "object",
+        "description": "`PUT …/exposures/inward/{name}`.",
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/InwardTarget"
+          }
+        }
+      },
+      "InwardTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An absolute Unix socket path in the vessel.",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string",
+                "description": "An absolute Unix socket path in the vessel."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A numeric `ip:port` in the vessel.",
+            "required": [
+              "tcp"
+            ],
+            "properties": {
+              "tcp": {
+                "type": "string",
+                "description": "A numeric `ip:port` in the vessel."
+              }
+            }
+          }
+        ],
+        "description": "Where an inward exposure's connections go, in the vessel."
+      },
       "LoadableModule": {
         "type": "object",
         "required": [
@@ -2430,6 +3261,22 @@
             "type": "string"
           }
         }
+      },
+      "Local": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "How the client is handed an exposure's end on drydock's machine. Drydock\nchooses it; only a Unix socket for now."
       },
       "MaterialMode": {
         "type": "string",
@@ -2611,6 +3458,102 @@
           }
         ],
         "description": "Hosts unable to replay emit a snapshot marking the gap. Inventory is complete\nonly for providers absent from `unavailable_providers`."
+      },
+      "Outward": {
+        "type": "object",
+        "description": "An outward exposure as it stands.",
+        "required": [
+          "name",
+          "guest",
+          "destination",
+          "ready"
+        ],
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a guest name: the loopback address and port it was given in the vessel."
+          },
+          "destination": {
+            "$ref": "#/components/schemas/OutwardDestination"
+          },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ExposureError",
+                "description": "Why the exposure is not working, when `ready` is false."
+              }
+            ]
+          },
+          "guest": {
+            "$ref": "#/components/schemas/Guest"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "resolved": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For a TCP destination: the address it resolved to when set."
+          }
+        }
+      },
+      "OutwardDestination": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An absolute Unix socket path on drydock's machine.",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string",
+                "description": "An absolute Unix socket path on drydock's machine."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`host:port`, where host is a DNS name or IP literal (IPv6 in brackets).\nA name is resolved once, when the exposure is set.",
+            "required": [
+              "tcp"
+            ],
+            "properties": {
+              "tcp": {
+                "type": "string",
+                "description": "`host:port`, where host is a DNS name or IP literal (IPv6 in brackets).\nA name is resolved once, when the exposure is set."
+              }
+            }
+          }
+        ],
+        "description": "Where an outward exposure's connections go, on drydock's machine."
+      },
+      "OutwardRequest": {
+        "type": "object",
+        "description": "`PUT …/exposures/outward/{name}`.",
+        "required": [
+          "guest",
+          "destination"
+        ],
+        "properties": {
+          "destination": {
+            "$ref": "#/components/schemas/OutwardDestination"
+          },
+          "guest": {
+            "$ref": "#/components/schemas/Guest"
+          }
+        }
       },
       "Period": {
         "type": "object",

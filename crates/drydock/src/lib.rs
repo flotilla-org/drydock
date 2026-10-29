@@ -6,6 +6,7 @@ pub mod config;
 pub mod conformance;
 pub mod credentials;
 pub mod daemon;
+pub mod exposures;
 pub mod launch;
 pub mod local;
 pub mod runtime;
