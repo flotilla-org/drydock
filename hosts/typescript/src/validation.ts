@@ -26,6 +26,7 @@ function integerWidth(bits: number) {
       value < 2 ** bits,
   };
 }
+// Intentionally replaces ajv-formats' signed-only and safe-integer versions.
 ajv.addFormat("int32", integerWidth(32));
 ajv.addFormat("int64", integerWidth(64));
 

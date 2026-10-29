@@ -7,6 +7,7 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { serve } from "../dist/server.js";
 import { ProtocolFailure } from "../dist/provider.js";
+import { compile } from "../dist/validation.js";
 import type {
   Provider,
   ProviderModule,
@@ -379,6 +380,20 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     (await request(f.socketPath, "/v1/providers", undefined, "GET")).body,
     [],
   );
+});
+// Integer formats bound their Rust width; `minimum: 0` marks unsigned types.
+test("integer formats accept signed and unsigned widths", () => {
+  // The largest doubles below 2^32 and 2^64 (doubles near 2^64 are 2^11 apart).
+  for (const [format, max, below] of [
+    ["int32", 2 ** 32, 2 ** 32 - 1],
+    ["int64", 2 ** 64, 2 ** 64 - 2 ** 11],
+  ] as const) {
+    const valid = compile({ type: "integer", format });
+    assert.equal(valid(below), true, format);
+    assert.equal(valid(-(max / 2)), true, format);
+    assert.equal(valid(max), false, format);
+    assert.equal(valid(-(max / 2) - 2 ** 12), false, format);
+  }
 });
 // Client disconnect cancels awaited trait work.
 test("disconnect aborts inspect", async (t) => {
