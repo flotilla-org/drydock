@@ -432,8 +432,9 @@ impl Registry {
         }
         // Registries that keep blobs in object storage answer HEAD with a
         // redirect to it; the redirect itself says the blob exists, and we
-        // never follow it so our authorization stays on this origin.
-        if response.status().is_redirection() {
+        // never follow it so our authorization stays on this origin. Only a
+        // redirect that names a target says so; a 304 or a bare 3xx does not.
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) && response.headers().contains_key(header::LOCATION) {
             return Ok(true);
         }
         self.check(&response, &[200], "blob")?;
@@ -730,6 +731,16 @@ mod tests {
         let registry = Registry::new(canned.clone(), "harbor.test", None, None).unwrap();
         registry.put_blob("proj/repo", &digest, Bytes::from_static(b"layer")).await.unwrap();
         assert_eq!(*canned.2.lock().unwrap(), [format!("HEAD /v2/proj/repo/blobs/{digest}")]);
+    }
+
+    // A 3xx that names no target, or a 304, is not evidence the blob exists.
+    #[tokio::test]
+    async fn bare_redirection_is_not_presence() {
+        let digest = sha256(b"layer");
+        for canned in [Canned(307, None, Default::default()), Canned(304, Some("https://blobs.example/x"), Default::default())] {
+            let registry = Registry::new(Arc::new(canned), "harbor.test", None, None).unwrap();
+            assert!(registry.put_blob("proj/repo", &digest, Bytes::from_static(b"layer")).await.is_err());
+        }
     }
 
     // Challenge parameters may be quoted (and contain commas) or bare.
