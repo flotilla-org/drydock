@@ -413,7 +413,7 @@ impl Daemon {
         let (prepared, size) = self.prepare(provider, options).await?;
         let platform = prepared.platform.clone();
         let label = uuid::Uuid::new_v4().to_string();
-        let dir = self.key_directory(&label);
+        let dir = self.keys.join(&label);
         let (_, public) = launch::keypair(&dir).await?;
         let request = ProvisionRequest {
             label,
@@ -495,7 +495,7 @@ impl Daemon {
         if request.ssh_public_key.is_some() {
             return Ok(None);
         }
-        let directory = self.key_directory(&request.label);
+        let directory = self.client_key_directory(&request.label);
         let held = directory.join("id_ed25519");
         let holds = || held.is_file() && held.with_extension("pub").is_file();
         // A key drydock already holds was made for a provider that runs the agent.
@@ -537,8 +537,12 @@ impl Daemon {
             launch::keypair(&directory).await?.1
         };
         let request = ProvisionRequest { ssh_public_key: Some(public), ..request.clone() };
-        // The agent connection reads the prepared platform from this record:
-        // write it whole or not at all.
+        // The agent connection reads the prepared platform from this record. The
+        // first one stands, as the environment it made does; it is written whole
+        // or not at all.
+        if directory.join("request.json").is_file() {
+            return Ok(Some(request));
+        }
         let staged = directory.join("request.json.new");
         tokio::fs::write(&staged, serde_json::to_vec(&request).expect("provision request serializes"))
             .await
@@ -549,22 +553,26 @@ impl Daemon {
         Ok(Some(request))
     }
 
-    /// The directory holding a label's key: a launch's own UUID label names it
-    /// directly; any other label, chosen by a client, by its digest, so a label
-    /// never selects a filesystem path.
-    fn key_directory(&self, label: &str) -> PathBuf {
-        match uuid::Uuid::parse_str(label) {
-            Ok(uuid) if uuid.hyphenated().to_string() == label => self.keys.join(label),
-            _ => self.keys.join(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(label.as_bytes()))),
-        }
+    /// The directory holding a client label's key, named by the label's
+    /// digest: a label never selects a filesystem path, nor a launch's key.
+    fn client_key_directory(&self, label: &str) -> PathBuf {
+        self.keys.join(format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(label.as_bytes())))
     }
-
     pub fn key_for(&self, environment: &Environment) -> Result<PathBuf, Error> {
         let label = environment
             .label
             .as_deref()
             .ok_or_else(|| Error::Protocol(ProtocolError::Refused { reason: "environment has no drydock-managed SSH key".into() }))?;
-        Ok(self.key_directory(label).join("id_ed25519"))
+        // A launch's own UUID label names its key directory directly.
+        if let Ok(uuid) = uuid::Uuid::parse_str(label)
+            && uuid.hyphenated().to_string() == label
+        {
+            let launched = self.keys.join(label).join("id_ed25519");
+            if launched.is_file() {
+                return Ok(launched);
+            }
+        }
+        Ok(self.client_key_directory(label).join("id_ed25519"))
     }
 }
 // Routing between per-host runtimes. Policy stays in each host's Runtime;

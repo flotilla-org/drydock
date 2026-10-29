@@ -302,6 +302,19 @@ async fn concurrent_first_provisions_of_a_label_share_one_key() {
     assert_eq!(held, 2, "the harness's launch and this label");
 }
 
+// A client label equal to a launch's UUID gets no share of that launch's key:
+// it names an environment drydock holds no client key for, so it is refused.
+#[tokio::test]
+async fn a_client_label_never_takes_a_launchs_key() {
+    let h = Harness::start().await;
+    let launched = h.api.inspect(PROVIDER, &h.id).await.unwrap().label.unwrap();
+    let request = labelled(&h, &launched, None).await;
+    let refused = h.api.provision(PROVIDER, &request).await.map(drop);
+    assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
+    let launch = std::fs::read(h.path("run/keys").join(&launched).join("request.json")).unwrap();
+    assert!(!String::from_utf8_lossy(&launch).contains("\"tools\""), "the launch's record is its own");
+}
+
 // A keyless provision for a provider whose vessels run no agent is passed
 // through untouched: drydock makes no key for it.
 #[tokio::test]
