@@ -1,5 +1,5 @@
-use drydock_agent::{Client, Endpoint, GuestForward};
-use drydock_transport::{Limits, ssh};
+use drydock_agent::{Client, Endpoint, OutwardForward};
+use drydock_transport::ssh;
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -10,20 +10,20 @@ use tokio::{
 mod sshd;
 
 // Actual process boundary: the shipped agent binary, started with only its
-// fixed flags, behind an OpenSSH server that refuses remote Unix-socket
-// forwards as Daytona's gateway does. Its guest-to-host socket never appears,
-// so hello, exec and guest-to-host forward streams must all use the host's link.
+// fixed flags, behind an OpenSSH server that grants only local forwards, as
+// Daytona's gateway does. Hello, exec and outward connections all travel on
+// the one HTTP/2 connection through the local forward.
 #[tokio::test]
-async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
+async fn agent_serves_hello_and_outward_connections_through_a_local_forward() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("run/agent.sock");
     let mut agent = Command::new(env!("CARGO_BIN_EXE_drydock-agent")).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
-    let (config, mut server) = sshd::start(dir.path(), &socket, ssh::GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
+    let (config, mut server) = sshd::start(dir.path(), &socket).await;
     let binary = std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap();
     let client = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match Client::connect_current(
-                || ssh::connect(config.clone(), Limits::default()),
+                || ssh::connect(config.clone()),
                 &drydock_agent::Platform::current(),
                 &binary,
                 Duration::from_secs(5),
@@ -49,8 +49,8 @@ async fn agent_serves_hello_and_guest_streams_without_a_reverse_forward() {
     assert_eq!(stdout, b"ready");
     let target = dir.path().join("target");
     let target_listener = UnixListener::bind(&target).unwrap();
-    let forward = GuestForward { id: "service".into(), unix: dir.path().join("forward"), tcp: None };
-    client.put_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
+    let forward = OutwardForward { id: "service".into(), unix: dir.path().join("forward"), tcp: None };
+    client.put_outward_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
     for round in 0..3u8 {
         let mut guest = UnixStream::connect(&forward.unix).await.unwrap();
         guest.write_all(&[round; 4]).await.unwrap();

@@ -70,7 +70,7 @@ impl Harness {
         std::fs::write(dir.path().join("hosts"), "127.0.0.1 localhost\n").unwrap();
         let vessel = dir.path().join("vessel");
         std::fs::create_dir(&vessel).unwrap();
-        let gateway = Gateway::start_as(&vessel, false, BUILD, Platform::new("linux", "amd64")).unwrap();
+        let gateway = Gateway::start_as(&vessel, BUILD, Platform::new("linux", "amd64")).unwrap();
         let reference = dir.path().join("reference.sock");
         let socket = reference.clone();
         let host = tokio::spawn(async move {
@@ -96,7 +96,7 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let text = format!(
-            "[providers.{PROVIDER}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nagent_link='local_forward'\n\
+            "[providers.{PROVIDER}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\n\
              settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n\
              [providers.{PLAIN}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\nsettings={{poll_interval_ms=10}}\n",
             "a".repeat(64),
@@ -226,7 +226,8 @@ async fn an_inward_exposure_reaches_a_socket_in_the_vessel() {
 }
 
 // Flotilla case 4, drive the agent: case 1 aimed at the agent's own socket
-// gives a client a working agent connection without SSH or keys.
+// gives a client a working agent connection without SSH or keys, and the
+// agent speaks plain HTTP there, so curl reads its hello.
 #[tokio::test]
 async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
     let h = Harness::start().await;
@@ -234,9 +235,18 @@ async fn an_inward_exposure_of_the_agent_socket_drives_the_agent() {
     let set = h.api.put_inward(PROVIDER, &h.id, "agent", &request).await.unwrap().into_inner();
     assert!(set.ready, "{set:?}");
     let stream = UnixStream::connect(local(&set)).await.unwrap();
-    let transport = drydock_transport::Transport::yamux(Box::new(stream), true, Default::default()).await.unwrap();
-    let agent = drydock_agent::Client::connect(transport, String::new()).await.unwrap();
+    let agent = drydock_agent::Client::connect(Box::new(stream), String::new()).await.unwrap();
     assert!(!agent.hello().boot_id.is_empty());
+    let hello = tokio::process::Command::new("curl")
+        .arg("--unix-socket")
+        .arg(local(&set))
+        .args(["-sS", "http://agent/hello"])
+        .output()
+        .await
+        .expect("curl is required by this test");
+    assert!(hello.status.success(), "{}", String::from_utf8_lossy(&hello.stderr));
+    let hello: drydock_agent::Hello = serde_json::from_slice(&hello.stdout).unwrap();
+    assert_eq!(hello.boot_id, agent.hello().boot_id);
 }
 
 /// A provision request under `label`, prepared on the reference module.

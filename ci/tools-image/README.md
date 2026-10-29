@@ -93,8 +93,8 @@ fall back to a different image.
 
 The pin need not match the host build exactly. It selects the bootstrap agent;
 a host connects with `drydock_agent::Client::connect_current`, supplying the vessel's prepared platform, its
-current agent build for that platform and a factory for fresh provider
-transports. A
+current agent build for that platform and a factory for fresh connections to
+the agent socket. A
 fingerprint mismatch at hello triggers push plus re-exec, followed by reconnect
 and verification of the new hello. The host pushes configuration only afterwards.
 Raw `Client::connect` is for tooling that explicitly manages this upgrade flow;
@@ -132,8 +132,8 @@ older ADR 0070 Bootstrap wording that the pair alone keys every prepared form.
 Callers always prepare then provision; refuse a provision that does not match.
 
 Start `/opt/drydock/drydock-agent` with **no arguments** through the provider's
-own alongside-process mechanism. It listens on `/run/drydock/agent.sock`, dials
-`/run/drydock/host.sock`, never runs as PID 1, and is ready only after hello.
+own alongside-process mechanism. It serves plain HTTP on `/run/drydock/agent.sock`,
+never runs as PID 1, and is ready only after hello.
 Restart it after a crash and after each start/resume. Do not install anything in
 the base's init. Keep `/opt/drydock` writable by the agent's identity: upgrade
 creates `.upgrade`, `.prev`, and `.probation` beside the binary. Keep the previous

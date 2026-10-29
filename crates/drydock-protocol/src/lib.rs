@@ -532,8 +532,8 @@ pub enum Reach {
         user: Secret,
         host_key: String,
         /// Whether this SSH server accepts remote (reverse) Unix-socket forwards.
-        /// When it does, guest-to-host streams get their own SSH channels; when it
-        /// doesn't (Daytona's gateway), they share a link through the local forward.
+        /// Drydock reaches the agent through a local forward alone, so it does
+        /// not depend on this.
         #[serde(default)]
         reverse_forwards: bool,
     },

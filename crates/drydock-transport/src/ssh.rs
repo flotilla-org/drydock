@@ -1,9 +1,8 @@
-//! OpenSSH Unix-socket forwards. With a reverse forward each stream gets an
-//! independent SSH channel; without one, streams share a yamux connection over
-//! the local forward. OpenSSH must be on PATH; the caller supplies an explicit
-//! key file and the reach recipe's host public key. No ambient SSH configuration is read.
-use crate::{ByteStream, Connections, Limits, Transport, native::UnixConnections};
-use async_trait::async_trait;
+//! One connection to a vessel's agent socket through an OpenSSH local
+//! Unix-socket forward. OpenSSH must be on PATH; the caller supplies an
+//! explicit key file and the reach recipe's host public key. No ambient SSH
+//! configuration is read.
+use crate::ByteStream;
 use std::{
     collections::VecDeque,
     io,
@@ -12,11 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    net::{UnixListener, UnixStream},
-    process::Command,
-    sync::{oneshot, watch},
-};
+use tokio::{net::UnixStream, process::Command, sync::oneshot};
 
 #[derive(Clone)]
 pub struct SshConfig {
@@ -29,27 +24,16 @@ pub struct SshConfig {
     pub host_key: String,
     pub identity_file: PathBuf,
     pub agent_socket: PathBuf,
-    pub guest_streams: GuestStreams,
 }
 
-/// How streams the guest opens reach the host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GuestStreams {
-    /// A remote forward from this unique per-vessel guest path to a private host
-    /// listener. Every stream, in either direction, gets its own SSH channel.
-    ReverseForward(PathBuf),
-    /// No remote forward, for servers that refuse one (Daytona's SSH gateway).
-    /// The host opens one yamux connection through the local forward and streams
-    /// in both directions share it; the agent opens its streams on that link.
-    OverLocalForward,
-}
-
-/// Starts and owns one SSH session. Local temporary files and the process are
-/// removed asynchronously after drop: the monitor kills and reaps the process
-/// before removing the directory. Keep the runtime running during teardown.
-/// Agent socket permissions and the remote path are the provider's responsibility.
-pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport> {
-    limits.validate()?;
+/// Starts one SSH session with a local forward to the agent socket and
+/// returns its one connection through it, which owns the session: dropping
+/// it ends the session. Every SSH server allows a local forward, Daytona's
+/// gateway included. Local temporary files and the process are removed
+/// asynchronously after drop: the monitor kills and reaps the process before
+/// removing the directory. Keep the runtime running during teardown. Agent
+/// socket permissions and the remote path are the provider's responsibility.
+pub async fn connect(config: SshConfig) -> io::Result<ByteStream> {
     validate_host_key(&config.host_key)?;
     if config.connect_timeout.is_zero()
         || config.host.is_empty()
@@ -66,12 +50,7 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     // limits even with a long TMPDIR; Windows hosts are not supported.
     let dir =
         tokio::task::spawn_blocking(|| tempfile::Builder::new().prefix("dd-ssh-").tempdir_in("/tmp")).await.map_err(io::Error::other)??;
-    let incoming_path = dir.path().join("in");
     let outgoing_path = dir.path().join("out");
-    let reverse = match &config.guest_streams {
-        GuestStreams::ReverseForward(guest) => Some((UnixListener::bind(&incoming_path)?, forward(guest, &incoming_path)?)),
-        GuestStreams::OverLocalForward => None,
-    };
     let known_hosts = dir.path().join("known_hosts");
     tokio::fs::write(&known_hosts, format!("drydock-vessel {}\n", config.host_key)).await?;
     let control = dir.path().join("master");
@@ -139,13 +118,10 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
                 ));
             }
             if tokio::fs::try_exists(&control).await? {
-                // The multiplexing control command waits for the remote forward
-                // acknowledgement. Local socket existence alone is not readiness.
+                // The multiplexing control command reports a refused forward.
+                // Local socket existence alone is not readiness.
                 let mut request = Command::new("ssh");
                 request.args(["-F", "/dev/null", "-S"]).arg(&control).args(["-O", "forward", "-L"]).arg(&local);
-                if let Some((_, remote)) = &reverse {
-                    request.arg("-R").arg(remote);
-                }
                 let output = request.arg(&config.host).stdin(Stdio::null()).kill_on_drop(true).output().await?;
                 if !output.status.success() {
                     return Err(io::Error::new(
@@ -163,7 +139,6 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
     let mut child = setup.child.take().unwrap();
     let dir = setup.dir.take().unwrap();
     let stderr = setup.stderr.take().unwrap();
-    let (ended, status) = watch::channel(false);
     let (stop, shutdown) = oneshot::channel();
     tokio::spawn(async move {
         tokio::select! {
@@ -171,24 +146,16 @@ pub async fn connect(config: SshConfig, limits: Limits) -> io::Result<Transport>
             _ = shutdown => { let _ = child.kill().await; }
         }
         let _ = child.wait().await;
-        let _ = ended.send(true);
         drop(stderr);
         // Reap the owned child before removing its private socket directory.
         let _ = tokio::task::spawn_blocking(move || drop(dir)).await;
     });
-    let session = Session { status, stop: Some(stop) };
-    match reverse {
-        Some((listener, _)) => {
-            Transport::native(Arc::new(SshConnections { native: UnixConnections::new(listener, outgoing_path), session }), limits)
-        }
-        None => {
-            // The SSH channel opens when the local forward is dialled. If the
-            // guest socket is absent, OpenSSH closes this stream, so callers see
-            // the failure on their first request rather than here.
-            let stream = UnixStream::connect(&outgoing_path).await?;
-            Transport::yamux(Box::new(SessionStream { stream, _session: session }), true, limits).await
-        }
-    }
+    let session = Session { stop: Some(stop) };
+    // The SSH channel opens when the local forward is dialled. If the guest
+    // socket is absent, OpenSSH closes this stream, so callers see the
+    // failure on their first request rather than here.
+    let stream = UnixStream::connect(&outgoing_path).await?;
+    Ok(Box::new(SessionStream { stream, _session: session }))
 }
 fn one_line(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join("; ")
@@ -214,7 +181,6 @@ fn forward(local: &std::path::Path, remote: &std::path::Path) -> io::Result<Stri
 }
 /// Dropping the session stops the SSH process; the monitor then reaps it.
 struct Session {
-    status: watch::Receiver<bool>,
     stop: Option<oneshot::Sender<()>>,
 }
 impl Drop for Session {
@@ -224,29 +190,7 @@ impl Drop for Session {
         }
     }
 }
-struct SshConnections {
-    native: UnixConnections,
-    session: Session,
-}
-#[async_trait]
-impl Connections for SshConnections {
-    async fn connect(&self) -> io::Result<ByteStream> {
-        if *self.session.status.borrow() {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected"));
-        }
-        self.native.connect().await
-    }
-    async fn accept(&self) -> io::Result<ByteStream> {
-        let mut status = self.session.status.clone();
-        tokio::select! {
-            result = self.native.accept() => result,
-            _ = status.wait_for(|ended| *ended) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "SSH disconnected")),
-        }
-    }
-}
-
-/// The yamux link's only connection owns the SSH session: the transport's
-/// driver drops it when the transport closes. SSH exit ends the stream.
+/// The forward's only connection owns the SSH session. SSH exit ends the stream.
 struct SessionStream {
     stream: UnixStream,
     _session: Session,

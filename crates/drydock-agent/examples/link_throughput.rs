@@ -1,11 +1,11 @@
 //! Measure file transfer throughput through the real agent and client over a
 //! shaped in-process link: a fixed one-way delay and a bandwidth cap in each
-//! direction, carrying yamux like a provider relay. HTTP/2 flow-control
-//! windows were sized from these numbers.
+//! direction, carrying the agent's one HTTP/2 connection like a provider
+//! relay. HTTP/2 flow-control windows were sized from these numbers.
 //!
 //! `cargo run --release -p drydock-agent --example link_throughput -- RTT_MS MBIT MIB`
 use drydock_agent::{Agent, Client, FileOptions};
-use drydock_transport::{Limits, Transport};
+use drydock_transport::{ByteStream, Listener};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -37,18 +37,25 @@ fn shape(mut from: tokio::io::ReadHalf<DuplexStream>, mut to: tokio::io::WriteHa
         }
     });
 }
-async fn link(rtt: Duration, bytes_per_second: f64) -> (Transport, Transport) {
+/// One connection's two ends, the agent's arriving through a listener.
+struct Once(Option<ByteStream>);
+#[async_trait::async_trait]
+impl Listener for Once {
+    async fn accept(&mut self) -> std::io::Result<ByteStream> {
+        match self.0.take() {
+            Some(stream) => Ok(stream),
+            None => std::future::pending().await,
+        }
+    }
+}
+async fn link(rtt: Duration, bytes_per_second: f64) -> (ByteStream, Once) {
     let (host, host_side) = tokio::io::duplex(1 << 20);
     let (guest, guest_side) = tokio::io::duplex(1 << 20);
     let (host_read, host_write) = tokio::io::split(host_side);
     let (guest_read, guest_write) = tokio::io::split(guest_side);
     shape(host_read, guest_write, rtt / 2, bytes_per_second);
     shape(guest_read, host_write, rtt / 2, bytes_per_second);
-    let (a, b) = tokio::join!(
-        Transport::yamux(Box::new(host), true, Limits::default()),
-        Transport::yamux(Box::new(guest), false, Limits::default())
-    );
-    (a.unwrap(), b.unwrap())
+    (Box::new(host), Once(Some(Box::new(guest))))
 }
 
 #[tokio::main]

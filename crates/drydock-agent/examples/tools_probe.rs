@@ -1,9 +1,9 @@
 //! Stock-Ubuntu acceptance helper, built for the same architecture as the tools.
 //! Reads hello from the running agent; does not add a diagnostic flag to it.
 use drydock_agent::{Client, Platform};
-use drydock_transport::{Limits, Transport, native::UnixConnections};
-use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::net::UnixListener;
+use drydock_transport::ByteStream;
+use std::{path::PathBuf, time::Duration};
+use tokio::net::UnixStream;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,11 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket = PathBuf::from(&args[0]);
     let executable = PathBuf::from(&args[1]);
     let current = std::fs::read(&executable)?;
-    let host = socket.parent().unwrap().join("host.sock");
-    let listener = UnixListener::bind(&host)?;
-    let connections = Arc::new(UnixConnections::new(listener, &socket));
     let client = Client::connect_current(
-        || std::future::ready(Transport::native(connections.clone(), Limits::default())),
+        || async { Ok(Box::new(UnixStream::connect(&socket).await?) as ByteStream) },
         // The probe and the agent come from the same image platform.
         &Platform::current(),
         &current,
@@ -43,6 +40,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(found, "agent process missing");
     println!("{}", serde_json::to_string(client.hello())?);
     drop(client);
-    std::fs::remove_file(host)?;
     Ok(())
 }

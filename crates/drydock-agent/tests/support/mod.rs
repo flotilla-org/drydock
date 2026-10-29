@@ -1,16 +1,15 @@
-//! Shared harness: a real agent behind a real transport, a typed client, and
+//! Shared harness: a real agent behind a real connection, a typed client, and
 //! a raw HTTP/2 sender for requests the typed client would never make; or the
 //! real agent executable as a subprocess, for restarts and re-execs.
 #![allow(dead_code)]
 pub mod origin;
 use bytes::Bytes;
 use drydock_agent::{Agent, AgentError, Client, ErrorKind, ExecEvent, ExitStatus};
-use drydock_transport::{ByteStream, Limits, Purpose, Transport, native::UnixConnections};
+use drydock_transport::{ByteStream, Listener, MemoryDialer, http as link};
 use http_body_util::{BodyExt, Full};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -22,8 +21,8 @@ use tokio::{
 
 pub struct Harness {
     pub client: Client,
-    pub guest_opener: drydock_transport::Opener,
-    pub raw: drydock_transport::http2::Client,
+    pub dial: Dial,
+    pub raw: link::Client,
     pub agent: JoinHandle<std::io::Result<PathBuf>>,
     pub dir: tempfile::TempDir,
 }
@@ -40,37 +39,54 @@ impl Harness {
         root
     }
 }
-/// A connected host and guest transport: yamux over memory, or native Unix sockets.
-pub async fn pair(unix: bool, dir: &Path) -> (Transport, Transport) {
-    if unix {
-        let hp = dir.join("host");
-        let gp = dir.join("guest");
-        let hl = UnixListener::bind(&hp).unwrap();
-        let gl = UnixListener::bind(&gp).unwrap();
-        (
-            Transport::native(Arc::new(UnixConnections::new(hl, gp)), Limits::default()).unwrap(),
-            Transport::native(Arc::new(UnixConnections::new(gl, hp)), Limits::default()).unwrap(),
-        )
-    } else {
-        let (a, b) = tokio::io::duplex(1 << 16);
-        let (a, b) =
-            tokio::join!(Transport::yamux(Box::new(a), true, Limits::default()), Transport::yamux(Box::new(b), false, Limits::default()));
-        (a.unwrap(), b.unwrap())
+/// How a test reaches its agent: in memory, or on a real Unix socket.
+#[derive(Clone)]
+pub enum Dial {
+    Memory(MemoryDialer),
+    Unix(PathBuf),
+}
+impl Dial {
+    pub async fn connect(&self) -> std::io::Result<ByteStream> {
+        match self {
+            Self::Memory(dialer) => dialer.connect().await,
+            Self::Unix(path) => Ok(Box::new(UnixStream::connect(path).await?)),
+        }
     }
+    /// The agent's socket, for tools such as curl.
+    pub fn socket(&self) -> &Path {
+        match self {
+            Self::Unix(path) => path,
+            Self::Memory(_) => panic!("an in-memory agent has no socket"),
+        }
+    }
+}
+/// A way to reach an agent and its listener: in memory, or a Unix socket.
+pub fn pair(unix: bool, dir: &Path) -> (Dial, Box<dyn Listener>) {
+    if unix {
+        let path = dir.join("agent.sock");
+        (Dial::Unix(path.clone()), Box::new(UnixListener::bind(path).unwrap()))
+    } else {
+        let (dialer, listener) = drydock_transport::memory();
+        (Dial::Memory(dialer), Box::new(listener))
+    }
+}
+/// A raw HTTP/2 sender on a fresh connection to the agent.
+pub async fn raw_client(dial: &Dial) -> link::Client {
+    let (raw, driver) = link::connect(dial.connect().await.unwrap()).await.unwrap();
+    // The raw connection lives as long as the test; its driver is detached.
+    drop(driver);
+    raw
 }
 pub async fn harness(unix: bool, expected: &str) -> Harness {
     harness_with(unix, expected, |guest, dir| Agent::new(guest, "test-build".into(), dir.join("agent"))).await
 }
-pub async fn harness_with(unix: bool, expected: &str, agent: impl FnOnce(Transport, &Path) -> Agent) -> Harness {
+pub async fn harness_with(unix: bool, expected: &str, agent: impl FnOnce(Box<dyn Listener>, &Path) -> Agent) -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let (host, guest) = pair(unix, dir.path()).await;
-    let guest_opener = guest.opener.clone();
-    let agent = tokio::spawn(agent(guest, dir.path()).run());
-    let (raw, driver) = drydock_transport::http2::connect(&host.opener, Purpose::Control).await.unwrap();
-    // The raw connection lives as long as the test; its driver is detached.
-    drop(driver);
-    let client = Client::connect(host, expected).await.unwrap();
-    Harness { client, guest_opener, raw, agent, dir }
+    let (dial, listener) = pair(unix, dir.path());
+    let agent = tokio::spawn(agent(listener, dir.path()).run());
+    let raw = raw_client(&dial).await;
+    let client = Client::connect(dial.connect().await.unwrap(), expected).await.unwrap();
+    Harness { client, dial, raw, agent, dir }
 }
 /// A multi-threaded runtime for a hegel test body.
 pub fn runtime() -> tokio::runtime::Runtime {
@@ -220,8 +236,8 @@ pub fn start_agent(executable: &Path, socket: &Path) -> tokio::process::Child {
 pub async fn connect(socket: &Path, expected: &str) -> Client {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Ok(transport) = dial(socket).await
-                && let Ok(client) = Client::connect(transport, expected).await
+            if let Ok(stream) = dial(socket).await
+                && let Ok(client) = Client::connect(stream, expected).await
             {
                 return client;
             }
@@ -245,8 +261,7 @@ pub async fn connect_compatible(socket: &Path, expected: &str) -> Client {
     .await
     .unwrap()
 }
-/// One transport to the agent serving `socket`.
-pub async fn dial(socket: &Path) -> std::io::Result<Transport> {
-    let stream = UnixStream::connect(socket).await?;
-    Transport::yamux(Box::new(stream), true, Limits::default()).await
+/// One connection to the agent serving `socket`.
+pub async fn dial(socket: &Path) -> std::io::Result<ByteStream> {
+    Ok(Box::new(UnixStream::connect(socket).await?))
 }

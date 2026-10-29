@@ -1,5 +1,5 @@
 mod support;
-use drydock_agent::{Client, Configuration, Endpoint, ErrorKind, Exec, ExecEvent, FileOptions, GuestForward, HostForward, Platform};
+use drydock_agent::{Client, Configuration, Endpoint, ErrorKind, Exec, ExecEvent, FileOptions, InwardForward, OutwardForward, Platform};
 use std::{os::unix::fs::PermissionsExt, time::Duration};
 use support::*;
 use tokio::process::Command;
@@ -46,7 +46,10 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let endpoint = dir.path().join("host-endpoint");
     let _listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
     client
-        .put_guest_forward(GuestForward { id: "restart-forward".into(), unix: guest_socket.clone(), tcp: None }, Endpoint::Unix(endpoint))
+        .put_outward_forward(
+            OutwardForward { id: "restart-forward".into(), unix: guest_socket.clone(), tcp: None },
+            Endpoint::Unix(endpoint),
+        )
         .await
         .unwrap();
     let mut output = client
@@ -84,13 +87,13 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     assert_mismatch(mismatch.exec(Exec::new("/bin/true", [""; 0])).await);
     assert_mismatch(mismatch.write_bytes(&file, vec![], &FileOptions::default()).await);
     assert_mismatch(mismatch.read(&file).await);
-    assert_mismatch(mismatch.forward("x").await);
-    assert_mismatch(mismatch.put_host_forward(HostForward { id: "x".into(), endpoint: Endpoint::Unix(file.clone()) }).await);
-    assert_mismatch(mismatch.remove_host_forward("x").await);
+    assert_mismatch(mismatch.open_inward("x").await);
+    assert_mismatch(mismatch.put_inward_forward(InwardForward { id: "x".into(), endpoint: Endpoint::Unix(file.clone()) }).await);
+    assert_mismatch(mismatch.remove_inward_forward("x").await);
     assert_mismatch(
-        mismatch.put_guest_forward(GuestForward { id: "x".into(), unix: file.clone(), tcp: None }, Endpoint::Unix(file.clone())).await,
+        mismatch.put_outward_forward(OutwardForward { id: "x".into(), unix: file.clone(), tcp: None }, Endpoint::Unix(file.clone())).await,
     );
-    assert_mismatch(mismatch.remove_guest_forward("x").await);
+    assert_mismatch(mismatch.remove_outward_forward("x").await);
     assert_mismatch(mismatch.register_host_endpoint("x".into(), Endpoint::Unix(file.clone())));
     assert!(!file.exists());
     mismatch.upgrade(new_binary).await.unwrap();
@@ -139,7 +142,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let crash_target = dir.path().join("crash-target");
     let _crash_listener = tokio::net::UnixListener::bind(&crash_target).unwrap();
     upgraded
-        .put_guest_forward(GuestForward { id: "crash".into(), unix: crash_socket.clone(), tcp: None }, Endpoint::Unix(crash_target))
+        .put_outward_forward(OutwardForward { id: "crash".into(), unix: crash_socket.clone(), tcp: None }, Endpoint::Unix(crash_target))
         .await
         .unwrap();
     child.kill().await.unwrap();
@@ -151,7 +154,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let recovered_target = dir.path().join("recovered-target");
     let _recovered_listener = tokio::net::UnixListener::bind(&recovered_target).unwrap();
     recovered
-        .put_guest_forward(GuestForward { id: "crash".into(), unix: crash_socket, tcp: None }, Endpoint::Unix(recovered_target))
+        .put_outward_forward(OutwardForward { id: "crash".into(), unix: crash_socket, tcp: None }, Endpoint::Unix(recovered_target))
         .await
         .unwrap();
     replacement.kill().await.unwrap();

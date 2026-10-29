@@ -1,6 +1,6 @@
 use super::{stand_in::Gateway, *};
 use crate::runtime::Runtime;
-use drydock_agent::{Endpoint, GuestForward};
+use drydock_agent::{Endpoint, OutwardForward};
 use drydock_protocol::{EgressRequest, PrepareRequest, ProvisionRequest, Secret, Size};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,13 +36,13 @@ fn ssh_reach(reverse_forwards: bool) -> Reach {
     Reach::Ssh { endpoint: "gateway.test:22".into(), user: Secret::new("minted"), host_key: "ssh-ed25519 AAAA".into(), reverse_forwards }
 }
 
-/// Serve `target` to the guest through the agent's guest forward, and prove a
-/// guest connection reaches it and hears back.
+/// Serve `target` to the guest through an outward forward, and prove a guest
+/// connection reaches it and hears back.
 async fn guest_reaches_host(client: &drydock_agent::Client, directory: &Path) {
     let target = directory.join("target");
     let target_listener = tokio::net::UnixListener::bind(&target).unwrap();
-    let forward = GuestForward { id: "service".into(), unix: directory.join("forward"), tcp: None };
-    client.put_guest_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
+    let forward = OutwardForward { id: "service".into(), unix: directory.join("forward"), tcp: None };
+    client.put_outward_forward(forward.clone(), Endpoint::Unix(target)).await.unwrap();
     let mut guest = tokio::net::UnixStream::connect(&forward.unix).await.unwrap();
     guest.write_all(b"guest to host").await.unwrap();
     let (mut host, _) = tokio::time::timeout(Duration::from_secs(5), target_listener.accept()).await.unwrap().unwrap();
@@ -55,46 +55,21 @@ async fn guest_reaches_host(client: &drydock_agent::Client, directory: &Path) {
     assert_eq!(&reply, b"reply");
 }
 
-// Behaviour (flotilla#3980 contract 8): the link follows the provider's
-// preference where its SSH server allows it, and shares the local forward
-// where the server refuses remote forwards, whatever the preference.
-#[test]
-fn the_link_follows_the_preference_where_the_server_allows_it() {
-    for (preferred, reverse_forwards, link, streams) in [
-        (AgentLink::ReverseForward, true, AgentLink::ReverseForward, GuestStreams::ReverseForward(HOST_SOCKET.into())),
-        (AgentLink::ReverseForward, false, AgentLink::LocalForward, GuestStreams::OverLocalForward),
-        (AgentLink::LocalForward, true, AgentLink::LocalForward, GuestStreams::OverLocalForward),
-        (AgentLink::LocalForward, false, AgentLink::LocalForward, GuestStreams::OverLocalForward),
-    ] {
-        let chosen = preferred.under(reverse_forwards);
-        assert_eq!(chosen, link, "{preferred} with reverse forwards {reverse_forwards}");
-        let config = ssh_config("secret@gw.example:22", "u", "ssh-ed25519 AAAA".into(), "/k".into(), chosen).unwrap();
-        assert_eq!(config.guest_streams, streams);
-        assert_eq!((config.host.as_str(), config.port, config.user.as_str()), ("gw.example", 22, "u"), "userinfo is never dialled");
-    }
-}
-
-// Behaviour (flotilla#3980 contracts 1, 8 and 9): the entry point connects through
-// whichever link the provider's reach and the preference allow, and reports
-// what it chose: provider, module, vessel, endpoint and link.
-// Against a gateway that refuses remote forwards it never asks for one; against
-// one that accepts them it uses them unless the provider prefers the local
-// forward. Either way the guest reaches the host through a guest forward.
+// Behaviour (flotilla#3980 contracts 1 and 9): the entry point connects through
+// the SSH reach's local forward, whether or not its server accepts remote
+// forwards, and reports what it chose: provider, module, vessel and endpoint.
+// Userinfo in the endpoint is neither dialled nor reported. The guest reaches
+// the host through an outward forward on the same connection.
 #[tokio::test]
-async fn connects_through_the_link_the_reach_and_preference_allow() {
-    // The last row's endpoint carries userinfo, which is neither dialled nor reported.
-    for (reverse_forwards, preferred, link, endpoint) in [
-        (false, AgentLink::ReverseForward, AgentLink::LocalForward, "gateway.test:22"),
-        (true, AgentLink::ReverseForward, AgentLink::ReverseForward, "gateway.test:22"),
-        (true, AgentLink::LocalForward, AgentLink::LocalForward, "secret@gateway.test:22"),
-    ] {
+async fn connects_through_the_local_forward_and_reports_it() {
+    for (reverse_forwards, endpoint) in [(false, "gateway.test:22"), (true, "secret@gateway.test:22")] {
         // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let reach =
             Reach::Ssh { endpoint: endpoint.into(), user: Secret::new("minted"), host_key: "ssh-ed25519 AAAA".into(), reverse_forwards };
         let (api, environment) = provider(true, reach).await;
-        let gateway = Gateway::start(directory.path(), reverse_forwards, BUILD).unwrap();
-        let reach = AgentReach::new(preferred).with_dialer(gateway.clone()).with_timeout(Duration::from_secs(10));
+        let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+        let reach = AgentReach::new().with_dialer(gateway.clone()).with_timeout(Duration::from_secs(10));
         let identity = directory.path().join("id_ed25519");
         let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
         let connected = reach.connect(&api, &vessel).await.unwrap();
@@ -103,10 +78,9 @@ async fn connects_through_the_link_the_reach_and_preference_allow() {
             module: "reference".into(),
             environment: environment.clone(),
             endpoint: "gateway.test:22".into(),
-            link,
         };
         assert_eq!(connected.report, report, "drydock reports what it chose");
-        assert_eq!(gateway.links(), vec![link], "the gateway is never asked for a link it refuses");
+        assert_eq!(gateway.dials(), 1);
         guest_reaches_host(&connected.client, directory.path()).await;
     }
 }
@@ -119,10 +93,10 @@ async fn a_gateway_stands_in_for_the_platform_it_was_started_as() {
     let prepared = Platform::new("linux", if current == Platform::new("linux", "amd64") { "arm64" } else { "amd64" });
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let (api, environment) = provider(true, ssh_reach(true)).await;
-    let gateway = Gateway::start_as(directory.path(), true, BUILD, prepared.clone()).unwrap();
+    let gateway = Gateway::start_as(directory.path(), BUILD, prepared.clone()).unwrap();
     let identity = directory.path().join("id_ed25519");
     let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &prepared, build: BUILD };
-    let connected = AgentReach::new(AgentLink::default()).with_dialer(gateway).with_timeout(Duration::from_secs(10));
+    let connected = AgentReach::new().with_dialer(gateway).with_timeout(Duration::from_secs(10));
     let connected = connected.connect(&api, &vessel).await.unwrap();
     assert_eq!(connected.client.hello().platform, Some(prepared));
 }
@@ -137,19 +111,26 @@ async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
     {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(agent, reach).await;
-        let gateway = Gateway::start(directory.path(), true, BUILD).unwrap();
+        let gateway = Gateway::start(directory.path(), BUILD).unwrap();
         let identity = directory.path().join("id_ed25519");
         let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
         let started = tokio::time::Instant::now();
-        let error = AgentReach::new(AgentLink::default()).with_dialer(gateway.clone()).connect(&api, &vessel).await.err().unwrap();
+        let error = AgentReach::new().with_dialer(gateway.clone()).connect(&api, &vessel).await.err().unwrap();
         assert!(matches!(&error, Error::Protocol(ProtocolError::Refused { reason }) if reason.contains(refusal)), "{error}");
-        assert!(gateway.links().is_empty());
+        assert_eq!(gateway.dials(), 0);
         assert!(started.elapsed() < Duration::from_secs(30), "refused without waiting for the readiness deadline");
     }
 }
 
-// A transport connection alone is not readiness. Fail initial opens, then
-// serve the real agent API over yamux and require its compatible hello.
+/// A connection to a real agent served in memory.
+async fn served(fingerprint: String) -> io::Result<drydock_transport::ByteStream> {
+    let (dialer, listener) = drydock_transport::memory();
+    tokio::spawn(drydock_agent::Agent::new(listener, fingerprint, "/unused".into()).run());
+    dialer.connect().await
+}
+
+// A connection alone is not readiness. Fail initial opens, then serve the
+// real agent API and require its compatible hello.
 #[tokio::test]
 async fn retries_startup_until_current_hello() {
     let mut attempts = 0;
@@ -161,13 +142,7 @@ async fn retries_startup_until_current_hello() {
                 if attempt < 3 {
                     return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
                 }
-                let (host, guest) = tokio::io::duplex(4096);
-                let (host, guest) = tokio::join!(
-                    Transport::yamux(Box::new(host), true, Default::default()),
-                    Transport::yamux(Box::new(guest), false, Default::default())
-                );
-                tokio::spawn(drydock_agent::Agent::new(guest?, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
-                host
+                served(format!("{:x}", Sha256::digest(BUILD))).await
             }
         },
         &Platform::current(),
@@ -191,15 +166,7 @@ async fn platform_mismatch_is_refused_without_waiting() {
     let error = wait_for_agent(
         || {
             opens += 1;
-            async move {
-                let (host, guest) = tokio::io::duplex(4096);
-                let (host, guest) = tokio::join!(
-                    Transport::yamux(Box::new(host), true, Default::default()),
-                    Transport::yamux(Box::new(guest), false, Default::default())
-                );
-                tokio::spawn(drydock_agent::Agent::new(guest?, "older".into(), "/unused".into()).run());
-                host
-            }
+            served("older".into())
         },
         &prepared,
         b"prepared platform build",
@@ -215,15 +182,11 @@ async fn platform_mismatch_is_refused_without_waiting() {
     assert!(started.elapsed() < Duration::from_secs(30));
 }
 
-// A reachable transport whose peer never sends hello must time out.
+// A reachable connection whose peer never answers hello must time out.
 #[tokio::test]
-async fn transport_without_hello_is_not_ready() {
-    let (host, guest) = tokio::io::duplex(4096);
-    let (host, _guest) = tokio::join!(
-        Transport::yamux(Box::new(host), true, Default::default()),
-        Transport::yamux(Box::new(guest), false, Default::default())
-    );
-    let mut host = Some(host.unwrap());
+async fn connection_without_hello_is_not_ready() {
+    let (host, _guest) = tokio::io::duplex(4096);
+    let mut host = Some(Box::new(host) as drydock_transport::ByteStream);
     let result = wait_for_agent(
         || std::future::ready(host.take().ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionRefused))),
         &Platform::current(),
@@ -257,19 +220,16 @@ async fn timeout_reports_the_last_masked_error() {
 }
 
 // The entry point against a real OpenSSH server that, like Daytona's gateway,
-// refuses remote Unix-socket forwards. The agent listens with its fixed native
-// transport and its guest-to-host socket never appears; hello and a
-// guest-to-host forward stream must both work over the host's link.
+// grants only local Unix-socket forwards. Hello and an outward connection
+// both travel on the one connection through the local forward.
 #[tokio::test]
-async fn agent_reach_works_through_a_gateway_without_reverse_forwards() {
+async fn agent_reach_works_through_a_gateway_with_only_local_forwards() {
     // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let agent_socket = directory.path().join("agent.sock");
     let listener = tokio::net::UnixListener::bind(&agent_socket).unwrap();
-    let connections = drydock_transport::native::UnixConnections::new(listener, directory.path().join("host.sock"));
-    let guest = Transport::native(Arc::new(connections), Default::default()).unwrap();
-    let agent = tokio::spawn(drydock_agent::Agent::new(guest, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
-    let (sshd, mut server) = sshd::start(directory.path(), &agent_socket, GuestStreams::OverLocalForward, sshd::Forwarding::Gateway).await;
+    let agent = tokio::spawn(drydock_agent::Agent::new(listener, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
+    let (sshd, mut server) = sshd::start(directory.path(), &agent_socket).await;
     let reach = Reach::Ssh {
         endpoint: format!("{}:{}", sshd.host, sshd.port),
         user: Secret::new(sshd.user.clone()),
@@ -279,11 +239,9 @@ async fn agent_reach_works_through_a_gateway_without_reverse_forwards() {
     let (api, environment) = provider(true, reach).await;
     let vessel =
         Vessel { provider: "a", environment: &environment, identity: &sshd.identity_file, platform: &Platform::current(), build: BUILD };
-    let connected =
-        AgentReach::new(AgentLink::default()).with_timeout(Duration::from_secs(10)).connect_at(&api, &vessel, &agent_socket).await.unwrap();
-    assert_eq!(connected.report.link, AgentLink::LocalForward);
+    let connected = AgentReach::new().with_timeout(Duration::from_secs(10)).connect_at(&api, &vessel, &agent_socket).await.unwrap();
+    assert_eq!(connected.report.endpoint, format!("{}:{}", sshd.host, sshd.port));
     guest_reaches_host(&connected.client, directory.path()).await;
-    assert!(!directory.path().join("host.sock").exists());
     drop(connected);
     agent.abort();
     server.kill().await.unwrap();

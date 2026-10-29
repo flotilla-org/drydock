@@ -5,10 +5,7 @@
 use crate::{api::ProviderApi, client::Error};
 use async_trait::async_trait;
 use drydock_protocol::{DiagnosticMasker, Platform, ProtocolError, Reach};
-use drydock_transport::{
-    Limits, Transport,
-    ssh::{GuestStreams, SshConfig},
-};
+use drydock_transport::{ByteStream, ssh::SshConfig};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -21,55 +18,13 @@ pub mod stand_in;
 
 /// The agent's control socket inside every vessel.
 pub const AGENT_SOCKET: &str = "/run/drydock/agent.sock";
-/// The guest path a reverse forward serves the agent's guest-to-host streams on.
-pub const HOST_SOCKET: &str = "/run/drydock/host.sock";
 
-/// How guest-to-host streams travel on the agent's SSH link.
-///
-/// As a provider setting (`agent_link` in drydock's configuration) it is the
-/// preferred link, used where the provider's SSH server allows it; reverse
-/// forward is the default. In an [`AgentReport`] it is the link in use.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLink {
-    /// Each guest-to-host stream gets its own SSH channel through a remote
-    /// forward. Only servers that accept remote Unix-socket forwards allow it.
-    #[default]
-    ReverseForward,
-    /// Streams in both directions share one yamux link through the local
-    /// forward. Every SSH server allows it, Daytona's gateway included.
-    LocalForward,
-}
-
-impl AgentLink {
-    /// The link to use under this preference, given whether the provider's
-    /// server accepts remote forwards.
-    pub fn under(self, reverse_forwards: bool) -> Self {
-        match self {
-            Self::ReverseForward if reverse_forwards => Self::ReverseForward,
-            _ => Self::LocalForward,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ReverseForward => "reverse_forward",
-            Self::LocalForward => "local_forward",
-        }
-    }
-}
-
-impl std::fmt::Display for AgentLink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Opens the SSH link a reach recipe describes. OpenSSH in production; tests
-/// stand in a gateway with the same forwarding rules.
+/// Opens the SSH link a reach recipe describes: one connection to the agent's
+/// socket through a local forward, which every SSH server allows (Daytona's
+/// gateway included). OpenSSH in production; tests stand in a gateway.
 #[async_trait]
 pub trait SshDialer: Send + Sync {
-    async fn dial(&self, config: SshConfig) -> io::Result<Transport>;
+    async fn dial(&self, config: SshConfig) -> io::Result<ByteStream>;
 }
 
 /// Drydock's OpenSSH transport.
@@ -77,8 +32,8 @@ pub struct OpenSsh;
 
 #[async_trait]
 impl SshDialer for OpenSsh {
-    async fn dial(&self, config: SshConfig) -> io::Result<Transport> {
-        drydock_transport::ssh::connect(config, Limits::default()).await
+    async fn dial(&self, config: SshConfig) -> io::Result<ByteStream> {
+        drydock_transport::ssh::connect(config).await
     }
 }
 
@@ -107,13 +62,11 @@ pub struct AgentReport {
     pub environment: String,
     /// The SSH endpoint the agent is reached through, without credentials.
     pub endpoint: String,
-    /// How guest-to-host streams travel on that link.
-    pub link: AgentLink,
 }
 
 impl std::fmt::Display for AgentReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} over ssh {} to {} vessel {} (provider {})", self.link, self.endpoint, self.module, self.environment, self.provider)
+        write!(f, "ssh {} to {} vessel {} (provider {})", self.endpoint, self.module, self.environment, self.provider)
     }
 }
 
@@ -123,17 +76,22 @@ pub struct ConnectedAgent {
     pub report: AgentReport,
 }
 
-/// Connects to vessel agents under one provider's link preference.
+/// Connects to vessel agents.
 #[derive(Clone)]
 pub struct AgentReach {
-    preferred: AgentLink,
     dialer: Arc<dyn SshDialer>,
     timeout: Duration,
 }
 
+impl Default for AgentReach {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentReach {
-    pub fn new(preferred: AgentLink) -> Self {
-        Self { preferred, dialer: Arc::new(OpenSsh), timeout: Duration::from_secs(60) }
+    pub fn new() -> Self {
+        Self { dialer: Arc::new(OpenSsh), timeout: Duration::from_secs(60) }
     }
 
     pub fn with_dialer(mut self, dialer: Arc<dyn SshDialer>) -> Self {
@@ -169,19 +127,20 @@ impl AgentReach {
         let choice = Mutex::new(None);
         let open = || async {
             let reach = api.reach(vessel.provider, vessel.environment).await.map_err(|e| io::Error::other(format!("agent reach: {e}")))?;
-            let Reach::Ssh { endpoint, user, host_key, reverse_forwards } = reach else {
+            // Whether the server accepts remote forwards does not matter: the
+            // agent never opens a connection towards drydock.
+            let Reach::Ssh { endpoint, user, host_key, .. } = reach else {
                 return Err(io::Error::new(io::ErrorKind::Unsupported, "agent hello requires an SSH reach"));
             };
             masker.lock().unwrap().remember(user.expose());
-            let chosen = self.preferred.under(reverse_forwards);
-            let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into(), chosen)?;
+            let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into())?;
             // The endpoint dialled, which is the one reported: host and port only.
             let reached = format!("{}:{}", config.host, config.port);
             config.agent_socket = socket.into();
-            let transport = self.dialer.dial(config).await?;
-            // The link of the last dial that succeeded, which carries the agent returned.
-            *choice.lock().unwrap() = Some((reached, chosen));
-            Ok(transport)
+            let stream = self.dialer.dial(config).await?;
+            // The endpoint of the last dial that succeeded, which carries the agent returned.
+            *choice.lock().unwrap() = Some(reached);
+            Ok(stream)
         };
         let client = wait_for_agent(open, vessel.platform, vessel.build, self.timeout, |text| masker.lock().unwrap().text(text))
             .await
@@ -192,21 +151,20 @@ impl AgentReach {
                     _ => ProtocolError::unavailable(reason, None),
                 })
             })?;
-        let (endpoint, link) = choice.lock().unwrap().take().expect("a connected agent was reached");
+        let endpoint = choice.lock().unwrap().take().expect("a connected agent was reached");
         let report = AgentReport {
             provider: declaration.provider.clone(),
             module: declaration.module.clone(),
             environment: vessel.environment.into(),
             endpoint,
-            link,
         };
         Ok(ConnectedAgent { client, report })
     }
 }
 
-/// The SSH link for one reach recipe and the chosen agent link. Any userinfo a
-/// provider puts in the endpoint is dropped: the user is the reach's own.
-pub(crate) fn ssh_config(endpoint: &str, user: &str, host_key: String, identity: PathBuf, link: AgentLink) -> io::Result<SshConfig> {
+/// The SSH link for one reach recipe. Any userinfo a provider puts in the
+/// endpoint is dropped: the user is the reach's own.
+pub(crate) fn ssh_config(endpoint: &str, user: &str, host_key: String, identity: PathBuf) -> io::Result<SshConfig> {
     let endpoint = endpoint.rsplit_once('@').map_or(endpoint, |(_, host)| host);
     let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| io::Error::other("invalid SSH endpoint"))?;
     Ok(SshConfig {
@@ -217,10 +175,6 @@ pub(crate) fn ssh_config(endpoint: &str, user: &str, host_key: String, identity:
         host_key,
         identity_file: identity,
         agent_socket: AGENT_SOCKET.into(),
-        guest_streams: match link {
-            AgentLink::ReverseForward => GuestStreams::ReverseForward(HOST_SOCKET.into()),
-            AgentLink::LocalForward => GuestStreams::OverLocalForward,
-        },
     })
 }
 
@@ -238,7 +192,7 @@ pub(crate) async fn wait_for_agent<F, Fut>(
 ) -> io::Result<drydock_agent::Client>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = io::Result<Transport>>,
+    Fut: std::future::Future<Output = io::Result<ByteStream>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = None;

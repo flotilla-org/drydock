@@ -188,8 +188,9 @@ refused before provisioning with the platform and the file or variable that
 would supply it. A hello reporting a different platform is refused naming both;
 a hello without a platform (an agent older than platform reporting) is not
 checked, and the prepared platform's build is pushed.
-The gateway refuses remote Unix-socket forwards, so the link uses only a local
-forward to the agent socket, and guest-to-host streams share that connection. If
+The gateway refuses remote Unix-socket forwards; drydock needs only a local
+forward to the agent socket, and one HTTP/2 connection through it carries
+requests, byte streams and the vessel's outward connections. If
 the handshake never succeeds, launch fails with the last attempt's error (SSH
 user redacted), and `drydockd` logs each failed attempt to stderr. A failed bootstrap leaves a labelled
 resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing

@@ -1,22 +1,12 @@
 //! Real OpenSSH test server at the provider boundary, with disposable host and
 //! user keys. It runs as the current user and never reads ambient SSH config.
+//! It grants local Unix-socket forwards only, as Daytona's gateway does.
 //! Shared by the transport, agent and daemon tests through `#[path]`.
-use drydock_transport::ssh::{GuestStreams, SshConfig};
+use drydock_transport::ssh::SshConfig;
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::process::{Child, Command};
 
-/// Which Unix-socket forwards the server grants.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
-pub enum Forwarding {
-    /// Local and remote forwards, like a vessel's own sshd.
-    Both,
-    /// Local forwards only. Daytona's gateway refuses remote Unix-socket
-    /// forwards ("remote port forwarding failed for listen path ...").
-    Gateway,
-}
-
-pub async fn start(dir: &Path, agent_socket: &Path, guest_streams: GuestStreams, forwarding: Forwarding) -> (SshConfig, Child) {
+pub async fn start(dir: &Path, agent_socket: &Path) -> (SshConfig, Child) {
     for name in ["host_key", "user_key"] {
         let result = Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-f"])
@@ -31,12 +21,8 @@ pub async fn start(dir: &Path, agent_socket: &Path, guest_streams: GuestStreams,
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
     drop(socket);
-    let allow = match forwarding {
-        Forwarding::Both => "yes",
-        Forwarding::Gateway => "local",
-    };
     let config_path = dir.join("sshd_config");
-    std::fs::write(&config_path, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPidFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin yes\nAllowUsers {user}\nAllowStreamLocalForwarding {allow}\nStreamLocalBindUnlink yes\n", dir.join("host_key").display(), dir.join("user_key.pub").display(), dir.join("sshd.pid").display())).unwrap();
+    std::fs::write(&config_path, format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nPidFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin yes\nAllowUsers {user}\nAllowStreamLocalForwarding local\n", dir.join("host_key").display(), dir.join("user_key.pub").display(), dir.join("sshd.pid").display())).unwrap();
     let sshd = std::env::var("DRYDOCK_TEST_SSHD").unwrap_or_else(|_| "/usr/sbin/sshd".into());
     let log = std::fs::File::create(dir.join("sshd.log")).unwrap();
     let mut child = Command::new(sshd)
@@ -68,7 +54,6 @@ pub async fn start(dir: &Path, agent_socket: &Path, guest_streams: GuestStreams,
             host_key: std::fs::read_to_string(dir.join("host_key.pub")).unwrap().trim().into(),
             identity_file: dir.join("user_key"),
             agent_socket: agent_socket.into(),
-            guest_streams,
         },
         child,
     )

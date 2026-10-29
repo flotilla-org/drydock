@@ -5,7 +5,7 @@ use crate::{
     *,
 };
 use bytes::Bytes;
-use drydock_transport::{Opener, Purpose, Transport, http2};
+use drydock_transport::http::{self as link, BYTE_STREAM};
 use http_body_util::{BodyExt, Empty, Full, StreamBody, combinators::UnsyncBoxBody};
 use sha2::{Digest, Sha256};
 use std::{
@@ -132,10 +132,10 @@ fn route(prefix: &str, path: &Path) -> io::Result<String> {
     Ok(format!("{prefix}{}", encode_path(path)))
 }
 
-/// The HTTP/2 control link, shared by a client and its process handles.
+/// The HTTP/2 connection to the agent, shared by a client and its process handles.
 #[derive(Clone)]
 struct Control {
-    sender: http2::Client<RequestBody>,
+    sender: link::Client<RequestBody>,
     compatible: bool,
 }
 impl Control {
@@ -164,20 +164,24 @@ impl Control {
         let (parts, body) = response.into_parts();
         let body = axum::body::Body::new(body);
         if !status.is_success() {
-            let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap_or_default();
-            return Err(match serde_json::from_slice::<AgentError>(&bytes) {
-                Ok(error) => error.into_io(),
-                Err(_) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let message =
-                        if text.is_empty() { status.canonical_reason().unwrap_or("refused").to_owned() } else { text.into_owned() };
-                    AgentError::new("request", format!("{method} {uri}"), ErrorKind::from_status(status.as_u16()), message)
-                        .with_status(status.as_u16())
-                        .into_io()
-                }
-            });
+            return Err(refusal(method, uri, status, body).await);
         }
         Ok(http::Response::from_parts(parts, body))
+    }
+    /// A byte stream: an extended CONNECT to `uri`, raw bytes once it is 200.
+    async fn stream(&self, uri: &str) -> io::Result<ByteStream> {
+        if !self.compatible {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "agent fingerprint mismatch: only hello and upgrade are permitted"));
+        }
+        // An extended CONNECT names its target with a scheme and path.
+        let mut request = http::Request::connect(format!("http://agent{uri}")).body(empty()).map_err(invalid)?;
+        request.extensions_mut().insert(hyper::ext::Protocol::from_static(BYTE_STREAM));
+        let mut response = self.sender.clone().send_request(request).await.map_err(|e| link_error(format!("CONNECT {uri}"), e))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(refusal("CONNECT", uri, status, axum::body::Body::new(response.into_body())).await);
+        }
+        link::upgraded(hyper::upgrade::on(&mut response)).await.map_err(|e| link_error(format!("CONNECT {uri}"), e))
     }
     async fn json<T: serde::de::DeserializeOwned>(&self, method: &str, uri: &str, body: RequestBody) -> io::Result<T> {
         decode(self.send(method, uri, &[("content-type", "application/json".into())], body).await?, method, uri).await
@@ -187,6 +191,20 @@ impl Control {
         let (parts, body) = response.into_parts();
         body.collect().await.map_err(|e| link_error(format!("{method} {uri}"), e))?;
         Ok(http::Response::from_parts(parts, axum::body::Body::empty()))
+    }
+}
+/// The structured error of a refused request, or one made from its status.
+async fn refusal(method: &str, uri: &str, status: http::StatusCode, body: axum::body::Body) -> io::Error {
+    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+    match serde_json::from_slice::<AgentError>(&bytes) {
+        Ok(error) => error.into_io(),
+        Err(_) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let message = if text.is_empty() { status.canonical_reason().unwrap_or("refused").to_owned() } else { text.into_owned() };
+            AgentError::new("request", format!("{method} {uri}"), ErrorKind::from_status(status.as_u16()), message)
+                .with_status(status.as_u16())
+                .into_io()
+        }
     }
 }
 /// A reply's JSON body.
@@ -217,28 +235,32 @@ fn header(response: &http::Response<axum::body::Body>, name: &str) -> Option<Str
     response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
 }
 
-/// One vessel per client. A host endpoint stays exclusively claimed until all
-/// streams using it close. Controllers in separate processes must allocate
-/// separate endpoints; direct multi-controller connections are out of scope.
+/// One vessel per client, on one HTTP/2 connection. A host endpoint stays
+/// exclusively claimed until all streams using it close. Controllers in
+/// separate processes must allocate separate endpoints; direct
+/// multi-controller connections are out of scope.
 pub struct Client {
     link: Control,
-    opener: Opener,
     hello: Hello,
     expected: String,
     targets: Targets,
-    tasks: Vec<tokio::task::AbortHandle>,
+    driver: tokio::task::AbortHandle,
+    /// Follows `/events` and claims outward connections, from the first
+    /// host endpoint registered on.
+    follower: OnceLock<tokio::task::AbortHandle>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+        self.driver.abort();
+        if let Some(follower) = self.follower.get() {
+            follower.abort();
         }
     }
 }
 impl Client {
     /// Connect to a vessel started from any published tools pin. A mismatched
     /// hello triggers push + re-exec, then a fresh transport and verified hello.
-    /// The factory must open a new provider transport on every invocation.
+    /// The factory must open a new connection to the agent on every invocation.
     /// `platform` is the platform the vessel was prepared for and `executable`
     /// the current agent build for it; the caller chose both from the prepared
     /// form, never from the guest. Returns only a compatible, confirmed client;
@@ -258,7 +280,7 @@ impl Client {
     ) -> io::Result<Self>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = io::Result<Transport>>,
+        Fut: std::future::Future<Output = io::Result<ByteStream>>,
     {
         if executable.is_empty() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, format!("agent build for platform {platform} is empty")));
@@ -293,7 +315,7 @@ impl Client {
             drop(client);
             loop {
                 match open().await {
-                    Ok(transport) => match Self::connect(transport, &expected).await {
+                    Ok(stream) => match Self::connect(stream, &expected).await {
                         Ok(client) if client.is_compatible() => {
                             if client.hello.probation {
                                 client.confirm_upgrade().await?;
@@ -319,44 +341,27 @@ impl Client {
 
     /// Low-level connection for explicit hello/upgrade tooling. Normal hosts
     /// should use connect_current so an older tools pin upgrades automatically.
-    pub async fn connect(mut transport: Transport, expected: impl Into<String>) -> io::Result<Self> {
-        let (sender, driver) = http2::connect_with_body::<RequestBody>(&transport.opener, Purpose::Control).await?;
-        let targets: Targets = Arc::default();
-        let map = targets.clone();
-        let opener = transport.opener.clone();
-        let task = tokio::spawn(async move {
-            let mut streams = JoinSet::new();
-            loop {
-                tokio::select! {
-                    Some(_) = streams.join_next(), if !streams.is_empty() => {},
-                    incoming = transport.accept() => {
-                        let Ok(Some(incoming)) = incoming else { break; };
-                        // Guest-supplied IDs resolve only in THIS vessel's registry.
-                        // No path, host, or port supplied by the guest is dialed.
-                        if let Purpose::Forward { id } = incoming.purpose {
-                            let target = map.lock().unwrap().get(&id).cloned();
-                            streams.spawn(async move {
-                                let endpoint = target.as_ref().map(|claim| &claim.endpoint);
-                                if let Err(error) = crate::forward::serve(incoming.stream, &id, endpoint).await {
-                                    tracing::warn!(%error, forward = %id, "guest-to-host forward failed");
-                                }
-                            });
-                        }
-                    }
-                }
-            }
-        });
+    /// `stream` is a fresh connection to the agent's socket.
+    pub async fn connect(stream: ByteStream, expected: impl Into<String>) -> io::Result<Self> {
+        let (sender, driver) = link::connect::<RequestBody>(stream).await?;
         let mut client = Self {
             link: Control { sender, compatible: false },
-            opener,
             hello: Hello { fingerprint: String::new(), features: vec![], platform: None, boot_id: String::new(), probation: false },
             expected: String::new(),
-            targets,
-            tasks: vec![driver.abort_handle(), task.abort_handle()],
+            targets: Arc::default(),
+            driver: driver.abort_handle(),
+            follower: OnceLock::new(),
         };
         client.hello = client.link.json("GET", "/hello", empty()).await?;
         client.set_expected(expected.into());
         Ok(client)
+    }
+    /// Claim outward connections from now on. Guest-supplied forward IDs
+    /// resolve only in THIS vessel's registry; no path, host or port supplied
+    /// by the guest is dialled.
+    fn follow(&self) {
+        let (link, targets) = (self.link.clone(), self.targets.clone());
+        self.follower.get_or_init(|| tokio::spawn(follow(link, targets)).abort_handle());
     }
     fn set_expected(&mut self, expected: String) {
         self.link.compatible = self.hello.fingerprint == expected;
@@ -725,14 +730,17 @@ impl Client {
     pub fn register_host_endpoint(&self, id: String, endpoint: Endpoint) -> io::Result<()> {
         self.require_compatible()?;
         check_id(&id)?;
-        let mut targets = self.targets.lock().unwrap();
-        if let Some(existing) = targets.get(&id) {
-            if canonical(endpoint)? == existing.endpoint {
-                return Ok(());
+        {
+            let mut targets = self.targets.lock().unwrap();
+            if let Some(existing) = targets.get(&id) {
+                if canonical(endpoint)? == existing.endpoint {
+                    return Ok(());
+                }
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("forward ID {id} already names another host endpoint")));
             }
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("forward ID {id} already names another host endpoint")));
+            targets.insert(id, Arc::new(claim(endpoint)?));
         }
-        targets.insert(id, Arc::new(claim(endpoint)?));
+        self.follow();
         Ok(())
     }
     /// Release a host endpoint; live streams keep their claim until they close.
@@ -745,9 +753,9 @@ impl Client {
         }
         Ok(())
     }
-    /// Create or update a guest listener whose connections reach `endpoint`.
+    /// Create or update a vessel listener whose connections reach `endpoint`.
     /// An identical forward is left as it is, live streams included.
-    pub async fn put_guest_forward(&self, forward: GuestForward, endpoint: Endpoint) -> io::Result<()> {
+    pub async fn put_outward_forward(&self, forward: OutwardForward, endpoint: Endpoint) -> io::Result<()> {
         self.require_compatible()?;
         check_id(&forward.id)?;
         let registered = self.targets.lock().unwrap().get(&forward.id).cloned();
@@ -756,37 +764,39 @@ impl Client {
             Some(existing) if canonical(endpoint.clone())? == existing.endpoint => None,
             _ => Some(Arc::new(claim(endpoint)?)),
         };
-        let uri = format!("/forwards/guest/{}", encode_segment(&forward.id));
+        self.follow();
+        let uri = format!("/forwards/outward/{}", encode_segment(&forward.id));
         self.link.empty("PUT", &uri, json_body(&forward)?).await?;
         if let Some(fresh) = fresh {
             self.targets.lock().unwrap().insert(forward.id, fresh);
         }
         Ok(())
     }
-    /// As [`Self::put_guest_forward`], to a destination the caller chose
+    /// As [`Self::put_outward_forward`], to a destination the caller chose
     /// explicitly: it is not claimed, so other vessels may reach it too, and a
     /// TCP destination need not be loopback. The destination is dialled as
-    /// given for each guest connection; it need not exist yet.
-    pub async fn put_shared_guest_forward(&self, forward: GuestForward, destination: Endpoint) -> io::Result<()> {
+    /// given for each vessel connection; it need not exist yet.
+    pub async fn put_shared_outward_forward(&self, forward: OutwardForward, destination: Endpoint) -> io::Result<()> {
         self.require_compatible()?;
         check_id(&forward.id)?;
         if matches!(&destination, Endpoint::Tcp(address) if address.port() == 0) {
             return Err(invalid("destination TCP port must be nonzero"));
         }
-        let uri = format!("/forwards/guest/{}", encode_segment(&forward.id));
+        self.follow();
+        let uri = format!("/forwards/outward/{}", encode_segment(&forward.id));
         self.link.empty("PUT", &uri, json_body(&forward)?).await?;
         self.targets.lock().unwrap().insert(forward.id, Arc::new(unclaimed(destination)));
         Ok(())
     }
-    pub async fn guest_forward(&self, id: &str) -> io::Result<GuestForward> {
-        self.link.json("GET", &format!("/forwards/guest/{}", encode_segment(id)), empty()).await
+    pub async fn outward_forward(&self, id: &str) -> io::Result<OutwardForward> {
+        self.link.json("GET", &format!("/forwards/outward/{}", encode_segment(id)), empty()).await
     }
-    pub async fn guest_forwards(&self) -> io::Result<Vec<GuestForward>> {
-        self.link.json("GET", "/forwards/guest", empty()).await
+    pub async fn outward_forwards(&self) -> io::Result<Vec<OutwardForward>> {
+        self.link.json("GET", "/forwards/outward", empty()).await
     }
-    pub async fn remove_guest_forward(&self, id: &str) -> io::Result<()> {
+    pub async fn remove_outward_forward(&self, id: &str) -> io::Result<()> {
         let original = self.targets.lock().unwrap().get(id).cloned();
-        self.link.empty("DELETE", &format!("/forwards/guest/{}", encode_segment(id)), empty()).await?;
+        self.link.empty("DELETE", &format!("/forwards/outward/{}", encode_segment(id)), empty()).await?;
         let mut targets = self.targets.lock().unwrap();
         if let Some(original) = original
             && targets.get(id).is_some_and(|current| Arc::ptr_eq(current, &original))
@@ -795,27 +805,101 @@ impl Client {
         }
         Ok(())
     }
-    /// Create or update a guest endpoint the host can open streams to. An
-    /// unchanged endpoint keeps its live streams.
-    pub async fn put_host_forward(&self, forward: HostForward) -> io::Result<()> {
-        let uri = format!("/forwards/host/{}", encode_segment(&forward.id));
+    /// Create or update a target in the vessel the host can open streams to.
+    /// An unchanged target keeps its live streams.
+    pub async fn put_inward_forward(&self, forward: InwardForward) -> io::Result<()> {
+        let uri = format!("/forwards/inward/{}", encode_segment(&forward.id));
         self.link.empty("PUT", &uri, json_body(&forward)?).await.map(drop)
     }
-    pub async fn host_forward(&self, id: &str) -> io::Result<HostForward> {
-        self.link.json("GET", &format!("/forwards/host/{}", encode_segment(id)), empty()).await
+    pub async fn inward_forward(&self, id: &str) -> io::Result<InwardForward> {
+        self.link.json("GET", &format!("/forwards/inward/{}", encode_segment(id)), empty()).await
     }
-    pub async fn host_forwards(&self) -> io::Result<Vec<HostForward>> {
-        self.link.json("GET", "/forwards/host", empty()).await
+    pub async fn inward_forwards(&self) -> io::Result<Vec<InwardForward>> {
+        self.link.json("GET", "/forwards/inward", empty()).await
     }
-    pub async fn remove_host_forward(&self, id: &str) -> io::Result<()> {
-        self.link.empty("DELETE", &format!("/forwards/host/{}", encode_segment(id)), empty()).await.map(drop)
+    pub async fn remove_inward_forward(&self, id: &str) -> io::Result<()> {
+        self.link.empty("DELETE", &format!("/forwards/inward/{}", encode_segment(id)), empty()).await.map(drop)
     }
-    pub async fn forward(&self, id: &str) -> io::Result<ByteStream> {
-        self.require_compatible()?;
-        let mut stream = self.opener.open(Purpose::Forward { id: id.into() }).await?;
-        crate::forward::opened(&mut stream).await?;
-        Ok(stream)
+    /// One byte stream to the inward forward's target. It returns once the
+    /// agent has reached the target, or with the agent's reason it could not.
+    pub async fn open_inward(&self, id: &str) -> io::Result<ByteStream> {
+        self.link.stream(&format!("/forwards/inward/{}/stream", encode_segment(id))).await
     }
+}
+
+/// Follow the agent's events for as long as the client lives, claiming each
+/// outward connection whose forward has a registered host endpoint. A
+/// connection with none is left for the agent to close at its deadline.
+async fn follow(link: Control, targets: Targets) {
+    use tokio::io::AsyncBufReadExt;
+    let mut cursor: Option<String> = None;
+    let mut streams = JoinSet::new();
+    loop {
+        let uri = match &cursor {
+            Some(cursor) => format!("/events{}", query(&crate::events::Since { since: Some(cursor.clone()) }).unwrap_or_default()),
+            None => "/events".to_owned(),
+        };
+        match link.send("GET", &uri, &[], empty()).await {
+            Ok(response) => {
+                use futures_util::TryStreamExt;
+                let body = TryStreamExt::map_err(response.into_body().into_data_stream(), io::Error::other);
+                let mut lines = tokio_util::io::StreamReader::new(body).lines();
+                loop {
+                    tokio::select! {
+                        Some(_) = streams.join_next(), if !streams.is_empty() => {}
+                        line = lines.next_line() => {
+                            let line = match line {
+                                Ok(Some(line)) => line,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    tracing::warn!(%error, "agent events ended");
+                                    break;
+                                }
+                            };
+                            let record: crate::events::Record = match serde_json::from_str(&line) {
+                                Ok(record) => record,
+                                Err(error) => {
+                                    tracing::warn!(%error, "unreadable agent event");
+                                    continue;
+                                }
+                            };
+                            cursor = Some(record.cursor);
+                            if let crate::events::Event::OutwardConnection { forward, connection } = record.event {
+                                let target = targets.lock().unwrap().get(&forward).cloned();
+                                let Some(target) = target else { continue };
+                                let link = link.clone();
+                                streams.spawn(async move {
+                                    let uri = format!("/forwards/outward/{}/connections/{connection}", encode_segment(&forward));
+                                    let result = match link.stream(&uri).await {
+                                        Ok(stream) => splice(stream, &target).await,
+                                        // A replayed announcement of a connection already claimed or closed.
+                                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                                            tracing::debug!(%error, forward = %forward, connection, "outward connection already gone");
+                                            return;
+                                        }
+                                        Err(error) => Err(error),
+                                    };
+                                    if let Err(error) = result {
+                                        tracing::warn!(%error, forward = %forward, connection, "outward connection failed");
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "agent events unavailable"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+/// Splice a claimed outward connection to the forward's host endpoint. A
+/// destination that cannot be reached closes the connection at once rather
+/// than leaving it to the deadline.
+async fn splice(mut stream: ByteStream, target: &Claim) -> io::Result<()> {
+    let mut destination = target.endpoint.connect_marked(false).await?;
+    tokio::io::copy_bidirectional(&mut stream, &mut destination).await?;
+    Ok(())
 }
 /// HEAD replies carry no body, so a refusal has only its status.
 fn head_error(error: io::Error, operation: &str, subject: &Path) -> io::Error {

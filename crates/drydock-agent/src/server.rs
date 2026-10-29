@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, head, post, put},
 };
-use drydock_transport::{Opener, Purpose, Transport, http2};
+use drydock_transport::{Listener as Connections, http};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -21,9 +21,9 @@ use tokio::{
 
 type Refusal<T> = Result<T, AgentError>;
 
-struct Target {
-    endpoint: Endpoint,
-    streams: JoinSet<()>,
+pub(crate) struct Target {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) streams: JoinSet<()>,
 }
 impl Target {
     async fn stop(mut self) {
@@ -39,11 +39,11 @@ impl Drop for GuestSocket {
         let _ = std::fs::remove_file(&self.path);
     }
 }
-/// Live guest-to-host streams of one forward ID. They outlive a rebind of
-/// the forward's listeners and end when the forward is removed.
+/// Live connections of one outward forward. They outlive a rebind of the
+/// forward's listeners and end when the forward is removed.
 type Bridges = Arc<std::sync::Mutex<JoinSet<()>>>;
 struct Listener {
-    forward: GuestForward,
+    forward: OutwardForward,
     task: tokio::task::JoinHandle<()>,
     unix: Arc<GuestSocket>,
     tcp: Option<(std::net::SocketAddr, Arc<TcpListener>)>,
@@ -61,17 +61,17 @@ impl Drop for Listener {
     }
 }
 #[derive(Default)]
-struct Settings {
-    config: Configuration,
-    listeners: BTreeMap<String, Listener>,
-    targets: BTreeMap<String, Target>,
+pub(crate) struct Settings {
+    pub(crate) config: Configuration,
+    outward: BTreeMap<String, Listener>,
+    pub(crate) inward: BTreeMap<String, Target>,
     capture: Option<crate::egress::Capture>,
 }
 impl Settings {
     /// Loopback listeners exempt from capture, optionally with one forward's
     /// listener replaced or removed.
-    fn exemptions(&self, id: &str, replacement: Option<&GuestForward>) -> Vec<std::net::SocketAddr> {
-        self.listeners
+    fn exemptions(&self, id: &str, replacement: Option<&OutwardForward>) -> Vec<std::net::SocketAddr> {
+        self.outward
             .iter()
             .filter(|(other, _)| other.as_str() != id)
             .map(|(_, l)| &l.forward)
@@ -83,8 +83,9 @@ impl Settings {
 pub(crate) struct Shared {
     hello: Hello,
     egress_system: crate::egress::System,
-    opener: Arc<Mutex<Opener>>,
-    settings: Mutex<Settings>,
+    pub(crate) events: Arc<crate::events::Events>,
+    pub(crate) outward: Arc<crate::streams::Outward>,
+    pub(crate) settings: Mutex<Settings>,
     executable: PathBuf,
     upgrade: Mutex<()>,
     restart: mpsc::Sender<PathBuf>,
@@ -96,17 +97,19 @@ impl Shared {
     pub(crate) async fn network(&self) -> crate::fetch::Network {
         let settings = self.settings.lock().await;
         match &settings.config.egress {
-            Some(egress) => {
-                crate::fetch::Network::Upstream { opener: self.opener.clone(), id: egress.upstream.clone(), ca: settings.config.ca.clone() }
-            }
+            Some(egress) => crate::fetch::Network::Upstream {
+                outward: self.outward.clone(),
+                id: egress.upstream.clone(),
+                ca: settings.config.ca.clone(),
+            },
             None => crate::fetch::Network::Direct,
         }
     }
 }
-/// Owns one host-facing transport. Never expose this router on guest TCP.
+/// Serves drydock's connections. Never expose this router on guest TCP.
 pub struct Agent {
-    transports: Vec<Transport>,
-    shared: Arc<Shared>,
+    listeners: Vec<Box<dyn Connections>>,
+    pub(crate) shared: Arc<Shared>,
     restart: mpsc::Receiver<PathBuf>,
 }
 /// Output bytes held per process before the process blocks on its pipe.
@@ -127,30 +130,40 @@ fn boot_id() -> String {
 impl Agent {
     /// `executable` is the installed agent path; the upgrade sidecars and the
     /// digest store (`<executable>.store`) live beside it.
-    pub fn new(transport: Transport, fingerprint: String, executable: PathBuf) -> Self {
-        Self::with_process_buffer(transport, fingerprint, executable, PROCESS_BUFFER)
+    pub fn new(listener: impl Connections, fingerprint: String, executable: PathBuf) -> Self {
+        Self::with_process_buffer(listener, fingerprint, executable, PROCESS_BUFFER)
     }
     /// As [`Agent::new`], holding at most `buffer` output bytes per process.
-    pub fn with_process_buffer(transport: Transport, fingerprint: String, executable: PathBuf, buffer: usize) -> Self {
+    pub fn with_process_buffer(listener: impl Connections, fingerprint: String, executable: PathBuf, buffer: usize) -> Self {
         let (tx, restart) = mpsc::channel(1);
+        let boot_id = boot_id();
+        let events = Arc::new(crate::events::Events::new(boot_id.clone()));
         let shared = Arc::new(Shared {
             hello: Hello {
                 fingerprint,
                 features: FEATURES.iter().map(|s| (*s).into()).collect(),
                 platform: Some(Platform::current()),
-                boot_id: boot_id(),
+                boot_id,
                 probation: false,
             },
             egress_system: crate::egress::System::default(),
-            opener: Arc::new(Mutex::new(transport.opener.clone())),
+            outward: Arc::new(crate::streams::Outward::new(events.clone(), crate::streams::CLAIM_DEADLINE)),
+            processes: crate::process::Processes::new(buffer, events.clone()),
+            events,
             settings: Mutex::new(Settings::default()),
             store: crate::store::Store::new(crate::upgrade::sidecar(&executable, "store")),
             executable,
             upgrade: Mutex::new(()),
             restart: tx,
-            processes: crate::process::Processes::new(buffer),
         });
-        Self { transports: vec![transport], shared, restart }
+        Self { listeners: vec![Box::new(listener)], shared, restart }
+    }
+    /// Close an outward connection nobody claims within `deadline`, instead
+    /// of [`crate::CLAIM_DEADLINE`].
+    pub fn with_claim_deadline(mut self, deadline: std::time::Duration) -> Self {
+        let shared = Arc::get_mut(&mut self.shared).expect("the deadline is chosen before the agent runs");
+        shared.outward = Arc::new(crate::streams::Outward::new(shared.events.clone(), deadline));
+        self
     }
     /// Keep the digest store at `root` instead of beside the executable.
     /// Agents on one host may share a store, so that an artifact one vessel
@@ -166,14 +179,15 @@ impl Agent {
         Arc::get_mut(&mut self.shared).expect("the platform is chosen before the agent runs").hello.platform = Some(platform);
         self
     }
-    /// Add another host-facing native link (e.g. vsock). All links share state.
-    pub fn add_transport(&mut self, transport: Transport) {
-        self.transports.push(transport);
+    /// Serve another listener (e.g. vsock). All listeners share state.
+    pub fn add_listener(&mut self, listener: impl Connections) {
+        self.listeners.push(Box::new(listener));
     }
     fn router(&self) -> Router {
         use crate::files::*;
         Router::new()
             .route("/hello", get(hello))
+            .route("/events", get(events))
             .route("/upgrade", post(activate_upgrade))
             .route("/upgrade/confirm", post(confirm_upgrade))
             .route("/configuration", get(configuration).put(configure))
@@ -198,10 +212,12 @@ impl Agent {
                 get(crate::artifacts::get_artifact).put(crate::artifacts::put_artifact).delete(crate::artifacts::delete_artifact),
             )
             .route("/artifacts/{sha256}/links/{*path}", put(crate::artifacts::put_artifact_link))
-            .route("/forwards/guest", get(guest_forwards))
-            .route("/forwards/guest/{id}", get(guest_forward).put(put_guest).delete(remove_guest))
-            .route("/forwards/host", get(host_forwards))
-            .route("/forwards/host/{id}", get(host_forward).put(put_target).delete(remove_target))
+            .route("/forwards/outward", get(outward_forwards))
+            .route("/forwards/outward/{id}", get(outward_forward).put(put_outward).delete(remove_outward))
+            .route("/forwards/outward/{id}/connections/{connection}", get(crate::streams::claim).connect(crate::streams::claim))
+            .route("/forwards/inward", get(inward_forwards))
+            .route("/forwards/inward/{id}", get(inward_forward).put(put_inward).delete(remove_inward))
+            .route("/forwards/inward/{id}/stream", get(crate::streams::open_inward).connect(crate::streams::open_inward))
             // A deliberate cap on JSON control bodies only; streamed bodies have none.
             .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
             .layer(axum::middleware::from_fn(structured))
@@ -223,32 +239,36 @@ impl Agent {
             tracing::warn!(%error, "could not sweep abandoned artifact staging");
         }
         let router = self.router();
-        let mut controller_bound = false;
         let mut tasks = JoinSet::new();
-        let (incoming_tx, mut incoming_rx) = mpsc::channel(64);
-        for mut transport in self.transports.drain(..) {
-            let tx = incoming_tx.clone();
+        for mut listener in self.listeners.drain(..) {
+            let router = router.clone();
             tasks.spawn(async move {
+                let mut connections = JoinSet::new();
                 let mut backoff = std::time::Duration::from_millis(100);
                 loop {
-                    let incoming = match transport.accept().await {
-                        Ok(Some(incoming)) => incoming,
-                        Ok(None) => break,
-                        Err(error) => {
-                            tracing::warn!(%error, "agent transport accept failed");
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
-                            continue;
-                        }
-                    };
-                    backoff = std::time::Duration::from_millis(100);
-                    if tx.send((incoming, transport.opener.clone())).await.is_err() {
-                        break;
+                    tokio::select! {
+                        Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                        accepted = listener.accept() => match accepted {
+                            Ok(stream) => {
+                                backoff = std::time::Duration::from_millis(100);
+                                connections.spawn(http::serve(stream, router.clone()));
+                            }
+                            Err(error) if retryable(&error) => {
+                                tracing::warn!(%error, "agent listener accept failed");
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "agent listener stopped");
+                                break;
+                            }
+                        },
                     }
                 }
+                // Connections already accepted are served to their end.
+                while connections.join_next().await.is_some() {}
             });
         }
-        drop(incoming_tx);
         loop {
             tokio::select! {
                 path = self.restart.recv() => {
@@ -256,50 +276,35 @@ impl Agent {
                     // Remove owned guest socket paths before exec discards the
                     // runtime. Aborting tasks alone does not synchronously drop them.
                     let mut settings = self.shared.settings.lock().await;
-                    for (_, listener) in std::mem::take(&mut settings.listeners) { listener.stop().await; }
+                    for (_, listener) in std::mem::take(&mut settings.outward) { listener.stop().await; }
                     // The configuration dies with this process; so do its redirects.
                     if let Err(error) = self.shared.egress_system.clear().await {
                         tracing::warn!(%error, "could not clear guest egress redirects before re-exec");
                     }
                     return path.ok_or_else(|| io::Error::other("upgrade channel closed"));
                 },
-                Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
-                incoming = incoming_rx.recv() => {
-                    let Some((incoming, opener)) = incoming else { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "host transport closed")); };
-                    match incoming.purpose {
-                        Purpose::Control => {
-                            if !controller_bound {
-                                *self.shared.opener.lock().await = opener;
-                                controller_bound = true;
-                            }
-                            let router = router.clone();
-                            tasks.spawn(async move { let _ = http2::serve(incoming, router).await; });
-                        }
-                        Purpose::Forward { id } => {
-                            let mut settings = self.shared.settings.lock().await;
-                            // Choose the dial policy from the configuration at
-                            // forward acceptance, under configure's lock. Marks
-                            // belong to sockets; toggles do not rewrite existing
-                            // streams or retroactively change this choice.
-                            let marked = settings.config.egress.is_some();
-                            if let Some(target) = settings.targets.get_mut(&id) {
-                                // Reap completed bridges without retaining an unbounded history.
-                                while target.streams.try_join_next().is_some() {}
-                                let endpoint = target.endpoint.clone();
-                                target.streams.spawn(async move {
-                                    if let Err(error) = crate::forward::serve_marked(incoming.stream, &id, Some(&endpoint), marked).await {
-                                        tracing::warn!(%error, forward = %id, "host-to-guest forward failed");
-                                    }
-                                });
-                            } else {
-                                tasks.spawn(async move { let _ = crate::forward::serve(incoming.stream, &id, None).await; });
-                            }
-                        }
-                    }
-                }
+                finished = tasks.join_next() => if finished.is_none() {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "every agent listener closed"));
+                },
             }
         }
     }
+}
+
+/// Transient accept failures: the listener stays bound and is served again.
+fn retryable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::OutOfMemory
+    ) || matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+async fn events(State(s): State<Arc<Shared>>, Query(query): Query<crate::events::Since>) -> Response {
+    crate::events::follow(s.events.clone(), query.since.as_deref())
 }
 
 async fn hello(State(s): State<Arc<Shared>>) -> Json<Hello> {
@@ -341,19 +346,19 @@ async fn configure(State(s): State<Arc<Shared>>, headers: HeaderMap, Json(config
     if let Some(egress) = &config.egress {
         check_id(&egress.upstream).map_err(|e| AgentError::io(OP, "egress.upstream", e))?;
         if let Some(conflict) =
-            settings.listeners.values().find(|l| l.forward.tcp.is_some_and(|a| crate::egress::RESERVED_PORTS.contains(&a.port())))
+            settings.outward.values().find(|l| l.forward.tcp.is_some_and(|a| crate::egress::RESERVED_PORTS.contains(&a.port())))
         {
             return Err(AgentError::new(
                 OP,
                 "egress",
                 ErrorKind::Conflict,
-                format!("guest forward {} listens on a port egress capture needs", conflict.forward.id),
+                format!("outward forward {} listens on a port egress capture needs", conflict.forward.id),
             ));
         }
     }
     let mut prepared_capture = match (&settings.capture, &config.egress) {
         (None, Some(egress)) => Some(
-            crate::egress::Capture::prepare(s.opener.clone(), egress.upstream.clone())
+            crate::egress::Capture::prepare(s.outward.clone(), egress.upstream.clone())
                 .await
                 .map_err(|e| AgentError::io("egress.prepare", "listeners", e))?,
         ),
@@ -402,7 +407,7 @@ async fn configure(State(s): State<Arc<Shared>>, headers: HeaderMap, Json(config
     Ok((StatusCode::NO_CONTENT, [(header::ETAG, header_value(tag))]).into_response())
 }
 
-async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<&Listener>) -> io::Result<Listener> {
+async fn listen(forward: &OutwardForward, s: &Arc<Shared>, old: Option<&Listener>) -> io::Result<Listener> {
     if forward.tcp.is_some_and(|addr| !addr.ip().is_loopback()) {
         return Err(invalid("guest TCP listener must be loopback"));
     }
@@ -444,6 +449,7 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
     let bridges = old.map(|old| old.bridges.clone()).unwrap_or_default();
     let streams = bridges.clone();
     let id = forward.id.clone();
+    let (outward, events) = (s.outward.clone(), s.events.clone());
     let task = tokio::spawn(async move {
         loop {
             let accepted: io::Result<ByteStream> = tokio::select! {
@@ -466,27 +472,23 @@ async fn listen(forward: &GuestForward, opener: Arc<Mutex<Opener>>, old: Option<
                     continue;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, forward = %id, "guest listener stopped");
+                    tracing::warn!(%error, forward = %id, "outward listener stopped");
+                    events.push(crate::events::Event::ForwardFailed { forward: id.clone(), reason: format!("listener stopped: {error}") });
                     break;
                 }
             };
-            let opener = opener.lock().await.clone();
-            let id = id.clone();
+            let (outward, id) = (outward.clone(), id.clone());
             let mut streams = streams.lock().unwrap();
             // Reap finished bridges without retaining an unbounded history.
             while streams.try_join_next().is_some() {}
             streams.spawn(async move {
-                match opener.open(Purpose::Forward { id: id.clone() }).await {
+                match outward.open(&id).await {
                     Ok(mut remote) => {
-                        if let Err(error) = crate::forward::opened(&mut remote).await {
-                            tracing::warn!(%error, forward = %id, "guest-to-host forward rejected");
-                            return;
-                        }
                         if let Err(error) = tokio::io::copy_bidirectional(&mut stream, &mut remote).await {
-                            tracing::warn!(%error, forward = %id, "guest-to-host stream failed");
+                            tracing::warn!(%error, forward = %id, "outward connection failed");
                         }
                     }
-                    Err(error) => tracing::warn!(%error, forward = %id, "guest-to-host forward open failed"),
+                    Err(error) => tracing::warn!(%error, forward = %id, "outward connection was not claimed"),
                 }
             });
         }
@@ -500,24 +502,24 @@ fn check_path_id(operation: &str, path_id: &str, body_id: &str) -> Refusal<()> {
     }
     Ok(())
 }
-async fn guest_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<GuestForward>> {
-    Json(s.settings.lock().await.listeners.values().map(|l| l.forward.clone()).collect())
+async fn outward_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<OutwardForward>> {
+    Json(s.settings.lock().await.outward.values().map(|l| l.forward.clone()).collect())
 }
-async fn guest_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<GuestForward>> {
+async fn outward_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<OutwardForward>> {
     let settings = s.settings.lock().await;
     let listener = settings
-        .listeners
+        .outward
         .get(&id)
-        .ok_or_else(|| AgentError::new("forward.guest.read", &id, ErrorKind::NotFound, "no guest forward with this ID"))?;
+        .ok_or_else(|| AgentError::new("forward.outward.read", &id, ErrorKind::NotFound, "no outward forward with this ID"))?;
     Ok(Json(listener.forward.clone()))
 }
 /// Idempotent upsert. An unchanged forward with a live listener is left
 /// alone, streams and all; a changed one is rebound before the old one stops.
-async fn put_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<GuestForward>) -> Refusal<StatusCode> {
-    const OP: &str = "forward.guest.put";
+async fn put_outward(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<OutwardForward>) -> Refusal<StatusCode> {
+    const OP: &str = "forward.outward.put";
     check_path_id(OP, &id, &forward.id)?;
     let mut settings = s.settings.lock().await;
-    let old = settings.listeners.get(&id);
+    let old = settings.outward.get(&id);
     if old.is_some_and(|old| old.forward == forward && !old.task.is_finished()) {
         return Ok(StatusCode::OK);
     }
@@ -527,8 +529,7 @@ async fn put_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(fo
     }
     let existed = old.is_some();
     let tcp_changed = old.map(|old| old.forward.tcp) != Some(forward.tcp);
-    let listener =
-        listen(&forward, s.opener.clone(), old).await.map_err(|e| AgentError::io("forward.listen", forward.unix.display(), e))?;
+    let listener = listen(&forward, &s, old).await.map_err(|e| AgentError::io("forward.listen", forward.unix.display(), e))?;
     if capture && tcp_changed {
         let exempt = settings.exemptions(&id, Some(&forward));
         if let Err(error) = s.egress_system.install(true, &exempt).await {
@@ -536,66 +537,66 @@ async fn put_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(fo
             return Err(AgentError::io("egress.redirect", "nftables", error));
         }
     }
-    if let Some(old) = settings.listeners.insert(id, listener) {
+    if let Some(old) = settings.outward.insert(id, listener) {
         old.stop().await;
     }
     Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
 }
-async fn remove_guest(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
+async fn remove_outward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
     let mut settings = s.settings.lock().await;
-    let Some(listener) = settings.listeners.remove(&id) else {
-        return Err(AgentError::new("forward.guest.remove", &id, ErrorKind::NotFound, "no guest forward with this ID"));
+    let Some(listener) = settings.outward.remove(&id) else {
+        return Err(AgentError::new("forward.outward.remove", &id, ErrorKind::NotFound, "no outward forward with this ID"));
     };
     if settings.capture.is_some() && listener.forward.tcp.is_some() {
         let exempt = settings.exemptions(&id, None);
         if let Err(error) = s.egress_system.install(true, &exempt).await {
-            settings.listeners.insert(id, listener);
+            settings.outward.insert(id, listener);
             return Err(AgentError::io("egress.redirect", "nftables", error));
         }
     }
     listener.stop().await;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn host_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<HostForward>> {
+async fn inward_forwards(State(s): State<Arc<Shared>>) -> Json<Vec<InwardForward>> {
     let settings = s.settings.lock().await;
-    Json(settings.targets.iter().map(|(id, t)| HostForward { id: id.clone(), endpoint: t.endpoint.clone() }).collect())
+    Json(settings.inward.iter().map(|(id, t)| InwardForward { id: id.clone(), endpoint: t.endpoint.clone() }).collect())
 }
-async fn host_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<HostForward>> {
+async fn inward_forward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<Json<InwardForward>> {
     let settings = s.settings.lock().await;
     let target = settings
-        .targets
+        .inward
         .get(&id)
-        .ok_or_else(|| AgentError::new("forward.host.read", &id, ErrorKind::NotFound, "no host forward with this ID"))?;
-    Ok(Json(HostForward { id, endpoint: target.endpoint.clone() }))
+        .ok_or_else(|| AgentError::new("forward.inward.read", &id, ErrorKind::NotFound, "no inward forward with this ID"))?;
+    Ok(Json(InwardForward { id, endpoint: target.endpoint.clone() }))
 }
-/// A changed endpoint ends the streams to the old one, unlike a guest
+/// A changed endpoint ends the streams to the old one, unlike an outward
 /// listener's rebind: they would otherwise keep reaching a target the host
 /// no longer names.
-async fn put_target(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<HostForward>) -> Refusal<StatusCode> {
-    const OP: &str = "forward.host.put";
+async fn put_inward(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(forward): Json<InwardForward>) -> Refusal<StatusCode> {
+    const OP: &str = "forward.inward.put";
     check_path_id(OP, &id, &forward.id)?;
     if matches!(&forward.endpoint, Endpoint::Tcp(address) if address.port() == 0) {
-        return Err(AgentError::new(OP, &id, ErrorKind::InvalidInput, "guest target TCP port must be nonzero"));
+        return Err(AgentError::new(OP, &id, ErrorKind::InvalidInput, "inward target TCP port must be nonzero"));
     }
     let mut settings = s.settings.lock().await;
-    if settings.targets.get(&id).is_some_and(|t| t.endpoint == forward.endpoint) {
+    if settings.inward.get(&id).is_some_and(|t| t.endpoint == forward.endpoint) {
         return Ok(StatusCode::OK);
     }
-    let old = settings.targets.insert(id, Target { endpoint: forward.endpoint, streams: JoinSet::new() });
+    let old = settings.inward.insert(id, Target { endpoint: forward.endpoint, streams: JoinSet::new() });
     let existed = old.is_some();
     if let Some(old) = old {
         old.stop().await;
     }
     Ok(if existed { StatusCode::OK } else { StatusCode::CREATED })
 }
-async fn remove_target(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
+async fn remove_inward(State(s): State<Arc<Shared>>, Path(id): Path<String>) -> Refusal<StatusCode> {
     let target = s
         .settings
         .lock()
         .await
-        .targets
+        .inward
         .remove(&id)
-        .ok_or_else(|| AgentError::new("forward.host.remove", &id, ErrorKind::NotFound, "no host forward with this ID"))?;
+        .ok_or_else(|| AgentError::new("forward.inward.remove", &id, ErrorKind::NotFound, "no inward forward with this ID"))?;
     target.stop().await;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -741,37 +742,47 @@ async fn confirm_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    async fn agent(dir: &std::path::Path) -> (Transport, Agent) {
-        let (a, b) = tokio::io::duplex(4096);
-        let (host, guest) = tokio::join!(
-            Transport::yamux(Box::new(a), true, drydock_transport::Limits::default()),
-            Transport::yamux(Box::new(b), false, drydock_transport::Limits::default())
-        );
-        (host.unwrap(), Agent::new(guest.unwrap(), "build".into(), dir.join("agent")))
+    async fn agent(dir: &std::path::Path) -> (drydock_transport::MemoryDialer, Agent) {
+        let (dialer, listener) = drydock_transport::memory();
+        (dialer, Agent::new(listener, "build".into(), dir.join("agent")))
     }
-    fn forward(id: &str, unix: PathBuf) -> GuestForward {
-        GuestForward { id: id.into(), unix, tcp: None }
+    fn forward(id: &str, unix: PathBuf) -> OutwardForward {
+        OutwardForward { id: id.into(), unix, tcp: None }
     }
     // A finished listener is rebuilt even when the desired forward is identical.
     // Aborting the task stands in for a fatal listener boundary failure.
     #[tokio::test]
     async fn identical_forward_recovers_finished_listener() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut host, agent) = agent(dir.path()).await;
+        let (_host, agent) = agent(dir.path()).await;
         let f = forward("recover", dir.path().join("socket"));
-        put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
+        put_outward(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
         {
             let mut settings = agent.shared.settings.lock().await;
-            let listener = settings.listeners.get_mut("recover").unwrap();
+            let listener = settings.outward.get_mut("recover").unwrap();
             listener.task.abort();
             while !listener.task.is_finished() {
                 tokio::task::yield_now().await;
             }
         }
-        put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
+        put_outward(State(agent.shared.clone()), Path(f.id.clone()), Json(f.clone())).await.unwrap();
         let _stream = tokio::net::UnixStream::connect(f.unix).await.unwrap();
-        let incoming = tokio::time::timeout(std::time::Duration::from_secs(2), host.accept()).await.unwrap().unwrap().unwrap();
-        assert_eq!(incoming.purpose, Purpose::Forward { id: "recover".into() });
+        let announced = || {
+            agent
+                .shared
+                .events
+                .after(None)
+                .0
+                .iter()
+                .any(|record| matches!(&record.event, crate::events::Event::OutwardConnection { forward, .. } if forward == "recover"))
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !announced() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
     // Real filesystem boundary: if backup linking fails, activation must retain
     // both the uploaded image and previous rollback, and activation alone retries.
@@ -876,8 +887,8 @@ printf '\n--transaction--\n' >> "$0.log"
             Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft, ca };
             if !fail_persist {
                 // Refused before any listener is prepared: a forward holds a capture port.
-                let f = GuestForward { id: "dns".into(), unix: dir.path().join("forward"), tcp: Some("127.0.0.1:1053".parse().unwrap()) };
-                put_guest(State(agent.shared.clone()), Path(f.id.clone()), Json(f)).await.unwrap();
+                let f = OutwardForward { id: "dns".into(), unix: dir.path().join("forward"), tcp: Some("127.0.0.1:1053".parse().unwrap()) };
+                put_outward(State(agent.shared.clone()), Path(f.id.clone()), Json(f)).await.unwrap();
             }
             let previous = Configuration { environment: [("OLD".into(), "kept".into())].into(), ..Configuration::default() };
             configure(State(agent.shared.clone()), HeaderMap::new(), Json(previous.clone())).await.unwrap();
@@ -892,12 +903,12 @@ printf '\n--transaction--\n' >> "$0.log"
             } else {
                 assert_eq!((error.kind, error.status), (ErrorKind::Conflict, 409));
                 assert!(error.message.contains("dns"), "{error}");
-                remove_guest(State(agent.shared.clone()), Path("dns".into())).await.unwrap();
+                remove_outward(State(agent.shared.clone()), Path("dns".into())).await.unwrap();
             }
             let settings = agent.shared.settings.lock().await;
             assert_eq!(settings.config, previous);
             assert!(settings.capture.is_none());
-            assert!(settings.listeners.is_empty());
+            assert!(settings.outward.is_empty());
             assert_eq!(std::fs::read_to_string(&state_path).unwrap(), initial_rules);
             let log = std::fs::read_to_string(&log_path).unwrap();
             if fail_persist {

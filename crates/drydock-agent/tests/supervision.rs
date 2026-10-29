@@ -65,13 +65,11 @@ fn agents(socket: &Path) -> Vec<i32> {
         .collect()
 }
 async fn hello(socket: &Path) -> String {
-    use drydock_transport::{Limits, Transport};
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let result = async {
             let stream = tokio::net::UnixStream::connect(socket).await?;
-            let transport = Transport::yamux(Box::new(stream), true, Limits::default()).await?;
-            drydock_agent::Client::connect(transport, "hello-only").await
+            drydock_agent::Client::connect(Box::new(stream), "hello-only").await
         };
         if let Ok(Ok(client)) = tokio::time::timeout(Duration::from_secs(2), result).await {
             return client.hello().fingerprint.clone();
@@ -164,7 +162,6 @@ async fn public_bootstrap_detaches_without_guest_packages() {
 // then restarts the installed current path, preserving the upgraded generation.
 #[tokio::test]
 async fn supervised_tools_upgrade_and_restart_current_agent() {
-    use drydock_transport::{Limits, Transport};
     use sha2::{Digest, Sha256};
     use std::os::unix::{fs::PermissionsExt, process::CommandExt};
     let directory = tempfile::tempdir().unwrap();
@@ -181,10 +178,7 @@ async fn supervised_tools_upgrade_and_restart_current_agent() {
     let desired = format!("{:x}", Sha256::digest(&current));
     assert_ne!(hello(&socket).await, desired);
     let client = drydock_agent::Client::connect_current(
-        || async {
-            let stream = tokio::net::UnixStream::connect(&socket).await?;
-            Transport::yamux(Box::new(stream), true, Limits::default()).await
-        },
+        || async { Ok(Box::new(tokio::net::UnixStream::connect(&socket).await?) as drydock_transport::ByteStream) },
         &drydock_agent::Platform::current(),
         &current,
         Duration::from_secs(15),

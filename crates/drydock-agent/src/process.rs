@@ -238,10 +238,11 @@ pub(crate) struct Processes {
     table: Mutex<HashMap<String, Arc<Handle>>>,
     next: AtomicU64,
     limit: usize,
+    events: Arc<crate::events::Events>,
 }
 impl Processes {
-    pub(crate) fn new(limit: usize) -> Self {
-        Self { table: Mutex::default(), next: AtomicU64::new(1), limit: limit.max(1) }
+    pub(crate) fn new(limit: usize, events: Arc<crate::events::Events>) -> Self {
+        Self { table: Mutex::default(), next: AtomicU64::new(1), limit: limit.max(1), events }
     }
     pub(crate) fn get(&self, id: &str) -> Result<Arc<Handle>, AgentError> {
         self.table
@@ -337,6 +338,7 @@ impl Processes {
         tokio::spawn(pump(handle.clone(), stdout, false, exited.clone()));
         tokio::spawn(pump(handle.clone(), stderr, true, exited));
         let waiter = handle.clone();
+        let events = self.events.clone();
         let timeout = request.timeout_ms.map(Duration::from_millis);
         let unreaped = rustix::process::Pid::from_raw(pid as i32).expect("a spawned child has a PID");
         tokio::spawn(async move {
@@ -359,9 +361,9 @@ impl Processes {
             if let Err(error) = exited {
                 tracing::warn!(%error, process = %waiter.id, "process wait failed");
             }
-            {
+            let status = {
                 let mut output = waiter.output.lock().unwrap();
-                output.exit = Some(match child.try_wait() {
+                *output.exit.insert(match child.try_wait() {
                     Ok(Some(status)) => {
                         use std::os::unix::process::ExitStatusExt;
                         ExitStatus { code: status.code(), signal: status.signal(), timed_out }
@@ -370,10 +372,11 @@ impl Processes {
                         tracing::warn!(?other, process = %waiter.id, "process reaping failed");
                         ExitStatus { code: None, signal: None, timed_out }
                     }
-                });
-            }
+                })
+            };
             let _ = exited_tx.send(true);
             waiter.bump();
+            events.push(crate::events::Event::ProcessExited { id: waiter.id.clone(), status });
         });
         let mut table = self.table.lock().unwrap();
         let mut exited: Vec<_> = table.values().filter(|h| !h.running()).map(|h| (h.sequence, h.id.clone())).collect();
@@ -501,7 +504,7 @@ mod tests {
     // alive after the process is gone.
     #[tokio::test]
     async fn removed_handles_are_released() {
-        let processes = Processes::new(4096);
+        let processes = Processes::new(4096, Arc::new(crate::events::Events::new("test".into())));
         let script = "head -c 1000000 /dev/zero; sleep 30";
         let handle = processes.spawn(Exec::new("/bin/sh", ["-c", script]), BTreeMap::new()).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

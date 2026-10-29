@@ -2,7 +2,7 @@
 
 The substrate for just launching vessels: isolated environments for AI coding agents, on any provider.
 
-Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over a bidirectional stream transport, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) can embed the crate or delegate to the same provider API; standalone use runs `drydockd`.
+Drydock hosts out-of-process provider adaptors behind one HTTP protocol, reaches an agent inside each vessel over plain HTTP, and carries the vessel's egress. [Flotilla](https://github.com/flotilla-org/flotilla) can embed the crate or delegate to the same provider API; standalone use runs `drydockd`.
 
 Status: design decided ([flotilla-org/flotilla#3503](https://github.com/flotilla-org/flotilla/issues/3503)); protocol workspace, [`drydock-transport`](crates/drydock-transport), the [Rust reference host](crates/drydock-host), [typed client](crates/drydock-client), [daemon/client CLI](crates/drydock), Daytona module, and [vessel agent and client](crates/drydock-agent) implemented; additional language hosts, the tools image, and egress capture follow.
 
@@ -44,8 +44,8 @@ the recorded platform's build.
 Create `~/.config/drydock/drydock.toml` (TOML 1.1 multiline inline tables work).
 It is the configuration document of `PUT /v1/config`, written in TOML: providers
 keyed by an arbitrary instance name, each with `module`, opaque `settings` and the
-server-only `credential`. The CLI's launch defaults (`image`, `size`, `egress`,
-`agent_link`) sit beside them but are not part of that document:
+server-only `credential`. The CLI's launch defaults (`image`, `size`, `egress`)
+sit beside them but are not part of that document:
 
 ```toml
 [providers.daytona]
@@ -121,13 +121,14 @@ them. Keys and launch evidence currently remain after errors and destruction;
 cleanup without losing access after ambiguous provider outcomes. Progress is on
 stderr; JSON results are on stdout.
 
-`agent_link = "reverse_forward"` (the default) or `"local_forward"` picks how
-guest-to-host streams travel on a vessel agent's SSH link, where the provider's
-server accepts remote forwards. A server that refuses them, such as Daytona's
-gateway, always shares the local forward. Embedding clients reach an agent
-through `drydock::agent::AgentReach`. It applies this preference, the provider's
-declared `agent` capability and its reach. It reports what it chose as an
-`AgentReport`: the provider, its module, the vessel, the endpoint and the link.
+A vessel's agent speaks plain HTTP on `/run/drydock/agent.sock`; drydock
+reaches it with one HTTP/2 connection through an SSH local forward, which every
+SSH server allows, Daytona's gateway included. Embedding clients reach an agent
+through `drydock::agent::AgentReach`. It applies the provider's declared
+`agent` capability and its reach, and reports what it chose as an
+`AgentReport`: the provider, its module, the vessel and the endpoint. An agent
+too old to speak plain HTTP cannot be reached: the vessel is reported
+unreachable until its operator restarts it from a current tools image.
 
 The daemon discovers loadable modules from host `hello`, then sends only the
 providers assigned to each host. A failed optional host is logged and skipped;
@@ -235,7 +236,7 @@ each provider's module, capabilities, readiness, rate limits, optional `ports`
 and `observation`; hello keeps only the versions and loadable modules. Egress
 evidence (`egress_measured`, `egress_policy`) and the provider `timestamp` are
 optional `Environment` fields. `Reach` is the one reach type; SSH
-`reverse_forwards` defaults to false. The server observes every provider by
+`reverse_forwards` defaults to false, and drydock no longer depends on it. The server observes every provider by
 polling its list.
 
 Protocol version 7 adds platforms. Capabilities list the platforms a provider
