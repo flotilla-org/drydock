@@ -323,12 +323,13 @@ async fn a_guest_name_removed_while_stopped_loses_its_hosts_line_on_resume() {
     assert!(std::fs::read_to_string(h.path("hosts")).unwrap().contains("forge.test"), "unreachable while stopped");
     h.api.resume(PROVIDER, &h.id, &token).await.unwrap();
     let hosts = h.path("hosts");
+    // The file is rewritten in place (a bind-mounted hosts file keeps its
+    // inode), so wait for its final content rather than any without the line.
     eventually(|| {
         let hosts = hosts.clone();
-        async move { !std::fs::read_to_string(&hosts).unwrap().contains("forge.test") }
+        async move { std::fs::read_to_string(&hosts).unwrap() == "127.0.0.1 localhost\n" }
     })
     .await;
-    assert_eq!(std::fs::read_to_string(&hosts).unwrap(), "127.0.0.1 localhost\n");
 }
 
 // What a PUT reports is what drydock stored: when the record cannot be
