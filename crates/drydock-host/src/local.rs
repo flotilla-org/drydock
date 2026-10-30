@@ -58,7 +58,7 @@ impl Module for LocalModule {
     }
     async fn configure(&self, name: &str, c: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings = serde_json::from_value(serde_json::to_value(&c.settings).expect("settings map"))
-            .map_err(|_| refused("invalid local settings: expected optional string `root` and `agent` paths"))?;
+            .map_err(|e| refused(format!("invalid local settings (optional `root` and `agent` paths): {e}")))?;
         let root = match settings.root {
             Some(root) => root,
             None => default_root()?,
@@ -110,7 +110,8 @@ struct Local {
     root: PathBuf,
     agent: Option<PathBuf>,
     /// Serializes changes, so a label is created once and suspend, resume and
-    /// destroy never interleave. Reads do not take it.
+    /// destroy never interleave. Reads do not take it. One lock for the provider,
+    /// not one per environment, on purpose: a fixture's startup waits are short.
     lifecycle: tokio::sync::Mutex<()>,
 }
 
@@ -205,6 +206,8 @@ impl Local {
             .mode(0o600)
             .open(dir.join("agent.log"))
             .map_err(|e| unavailable(format!("open agent log: {e}")))?;
+        // A socket left by a dead agent would only be unlinked by the new one after a probe.
+        let _ = tokio::fs::remove_file(&socket).await;
         let mut command = tokio::process::Command::new(dir.join(AGENT));
         command
             .arg("--socket")
@@ -269,7 +272,10 @@ impl Local {
             // The vessel's own copy: an agent upgrade replaces this file, never the installed build.
             std::fs::copy(&build, dir.join(AGENT))?;
             std::fs::set_permissions(dir.join(AGENT), std::fs::Permissions::from_mode(0o700))?;
-            std::fs::write(dir.join(RECORD), serde_json::to_vec(&record).expect("record serializes"))
+            // Whole or absent: a crash mid-write must not leave a record that never parses.
+            let staged = dir.join("environment.json.new");
+            std::fs::write(&staged, serde_json::to_vec(&record).expect("record serializes"))?;
+            std::fs::rename(staged, dir.join(RECORD))
         };
         if let Err(e) = setup() {
             let _ = std::fs::remove_dir_all(&dir);

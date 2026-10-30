@@ -90,7 +90,8 @@ impl Provider for RemoteProvider {
             return readiness;
         }
         // A host that reports a provider ready without having been given a credential
-        // is one that needs none.
+        // is one that needs none. Modules that need one must report MissingCredential until
+        // it arrives, as the trait's default does; the mixed-config test in tests/local.rs pins that.
         if c.token().is_some() || matches!(readiness, Readiness::Ready) {
             Readiness::Ready
         } else {
