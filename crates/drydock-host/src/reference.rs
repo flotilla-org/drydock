@@ -132,6 +132,7 @@ impl Provider for Reference {
             }],
             usage: true,
             quota: true,
+            host_filesystem: false,
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

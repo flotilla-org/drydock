@@ -440,6 +440,8 @@ impl Provider for Local {
             }],
             usage: false,
             quota: false,
+            // Vessels are directories on this machine: guest paths are its own.
+            host_filesystem: true,
         }
     }
     fn observation(&self) -> ObservationMode {

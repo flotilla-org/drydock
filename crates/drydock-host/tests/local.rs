@@ -125,7 +125,8 @@ async fn prepare_records_the_request_without_pulling() {
 }
 
 // The declaration says what a local vessel is: no isolation, the host's platform,
-// open egress that is only advisory, and no usage or quota to report.
+// open egress that is only advisory, no usage or quota to report, and the
+// host's own filesystem.
 #[tokio::test]
 async fn capabilities_are_honest_about_having_no_isolation() {
     let root = Root::new();
@@ -137,6 +138,7 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     assert!(c.suspend_resume && c.suspend_preserves_memory == Some(false));
     assert!(!c.usage && !c.quota && !c.export && !c.fallback_runner);
     assert_eq!(c.workspace_root, root.path().to_str().unwrap());
+    assert!(c.host_filesystem, "vessels share this machine's filesystem");
     let ports = Ports::from(p.operations());
     assert_eq!(ports, Ports { suspend_resume: true, ..Ports::default() });
     assert_eq!(p.readiness(&credentials()), Readiness::Ready);

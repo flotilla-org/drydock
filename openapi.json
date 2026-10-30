@@ -2207,6 +2207,10 @@
           "fallback_runner": {
             "type": "boolean"
           },
+          "host_filesystem": {
+            "type": "boolean",
+            "description": "Vessels run on the host's own filesystem, shared with the host and with\none another: a guest path is a host path. A client lays each vessel out\nbelow paths it can write, never at fixed guest locations."
+          },
           "image_routes": {
             "type": "array",
             "items": {
