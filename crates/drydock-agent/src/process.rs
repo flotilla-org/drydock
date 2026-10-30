@@ -249,7 +249,10 @@ impl Processes {
         Self { table: Mutex::default(), next: AtomicU64::new(1), limit: limit.max(1), events, draining: RwLock::new(false) }
     }
     /// Stop accepting processes, then wait up to `limit` for the running ones
-    /// to exit. Returns those still running at the limit.
+    /// to exit. Returns those still running at the limit. There is no way
+    /// back: a drain is always followed by the re-exec, and if both the
+    /// candidate's and the rollback's exec fail the agent exits, so no agent
+    /// process ever serves on after draining.
     pub(crate) async fn drain(&self, limit: Duration) -> Vec<ProcessInfo> {
         *self.draining.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         let deadline = tokio::time::Instant::now() + limit;

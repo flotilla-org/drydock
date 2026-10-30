@@ -328,7 +328,11 @@ impl Client {
                     let running: Vec<_> = activated.running.iter().map(|p| format!("{} ({})", p.id, p.program)).collect();
                     tracing::warn!(running = %running.join(", "), "agent processes outlived the upgrade drain and lost their handles");
                 }
-                _ => {}
+                Ok(_) => {}
+                // A refusal (no such blob, a digest mismatch) means no re-exec
+                // follows; a broken link may be the re-exec itself.
+                Err(error) if AgentError::of(&error).is_some() => tracing::warn!(%error, "the agent refused the upgrade activation"),
+                Err(error) => tracing::debug!(%error, "no reply to the upgrade activation"),
             }
             drop(path);
             loop {

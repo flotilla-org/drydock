@@ -196,9 +196,8 @@ impl Agent {
     /// with its original fixed flags; dropping this future drops all agent streams.
     pub async fn run(mut self) -> io::Result<PathBuf> {
         // Redirects an earlier agent left stay in place: this process takes
-        // them over, and the next configuration replaces them. Without the
-        // nft executable no agent can have installed any.
-        if self.shared.egress_system.nft.exists() {
+        // them over, and the next configuration replaces them.
+        if self.shared.egress_system.installed().await {
             self.shared.settings.lock().await.inherited = true;
         }
         match self.shared.store.sweep(crate::store::ABANDONED) {
@@ -751,7 +750,9 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>, Query(query): Query<Dige
     };
     let _guard = s.upgrade.lock().await;
     let path = crate::upgrade::activate(&s.executable, &s.store, &query.sha256).await?;
-    let running = s.processes.drain(std::time::Duration::from_millis(activation.drain_ms)).await;
+    // The drain holds the upgrade lock, so it is bounded whatever the request asks.
+    let drain = std::time::Duration::from_millis(activation.drain_ms).min(MAX_DRAIN);
+    let running = s.processes.drain(drain).await;
     if !running.is_empty() {
         tracing::warn!(count = running.len(), "processes still running at the drain limit lose their handles at re-exec");
     }
@@ -764,6 +765,8 @@ async fn activate_upgrade(State(s): State<Arc<Shared>>, Query(query): Query<Dige
     });
     Ok((StatusCode::ACCEPTED, Json(Activated { sha256: query.sha256, running })).into_response())
 }
+/// The longest drain an activation may ask for.
+const MAX_DRAIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// `GET /control` with `Upgrade: drydock-control` on HTTP/1.1: the
 /// connection becomes one serving every route, HTTP/1.1 or HTTP/2 as its
 /// next bytes say. A host that has read a matching hello over the frozen
@@ -895,7 +898,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
         let nft = dir.path().join("nft");
-        std::fs::write(&nft, "#!/bin/sh\ncat >> \"$0.log\"\nprintf -- '--\\n' >> \"$0.log\"\n").unwrap();
+        // `list` finds the table installed; anything else is a transaction.
+        std::fs::write(&nft, "#!/bin/sh\n[ \"$1\" = list ] && exit 0\ncat >> \"$0.log\"\nprintf -- '--\\n' >> \"$0.log\"\n").unwrap();
         std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = nft.with_extension("log");
         let transactions = || std::fs::read_to_string(&log).unwrap_or_default();
@@ -934,6 +938,26 @@ mod tests {
         assert_eq!(transactions(), "add table inet drydock_egress\nflush table inet drydock_egress\n--\n");
         configure(State(shared.clone()), HeaderMap::new(), Json(Configuration::default())).await.unwrap();
         assert_eq!(transactions().matches("--").count(), 1, "replaced redirects are no longer inherited");
+        running.abort();
+    }
+    // An agent whose nft finds no capture table inherits nothing: its first
+    // configuration without egress touches nft no more than before.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn without_an_installed_table_nothing_is_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let nft = dir.path().join("nft");
+        std::fs::write(&nft, "#!/bin/sh\n[ \"$1\" = list ] && exit 1\ncat >> \"$0.log\"\n").unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_host, mut agent) = agent(dir.path()).await;
+        Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft: nft.clone(), ca: dir.path().join("ca.pem") };
+        let shared = agent.shared.clone();
+        let running = tokio::spawn(agent.run());
+        // Startup sweeps the store after probing nft; wait for a served route.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!shared.settings.lock().await.inherited);
+        configure(State(shared.clone()), HeaderMap::new(), Json(Configuration::default())).await.unwrap();
+        assert!(!nft.with_extension("log").exists(), "no transaction without an inherited table");
         running.abort();
     }
     // Activation rehashes the upload as it copies it out of the store, so

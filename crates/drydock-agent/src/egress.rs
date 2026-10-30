@@ -477,6 +477,17 @@ impl System {
     pub(crate) async fn install(&self, egress: bool, exempt: &[SocketAddr]) -> io::Result<()> {
         self.transaction(&rules(egress, exempt)).await
     }
+    /// Whether a capture table is installed, as an earlier agent process may
+    /// have left it. Without the nft executable no agent can have installed one.
+    pub(crate) async fn installed(&self) -> bool {
+        use std::process::Stdio;
+        if !self.nft.exists() {
+            return false;
+        }
+        let mut command = tokio::process::Command::new(&self.nft);
+        command.args(["list", "table", "inet", "drydock_egress"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        command.kill_on_drop(true).status().await.is_ok_and(|status| status.success())
+    }
     async fn transaction(&self, rules: &str) -> io::Result<()> {
         use std::process::Stdio;
         let mut command = tokio::process::Command::new(&self.nft);

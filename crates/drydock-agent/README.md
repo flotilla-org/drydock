@@ -437,7 +437,7 @@ installed binary and hashing it again as it goes, so a blob changed on disk
 is refused (422) and discarded rather than executed. It then drains: the
 agent starts no more processes (`POST /processes` is refused with 409) and
 waits for the running ones to exit, up to `drain_ms` from the request body
-(no wait without one). The reply, 202 `Activated { sha256, running }`, names
+(no wait without one; at most 60 seconds). The reply, 202 `Activated { sha256, running }`, names
 the processes still running at the limit; they keep running across the
 re-exec, but lose their handles and output reader. The agent then re-execs
 with the original flags; the host reconnects with a fresh connection and
@@ -464,7 +464,8 @@ reconnecting and checking hello.
 Re-exec drops connections and byte streams, removes owned outward sockets
 and resets configuration, forwards and events; the new `boot_id` tells the
 host to send them again. The capture table stays in place, so egress stays
-enforced across the re-exec: the new process takes it over at startup, and
+enforced across the re-exec: the new process takes it over at startup (when
+`nft list table` finds it), and
 guest TCP and DNS keep being redirected, to capture ports nobody serves
 until the host configures the new agent. The first configuration replaces
 the inherited table, also when it disables egress. Stale socket inodes from

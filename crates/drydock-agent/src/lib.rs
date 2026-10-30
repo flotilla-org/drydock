@@ -69,7 +69,7 @@ pub struct Hello {
 pub struct Activation {
     /// How long, in milliseconds, the agent waits for its running processes
     /// to exit before it re-execs. It starts no new ones meanwhile. Absent
-    /// or zero: it does not wait.
+    /// or zero: it does not wait. The agent waits at most 60 seconds.
     #[serde(default)]
     pub drain_ms: u64,
 }
