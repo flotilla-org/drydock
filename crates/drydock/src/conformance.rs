@@ -1131,7 +1131,7 @@ async fn agent_hello(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> R
     let mut reply = Vec::new();
     (&mut stream).take(65536).read_to_end(&mut reply).await.map_err(SafeError::category)?;
     let reply = String::from_utf8_lossy(&reply);
-    // The body is the hello JSON, possibly framed by chunk sizes.
+    // The body is the hello JSON; taking the outermost braces is deliberately lenient about chunk framing.
     let body =
         reply.find('{').zip(reply.rfind('}')).and_then(|(start, end)| serde_json::from_str::<serde_json::Value>(&reply[start..=end]).ok());
     require(

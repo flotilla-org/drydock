@@ -510,8 +510,12 @@ impl SuspendResume for Local {
         let _changing = self.lifecycle.lock().await;
         self.record(id).await?;
         let dir = self.dir(id);
-        stop(&dir, &self.socket(id)).await?;
+        // Marked first, so the stop in between never reads as a crash.
         tokio::fs::write(dir.join(SUSPENDED), b"").await.map_err(|e| unavailable(format!("record suspension: {e}")))?;
+        if let Err(error) = stop(&dir, &self.socket(id)).await {
+            let _ = tokio::fs::remove_file(dir.join(SUSPENDED)).await;
+            return Err(error);
+        }
         Ok(resume_token(&self.name, id))
     }
     /// Starts the agent again, whether it was suspended or died.

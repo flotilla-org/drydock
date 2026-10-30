@@ -486,3 +486,30 @@ async fn destroy_spares_a_process_that_recycled_the_agents_pid() {
     bystander.kill().unwrap();
     bystander.wait().unwrap();
 }
+
+// While suspend stops the agent, the environment never reads as a crash.
+#[tokio::test]
+async fn suspending_never_looks_like_a_crash() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "quiet").await;
+    let suspend = p.operations().suspend_resume.unwrap();
+    let credentials = credentials();
+    let (token, seen) = tokio::join!(suspend.suspend(&environment.id, &credentials), async {
+        let mut seen = vec![];
+        loop {
+            let state = p.inspect(&environment.id, &credentials).await.unwrap().state;
+            let stopped = matches!(state, Observation::Stopped { .. });
+            seen.push(state);
+            if stopped {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    token.unwrap();
+    assert!(
+        seen.iter().all(|state| matches!(state, Observation::Running | Observation::Stopped { cause: StopCause::SuspendedByRequest })),
+        "{seen:?}"
+    );
+}
