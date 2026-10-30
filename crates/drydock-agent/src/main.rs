@@ -13,6 +13,14 @@ async fn main() -> io::Result<()> {
     }
     reap_inherited_children();
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--bridge") {
+        let socket = match args.get(1..) {
+            Some([]) => PathBuf::from("/run/drydock/agent.sock"),
+            Some([flag, path]) if flag == "--socket" => path.into(),
+            _ => return Err(io::Error::other("usage: drydock-agent --bridge [--socket PATH]")),
+        };
+        return drydock_agent::socket::bridge(&socket, tokio::io::stdin(), tokio::io::stdout()).await;
+    }
     if args.first().is_some_and(|a| a == "--supervise") {
         return supervisor::start(&args[1..]);
     }

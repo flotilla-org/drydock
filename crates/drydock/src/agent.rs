@@ -21,7 +21,8 @@ pub const AGENT_SOCKET: &str = "/run/drydock/agent.sock";
 
 /// Opens the SSH link a reach recipe describes: one connection to the agent's
 /// socket through a local forward, which every SSH server allows (Daytona's
-/// gateway included). OpenSSH in production; tests stand in a gateway.
+/// gateway included). OpenSSH in production; tests stand in a gateway. A relay
+/// reach needs no dialer: the provider's host relays the connection.
 #[async_trait]
 pub trait SshDialer: Send + Sync {
     async fn dial(&self, config: SshConfig) -> io::Result<ByteStream>;
@@ -60,13 +61,21 @@ pub struct AgentReport {
     pub module: String,
     /// The provider's environment ID for the vessel.
     pub environment: String,
-    /// The SSH endpoint the agent is reached through, without credentials.
+    /// The SSH endpoint the agent is reached through, without credentials, or
+    /// [`RELAY`] when the provider's host carries the connection.
     pub endpoint: String,
 }
 
+/// The reported endpoint of an agent reached through its provider's relay route.
+pub const RELAY: &str = "relay";
+
 impl std::fmt::Display for AgentReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ssh {} to {} vessel {} (provider {})", self.endpoint, self.module, self.environment, self.provider)
+        match self.endpoint.as_str() {
+            RELAY => write!(f, "relay"),
+            endpoint => write!(f, "ssh {endpoint}"),
+        }?;
+        write!(f, " to {} vessel {} (provider {})", self.module, self.environment, self.provider)
     }
 }
 
@@ -129,8 +138,19 @@ impl AgentReach {
             let reach = api.reach(vessel.provider, vessel.environment).await.map_err(|e| io::Error::other(format!("agent reach: {e}")))?;
             // Whether the server accepts remote forwards does not matter: the
             // agent never opens a connection towards drydock.
-            let Reach::Ssh { endpoint, user, host_key, .. } = reach else {
-                return Err(io::Error::new(io::ErrorKind::Unsupported, "agent hello requires an SSH reach"));
+            let (endpoint, user, host_key) = match reach {
+                Reach::Ssh { endpoint, user, host_key, .. } => (endpoint, user, host_key),
+                // The provider's host carries the connection to the agent's
+                // socket itself, as Namespace's does over an SSH exec channel.
+                Reach::Relay { .. } => {
+                    let stream =
+                        api.relay(vessel.provider, vessel.environment).await.map_err(|e| io::Error::other(format!("agent relay: {e}")))?;
+                    *choice.lock().unwrap() = Some(RELAY.to_owned());
+                    return Ok(Box::new(stream) as ByteStream);
+                }
+                Reach::Dial { .. } => {
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, "agent hello requires an SSH or relay reach"));
+                }
             };
             masker.lock().unwrap().remember(user.expose());
             let mut config = ssh_config(&endpoint, user.expose(), host_key, vessel.identity.into())?;

@@ -92,7 +92,9 @@ provider configuration; restart it after edits. Stop its foreground process or
 send SIGTERM to the owning `drydockd`; the next CLI command starts it again.
 Provider settings are opaque to
 drydock and reach only the module. Credentials are `{ env = "NAME" }` or
-`{ file = "PATH", json_field = "token" }`; only the resolved value is delivered
+`{ file = "PATH", json_field = "token" }`; a file holding a JSON object without
+`json_field` is the whole object, compacted onto one line (Namespace takes
+`{"bearer_token": …}`). Only the resolved value is delivered
 by credential refresh on the authenticated host connection.
 
 Rigging resolves XDG paths: `XDG_CONFIG_HOME/drydock/drydock.toml`, falling back

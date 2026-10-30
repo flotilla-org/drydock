@@ -1,1 +1,5 @@
-allowBuilds: {}
+# ssh2 (through @namespacelabs/sdk) has optional native bindings; the companion
+# stays pure JavaScript, so their build scripts never run.
+allowBuilds:
+  cpu-features: false
+  ssh2: false

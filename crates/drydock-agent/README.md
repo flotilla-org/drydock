@@ -9,6 +9,12 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
 [--vsock-port PORT] [--store DIR]` alongside the image's own processes. It must not be PID 1.
 Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`.
+Namespace runs it as a devbox service (its own agent is PID 1, and restarts
+the service on boot). `drydock-agent --bridge [--socket PATH]` joins its stdin
+and stdout to a running agent's socket and exits when the agent closes; the end
+of stdin half-closes the socket. It is how a provider whose only way in is a
+command channel (Namespace's SSH gateway refuses Unix-socket forwards) relays
+drydock's connection; the image needs nothing else.
 This detaches a singleton supervisor alongside the provider's init; the supervisor
 holds an OS file lock and restarts the agent after a crash, without guest Python
 or util-linux. Repeated startup failures back off from 250 ms to four seconds;

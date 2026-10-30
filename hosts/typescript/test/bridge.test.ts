@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
+import { Duplex, PassThrough } from "node:stream";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
@@ -445,3 +447,130 @@ test("CLI rejects invalid provider module exports before listen", async (t) => {
       /invalid default ProviderModule export/.test(error.stderr),
   );
 });
+/** A raw relay upgrade: request headers, then `payload` and a half close. */
+function upgrade(
+  socketPath: string,
+  path: string,
+  payload: Buffer,
+  headers = "Connection: upgrade\r\nUpgrade: drydock-relay\r\n",
+) {
+  return new Promise<{ head: string; body: Buffer }>((resolve, reject) => {
+    const socket = net.connect(socketPath, () => {
+      // The first bytes travel with the request, as an eager client's would.
+      socket.write(
+        Buffer.concat([
+          Buffer.from(`GET ${path} HTTP/1.1\r\nHost: host\r\n${headers}\r\n`),
+          payload.subarray(0, 10),
+        ]),
+      );
+      socket.end(payload.subarray(10));
+    });
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("error", reject);
+    socket.on("close", () => {
+      const all = Buffer.concat(chunks);
+      const end = all.indexOf("\r\n\r\n") + 4;
+      resolve({
+        head: all.subarray(0, end).toString(),
+        body: all.subarray(end),
+      });
+    });
+  });
+}
+// Optional ports are the methods a provider implements, declared in its
+// ports and served; an absent one is refused. Relay upgrades only with both
+// headers, calls the provider first (so its refusals are ordinary errors),
+// then carries bytes both ways through half close.
+test("optional ports and the relay upgrade delegate to the provider", async (t) => {
+  const p = provider();
+  const credentials: (string | undefined)[] = [];
+  p.suspend = async () => ({ token: "token" });
+  p.resume = async (_id, token) => {
+    if (token.token !== "token") refusedFailure();
+  };
+  p.quota = async () => ({ resources: [] });
+  p.relay = async (id, ctx) => {
+    credentials.push(ctx.credential);
+    if (id === "refused") refusedFailure();
+    const ab = new PassThrough(),
+      ba = new PassThrough();
+    // The other end echoes, standing in for the vessel's agent.
+    ab.pipe(ba);
+    return Duplex.from({ readable: ba, writable: ab });
+  };
+  const f = await fixture(t, p),
+    url = "/v1/providers/a/environments/x";
+  const declared = await request(
+    f.socketPath,
+    "/v1/providers/a",
+    undefined,
+    "GET",
+  );
+  assert.deepEqual(declared.body.ports, {
+    exec: false,
+    suspend_resume: true,
+    export: false,
+    usage: false,
+    quota: true,
+  });
+  assert.deepEqual((await request(f.socketPath, `${url}/suspend`)).body, {
+    token: "token",
+  });
+  assert.equal(
+    (await request(f.socketPath, `${url}/resume`, { token: "token" })).status,
+    204,
+  );
+  assert.equal((await request(f.socketPath, `${url}/resume`, {})).status, 422);
+  assert.deepEqual(
+    (await request(f.socketPath, "/v1/providers/a/quota", undefined, "GET"))
+      .body,
+    { resources: [] },
+  );
+  const relay = await request(f.socketPath, `${url}/relay`, undefined, "GET");
+  assert.deepEqual([relay.status, relay.body.kind], [422, "refused"]);
+
+  const payload = Buffer.from(
+    Array.from({ length: 200_000 }, (_, n) => n % 256),
+  );
+  const echoed = await upgrade(f.socketPath, `${url}/relay`, payload);
+  assert.match(echoed.head, /^HTTP\/1\.1 101 /);
+  assert.match(echoed.head, /upgrade: drydock-relay/i);
+  assert.ok(
+    echoed.body.equals(payload),
+    "bytes and half close cross the relay",
+  );
+  for (const [path, status, kind] of [
+    ["/v1/providers/missing/environments/x/relay", 404, "not_found"],
+    ["/v1/providers/a/environments/refused/relay", 422, "refused"],
+  ] as const) {
+    const result = await upgrade(f.socketPath, path, Buffer.from("ignored"));
+    assert.match(result.head, new RegExp(`^HTTP/1\\.1 ${status} `));
+    assert.equal(JSON.parse(result.body.toString()).kind, kind);
+  }
+  await upgrade(
+    f.socketPath,
+    `${url}/relay`,
+    Buffer.alloc(0),
+    "Connection: upgrade\r\nUpgrade: drydock-relay\r\nDrydock-Credential: test-only-relay\r\n",
+  );
+  assert.equal(credentials.at(-1), "test-only-relay");
+
+  const absent = await fixture(t);
+  for (const [path, method] of [
+    [`${url}/suspend`, "POST"],
+    ["/v1/providers/a/quota", "GET"],
+  ] as const) {
+    const result = await request(absent.socketPath, path, undefined, method);
+    assert.deepEqual([result.status, result.body.kind], [422, "refused"]);
+  }
+  const none = await upgrade(
+    absent.socketPath,
+    `${url}/relay`,
+    Buffer.alloc(0),
+  );
+  assert.match(none.head, /^HTTP\/1\.1 422 /);
+});
+function refusedFailure(): never {
+  throw new ProtocolFailure({ kind: "refused", reason: "test refusal" });
+}

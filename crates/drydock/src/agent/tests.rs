@@ -10,9 +10,14 @@ const BUILD: &[u8] = b"current agent";
 /// An in-process drydock with one reference provider whose vessels declare an
 /// agent (or not) and whose reach names an SSH server with the given forwarding.
 async fn provider(agent: bool, reach: Reach) -> (Runtime, String) {
+    provider_with(serde_json::json!({"agent": agent, "reach": reach})).await
+}
+
+/// [`provider`] with the reference module's `settings`.
+async fn provider_with(settings: serde_json::Value) -> (Runtime, String) {
     let runtime = Runtime::new(drydock_host::reference::registry());
     let configuration = serde_json::from_value(serde_json::json!({
-        "providers": {"a": {"module": "reference", "settings": {"agent": agent, "reach": reach}}}
+        "providers": {"a": {"module": "reference", "settings": settings}}
     }))
     .unwrap();
     runtime.configure(crate::api::ConfigUpdate::Replace(configuration)).await.unwrap();
@@ -85,6 +90,30 @@ async fn connects_through_the_local_forward_and_reports_it() {
     }
 }
 
+// Behaviour: a relay reach is followed through the provider's relay route,
+// which carries the one connection to the agent; nothing is dialled over SSH,
+// and drydock reports the relay. The guest reaches the host on it as well.
+#[tokio::test]
+async fn connects_through_the_providers_relay_and_reports_it() {
+    // Under /tmp, so the vessel's socket paths stay within SUN_LEN.
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let agent_socket = directory.path().join("relayed.sock");
+    let listener = tokio::net::UnixListener::bind(&agent_socket).unwrap();
+    let agent = tokio::spawn(drydock_agent::Agent::new(listener, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
+    let (api, environment) = provider_with(serde_json::json!({"agent": true, "relay_socket": agent_socket})).await;
+    let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+    let identity = directory.path().join("id_ed25519");
+    let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+    let reach = AgentReach::new().with_dialer(gateway.clone()).with_timeout(Duration::from_secs(10));
+    let connected = reach.connect(&api, &vessel).await.unwrap();
+    assert_eq!(connected.report.endpoint, RELAY);
+    assert_eq!(connected.report.to_string(), format!("relay to reference vessel {environment} (provider a)"));
+    assert_eq!(gateway.dials(), 0);
+    guest_reaches_host(&connected.client, directory.path()).await;
+    drop(connected);
+    agent.abort();
+}
+
 // A gateway started for a platform stands in for a guest of that platform on
 // any test host: a vessel prepared for it connects, and the agent reports it.
 #[tokio::test]
@@ -107,7 +136,8 @@ async fn a_gateway_stands_in_for_the_platform_it_was_started_as() {
 async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
     let dial =
         Reach::Dial { url: "wss://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
-    for (agent, reach, refusal) in [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "agent hello requires an SSH reach")]
+    for (agent, reach, refusal) in
+        [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "agent hello requires an SSH or relay reach")]
     {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(agent, reach).await;

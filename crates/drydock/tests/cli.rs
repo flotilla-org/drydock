@@ -514,7 +514,8 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     let image = format!("image@sha256:{}", "a".repeat(64));
     let text = format!(
         "[providers.plain]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{}}\n\
-         [providers.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\nsettings={{agent=true}}\n\
+         [providers.agent]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\n\
+         settings={{agent=true, reach={{kind='dial', url='wss://dial.test', token='minted', expires_at='2030-01-01T00:00:00Z'}}}}\n\
          [providers.foreign]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='{image}'\n\
          settings={{agent=true, platforms=[{{os='linux', architecture='riscv64'}}]}}\n"
     );
@@ -534,11 +535,11 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     daemon.launch("plain", &drydock::launch::LaunchOptions::default()).await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(10), daemon.launch("agent", &drydock::launch::LaunchOptions::default()))
         .await
-        .expect("a reach without SSH is refused at once, not retried")
+        .expect("a reach drydock cannot follow is refused at once, not retried")
         .err()
         .unwrap();
     let message = error.to_string();
-    assert!(message.contains("drydock-agent") || message.contains("agent hello requires an SSH reach"), "{message}");
+    assert!(message.contains("drydock-agent") || message.contains("agent hello requires an SSH or relay reach"), "{message}");
     // No build for the prepared platform: refused before anything is created.
     let error = daemon.launch("foreign", &drydock::launch::LaunchOptions::default()).await.err().unwrap().to_string();
     assert!(error.contains("no vessel agent build for linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");

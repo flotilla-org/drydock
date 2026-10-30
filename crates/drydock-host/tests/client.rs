@@ -408,7 +408,7 @@ async fn managed_socket_has_one_owner() {
     assert!(host.client.hello().await.is_ok());
 }
 
-// Built-ins cover raw and JSON file values, missing/invalid fields and files,
+// Built-ins cover raw, JSON-object and JSON-field file values, missing/invalid fields and files,
 // environment reads, and the unsupported embedder port, without exposing values.
 #[tokio::test]
 async fn builtin_credential_resolution_and_redaction() {
@@ -423,6 +423,9 @@ async fn builtin_credential_resolution_and_redaction() {
     std::fs::write(&path, r#"{"token":"second-value"}"#).unwrap();
     let json = CredentialReference::File { path: path.clone(), json_field: Some("token".into()) };
     assert_eq!(source.resolve(&json).await.unwrap().value.expose(), "second-value");
+    // A whole JSON object file is the value, compacted so it fits in a header.
+    std::fs::write(&path, "{\n  \"bearer_token\": \"third-value\"\n}\n").unwrap();
+    assert_eq!(source.resolve(&raw).await.unwrap().value.expose(), r#"{"bearer_token":"third-value"}"#);
     for content in ["{bad-json-secret", "{}", r#"{"token":123}"#, r#"{"token":""}"#] {
         std::fs::write(&path, content).unwrap();
         let error = source.resolve(&json).await.unwrap_err();

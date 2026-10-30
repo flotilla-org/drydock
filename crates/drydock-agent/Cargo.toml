@@ -27,7 +27,7 @@ sha2.workspace = true
 # SO_MARK and original-destination APIs require the all feature.
 socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "sync", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "process", "sync", "fs", "time"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 headers = "0.4"

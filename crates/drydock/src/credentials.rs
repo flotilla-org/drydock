@@ -53,7 +53,12 @@ impl CredentialSource for BuiltinCredentials {
                         .and_then(|v| v.as_str())
                         .ok_or(CredentialError)?
                         .to_owned(),
-                    None => content.trim_end_matches(['\r', '\n']).to_owned(),
+                    // A JSON object credential (Namespace's `{"bearer_token": …}`)
+                    // travels in a header, so its formatting whitespace goes.
+                    None => match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(object @ serde_json::Value::Object(_)) => object.to_string(),
+                        _ => content.trim_end_matches(['\r', '\n']).to_owned(),
+                    },
                 }
             }
             CredentialReference::Embedder { .. } => return Err(CredentialError),

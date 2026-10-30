@@ -1,4 +1,4 @@
-//! In-memory conformance module. Relay echoes; exec supports cat/echo without a subprocess.
+//! In-memory conformance module. Relay echoes (or reaches a configured agent socket); exec supports cat/echo without a subprocess.
 use crate::{RecoverLock, module::*};
 use async_trait::async_trait;
 use drydock_protocol::*;
@@ -33,6 +33,10 @@ struct ReferenceSettings {
     fixture_bad_relay: bool,
     #[serde(default)]
     reach: Option<Reach>,
+    /// Relay to the agent listening at this socket instead of echoing: a
+    /// stand-in for a host that carries the connection to its vessel's agent.
+    #[serde(default)]
+    relay_socket: Option<std::path::PathBuf>,
     /// Declare that vessels run the drydock agent (no guest exists here).
     #[serde(default)]
     agent: bool,
@@ -217,6 +221,12 @@ impl Provider for Reference {
     async fn relay(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
         self.check()?;
         self.find(id)?;
+        if let Some(socket) = &self.settings.relay_socket {
+            let stream = tokio::net::UnixStream::connect(socket)
+                .await
+                .map_err(|e| ProtocolError::unavailable(format!("relay socket: {e}"), None))?;
+            return Ok(Box::new(stream));
+        }
         let (client, mut server) = tokio::io::duplex(65536);
         let corrupt = self.settings.fixture && self.settings.fixture_bad_relay;
         tokio::spawn(async move {
