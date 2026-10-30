@@ -256,12 +256,18 @@ impl Processes {
     pub(crate) async fn drain(&self, limit: Duration) -> Vec<ProcessInfo> {
         *self.draining.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         let deadline = tokio::time::Instant::now() + limit;
+        // Every exit is pushed as an event, so wake on events, not a timer.
+        let mut events = self.events.subscribe();
         loop {
+            events.borrow_and_update();
             let running: Vec<_> = self.list().into_iter().filter(|p| p.state == ProcessState::Running).collect();
-            if running.is_empty() || tokio::time::Instant::now() >= deadline {
+            if running.is_empty() {
                 return running;
             }
-            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(20))).await;
+            match tokio::time::timeout_at(deadline, events.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return self.list().into_iter().filter(|p| p.state == ProcessState::Running).collect(),
+            }
         }
     }
     pub(crate) fn get(&self, id: &str) -> Result<Arc<Handle>, AgentError> {
