@@ -217,16 +217,15 @@ impl Daytona {
         }
     }
     fn remember(&self, id: &str) {
-        self.known.lock().unwrap().insert(id.to_owned());
+        self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned());
     }
     /// An empty list is a fact only if every sandbox this provider knows is gone.
     /// Otherwise the vendor is hiding live sandboxes and a sweep over the list
     /// would read as "nothing exists", so the provider reports itself unavailable.
-    async fn vouch_for_empty_list(&self, empty: bool, c: &Credentials) -> Result<()> {
-        if !empty {
-            return Ok(());
-        }
-        let known: Vec<String> = self.known.lock().unwrap().iter().cloned().collect();
+    /// The known set is per process: a freshly started host with a blind list has
+    /// nothing to vouch against, and its record-holding caller must cross-check.
+    async fn vouch_for_empty_list(&self, c: &Credentials) -> Result<()> {
+        let known: Vec<String> = self.known.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
         for id in known {
             match self.call(Method::GET, self.sandbox_url(&id, None)?, None, c).await {
                 Err(ProtocolError::NotFound { .. }) => {}
@@ -239,7 +238,7 @@ impl Daytona {
                 }
                 Err(e) => return Err(e),
             }
-            self.known.lock().unwrap().remove(&id);
+            self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         }
         Ok(())
     }
@@ -747,6 +746,7 @@ impl Provider for Daytona {
         }
         // The sandbox name derives from the label, so re-adoption is a direct read:
         // Daytona's list is not trusted to show a live sandbox.
+        // Daytona's `GET /sandbox/{idOrName}` accepts the derived name.
         let derived = name("environment", &r.label);
         let found = match self.call(Method::GET, self.sandbox_url(&derived, None)?, None, c).await {
             Ok(v) => Some(v),
@@ -807,7 +807,9 @@ impl Provider for Daytona {
         // sandbox mid-destroy is absent from `list`, while `inspect` still reports
         // `Destroying`.
         let inventory = self.inventory(None, c).await?;
-        self.vouch_for_empty_list(inventory.is_empty(), c).await?;
+        if inventory.is_empty() {
+            self.vouch_for_empty_list(c).await?;
+        }
         let mut rows = Vec::new();
         for v in inventory {
             let row = self.environment(v)?;
@@ -840,7 +842,10 @@ impl Provider for Daytona {
         for attempt in 1..=DESTROY_ATTEMPTS {
             let url = self.sandbox_url(id, None)?;
             match self.request(Method::DELETE, url, None, c, true, ResponseFormat::Json).await {
-                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
+                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => {
+                    self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                    return Ok(());
+                }
                 Ok(None) if attempt < DESTROY_ATTEMPTS => tokio::time::sleep(DESTROY_RETRY_DELAY).await,
                 Ok(None) => break,
                 Err(e) => return Err(e),
