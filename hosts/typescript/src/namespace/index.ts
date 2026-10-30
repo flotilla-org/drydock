@@ -439,21 +439,27 @@ class Namespace implements Provider {
     const present = async () =>
       (await box.services.list({ signal })).find((s) => s.name === SERVICE);
     if (await call(present)) return;
-    await call(
-      () =>
-        box.services.create(
-          {
-            name: SERVICE,
-            command: AGENT,
-            description: "drydock vessel agent",
-            startPolicy: "on-boot",
-            restartPolicy: "always",
-            preventIdleShutdown: true,
-          },
-          { signal },
-        ),
-      present,
-    );
+    try {
+      await call(
+        () =>
+          box.services.create(
+            {
+              name: SERVICE,
+              command: AGENT,
+              description: "drydock vessel agent",
+              startPolicy: "on-boot",
+              restartPolicy: "always",
+              preventIdleShutdown: true,
+            },
+            { signal },
+          ),
+        present,
+      );
+    } catch (error) {
+      // A concurrent provision of the same label created it first; Namespace
+      // refuses the second create as a name conflict.
+      if (!(await call(present))) throw error;
+    }
   }
 
   async provision(

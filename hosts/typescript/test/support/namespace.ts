@@ -96,7 +96,11 @@ export class StandIn implements Vendor {
           const target = standIn.row(id);
           standIn.connect(target);
           if (target.services.some((s) => s.name === input.name))
-            throw new ConnectError("service exists", Code.AlreadyExists);
+            // As Namespace answers it: an invalid argument, not AlreadyExists.
+            throw new ConnectError(
+              `conflict: service name "${input.name}" conflicts with svc-0`,
+              Code.InvalidArgument,
+            );
           const service = {
             id: `svc-${target.services.length}`,
             name: input.name,

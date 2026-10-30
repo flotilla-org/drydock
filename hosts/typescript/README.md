@@ -108,7 +108,9 @@ wait`, `ingress access` and `containerregistry *`,
   is missing, a stopped one is returned untouched.
 - Reach is this host's relay route; the relay is an SSH exec channel over the
   SDK's gateway running `drydock-agent --bridge`, since the gateway refuses
-  Unix-socket forwards. Exposures travel over that one agent connection.
+  Unix-socket forwards. Exposures travel over that one agent connection. The
+  tools image's agent must have `--bridge`: an older pin's agent never answers
+  hello, so Namespace needs a tools image published from this revision on.
 - Suspend and resume are devbox stop and start: files survive, memory does not.
   A devbox stopped by its lifetime cap or idling reads as `paused_by_provider`
   and resumes; one this host stopped reads as `suspended_by_request` until the
@@ -120,7 +122,10 @@ wait`, `ingress access` and `containerregistry *`,
   refuses CIDR, port and address entries; an absent request is deny all. Declared enforcement is advisory; an
   environment reports enforced only when `egress_probe` passes as root.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
-  platform class). Usage is undeclared.
+  platform class). The grants above do not cover it: without its grant quota
+  is refused and the provider stays ready. Usage is undeclared.
+- A permission denial (a token lacking a grant) is a refusal; only an
+  unauthenticated token is a rejected credential.
 - SDK calls through the gateway can fail with `Premature close` after taking
   effect; `src/namespace/vendor.ts` is the one place that retries them, and it
   checks the resulting state first, so nothing is created or stopped twice.

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   AGENT,
   LABEL,
@@ -179,6 +180,33 @@ test("provision creates a labelled devbox with the agent service, idempotently",
   assert.equal(again.environment.id, first.environment.id);
   assert.equal(standIn.rows.size, 1);
   assert.equal(row.services.length, 1);
+  // Concurrent provisions of a new label make one devbox and one service,
+  // even when both find the service missing before either creates it.
+  const get = standIn.devboxes.get;
+  let arrive = () => {};
+  const both = new Promise<void>((resolve) => {
+    let count = 0;
+    arrive = () => ++count === 2 && resolve();
+  });
+  standIn.devboxes.get = async (...args) => {
+    const box = await get(...args);
+    const list = box.services.list;
+    box.services.list = async (options) => {
+      const services = await list(options);
+      arrive();
+      await both;
+      return services;
+    };
+    return box;
+  };
+  const raced = await Promise.all([
+    provision("raced", egress),
+    provision("raced", egress),
+  ]);
+  standIn.devboxes.get = get;
+  assert.deepEqual(raced.map((r) => r.created).sort(), [false, true]);
+  assert.equal(raced[0].environment.id, raced[1].environment.id);
+  assert.equal(standIn.rows.get(raced[0].environment.id)!.services.length, 1);
   // The same label with another size or policy is not this devbox.
   await assert.rejects(
     provision("vessel", egress, { ...SIZE, cpus: 8, memory_bytes: 16 * GiB }),
@@ -448,6 +476,22 @@ test("quota reports live concurrency", async () => {
       ["environments", "linux", "{instance}", 1, 3],
     ],
   );
+});
+
+// A token without an operation's grant is still a valid credential: the call
+// is refused and the provider stays usable. Only an unauthenticated token is
+// rejected.
+test("a missing grant is refused; a bad token is rejected", async () => {
+  const { standIn, provider, context } = await setup();
+  for (const [code, expected] of [
+    [Code.PermissionDenied, "refused"],
+    [Code.Unauthenticated, "credential_rejected"],
+  ] as const) {
+    standIn.concurrency = async () => {
+      throw new ConnectError("access denied", code);
+    };
+    await assert.rejects(provider.quota!(context), kind(expected));
+  }
 });
 
 // A rotated credential gets a new SDK client; the old one closes only when

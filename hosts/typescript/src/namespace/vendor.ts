@@ -171,16 +171,23 @@ export function protocolError(error: unknown): ProtocolFailure {
     return new ProtocolFailure({ kind: "unavailable", reason: "call aborted" });
   const detail = String((error as Error)?.message ?? error);
   if (error instanceof DevboxGatewayError)
-    return error.statusCode === 401 || error.statusCode === 403
+    return error.statusCode === 401
       ? new ProtocolFailure({
           kind: "credential_rejected",
-          reason: `Namespace gateway refused the credential (HTTP ${error.statusCode})`,
+          reason: "Namespace gateway refused the credential (HTTP 401)",
         })
-      : new ProtocolFailure({
-          kind: "unavailable",
-          reason: `Namespace gateway HTTP ${error.statusCode}`,
-          provider_error: detail,
-        });
+      : error.statusCode === 403
+        ? // A token lacking a grant (`ingress access` here) is still valid.
+          new ProtocolFailure({
+            kind: "refused",
+            reason:
+              "Namespace gateway denied the call (HTTP 403): the token lacks a grant",
+          })
+        : new ProtocolFailure({
+            kind: "unavailable",
+            reason: `Namespace gateway HTTP ${error.statusCode}`,
+            provider_error: detail,
+          });
   if (error instanceof DevboxTimeoutError)
     return new ProtocolFailure({
       kind: "unavailable",
@@ -190,10 +197,15 @@ export function protocolError(error: unknown): ProtocolFailure {
   const connect = error instanceof ConnectError ? error : undefined;
   switch (connect?.code) {
     case Code.Unauthenticated:
-    case Code.PermissionDenied:
       return new ProtocolFailure({
         kind: "credential_rejected",
         reason: `Namespace refused the credential: ${connect.rawMessage}`,
+      });
+    case Code.PermissionDenied:
+      // The token is valid but lacks the operation's grant.
+      return new ProtocolFailure({
+        kind: "refused",
+        reason: `Namespace denied the operation (the token lacks a grant): ${connect.rawMessage}`,
       });
     case Code.NotFound:
       return new ProtocolFailure({
