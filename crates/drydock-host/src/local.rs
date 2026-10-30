@@ -220,10 +220,7 @@ impl Local {
         // so only the session finds everything it started.
         // SAFETY: setsid is async-signal-safe and touches no shared state.
         unsafe {
-            command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
+            command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
         }
         let mut child = command.spawn().map_err(|e| unavailable(format!("start agent: {e}")))?;
         let pid = child.id().ok_or_else(|| unavailable("agent exited at once"))?;
@@ -305,7 +302,8 @@ enum Process {
     Other,
 }
 fn process(pid: i32, socket: &Path) -> Process {
-    // SAFETY: signal 0 only checks that the process exists.
+    // SAFETY: signal 0 only checks that the process exists. EPERM (another user's
+    // process has taken the PID) also reads as gone: it is not ours to signal.
     if unsafe { libc::kill(pid, 0) } != 0 {
         return Process::Gone;
     }
@@ -313,8 +311,8 @@ fn process(pid: i32, socket: &Path) -> Process {
         Ok(cmdline) if cmdline.is_empty() => Process::Gone,
         Ok(cmdline) if cmdline.split(|b| *b == 0).any(|arg| arg == socket.as_os_str().as_bytes()) => Process::Agent,
         Ok(_) => Process::Other,
-        // Without procfs the signal check is all there is.
-        Err(_) => Process::Agent,
+        // Procfs is how the process is recognised; the module is ready only where it exists.
+        Err(_) => Process::Gone,
     }
 }
 /// The processes still in the session the agent leads: the agent, the commands
@@ -337,8 +335,12 @@ async fn stop(dir: &Path, socket: &Path) {
     let Some(pid) = agent_pid(dir).await else { return };
     if process(pid, socket) != Process::Other {
         let signal_all = |signal: i32| {
-            // SAFETY: signals the agent's own process group and session members; ESRCH when gone.
-            unsafe { libc::kill(-pid, signal) };
+            // The group is the agent's only while the agent is: its PID may have been recycled
+            // since. Session members are matched by session id, so they are always ours.
+            if process(pid, socket) == Process::Agent {
+                // SAFETY: signals the process group the agent leads.
+                unsafe { libc::kill(-pid, signal) };
+            }
             for member in session(pid) {
                 unsafe { libc::kill(member, signal) };
             }
@@ -404,6 +406,9 @@ impl Provider for Local {
         ObservationMode::Poll { interval_ms: 1000 }
     }
     fn readiness(&self, _: &Credentials) -> Readiness {
+        if !cfg!(target_os = "linux") {
+            return Readiness::MissingTool { reason: "local vessels track their processes through procfs and need Linux".into() };
+        }
         match agent_build(self.agent.as_deref()) {
             Ok(_) => Readiness::Ready,
             Err(reason) => Readiness::MissingTool { reason },
@@ -422,10 +427,17 @@ impl Provider for Local {
     async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
         let _changing = self.lifecycle.lock().await;
         let id = environment_id(&r.label);
-        if let Ok(record) = self.record(&id).await
-            && record.label.as_deref() == Some(r.label.as_str())
-        {
-            return Ok(Provisioned::Existing(self.environment(&id, record).await));
+        // Only an absent environment is created. An unreadable or corrupt record is an
+        // error, and a directory another label hashed to is never written over.
+        match self.record(&id).await {
+            Ok(record) if record.label.as_deref() == Some(r.label.as_str()) => {
+                return Ok(Provisioned::Existing(self.environment(&id, record).await));
+            }
+            Ok(_) => {
+                return Err(refused(format!("label {:?} collides with the id of another environment; use a different label", r.label)));
+            }
+            Err(ProtocolError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
         if r.prepared.provider != self.name
             || r.prepared.platform != Platform::current()
@@ -478,8 +490,8 @@ impl Provider for Local {
 impl SuspendResume for Local {
     /// Stops the agent and its process group; the directory and its files stay.
     async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
-        self.record(id).await?;
         let _changing = self.lifecycle.lock().await;
+        self.record(id).await?;
         let dir = self.dir(id);
         tokio::fs::write(dir.join(SUSPENDED), b"").await.map_err(|e| unavailable(format!("record suspension: {e}")))?;
         stop(&dir, &self.socket(id)).await;
@@ -487,11 +499,11 @@ impl SuspendResume for Local {
     }
     /// Starts the agent again, whether it was suspended or died.
     async fn resume(&self, id: &str, token: ResumeToken, _: &Credentials) -> Result<()> {
+        let _changing = self.lifecycle.lock().await;
         self.record(id).await?;
         if token != resume_token(&self.name, id) {
             return Err(refused("invalid resume token for this provider/environment"));
         }
-        let _changing = self.lifecycle.lock().await;
         let dir = self.dir(id);
         if !running(&dir, &self.socket(id)).await {
             self.start(id).await?;

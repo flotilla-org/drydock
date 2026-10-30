@@ -1125,6 +1125,7 @@ async fn reach(client: &Client, provider: &str, id: &str, options: &Options, age
     Err("reach requires a recipe round-trip probe (or hermetic echo relay)".into())
 }
 /// A relayed connection to a vessel's agent carries its hello over plain HTTP/1.1.
+/// (The local module's readiness probe speaks the same request; the crates share no code.)
 async fn agent_hello(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> Result<()> {
     stream.write_all(b"GET /hello HTTP/1.1\r\nhost: agent\r\nconnection: close\r\n\r\n").await.map_err(SafeError::category)?;
     let mut reply = Vec::new();

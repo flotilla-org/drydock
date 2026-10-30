@@ -439,3 +439,49 @@ async fn local_passes_conformance() {
     let remaining = managed.client.list("a").await.unwrap();
     assert_eq!(remaining.len(), 1, "{remaining:?}");
 }
+
+// A record that cannot be read is an error, not an absent environment: the
+// directory beside it is never written over.
+#[tokio::test]
+async fn a_corrupt_record_is_not_overwritten_by_provision() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "precious").await;
+    let record = root.path().join(&environment.id).join("environment.json");
+    std::fs::write(&record, "not json").unwrap();
+    let error = p.provision(request(&*p, "precious").await, &credentials()).await.unwrap_err();
+    assert!(matches!(error, ProtocolError::Internal { .. }), "{error:?}");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), "not json");
+    assert!(alive(pid(&root, &environment.id)), "the running agent was left alone");
+}
+
+// A label whose id belongs to another label is refused, not given that environment.
+#[tokio::test]
+async fn a_colliding_label_is_refused() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "owner").await;
+    let record = root.path().join(&environment.id).join("environment.json");
+    // Another label's environment sits where "owner" hashes to.
+    std::fs::write(&record, r#"{"label":"someone-else"}"#).unwrap();
+    let error = p.provision(request(&*p, "owner").await, &credentials()).await.unwrap_err();
+    assert!(matches!(error, ProtocolError::Refused { .. }), "{error:?}");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), r#"{"label":"someone-else"}"#);
+}
+
+// If the recorded PID now belongs to another process, destroy leaves that process alone.
+#[tokio::test]
+async fn destroy_spares_a_process_that_recycled_the_agents_pid() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "recycled").await;
+    let real = pid(&root, &environment.id);
+    unsafe { libc::kill(-real, libc::SIGKILL) };
+    eventually("the agent died", || !alive(real)).await;
+    let mut bystander = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+    std::fs::write(root.path().join(&environment.id).join("agent.pid"), bystander.id().to_string()).unwrap();
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    assert!(alive(bystander.id() as i32), "an unrelated process was killed");
+    bystander.kill().unwrap();
+    bystander.wait().unwrap();
+}
