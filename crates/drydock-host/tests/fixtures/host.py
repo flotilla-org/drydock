@@ -212,6 +212,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(200, value)
         if len(parts) == 5 and parts[-1] == "quota":
             quota_calls += 1
+            # Explicit nulls here are deliberate: they cover readers accepting `null` as absent.
             value = {"credits_remaining": float("inf") if fault in ("credits", "quota_before") or (fault == "quota_after" and quota_calls >= 3) else None,
                      "credit_unit": None, "concurrency_in_use": sum(row["state"]["state"] == "running" for row in rows.values()), "concurrency_limit": None}
             return self.respond(200, value)
