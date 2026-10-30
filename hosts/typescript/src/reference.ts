@@ -80,14 +80,9 @@ class Memory implements Provider {
       this.rows.set("unlabelled", {
         provider: name,
         id: "unlabelled",
-        label: null,
-        granted_size: null,
-        platform: null,
         egress: "advisory",
         state: { state: "transitioning", phase: "starting" },
-        timestamp: null,
         egress_measured: false,
-        egress_policy: null,
       });
   }
   readiness({ credential }: Context): Types["Readiness"] {

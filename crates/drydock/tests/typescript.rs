@@ -112,7 +112,6 @@ settings = {{ seed_unlabelled = true }}
             .filter(|s| !matches!(s, Scenario::Authentication | Scenario::HostFixtures | Scenario::Reach))
             .collect(),
         fixture_configuration: None,
-        null_environment_id: Some("unlabelled".into()),
         auth_audit: None,
         billing_sample_millis: 25,
         billing_settle_millis: 0,

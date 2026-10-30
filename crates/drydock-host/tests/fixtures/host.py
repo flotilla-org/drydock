@@ -97,8 +97,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value = {**value, "granted_size": None, "state": {"state": "unknown", "reason": "provider_api_error"}}
         if fault == "provision" and self.command == "POST" and self.path.endswith("/environments") and isinstance(value, dict) and "id" in value:
             value = {**value, "label": "wrong-label"}
-        if fault in ("explicit_nulls", "environment_nulls") and isinstance(value, dict) and value.get("id", "").startswith("null-"):
-            value = {key: val for key, val in value.items() if val is not None}
         body = b"" if status == 204 else json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -214,9 +212,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(200, value)
         if len(parts) == 5 and parts[-1] == "quota":
             quota_calls += 1
-            value = {"credits_remaining": float("inf") if fault in ("credits", "quota_before") or (fault == "quota_after" and quota_calls >= 3) else None,
+            # Explicit nulls here are deliberate: they cover readers accepting `null` as absent.
+            value = {"credits_remaining": float("inf") if fault in ("credits", "quota_before") or (fault == "quota_after" and quota_calls >= 2) else None,
                      "credit_unit": None, "concurrency_in_use": sum(row["state"]["state"] == "running" for row in rows.values()), "concurrency_limit": None}
-            if fault in ("null", "quota_nulls"): value.pop("credit_unit")
             return self.respond(200, value)
         if len(parts) == 5 and parts[-1] == "usage":
             period = {key: value[0] for key, value in urllib.parse.parse_qs(parsed.query).items()}
@@ -296,10 +294,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if parts[-1] == "exec" and body["command"][0] == "drydock-fixture":
                 command = body["command"]; action = command[1]; target = command[2] if len(command)>2 else identifier
                 result = None
-                if action == "null_environment":
-                    result = {"id":"null-"+identifier,"label":None,"provider":provider,"state":{"state":"unknown","reason":"provider_api_error"},"granted_size":None,"egress":"advisory"}
-                    rows[result["id"]] = result
-                elif action == "forget":
+                if action == "forget":
                     victim = rows[target]; stop_billing(target); del rows[target]; emit(victim,"gone",cause={"kind":"missing_on_list"})
                 elif action in ("state", "pause"):
                     stop_billing(target)

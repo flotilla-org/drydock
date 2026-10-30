@@ -8,7 +8,7 @@ fn fixture<T: Serialize + DeserializeOwned>(value: Value) {
 }
 
 // Literal fixtures independently pin every variant of the externally tagged wire families.
-// Empty strings/lists, null options and nested reasons exercise their boundary shapes.
+// Empty strings/lists, omitted options and nested reasons exercise their boundary shapes.
 #[test]
 fn tagged_wire_fixtures() {
     for value in [
@@ -46,7 +46,7 @@ fn tagged_wire_fixtures() {
     fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"","environments":[]}));
     // Partial snapshots explicitly mark unavailable providers; legacy complete snapshots omit the map.
     fixture::<ObserveRecord>(json!({"type":"snapshot","cursor":"c","environments":[],
-        "unavailable_providers":{"a":{"kind":"unavailable","reason":"not ready","retry_after":null}}}));
+        "unavailable_providers":{"a":{"kind":"unavailable","reason":"not ready"}}}));
     for event in [
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
@@ -55,7 +55,7 @@ fn tagged_wire_fixtures() {
         json!({"kind":"resumed"}),
         json!({"kind":"gone","cause":{"kind":"destroyed_by_request"}}),
     ] {
-        fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"usage","provider":"p","label":null,
+        fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"usage","provider":"p",
             "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"provider","event":event}}));
     }
     // Exposures: the agreed request and response layouts (drydock#132), with
@@ -63,8 +63,8 @@ fn tagged_wire_fixtures() {
     for event in [
         json!({"kind":"exposure","direction":"inward","name":"cleat","ready":false,
             "error":{"code":"vessel_unreachable","reason":"r"}}),
-        json!({"kind":"exposure","direction":"outward","name":"lab","ready":false,"error":null,"removed":true}),
-        json!({"kind":"exposure","direction":"inward","name":"cleat","ready":true,"error":null}),
+        json!({"kind":"exposure","direction":"outward","name":"lab","ready":false,"removed":true}),
+        json!({"kind":"exposure","direction":"inward","name":"cleat","ready":true}),
     ] {
         fixture::<ObserveRecord>(json!({"type":"event","event":{"cursor":"c","id":"e","provider":"p","label":"l",
             "timestamp":"2026-10-19T00:00:00Z","timestamp_source":"adaptor","event":event}}));
@@ -72,7 +72,7 @@ fn tagged_wire_fixtures() {
     fixture::<InwardRequest>(json!({"target":{"unix":"/run/cleat/cleat.sock"}}));
     fixture::<InwardRequest>(json!({"target":{"tcp":"127.0.0.1:8080"}}));
     fixture::<Inward>(json!({"name":"cleat","target":{"unix":"/run/cleat/cleat.sock"},
-        "local":{"unix":"/run/drydock/exposures/e/cleat.sock"},"ready":true,"error":null}));
+        "local":{"unix":"/run/drydock/exposures/e/cleat.sock"},"ready":true}));
     fixture::<OutwardRequest>(json!({"guest":{"unix":"/run/flotilla/crew.sock"},"destination":{"unix":"/srv/crew.sock"}}));
     fixture::<OutwardRequest>(json!({"guest":{"name":"forgejo.lab.flotilla.work","port":443},
         "destination":{"tcp":"forgejo.lab.flotilla.work:443"}}));
@@ -132,7 +132,7 @@ fn progress_and_neutral_resource_wire() {
     fixture::<UsageMeasurements>(
         json!({"scope":{"kind":"organization","id":"opaque/eu"},"resources":{"cpu":{"amount":123.0,"unit":"{vCPU}.s"}},"cost":{"amount":"9007199254740993.000001","currency":"USD"}}),
     );
-    fixture::<ResourceQuota>(json!({"key":{"region":"eu","class":"container","resource":"memory"},"unit":"By","in_use":0.0,"limit":null}));
+    fixture::<ResourceQuota>(json!({"key":{"region":"eu","class":"container","resource":"memory"},"unit":"By","in_use":0.0}));
     for amount in [json!(0.12), json!("NaN"), json!("-1"), json!("1e3"), json!(""), json!("1.")] {
         assert!(serde_json::from_value::<Cost>(json!({"amount":amount,"currency":"USD"})).is_err());
     }
@@ -195,8 +195,7 @@ fn platform_wire_shapes() {
     );
     fixture::<PrepareRequest>(json!({"size": size, "platform": amd64, "image_digest": "image", "tools_digest": "tools"}));
     fixture::<PrepareRequest>(json!({"size": size, "image_digest": "image", "tools_digest": "tools"}));
-    let environment =
-        json!({"id": "e", "label": null, "provider": "p", "state": {"state": "running"}, "granted_size": null, "egress": "advisory"});
+    let environment = json!({"id": "e", "provider": "p", "state": {"state": "running"}, "egress": "advisory"});
     fixture::<Environment>(environment.clone());
     let mut recorded = environment;
     recorded["platform"] = amd64;
@@ -217,4 +216,29 @@ fn platform_names_are_plain_oci_names() {
     for text in ["linux", "linux/", "/amd64", "Linux/amd64", "linux/amd64/v8"] {
         assert!(text.parse::<Platform>().is_err(), "{text}");
     }
+}
+
+// Absent optional fields are omitted on output, never written as `null`.
+#[test]
+fn absent_optional_fields_are_omitted() {
+    let environment: Environment =
+        serde_json::from_value(json!({"id": "e", "provider": "p", "state": {"state": "running"}, "egress": "advisory"})).unwrap();
+    let written = serde_json::to_value(&environment).unwrap();
+    for field in ["label", "granted_size", "platform", "timestamp", "egress_policy"] {
+        assert!(written.get(field).is_none(), "{field} was written");
+    }
+    assert_eq!(serde_json::to_value(serde_json::from_value::<Quota>(json!({})).unwrap()).unwrap(), json!({}));
+}
+
+// Readers accept an omitted optional field and an explicit `null` alike.
+#[test]
+fn readers_accept_omitted_and_null_optional_fields() {
+    let omitted = json!({"id": "e", "provider": "p", "state": {"state": "running"}, "egress": "advisory"});
+    let nulled = json!({"id": "e", "label": null, "provider": "p", "state": {"state": "running"}, "granted_size": null, "platform": null,
+        "timestamp": null, "egress_policy": null, "egress": "advisory"});
+    let from_omitted: Environment = serde_json::from_value(omitted).unwrap();
+    assert_eq!(from_omitted, serde_json::from_value(nulled).unwrap());
+    assert_eq!(from_omitted.label, None);
+    let quota: Quota = serde_json::from_value(json!({"credits_remaining": null, "credit_unit": null})).unwrap();
+    assert_eq!(quota, serde_json::from_value(json!({})).unwrap());
 }

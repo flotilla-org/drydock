@@ -450,15 +450,18 @@ pub struct ProvisionRequest {
     pub size: Size,
     #[serde(default)]
     pub egress: EgressRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_public_key: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Environment {
     pub id: String,
     /// Unlabelled resources are listable, inspectable and destroyable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub provider: String,
     pub state: Observation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_size: Option<Size>,
     pub egress: Enforcement,
     /// The platform the environment runs, when the provider records it.
@@ -626,6 +629,7 @@ pub struct Event {
     pub cursor: String,
     pub id: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// RFC 3339 timestamp.
     #[schema(format = DateTime)]
@@ -658,7 +662,7 @@ pub enum EventKind {
         direction: Direction,
         name: String,
         ready: bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ExposureError>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         removed: bool,
@@ -781,6 +785,7 @@ pub struct ResourceQuota {
     pub key: QuotaKey,
     pub unit: ResourceUnit,
     pub in_use: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<f64>,
 }
 
@@ -810,9 +815,13 @@ pub struct SizeUsage {
 pub struct Quota {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceQuota>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_remaining: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_in_use: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -849,6 +858,7 @@ pub enum ProtocolError {
     },
     Unavailable {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after: Option<u64>,
         /// Bounded provider/transport detail, masked for credentials by the host.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -858,6 +868,7 @@ pub enum ProtocolError {
     },
     RateLimited {
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after: Option<u64>,
     },
     QuotaExhausted {
