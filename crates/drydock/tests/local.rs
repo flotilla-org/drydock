@@ -1,6 +1,7 @@
 //! A daemon configured with the `local` provider takes a launch through to an
 //! agent it has connected to, the whole path a convoy's crew uses, with no
 //! credential configured and no cloud or container runtime involved.
+#![cfg(target_os = "linux")]
 #[path = "../../drydock-host/tests/support/agent.rs"]
 mod agent;
 use drydock::{

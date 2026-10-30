@@ -1,5 +1,6 @@
 //! The `local` module against the real `drydock-agent`: each test starts agents
 //! as child processes under a temporary root.
+#![cfg(target_os = "linux")]
 #[path = "support/agent.rs"]
 mod agent;
 #[path = "support/public_server.rs"]
@@ -286,7 +287,7 @@ async fn destroy_kills_the_agent_and_its_process_group() {
     let _child = client.spawn(drydock_agent::Exec::new("sh", ["-c", &script])).await.unwrap();
     eventually("the command started", || marker.exists() && !std::fs::read_to_string(&marker).unwrap().trim().is_empty()).await;
     let child_pid: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
-    assert!(alive(child_pid));
+    eventually("the command is running", || alive(child_pid)).await;
 
     p.destroy(&environment.id, &credentials()).await.unwrap();
     p.destroy(&environment.id, &credentials()).await.unwrap();

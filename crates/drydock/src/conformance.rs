@@ -1131,7 +1131,13 @@ async fn agent_hello(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> R
     let mut reply = Vec::new();
     (&mut stream).take(65536).read_to_end(&mut reply).await.map_err(SafeError::category)?;
     let reply = String::from_utf8_lossy(&reply);
-    require(reply.starts_with("HTTP/1.1 200") && reply.contains("fingerprint"), "relay did not carry the agent's hello")
+    // The body is the hello JSON, possibly framed by chunk sizes.
+    let body =
+        reply.find('{').zip(reply.rfind('}')).and_then(|(start, end)| serde_json::from_str::<serde_json::Value>(&reply[start..=end]).ok());
+    require(
+        reply.starts_with("HTTP/1.1 200") && body.is_some_and(|hello| hello["fingerprint"].is_string()),
+        "relay did not carry the agent's hello",
+    )
 }
 async fn egress(client: &Client, provider: &str, environment: &Environment, options: &Options) -> Result<()> {
     require(environment.egress == Enforcement::Enforced, "Enforced declaration downgraded")?;

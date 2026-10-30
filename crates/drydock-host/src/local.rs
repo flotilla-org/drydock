@@ -46,10 +46,8 @@ pub struct LocalModule;
 #[serde(deny_unknown_fields)]
 struct Settings {
     /// Where environment directories live. Defaults to `local` under drydock's state directory.
-    #[serde(default)]
     root: Option<PathBuf>,
     /// The `drydock-agent` to run, instead of the installed build.
-    #[serde(default)]
     agent: Option<PathBuf>,
 }
 
@@ -224,7 +222,11 @@ impl Local {
         }
         let mut child = command.spawn().map_err(|e| unavailable(format!("start agent: {e}")))?;
         let pid = child.id().ok_or_else(|| unavailable("agent exited at once"))?;
-        tokio::fs::write(dir.join(PID), pid.to_string()).await.map_err(|e| unavailable(format!("record agent pid: {e}")))?;
+        if let Err(e) = tokio::fs::write(dir.join(PID), pid.to_string()).await {
+            // Unrecorded, the agent could never be stopped later.
+            let _ = child.start_kill();
+            return Err(unavailable(format!("record agent pid: {e}")));
+        }
         // Reaps the agent when it exits, however that happens.
         let exit = tokio::spawn(async move { child.wait().await });
         let ready = tokio::time::timeout(STARTUP, async {
@@ -241,7 +243,7 @@ impl Local {
         .await;
         let result = ready.unwrap_or_else(|_| Err(unavailable(format!("agent did not answer hello within {STARTUP:?}"))));
         if result.is_err() {
-            stop(&dir, &socket).await;
+            let _ = stop(&dir, &socket).await;
         }
         result
     }
@@ -331,8 +333,8 @@ fn session(leader: i32) -> Vec<i32> {
         .collect()
 }
 /// Kill the agent and everything in its session, and wait until they are gone.
-async fn stop(dir: &Path, socket: &Path) {
-    let Some(pid) = agent_pid(dir).await else { return };
+async fn stop(dir: &Path, socket: &Path) -> Result<()> {
+    let Some(pid) = agent_pid(dir).await else { return Ok(()) };
     if process(pid, socket) != Process::Other {
         let signal_all = |signal: i32| {
             // The group is the agent's only while the agent is: its PID may have been recycled
@@ -342,6 +344,7 @@ async fn stop(dir: &Path, socket: &Path) {
                 unsafe { libc::kill(-pid, signal) };
             }
             for member in session(pid) {
+                // SAFETY: signals a process found in the agent's session; ESRCH when it has gone.
                 unsafe { libc::kill(member, signal) };
             }
         };
@@ -355,9 +358,13 @@ async fn stop(dir: &Path, socket: &Path) {
         gone(TERMINATION_GRACE).await;
         signal_all(libc::SIGKILL);
         gone(Duration::from_secs(5)).await;
+        if process(pid, socket) == Process::Agent || !session(pid).is_empty() {
+            return Err(unavailable("the agent or its processes survived SIGKILL"));
+        }
     }
     let _ = tokio::fs::remove_file(dir.join(PID)).await;
     let _ = tokio::fs::remove_file(socket).await;
+    Ok(())
 }
 /// Whether the agent at `socket` answers `GET /hello`, which it serves over plain HTTP/1.1.
 async fn hello(socket: &Path) -> bool {
@@ -467,7 +474,7 @@ impl Provider for Local {
         }
         let _changing = self.lifecycle.lock().await;
         let dir = self.dir(id);
-        stop(&dir, &self.socket(id)).await;
+        stop(&dir, &self.socket(id)).await?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -493,8 +500,8 @@ impl SuspendResume for Local {
         let _changing = self.lifecycle.lock().await;
         self.record(id).await?;
         let dir = self.dir(id);
+        stop(&dir, &self.socket(id)).await?;
         tokio::fs::write(dir.join(SUSPENDED), b"").await.map_err(|e| unavailable(format!("record suspension: {e}")))?;
-        stop(&dir, &self.socket(id)).await;
         Ok(resume_token(&self.name, id))
     }
     /// Starts the agent again, whether it was suspended or died.
