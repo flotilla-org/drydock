@@ -118,17 +118,26 @@ operator to land.
 
 `PrepareRequest.tools_digest` is the immutable bootstrap tools reference selected
 by this build's checked-in pin (or build-time override), including registry
-location and index digest. It may identify an older agent; upgrade it after hello
-as described above, rather than refusing the vessel for a fingerprint mismatch. Resolve the index
+location and index digest. The agent it carries is only a cache: it may be
+older than the host, which upgrades it to its own build after hello as
+described above, rather than refusing the vessel for a fingerprint mismatch. Resolve the index
 for the guest architecture. The prepared form is the selected base plus the
 tools layer, added where the image route the module declares says: built at
 the provider, or appended to the base manifest by the host. Record the prepared form at the provider. Leave the base's entrypoint,
 command and init unchanged. On `BootstrapRoute::Upload`, deliver the identical
-files under `/opt/drydock` instead of baking them.
+files under `/opt/drydock` instead of baking them. A vessel whose image has no
+agent gets one placed by its module before the first hello, through the
+provider's own route: a files API, a copy or upload, or at worst exec with the
+binary piped to a file that is then made executable, which every module can do.
 
-Each module decides its key, including both image and tools digests and any
-provider prepare-time constraints. Daytona adds size (#44). This supersedes the
-older ADR 0070 Bootstrap wording that the pair alone keys every prepared form.
+Each module decides its key from the image digest, the platform and any
+provider prepare-time constraints; Daytona adds size (#44). The tools digest is
+not part of it: a prepared form made with an older tools image is reused, and
+its agent upgraded at the first hello. Forms prepared before the frozen upgrade
+path (#152) carry an agent that predates it, so modules mark the new key (Daytona
+prefixes it with `frozen-agent`) and those images are prepared again, once. This
+supersedes the older ADR 0070 Bootstrap wording that the pair alone keys every
+prepared form.
 Callers always prepare then provision; refuse a provision that does not match.
 
 Start `/opt/drydock/drydock-agent` with **no arguments** through the provider's

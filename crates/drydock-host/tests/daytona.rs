@@ -1063,10 +1063,10 @@ async fn name_conflict_readopts_without_retrying_creation() {
     assert!(matches!(row(stopped).state, Observation::Stopped { .. }));
 }
 
-// Concurrent prepare at independent hosts converges on the digest-pair name;
-// changing the tools digest must produce a different snapshot.
+// Concurrent prepare at independent hosts converges on one snapshot name,
+// which another tools digest shares: the agent in it is only a cache.
 #[tokio::test]
-async fn preparation_converges_by_digest_pair() {
+async fn preparation_converges_on_the_image_and_ignores_the_tools_image() {
     let http = Arc::new(StandIn::default());
     let a = provider(http.clone()).await;
     let b = provider(http.clone()).await;
@@ -1083,10 +1083,12 @@ async fn preparation_converges_by_digest_pair() {
     let x = x.unwrap();
     assert_eq!(x, y.unwrap());
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
+    // The agent baked in is only a cache, so another tools image reuses the
+    // snapshot; the host upgrades its agent at the first hello.
     r.tools_digest = tools_image('b');
     let other = a.prepare(r, &c).await.unwrap();
-    assert_ne!(x.id, other.id);
-    assert_eq!(http.0.lock().unwrap().snapshots.len(), 2);
+    assert_eq!((other.id.as_str(), other.tools_digest.as_str()), (x.id.as_str(), tools_image('b').as_str()));
+    assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
     assert!(
         a.prepare(
             PrepareRequest {

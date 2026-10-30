@@ -69,7 +69,9 @@ struct Reference {
 }
 #[derive(Default)]
 struct Memory {
-    prepared: BTreeMap<(String, String, Platform), Prepared>,
+    /// Keyed by image and platform: the agent in a prepared form is only a
+    /// cache the host upgrades at hello, so the tools image is not in the key.
+    prepared: BTreeMap<(String, Platform), Prepared>,
     environments: BTreeMap<String, Environment>,
     tokens: BTreeMap<String, ResumeToken>,
     next: u64,
@@ -137,17 +139,14 @@ impl Provider for Reference {
         let platform = prepare_platform(&r)?;
         let mut state = self.state.recover();
         let n = state.prepared.len() + 1;
-        Ok(state
-            .prepared
-            .entry((r.image_digest.clone(), r.tools_digest.clone(), platform.clone()))
-            .or_insert_with(|| Prepared {
-                provider: self.name.clone(),
-                id: format!("prepared-{n}"),
-                platform,
-                image_digest: r.image_digest,
-                tools_digest: r.tools_digest,
-            })
-            .clone())
+        let prepared = state.prepared.entry((r.image_digest.clone(), platform.clone())).or_insert_with(|| Prepared {
+            provider: self.name.clone(),
+            id: format!("prepared-{n}"),
+            platform,
+            image_digest: r.image_digest,
+            tools_digest: r.tools_digest.clone(),
+        });
+        Ok(Prepared { tools_digest: r.tools_digest, ..prepared.clone() })
     }
     async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
         self.check()?;
@@ -159,7 +158,7 @@ impl Provider for Reference {
                 ..s.clone()
             }));
         }
-        if !state.prepared.values().any(|p| p == &r.prepared) {
+        if !state.prepared.values().any(|p| Prepared { tools_digest: r.prepared.tools_digest.clone(), ..p.clone() } == r.prepared) {
             return Err(refused("unknown prepared form"));
         }
         if matches!(&r.egress,EgressRequest::DenyAll {direct} if !direct.is_empty()) {

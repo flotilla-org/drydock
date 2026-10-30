@@ -35,6 +35,13 @@ pub fn fingerprint() -> io::Result<String> {
     std::io::copy(&mut std::fs::File::open(std::env::current_exe()?)?, &mut digest)?;
     Ok(format!("{:x}", digest.finalize()))
 }
+/// The `Upgrade` token of `GET /control`, which turns an HTTP/1.1
+/// connection of the frozen upgrade path into the current wire.
+pub const CONTROL: &str = "drydock-control";
+/// The reply to `GET /hello`. It belongs to the frozen upgrade path: every
+/// agent generation sends it over plain HTTP/1.1, and these fields keep their
+/// names and meanings. Fields can be added; none is removed or redefined, and
+/// a reader ignores fields it does not know.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hello {
     pub fingerprint: String,
@@ -53,6 +60,36 @@ pub struct Hello {
     /// ordinary start rolls back to the previous executable.
     #[serde(default)]
     pub probation: bool,
+}
+/// The optional JSON body of `POST /upgrade?sha256=`. Part of the frozen
+/// upgrade path: fields can be added, none removed or redefined, and the
+/// agent ignores fields it does not know. Options go here, not in the query,
+/// which keeps exactly `sha256`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Activation {
+    /// How long, in milliseconds, the agent waits for its running processes
+    /// to exit before it re-execs. It starts no new ones meanwhile. Absent
+    /// or zero: it does not wait. The agent waits at most 60 seconds.
+    #[serde(default)]
+    pub drain_ms: u64,
+}
+/// The reply to an activation, sent once the drain is over and just before
+/// the re-exec. Advisory: the re-exec can close the connection first.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Activated {
+    /// The digest activated as the candidate.
+    pub sha256: String,
+    /// Processes still running when the drain's limit passed. They keep
+    /// running across the re-exec, but lose their handles and output reader.
+    #[serde(default)]
+    pub running: Vec<RunningProcess>,
+}
+/// A process that outlived an upgrade's drain.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningProcess {
+    pub id: String,
+    pub pid: u32,
+    pub program: String,
 }
 /// The OCI platform type shared with the provider API; an agent reports the
 /// platform its own executable was built for.

@@ -102,13 +102,10 @@ class Memory implements Provider {
     signal.throwIfAborted();
     if (!request.platform || request.route !== "remote_build")
       refused("reference requires resolved platform and image route");
+    // The agent in a prepared form is only a cache the host upgrades at
+    // hello, so the tools image is not part of the key.
     const prepared: Types["Prepared"] = {
-      id: digest([
-        request.image_digest,
-        request.tools_digest,
-        request.platform,
-        request.size,
-      ]),
+      id: digest([request.image_digest, request.platform, request.size]),
       provider: this.name,
       platform: request.platform,
       image_digest: request.image_digest,
@@ -128,8 +125,13 @@ class Memory implements Provider {
     // Label idempotency wins over a new/stale prepared form, as in the Rust reference.
     if (existing)
       return { created: false, environment: structuredClone(existing) };
+    const build = this.builds.get(request.prepared.id);
     if (
-      !isDeepStrictEqual(this.builds.get(request.prepared.id), request.prepared)
+      !build ||
+      !isDeepStrictEqual(
+        { ...build, tools_digest: request.prepared.tools_digest },
+        request.prepared,
+      )
     )
       refused("unknown prepared form");
     const row: Types["Environment"] = {

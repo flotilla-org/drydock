@@ -51,7 +51,7 @@ test("reference validates settings and owns deterministic prepared keys", async 
     ),
     prepared,
   );
-  assert.notEqual(
+  assert.equal(
     (await provider.prepare({ ...input, tools_digest: "other-tools" }, context))
       .id,
     prepared.id,

@@ -62,6 +62,10 @@ impl Events {
         }
         self.changed.send_replace(log.serial);
     }
+    /// A receiver that sees every event pushed from now on.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
     /// Records after `since`. A cursor this process did not issue, or one
     /// older than what is retained, reads everything retained. The same holds
     /// for a live reader that falls more than [`RETAINED`] events behind: it

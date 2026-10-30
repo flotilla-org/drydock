@@ -16,7 +16,7 @@ use std::{
     io,
     process::Stdio,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -239,10 +239,36 @@ pub(crate) struct Processes {
     next: AtomicU64,
     limit: usize,
     events: Arc<crate::events::Events>,
+    /// Set once an upgrade drains the agent. Every spawn holds the read side
+    /// until its handle is in the table, so a drain that has set it sees
+    /// every process that will ever start under this agent.
+    draining: RwLock<bool>,
 }
 impl Processes {
     pub(crate) fn new(limit: usize, events: Arc<crate::events::Events>) -> Self {
-        Self { table: Mutex::default(), next: AtomicU64::new(1), limit: limit.max(1), events }
+        Self { table: Mutex::default(), next: AtomicU64::new(1), limit: limit.max(1), events, draining: RwLock::new(false) }
+    }
+    /// Stop accepting processes, then wait up to `limit` for the running ones
+    /// to exit. Returns those still running at the limit. There is no way
+    /// back: a drain is always followed by the re-exec, and if both the
+    /// candidate's and the rollback's exec fail the agent exits, so no agent
+    /// process ever serves on after draining.
+    pub(crate) async fn drain(&self, limit: Duration) -> Vec<ProcessInfo> {
+        *self.draining.write().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let deadline = tokio::time::Instant::now() + limit;
+        // Every exit is pushed as an event, so wake on events, not a timer.
+        let mut events = self.events.subscribe();
+        loop {
+            events.borrow_and_update();
+            let running: Vec<_> = self.list().into_iter().filter(|p| p.state == ProcessState::Running).collect();
+            if running.is_empty() {
+                return running;
+            }
+            match tokio::time::timeout_at(deadline, events.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return self.list().into_iter().filter(|p| p.state == ProcessState::Running).collect(),
+            }
+        }
     }
     pub(crate) fn get(&self, id: &str) -> Result<Arc<Handle>, AgentError> {
         self.table
@@ -269,6 +295,15 @@ impl Processes {
         Ok(())
     }
     pub(crate) fn spawn(&self, request: Exec, environment: BTreeMap<String, String>) -> Result<Arc<Handle>, AgentError> {
+        let draining = self.draining.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *draining {
+            return Err(AgentError::new(
+                "process.spawn",
+                &request.program,
+                ErrorKind::Conflict,
+                "the agent is draining for an upgrade and starts no more processes",
+            ));
+        }
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
@@ -389,6 +424,7 @@ impl Processes {
             }
         }
         table.insert(id, handle.clone());
+        drop(draining);
         Ok(handle)
     }
 }
