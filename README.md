@@ -533,8 +533,8 @@ control vocabulary is `drydock-fixture` plus `forget`,
 `state`, `timestamp`, `inventory_error`, or `pause`. Reference settings must
 explicitly enable `fixture`; vendor providers must not enable this profile.
 
-Each invalid
-CPU, memory, disk, destination and usage-period request gets its own verdict.
+Each invalid CPU, memory, disk, destination and usage-period request gets its own
+verdict.
 Billing checks require the exact stopped cause and vendor usage facts over a
 sample window (`billing_sample_millis`, default 25); use a distinct granted size
 and an idle account so aggregate usage does not mix in another running guest.
