@@ -1,6 +1,6 @@
 # Rust host
 
-`drydock-host` loads the compiled-in reference and Daytona modules and serves
+`drydock-host` loads the compiled-in reference, local and Daytona modules and serves
 them through the same `/v1` API as the drydock server, with the same routes and
 types (`drydock_client::api::router` over its `ProviderApi`), apart from the
 server-only credential and event extensions. Common provider policy lives in
@@ -89,6 +89,52 @@ override is supplied. The pin can be older than the host: use the agent client's
 `connect_current` handshake to push/re-exec the current binary after mismatched
 hello, then verify hello before configuration. Before the first image publish,
 prepare/launch explain how to publish and merge the pin; see the guide above.
+
+## Local module
+
+`local` runs vessels as child processes on the host's own machine, so vessel
+paths can be exercised end to end without a cloud provider or a container
+runtime. It is a test fixture, not a sandbox: a vessel shares the host's
+filesystem, network and users, and nothing is isolated.
+
+```toml
+[providers.local]
+module = "local"
+image = "ubuntu@sha256:…"   # recorded, never pulled
+settings = { root = "/tmp/drydock-local" }
+```
+
+No `credential` is needed: a provider configured without one and reported ready
+by its host holds none to deliver. Settings are both optional. `root` is where
+environment directories live (default: `local` under drydock's state directory)
+and `agent` is the `drydock-agent` build to run. Without `agent` the build is
+found the way drydock finds the one it pushes: `DRYDOCK_AGENT_BIN_<OS>_<ARCH>`,
+`DRYDOCK_AGENT_BIN`, then `drydock-agent` beside `drydock-host`. A provider with
+no build reports `missing_tool`.
+
+- **Prepare** records the image reference, tools digest and the host's platform
+  (the only one declared). Nothing is pulled.
+- **Provision** makes `<root>/<id>/`, copies the agent to its `opt/drydock/`, and
+  starts it with its socket at `<root>/<id>/run/drydock/agent.sock`, in a session
+  of its own. It returns once the agent answers hello. The id comes from the
+  label, so a repeated label is the same environment. The agent is the vessel's
+  own copy, so an upgrade pushed by drydock never touches the installed build.
+- **Reach** is the relay: the host connects to that socket, and exposures work
+  through the agent like on any provider.
+- **Suspend** kills the agent and everything in its session and keeps the
+  directory; **resume** starts the agent again. Memory and processes are not kept.
+- **Destroy** kills the agent and its session, then removes the directory. Anything
+  that started its own session escapes.
+- **Egress** is declared open and advisory. A deny-all request is refused with a
+  reason, because the host's network cannot be restricted per vessel.
+- **Capabilities** declare no usage, quota or export. Conformance reports the
+  checks that follow from that as not applicable.
+
+Nothing is held in memory: environments are found by their directories, so they
+survive a restart of the host, and agents keep running meanwhile. An agent that
+died is reported stopped (`guest_halted`) and is started again by resume. The
+workspace root declared is `root`; vessels share one filesystem, so a client must
+pick a distinct directory below it for each.
 
 ## Daytona module
 

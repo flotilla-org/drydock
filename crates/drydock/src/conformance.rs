@@ -127,9 +127,17 @@ pub struct Check {
     pub passed: bool,
     pub detail: String,
 }
+/// A check this provider's declaration rules out, reported instead of run so
+/// that it is neither failed nor silently dropped.
+#[derive(Debug, Serialize)]
+pub struct NotApplicable {
+    pub name: String,
+    pub reason: String,
+}
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub checks: Vec<Check>,
+    pub not_applicable: Vec<NotApplicable>,
     pub usage: Option<Usage>,
     pub quota_before: Option<Quota>,
     pub quota_after: Option<Quota>,
@@ -153,6 +161,9 @@ impl Report {
                 None
             }
         }
+    }
+    fn not_applicable(&mut self, name: &str, reason: &str) {
+        self.not_applicable.push(NotApplicable { name: name.into(), reason: reason.into() });
     }
     fn record(&mut self, name: &str, result: Result<()>) {
         let (passed, detail) = match result {
@@ -339,6 +350,9 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         report.record("authentication", authentication(client, Duration::from_secs(options.timeouts.request_seconds)).await);
         report.record("authentication_constant_time", auth_audit(options).await);
     }
+    if options.selected(Scenario::Metering) && !caps.quota {
+        report.not_applicable("quota", "the provider declares no quota");
+    }
     if options.selected(Scenario::Metering) && caps.quota {
         match client.quota(provider).await {
             Ok(quota) => {
@@ -386,15 +400,17 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             target.explicit_nulls(environment, &mut report, &mut owned_ids).await;
         }
         if options.selected(Scenario::Reach) {
-            report.record("reach_byte_stream", reach(client, provider, &environment.id, &options).await);
+            report.record("reach_byte_stream", reach(client, provider, &environment.id, &options, caps.agent).await);
         }
         if options.selected(Scenario::Refusal) {
             target.refusal(&mut report, &mut owned_ids).await;
         }
-        if options.selected(Scenario::Egress)
-            && (caps.egress.enforcement == Enforcement::Enforced || environment.egress == Enforcement::Enforced)
-        {
-            report.record("enforced_egress", egress(client, provider, environment, &options).await);
+        if options.selected(Scenario::Egress) {
+            if caps.egress.enforcement == Enforcement::Enforced || environment.egress == Enforcement::Enforced {
+                report.record("enforced_egress", egress(client, provider, environment, &options).await);
+            } else {
+                report.not_applicable("enforced_egress", "the provider declares egress as advisory and the environment is not enforced");
+            }
         }
         if options.selected(Scenario::HostFixtures) {
             host_fixtures(client, provider, &options, environment, &mut report, &mut owned_ids).await;
@@ -692,6 +708,12 @@ impl Target<'_> {
         } else {
             None
         };
+        if !caps.usage {
+            report.not_applicable("billing", "the provider declares no usage");
+        }
+        if !caps.suspend_resume {
+            report.not_applicable("suspend_resume", "the provider declares no suspend and resume");
+        }
         if caps.usage
             && let Some(size) = &environment.granted_size
         {
@@ -1031,6 +1053,9 @@ async fn finish_report(
             Err(e) => report.record("quota_after", Err(e.category())),
         }
     }
+    if !caps.usage {
+        report.not_applicable("usage", "the provider declares no usage");
+    }
     if caps.usage {
         let usage = async {
             let period = Period::new(period_start.into(), chrono::Utc::now().max(period_start).into()).map_err(str::to_owned)?;
@@ -1057,7 +1082,7 @@ async fn finish_report(
     report.elapsed_seconds = start.elapsed().as_secs_f64();
 }
 
-async fn reach(client: &Client, provider: &str, id: &str, options: &Options) -> Result<()> {
+async fn reach(client: &Client, provider: &str, id: &str, options: &Options, agent: bool) -> Result<()> {
     let recipe = client.reach(provider, id).await.map_err(SafeError::category)?;
     if let Some(command) = &options.reach_probe {
         let (program, args) = command.split_first().ok_or("empty reach probe")?;
@@ -1091,7 +1116,21 @@ async fn reach(client: &Client, provider: &str, id: &str, options: &Options) -> 
         .await
         .map_err(SafeError::category)?;
     }
+    if agent && matches!(recipe, Reach::Relay { .. }) {
+        let stream = client.relay(provider, id).await.map_err(SafeError::category)?;
+        return tokio::time::timeout(Duration::from_secs(options.timeouts.probe_seconds), agent_hello(stream))
+            .await
+            .map_err(SafeError::category)?;
+    }
     Err("reach requires a recipe round-trip probe (or hermetic echo relay)".into())
+}
+/// A relayed connection to a vessel's agent carries its hello over plain HTTP/1.1.
+async fn agent_hello(mut stream: impl AsyncReadExt + AsyncWriteExt + Unpin) -> Result<()> {
+    stream.write_all(b"GET /hello HTTP/1.1\r\nhost: agent\r\nconnection: close\r\n\r\n").await.map_err(SafeError::category)?;
+    let mut reply = Vec::new();
+    (&mut stream).take(65536).read_to_end(&mut reply).await.map_err(SafeError::category)?;
+    let reply = String::from_utf8_lossy(&reply);
+    require(reply.starts_with("HTTP/1.1 200") && reply.contains("fingerprint"), "relay did not carry the agent's hello")
 }
 async fn egress(client: &Client, provider: &str, environment: &Environment, options: &Options) -> Result<()> {
     require(environment.egress == Enforcement::Enforced, "Enforced declaration downgraded")?;

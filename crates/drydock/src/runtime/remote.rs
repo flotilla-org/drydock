@@ -89,7 +89,13 @@ impl Provider for RemoteProvider {
         if !matches!(readiness, Readiness::Ready | Readiness::MissingCredential { .. }) {
             return readiness;
         }
-        if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
+        // A host that reports a provider ready without having been given a credential
+        // is one that needs none.
+        if c.token().is_some() || matches!(readiness, Readiness::Ready) {
+            Readiness::Ready
+        } else {
+            Readiness::MissingCredential { reason: "credential not delivered".into() }
+        }
     }
     async fn refresh_readiness(&self, c: &Credentials) {
         let readiness = match self.host(c).provider(self.name()).await {

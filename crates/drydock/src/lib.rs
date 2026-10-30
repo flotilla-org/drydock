@@ -231,7 +231,12 @@ impl Supervisor {
         masker: &mut DiagnosticMasker,
     ) -> Result<BTreeMap<String, Readiness>, client::Error> {
         let mut unavailable = BTreeMap::new();
-        for name in spec.configuration.providers.keys() {
+        for (name, configured) in &spec.configuration.providers {
+            // A provider configured without a credential holds none to deliver. Its
+            // host decides whether it needs one: a module that does reports it missing.
+            if configured.credential.is_none() && !spec.credentials.contains_key(name) {
+                continue;
+            }
             let result = async {
                 let reference = spec.credentials.get(name).ok_or_else(missing_credential)?;
                 let credential = self.credentials.resolve(reference).await.map_err(|_| missing_credential())?;
