@@ -318,6 +318,28 @@ async fn destroy_removes_read_only_contents() {
     assert!(!root.path().join(&environment.id).exists());
 }
 
+// Destroy follows no link out of the environment: a read-only directory a link
+// names keeps its permissions and contents.
+#[tokio::test]
+async fn destroy_leaves_what_a_link_names_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    let outside = tempfile::tempdir().unwrap();
+    let kept = outside.path().join("kept");
+    std::fs::create_dir(&kept).unwrap();
+    std::fs::write(kept.join("file"), "kept").unwrap();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "linked").await;
+    std::os::unix::fs::symlink(&kept, root.path().join(&environment.id).join("link")).unwrap();
+
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    assert!(!root.path().join(&environment.id).exists());
+    assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o555);
+    assert_eq!(std::fs::read_to_string(kept.join("file")).unwrap(), "kept");
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 // Environments are their directories: a host that starts over finds them,
 // agents still running, and can destroy them.
 #[tokio::test]

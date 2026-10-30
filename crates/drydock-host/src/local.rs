@@ -378,25 +378,34 @@ async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
 }
+
 /// Give the owner write access to every directory below `dir`, so that its
-/// entries can be removed. Symbolic links are not followed.
-fn owner_writable(dir: &Path) -> std::io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => metadata,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    if !metadata.is_dir() {
-        return Ok(());
+/// entries can be removed. Symbolic links are not followed. Best effort: a
+/// directory it cannot change or read is logged and skipped, and removing the
+/// tree reports what is in the way.
+fn owner_writable(dir: &Path) {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "cannot read a local environment directory before removing it");
+                continue;
+            }
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700
+            && let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode | 0o700))
+        {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot make a local environment directory writable");
+        }
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => pending.extend(entries.flatten().map(|entry| entry.path())),
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "cannot list a local environment directory before removing it"),
+        }
     }
-    let mode = metadata.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))?;
-    }
-    for entry in std::fs::read_dir(dir)? {
-        owner_writable(&entry?.path())?;
-    }
-    Ok(())
 }
 
 /// Whether the agent at `socket` answers `GET /hello`, which it serves over plain HTTP/1.1.
@@ -514,8 +523,7 @@ impl Provider for Local {
         let writable = dir.clone();
         tokio::task::spawn_blocking(move || owner_writable(&writable))
             .await
-            .map_err(|e| internal(format!("make environment directory writable: {e}")))?
-            .map_err(|e| unavailable(format!("make environment directory writable: {e}")))?;
+            .map_err(|e| internal(format!("make environment directory writable: {e}")))?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
