@@ -1,0 +1,16 @@
+{
+  "about": "A released agent the current client must still upgrade through the frozen upgrade path. The tools image layer holding opt/drydock/drydock-agent, per platform, and the agent's sha256. Replace it only with an older release, or a newer one once every release since this one is known to keep the path.",
+  "release": "ghcr.io/flotilla-org/drydock-tools@sha256:a5d89fb58f3c98b3cf28655f71dd6220fd6f5acefcee014e354e8e29d32717c3",
+  "registry": "ghcr.io",
+  "repository": "flotilla-org/drydock-tools",
+  "platforms": {
+    "linux/amd64": {
+      "layer": "99a3caacb1e7e8092a00ab46ee2f15fb20b709ba0c56d08c632bdc51da8dc1aa",
+      "agent": "279f4353555568c088291f9472243e3711bd3509d7da9c6a5d7028118b237840"
+    },
+    "linux/arm64": {
+      "layer": "ebf18114ea592fda48387b44869e5fdcc35cf20b595920e51066330b38f79816",
+      "agent": "b258d850a980afa71fad18dbca62f63a7fe7518445c63b6fd3f330ba05c17a94"
+    }
+  }
+}

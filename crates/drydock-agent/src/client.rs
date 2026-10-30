@@ -15,6 +15,12 @@ use std::{
 };
 use tokio::{io::AsyncRead, task::JoinSet};
 
+mod frozen;
+
+/// How long [`Client::connect_current`] lets an agent drain its running
+/// processes before it re-execs as the new build.
+pub const UPGRADE_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum EndpointKey {
     Unix(u64, u64),
@@ -228,8 +234,11 @@ fn upload_headers(complete: bool, content_type: &str) -> Vec<(&'static str, Stri
 }
 /// An upload's offset and completeness from its headers.
 fn progress(response: &http::Response<axum::body::Body>) -> (u64, bool) {
-    let offset = header(response, "upload-offset").and_then(|v| v.parse().ok()).unwrap_or_default();
-    (offset, header(response, "upload-complete").as_deref() == Some("?1"))
+    upload_progress(response.headers())
+}
+fn upload_progress(headers: &http::HeaderMap) -> (u64, bool) {
+    let value = |name| headers.get(name).and_then(|v: &http::HeaderValue| v.to_str().ok());
+    (value("upload-offset").and_then(|v| v.parse().ok()).unwrap_or_default(), value("upload-complete") == Some("?1"))
 }
 fn header(response: &http::Response<axum::body::Body>, name: &str) -> Option<String> {
     response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_owned)
@@ -258,15 +267,19 @@ impl Drop for Client {
     }
 }
 impl Client {
-    /// Connect to a vessel started from any published tools pin. A mismatched
-    /// hello triggers push + re-exec, then a fresh transport and verified hello.
-    /// The factory must open a new connection to the agent on every invocation.
-    /// `platform` is the platform the vessel was prepared for and `executable`
-    /// the current agent build for it; the caller chose both from the prepared
-    /// form, never from the guest. Returns only a compatible, confirmed client;
-    /// callers push configuration afterwards. Initial transport/hello errors
-    /// return immediately; only post-upgrade reconnects retry. The caller must
-    /// arrange initial provider readiness.
+    /// Connect to a vessel's agent of any release since the upgrade path was
+    /// frozen, and bring it to `executable`. Over plain HTTP/1.1 this reads
+    /// hello and compares the fingerprint; on a mismatch it uploads and
+    /// activates `executable` (the agent drains for up to [`UPGRADE_DRAIN`]
+    /// and re-execs), reads hello again on a fresh connection and confirms
+    /// the candidate. Then the connection carries on over the current wire.
+    /// The factory must open a new connection to the agent on every
+    /// invocation. `platform` is the platform the vessel was prepared for and
+    /// `executable` the current agent build for it; the caller chose both
+    /// from the prepared form, never from the guest. Returns only a
+    /// compatible, confirmed client; callers push configuration afterwards.
+    /// Initial transport/hello errors return immediately; only post-upgrade
+    /// reconnects retry. The caller must arrange initial provider readiness.
     ///
     /// A hello that reports a platform is checked against `platform`. A
     /// different one fails with [`io::ErrorKind::Unsupported`], pushing
@@ -287,9 +300,9 @@ impl Client {
         }
         let mut observation = "no hello received".to_owned();
         let result = tokio::time::timeout(timeout, async {
-            let mut client = Self::connect(open().await?, String::new()).await?;
-            observation = format!("last hello fingerprint {}", client.hello.fingerprint);
-            if let Some(reported) = &client.hello.platform
+            let mut path = frozen::UpgradePath::connect(open().await?).await?;
+            observation = format!("last hello fingerprint {}", path.hello.fingerprint);
+            if let Some(reported) = &path.hello.platform
                 && reported != platform
             {
                 return Err(io::Error::new(
@@ -298,31 +311,36 @@ impl Client {
                 ));
             }
             let expected = format!("{:x}", Sha256::digest(executable));
-            client.set_expected(expected.clone());
             // Only the build this host wants is confirmed. Another candidate
             // on probation is replaced below by activating the wanted one,
             // and was never installed.
-            if client.is_compatible() {
-                if client.hello.probation {
-                    client.confirm_upgrade().await?;
+            if path.hello.fingerprint == expected {
+                if path.hello.probation {
+                    path.confirm().await?;
                 }
-                return Ok(client);
+                return path.into_client(&expected).await;
             }
-            let digest = client.put_upgrade(Bytes::copy_from_slice(executable)).await?;
+            let digest = path.put(executable).await?;
             // Activation acknowledgement is advisory: re-exec can close the
             // stream before the response arrives. Only the next hello decides.
-            let _ = client.activate_upgrade(&digest).await;
-            drop(client);
+            match path.activate(&digest, UPGRADE_DRAIN.min(timeout / 2)).await {
+                Ok(activated) if !activated.running.is_empty() => {
+                    let running: Vec<_> = activated.running.iter().map(|p| format!("{} ({})", p.id, p.program)).collect();
+                    tracing::warn!(running = %running.join(", "), "agent processes outlived the upgrade drain and lost their handles");
+                }
+                _ => {}
+            }
+            drop(path);
             loop {
                 match open().await {
-                    Ok(stream) => match Self::connect(stream, &expected).await {
-                        Ok(client) if client.is_compatible() => {
-                            if client.hello.probation {
-                                client.confirm_upgrade().await?;
+                    Ok(stream) => match frozen::UpgradePath::connect(stream).await {
+                        Ok(mut path) if path.hello.fingerprint == expected => {
+                            if path.hello.probation {
+                                path.confirm().await?;
                             }
-                            return Ok(client);
+                            return path.into_client(&expected).await;
                         }
-                        Ok(client) => observation = format!("last hello fingerprint {}", client.hello.fingerprint),
+                        Ok(path) => observation = format!("last hello fingerprint {}", path.hello.fingerprint),
                         Err(error) => observation = format!("last hello error: {error}"),
                     },
                     Err(error) => observation = format!("last transport error: {error}"),
@@ -714,10 +732,18 @@ impl Client {
         }
         Ok(digest)
     }
-    /// Activate the completed upload named by `sha256` as the next agent.
+    /// Activate the completed upload named by `sha256` as the next agent,
+    /// without waiting for running processes.
     pub async fn activate_upgrade(&self, sha256: &str) -> io::Result<()> {
+        self.activate_upgrade_draining(sha256, std::time::Duration::ZERO).await.map(drop)
+    }
+    /// Activate the completed upload named by `sha256` as the next agent. The
+    /// agent starts no more processes and waits up to `drain` for its running
+    /// ones to exit before it re-execs; the reply names those still running.
+    pub async fn activate_upgrade_draining(&self, sha256: &str, drain: std::time::Duration) -> io::Result<Activated> {
         let uri = format!("/upgrade{}", query(&DigestQuery { sha256: digest(sha256)?.to_owned() })?);
-        self.link.empty("POST", &uri, empty()).await.map(drop)
+        let body = json_body(&Activation { drain_ms: drain.as_millis().try_into().unwrap_or(u64::MAX) })?;
+        self.link.json("POST", &uri, body).await
     }
     /// Make the running candidate the installed agent. Until then, the next
     /// ordinary start rolls back to the previous executable.

@@ -590,21 +590,34 @@ async fn refusals_are_structured() {
     assert_eq!(h.client.configuration().await.unwrap().value, Configuration::default());
 }
 
-// Guest stand-in at the HTTP boundary: serves a fixed hello body and records
-// upgrade bodies and confirmations, so a test observes exactly what the host
-// sent.
-async fn hello_only_guest(hello: serde_json::Value) -> (ByteStream, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
-    use axum::routing::{get, post, put};
+// Guest stand-in at the HTTP boundary: serves a fixed hello body and the
+// frozen upload path, recording uploaded blobs, activations and
+// confirmations, and the HTTP version of every request, so a test observes
+// exactly what the host sent.
+async fn hello_only_guest(
+    hello: serde_json::Value,
+) -> (ByteStream, Arc<std::sync::Mutex<Vec<Vec<u8>>>>, Arc<std::sync::Mutex<Vec<http::Version>>>) {
+    use axum::routing::{get, post};
     let (dialer, mut guest) = drydock_transport::memory();
     let pushes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let (recorded, confirmed) = (pushes.clone(), pushes.clone());
+    let versions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (recorded, activated, confirmed) = (pushes.clone(), pushes.clone(), pushes.clone());
+    let seen = versions.clone();
     let router = axum::Router::new()
         .route("/hello", get(move || std::future::ready(axum::Json(hello.clone()))))
         .route(
-            "/upgrade",
-            put(move |body: bytes::Bytes| {
+            "/blobs/{sha256}",
+            get(|| std::future::ready(http::StatusCode::NOT_FOUND)).put(move |body: bytes::Bytes| {
                 recorded.lock().unwrap().push(body.to_vec());
-                std::future::ready(())
+                std::future::ready(http::StatusCode::CREATED)
+            }),
+        )
+        .route("/uploads/{sha256}", get(|| std::future::ready(http::StatusCode::NOT_FOUND)))
+        .route(
+            "/upgrade",
+            post(move || {
+                activated.lock().unwrap().push(b"activate".to_vec());
+                std::future::ready(http::StatusCode::ACCEPTED)
             }),
         )
         .route(
@@ -613,23 +626,28 @@ async fn hello_only_guest(hello: serde_json::Value) -> (ByteStream, Arc<std::syn
                 confirmed.lock().unwrap().push(b"confirm".to_vec());
                 std::future::ready(())
             }),
-        );
+        )
+        .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
+            seen.lock().unwrap().push(request.version());
+            next.run(request)
+        }));
     tokio::spawn(async move {
         while let Ok(stream) = guest.accept().await {
             tokio::spawn(drydock_transport::http::serve(stream, router.clone()));
         }
     });
-    (dialer.connect().await.unwrap(), pushes)
+    (dialer.connect().await.unwrap(), pushes, versions)
 }
 
 // An agent that predates platform reporting sends no platform. The host
 // already knows the vessel's platform from its prepared form, so it pushes
 // that platform's build; it never needs to ask the guest. The push uses the
-// same stable upgrade route older agents serve. A candidate on probation that
-// is not the wanted build is replaced, never confirmed.
+// frozen upgrade path, over HTTP/1.1. A candidate on probation that is not
+// the wanted build is replaced, never confirmed.
 #[tokio::test]
 async fn hello_without_platform_gets_the_prepared_platforms_build() {
-    let (host, pushes) = hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "probation": true})).await;
+    let (host, pushes, versions) =
+        hello_only_guest(serde_json::json!({"fingerprint": "older", "features": ["upgrade"], "probation": true})).await;
     let mut host = Some(host);
     // The fake guest never re-executes, so the reconnect after the push times out.
     let error = Client::connect_current(
@@ -642,7 +660,9 @@ async fn hello_without_platform_gets_the_prepared_platforms_build() {
     .err()
     .expect("the fake guest never reports the pushed build");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-    assert_eq!(*pushes.lock().unwrap(), [b"linux amd64 build".to_vec()]);
+    assert_eq!(*pushes.lock().unwrap(), [b"linux amd64 build".to_vec(), b"activate".to_vec()]);
+    let versions = versions.lock().unwrap();
+    assert!(!versions.is_empty() && versions.iter().all(|v| *v == http::Version::HTTP_11), "{versions:?}");
 }
 
 type EventLines =

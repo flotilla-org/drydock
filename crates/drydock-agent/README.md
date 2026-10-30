@@ -25,19 +25,55 @@ HTTP/2 without TLS, from its first byte, so `curl --unix-socket
 /run/drydock/agent.sock http://agent/hello` works as well as drydock's client.
 All listeners share one state. The agent never opens a connection towards the
 host: it tells drydockd what happens through `/events`, and drydockd claims
-the vessel's outward connections from there. Agents from before plain HTTP
-(the `DDT` framing) cannot be reached; such a vessel is reported unreachable
-and its operator restarts it. Live provider isolation and startup/supervision
-are verified in the provider integration work (#54).
+the vessel's outward connections from there. Agents from before the frozen
+upgrade path below (#152), in images prepared before it, cannot be relied
+on to take an upgrade; those images are prepared again, once. Live provider
+isolation and startup/supervision are verified in the provider integration
+work (#54).
+
+### The frozen upgrade path
+
+The upgrade path's requests and their meanings are frozen in the one agent.
+Every agent serves them exactly so, over plain HTTP/1.1 on its socket,
+whatever else changes:
+
+```
+GET   /hello                        → 200 {"fingerprint", "features", "platform", "boot_id", "probation", …}
+PUT   /blobs/{sha256}               → upload a blob (201, Location)
+HEAD  /uploads/{sha256}             → current length, to resume
+PATCH /uploads/{sha256}             → append
+POST  /upgrade?sha256={digest}      → activate that blob as the agent; drains, then re-execs
+POST  /upgrade/confirm              → end probation
+```
+
+The listed hello fields keep their names and meanings; fields can be added,
+none removed or redefined, and readers ignore fields they do not know.
+`HEAD /blobs/{sha256}` (present or 404) belongs to the path too, so a host
+uploads nothing the agent already holds. Options of `POST /upgrade` travel
+in its optional JSON body (`Activation`), which ignores unknown fields; the
+query keeps exactly `sha256`. Rollback of an unconfirmed candidate stays as
+described under [Upgrade](#upgrade). `tests/frozen.rs` keeps a released
+agent (`tests/fixtures/previous-agent.json`, fetched from its tools image
+layer and cached under Cargo's target directory, or named by
+`DRYDOCK_PREVIOUS_AGENT` offline) and upgrades it with the current client,
+so a change that breaks the path fails CI.
 
 The host normally calls `Client::connect_current(open, platform, executable,
-timeout)`, where `open` returns a fresh connection to the agent's socket, passing the platform recorded in the vessel's prepared
-form and the agent build for it. The tools image pin is a bootstrap reference
-and may contain an older agent. This handshake reads hello, hashes the build,
-and pushes the binary plus re-execs when fingerprints differ. It reconnects through the supplied
-factory and returns only after verifying the current fingerprint. A matching
-hello avoids an unnecessary upgrade. It confirms a candidate on probation once
-its fingerprint matches. Push configuration after this handshake.
+timeout)`, where `open` returns a fresh connection to the agent's socket,
+passing the platform recorded in the vessel's prepared form and the agent
+build for it. The host always upgrades the agent to its own build and
+activates only that build's digest: an agent already in the image is only a
+cache, saving the upload when it matches. Over HTTP/1.1 the handshake reads
+hello and compares the fingerprint; on a mismatch it uploads the build
+(resuming an earlier partial upload), activates it with a drain of up to
+`UPGRADE_DRAIN` (10 seconds, at most half the timeout), reconnects through
+the supplied factory, reads hello again and confirms the candidate. A
+matching hello avoids the upgrade; a matching candidate still on probation
+is confirmed. Then `GET /control` with `Connection: upgrade` and `Upgrade:
+drydock-control` (101) turns the same connection into the current wire,
+which the client speaks as HTTP/2; this route belongs to the current wire,
+so the client asks it only of an agent whose hello matched. Push
+configuration after this handshake.
 
 Hello's `platform` uses OCI names (`{"os": "linux", "architecture": "arm64"}`).
 The agent reports the platform its running executable was built for, not the
@@ -71,6 +107,7 @@ refused. Forward IDs are one percent-encoded route segment.
 | Method | Route | Body / result |
 | --- | --- | --- |
 | GET | `/hello` | `Hello { fingerprint, features, platform, boot_id, probation }`; changes nothing |
+| GET | `/control` | HTTP/1.1 `Upgrade: drydock-control`: 101, then the connection serves every route, HTTP/1.1 or HTTP/2 |
 | GET | `/events?since=<cursor>` | NDJSON `{ cursor, event }` lines from after `since`, held open for new ones |
 | GET / PUT | `/configuration` | Read / replace `Configuration`, with an `ETag`; PUT honours `If-Match` |
 | GET / PUT / DELETE | `/forwards/inward/{id}` | Read / upsert / remove one `InwardForward { id, endpoint }`; GET `/forwards/inward` lists them |
@@ -93,7 +130,7 @@ refused. Forward IDs are one percent-encoded route segment.
 | GET | `/artifacts` | Complete store entries, with the links that use them |
 | GET / PUT / DELETE | `/artifacts/{sha256}` | One entry / fetch it by digest (`Fetch`) / remove it unless in use |
 | PUT | `/artifacts/{sha256}/links/{path}` | `{ "member": ... }`; place a symlink to the entry atomically |
-| POST | `/upgrade?sha256=...` | Activate the completed upload of that digest and re-exec with the original flags |
+| POST | `/upgrade?sha256=...` | Optional `Activation { drain_ms }`; activate the completed upload of that digest, drain, and re-exec with the original flags (202, `Activated { sha256, running }`) |
 | POST | `/upgrade/confirm` | Confirm the running candidate |
 
 ### One error layer
@@ -397,13 +434,16 @@ push resumes, and the completed upload survives an agent restart.
 `POST /upgrade?sha256=` activates the completed upload of that digest (404
 without one), copying it out of the store beside the
 installed binary and hashing it again as it goes, so a blob changed on disk
-is refused (422) and discarded rather than executed. It then re-execs with
-the original flags; the host reconnects with a fresh connection and
-verifies the new fingerprint. `/hello`, `/upgrade` and the upload routes are
-the routes every generation keeps. Agents from before the blob store (their
-hello lacks `uploads`, as in published tools images) still take the image
-whole through `PUT /upgrade`, and ignore the digest query on activation, so
-the same client upgrades them.
+is refused (422) and discarded rather than executed. It then drains: the
+agent starts no more processes (`POST /processes` is refused with 409) and
+waits for the running ones to exit, up to `drain_ms` from the request body
+(no wait without one). The reply, 202 `Activated { sha256, running }`, names
+the processes still running at the limit; they keep running across the
+re-exec, but lose their handles and output reader. The agent then re-execs
+with the original flags; the host reconnects with a fresh connection and
+verifies the new fingerprint. The agent's processes are short calls:
+anything long-running that holds file descriptors belongs under cleat, not
+the agent.
 
 The candidate runs on probation: a durable `.probation` marker records it,
 and it runs from `.upgrade` while the installed entry point stays the previous
@@ -421,9 +461,14 @@ activation keeps its upload and the existing rollback until a new backup is
 ready. The activation acknowledgement is advisory: a lost response means
 reconnecting and checking hello.
 
-Re-exec drops connections and byte streams, removes owned outward sockets,
-clears the capture table and resets configuration. Stale socket inodes from a
-crash are reclaimed only when they refuse a connection; live listeners and
+Re-exec drops connections and byte streams, removes owned outward sockets
+and resets configuration, forwards and events; the new `boot_id` tells the
+host to send them again. The capture table stays in place, so egress stays
+enforced across the re-exec: the new process takes it over at startup, and
+guest TCP and DNS keep being redirected, to capture ports nobody serves
+until the host configures the new agent. The first configuration replaces
+the inherited table, also when it disables egress. Stale socket inodes from
+a crash are reclaimed only when they refuse a connection; live listeners and
 ordinary files are preserved.
 
 ## Egress and guest requirements
@@ -497,11 +542,11 @@ forward; there is no blanket loopback/private-network exemption. Direct access
 to capture/DNS service ports is also captured; use port 53 for fake DNS.
 Other guest TCP is captured regardless of environment. Refused configuration cleans up prepared listeners; unchanged
 egress listeners, DNS leases and active streams survive configuration pushes.
-Disabling capture removes redirects before stopping listeners. Redirects never
-outlive the configuration that installed them: the agent removes its table at
-startup, so a crashed agent's redirects go when it restarts with empty
-configuration, and before a re-exec. Agent re-exec loses DNS leases; callers
-must resolve names again.
+Disabling capture removes redirects before stopping listeners. Redirects
+outlive the agent process that installed them, across a re-exec or a crash
+and restart, until the next configuration replaces them: meanwhile guest
+connections fail rather than leave uncaptured. Agent re-exec loses DNS
+leases; callers must resolve names again.
 
 Capture, explicit-proxy and DNS-TCP connections share a 128-stream budget.
 Overflow connections are accepted and immediately closed, preserving descriptor
@@ -523,7 +568,8 @@ real UDP/TCP DNS listeners, CONNECT forwarding through claimed outward connectio
 explicit proxy transparency, refused/truncated CONNECT responses and half-closes.
 `tools/test-agent-egress.sh` additionally exercises nftables and SO_ORIGINAL_DST,
 a launched process without proxy variables, the same-UID capture invariant, CA
-installation and the agent socket exemption. It requires `sudo`, `nft`, `ip`,
+installation, the agent socket exemption, and redirects that stay enforced
+across an upgrade until the new agent is configured. It requires `sudo`, `nft`, `ip`,
 Python 3 and mount/network namespace support, and changes only disposable
 namespaces. The live Docker `--network none` operator check remains #3487.
 
@@ -592,7 +638,10 @@ fetches by digest from upstream, OCI and push sources against in-process
 stand-ins, with resume, fall-through, unpack refusals and links
 (`tests/artifacts.rs`); a streamed transfer and a fetch larger than 512 MiB
 in bounded memory (`tests/large_files.rs`, `tests/large_fetch.rs`);
-and every refusal as a structured error. Subprocess tests push a distinct ELF
+and every refusal as a structured error. `tests/frozen.rs` upgrades a released
+agent through the frozen upgrade path, drains a running process and reports
+one past the limit, and reads hello's fields over HTTP/1.1 with curl.
+Subprocess tests push a distinct ELF
 and verify real re-exec, the new hello and boot ID, explicit confirmation,
 rollback of an unconfirmed candidate, a durable upgrade upload, forward socket cleanup,
 fingerprint gating and survival/reaping of a child. No cloud provider or cleat

@@ -636,8 +636,10 @@ impl Provider for Daytona {
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
         // Keep binary units consistent with sandbox readback; decimal conversion
         // would also produce fractions rejected by CreateSnapshot's integer fields.
-        // Both routes produce the same filesystem, so the route is not part of the key.
-        let snapshot_name = snapshot_name(&r.image_digest, &r.tools_digest, &platform, &r.size);
+        // Both routes produce the same filesystem, so the route is not part of
+        // the key; nor is the tools image, whose agent is only a cache that
+        // the host upgrades to its own build at the first hello.
+        let snapshot_name = snapshot_name(&r.image_digest, &platform, &r.size);
         let url = self.path(&self.settings.api_url, &["snapshots", &snapshot_name])?;
         let snapshot = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
@@ -705,7 +707,7 @@ impl Provider for Daytona {
         let policy = allowlist(r.egress)?;
         let size = &r.size;
         validate_size(size)?;
-        if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.tools_digest, &r.prepared.platform, size) {
+        if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.platform, size) {
             return Err(refused("Daytona size does not match the prepared snapshot"));
         }
         if let Some(v) = self
@@ -1071,8 +1073,11 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 // The provider records the prepared form under this deterministic resource key.
 // Call only after validate_size: whole positive CPUs make the integer cast lossless.
-fn snapshot_name(image: &str, tools: &str, platform: &Platform, size: &Size) -> String {
-    name("snapshot", &format!("{image}\0{tools}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+/// The prepared form's key. "frozen-agent" sets apart snapshots made since
+/// the agent's upgrade path was frozen: those made before carry an agent
+/// that predates it, so they are prepared again, once.
+fn snapshot_name(image: &str, platform: &Platform, size: &Size) -> String {
+    name("snapshot", &format!("frozen-agent\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
 }
 /// Daytona runs x86_64 sandboxes only: "Daytona expects the local image to be
 /// built for AMD64 architecture" (docs, per the sandbox survey, 2026-10).
@@ -1127,9 +1132,9 @@ mod tests {
     #[test]
     fn snapshot_name_includes_platform() {
         let size = Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 };
-        let amd = snapshot_name("image", "tools", &Platform::new("linux", "amd64"), &size);
-        assert_eq!(amd, snapshot_name("image", "tools", &platform(), &size));
-        assert_ne!(amd, snapshot_name("image", "tools", &Platform::new("linux", "arm64"), &size));
+        let amd = snapshot_name("image", &Platform::new("linux", "amd64"), &size);
+        assert_eq!(amd, snapshot_name("image", &platform(), &size));
+        assert_ne!(amd, snapshot_name("image", &Platform::new("linux", "arm64"), &size));
     }
     // Vendor normalization must not break an exact label retry.
     #[test]

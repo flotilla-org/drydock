@@ -477,15 +477,6 @@ impl System {
     pub(crate) async fn install(&self, egress: bool, exempt: &[SocketAddr]) -> io::Result<()> {
         self.transaction(&rules(egress, exempt)).await
     }
-    /// Remove the capture table at startup and before re-exec, so redirects
-    /// never outlive the configuration that installed them. Without the nft
-    /// executable the agent cannot have installed any.
-    pub(crate) async fn clear(&self) -> io::Result<()> {
-        if !self.nft.exists() {
-            return Ok(());
-        }
-        self.transaction("add table inet drydock_egress\ndelete table inet drydock_egress\n").await
-    }
     async fn transaction(&self, rules: &str) -> io::Result<()> {
         use std::process::Stdio;
         let mut command = tokio::process::Command::new(&self.nft);
@@ -794,7 +785,30 @@ mod tests {
         stream.write_all(b"x").await.unwrap();
         assert_eq!(stream.read_u8().await.unwrap(), b'x');
         echo_task.await.unwrap();
+        // Egress stays enforced across an upgrade. After the re-exec, until
+        // the controller configures the new agent, guest TCP is still
+        // redirected, to capture ports nobody serves yet: it never reaches
+        // its destination. Open egress, once configured, does.
+        let destination = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = destination.local_addr().unwrap();
+        std::fs::write(dir.path().join("agent"), b"current image").unwrap();
+        let candidate = b"next image".to_vec();
+        let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&candidate));
+        client.upload(&digest, candidate.len() as u64, std::io::Cursor::new(candidate)).await.unwrap();
+        client.activate_upgrade(&digest).await.unwrap();
+        drop(client);
+        agent.await.unwrap().unwrap();
+        let (dialer, listener) = drydock_transport::memory();
+        let agent = tokio::spawn(Agent::new(listener, "test".into(), dir.path().join("agent")).run());
+        let client = Client::connect(dialer.connect().await.unwrap(), "test").await.unwrap();
+        let _attempt = tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(address)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), destination.accept()).await.is_err(),
+            "guest TCP escaped capture while the new agent was unconfigured"
+        );
         client.configure(Configuration::default()).await.unwrap();
+        let _reached = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), destination.accept()).await.unwrap().unwrap();
         agent.abort();
     }
 

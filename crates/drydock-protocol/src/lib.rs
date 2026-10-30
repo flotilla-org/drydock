@@ -384,12 +384,15 @@ pub enum Destination {
 /// Preparation is look-up-or-build at the provider: append the tools image's
 /// files under /opt/drydock to the base, preserving its entrypoint, command and
 /// init. tools_digest is the build-selected bootstrap agent OCI index reference.
-/// Its checked-in pin can be older than the host, which upgrades on mismatched
-/// agent hello. Build at the provider where possible, otherwise append its layer;
-/// Upload bootstrap installs those same files under /opt/drydock.
-/// Modules choose their own provider-recorded key including both digests and any
-/// prepare-time constraints (Daytona also includes size); configuration is not a
-/// key. Provision must match the recorded prepared form. See ADR 0070 Vessel tools.
+/// The agent it carries is only a cache: the host always upgrades the vessel's
+/// agent to its own build at the first hello, so a matching agent saves an
+/// upload and any other is replaced. Build at the provider where possible,
+/// otherwise append its layer; Upload bootstrap installs those same files
+/// under /opt/drydock before the first hello.
+/// Modules choose their own provider-recorded key from the image digest and
+/// any prepare-time constraints (Daytona also includes size). The tools
+/// digest is not part of it, nor is configuration. Provision must match the
+/// recorded prepared form. See ADR 0070 Vessel tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
     pub size: Size,
@@ -421,6 +424,9 @@ pub struct Prepared {
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub image_digest: String,
+    /// The tools image the prepare request named. Not part of the key: a
+    /// prepared form made with another tools image is reused, and its agent
+    /// is upgraded at the first hello.
     #[serde(deserialize_with = "validation::nonempty_string")]
     #[schema(min_length = 1)]
     pub tools_digest: String,

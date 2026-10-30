@@ -66,6 +66,10 @@ pub(crate) struct Settings {
     outward: BTreeMap<String, Listener>,
     pub(crate) inward: BTreeMap<String, Target>,
     capture: Option<crate::egress::Capture>,
+    /// Redirects an earlier agent process may have left installed, which
+    /// this one took over at startup. They stay until a configuration
+    /// replaces them, so egress stays enforced across a re-exec.
+    inherited: bool,
 }
 impl Settings {
     /// Loopback listeners exempt from capture, optionally with one forward's
@@ -89,6 +93,8 @@ pub(crate) struct Shared {
     executable: PathBuf,
     upgrade: Mutex<()>,
     restart: mpsc::Sender<PathBuf>,
+    /// Connections turned into the current wire by `GET /control`.
+    controls: std::sync::Mutex<JoinSet<()>>,
     pub(crate) store: crate::store::Store,
     processes: crate::process::Processes,
 }
@@ -151,6 +157,7 @@ impl Agent {
             processes: crate::process::Processes::new(buffer, events.clone()),
             events,
             settings: Mutex::new(Settings::default()),
+            controls: std::sync::Mutex::new(JoinSet::new()),
             store: crate::store::Store::new(crate::upgrade::sidecar(&executable, "store")),
             executable,
             upgrade: Mutex::new(()),
@@ -183,51 +190,16 @@ impl Agent {
         self.listeners.push(Box::new(listener));
     }
     fn router(&self) -> Router {
-        use crate::files::*;
-        Router::new()
-            .route("/hello", get(hello))
-            .route("/events", get(events))
-            .route("/upgrade", post(activate_upgrade))
-            .route("/upgrade/confirm", post(confirm_upgrade))
-            .route("/configuration", get(configuration).put(configure))
-            .route("/processes", get(list_processes).post(spawn))
-            .route("/processes/{id}", get(process).delete(remove_process))
-            .route("/processes/{id}/output", get(attach))
-            .route("/processes/{id}/stdin", put(write_stdin))
-            .route("/processes/{id}/signals", post(signal))
-            .route("/files/{*path}", get(get_file).head(head_file).put(put_file))
-            .route("/entries/", get(get_entry).delete(delete_entry).patch(patch_entry))
-            .route("/entries/{*path}", get(get_entry).delete(delete_entry).patch(patch_entry))
-            .route("/dirs/", get(get_dir))
-            .route("/dirs/{*path}", get(get_dir).put(put_dir))
-            .route("/links/{*path}", put(put_link))
-            .route("/trees/{*path}", put(put_tree))
-            .route("/renames", post(post_rename))
-            .route("/uploads/{sha256}", head(upload_offset).patch(append_upload).delete(remove_upload))
-            .route("/blobs/{sha256}", head(blob_size).put(create_upload).delete(remove_blob))
-            .route("/artifacts", get(crate::artifacts::list_artifacts))
-            .route(
-                "/artifacts/{sha256}",
-                get(crate::artifacts::get_artifact).put(crate::artifacts::put_artifact).delete(crate::artifacts::delete_artifact),
-            )
-            .route("/artifacts/{sha256}/links/{*path}", put(crate::artifacts::put_artifact_link))
-            .route("/forwards/outward", get(outward_forwards))
-            .route("/forwards/outward/{id}", get(outward_forward).put(put_outward).delete(remove_outward))
-            .route("/forwards/outward/{id}/connections/{connection}", get(crate::streams::claim).connect(crate::streams::claim))
-            .route("/forwards/inward", get(inward_forwards))
-            .route("/forwards/inward/{id}", get(inward_forward).put(put_inward).delete(remove_inward))
-            .route("/forwards/inward/{id}/stream", get(crate::streams::open_inward).connect(crate::streams::open_inward))
-            // A deliberate cap on JSON control bodies only; streamed bodies have none.
-            .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-            .layer(axum::middleware::from_fn(structured))
-            .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::rest::panicked))
-            .with_state(self.shared.clone())
+        router(self.shared.clone())
     }
     /// Returns the probation candidate on upgrade. The composition root re-execs
     /// with its original fixed flags; dropping this future drops all agent streams.
     pub async fn run(mut self) -> io::Result<PathBuf> {
-        if let Err(error) = self.shared.egress_system.clear().await {
-            tracing::warn!(%error, "could not clear guest egress redirects left by an earlier agent");
+        // Redirects an earlier agent left stay in place: this process takes
+        // them over, and the next configuration replaces them. Without the
+        // nft executable no agent can have installed any.
+        if self.shared.egress_system.nft.exists() {
+            self.shared.settings.lock().await.inherited = true;
         }
         match self.shared.store.sweep(crate::store::ABANDONED) {
             Ok(0) => {}
@@ -272,14 +244,14 @@ impl Agent {
             tokio::select! {
                 path = self.restart.recv() => {
                     tasks.shutdown().await;
+                    self.shared.controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).abort_all();
                     // Remove owned guest socket paths before exec discards the
                     // runtime. Aborting tasks alone does not synchronously drop them.
                     let mut settings = self.shared.settings.lock().await;
                     for (_, listener) in std::mem::take(&mut settings.outward) { listener.stop().await; }
-                    // The configuration dies with this process; so do its redirects.
-                    if let Err(error) = self.shared.egress_system.clear().await {
-                        tracing::warn!(%error, "could not clear guest egress redirects before re-exec");
-                    }
+                    // The configuration dies with this process, but its
+                    // redirects stay: the next agent takes them over, so
+                    // guest traffic is never uncaptured while it starts.
                     return path.ok_or_else(|| io::Error::other("upgrade channel closed"));
                 },
                 finished = tasks.join_next() => if finished.is_none() {
@@ -288,6 +260,51 @@ impl Agent {
             }
         }
     }
+}
+
+/// Every route, on every connection: the frozen upgrade path (`/hello`,
+/// `/blobs`, `/uploads`, `/upgrade`, `/upgrade/confirm`) and the current wire.
+fn router(shared: Arc<Shared>) -> Router {
+    use crate::files::*;
+    Router::new()
+        .route("/hello", get(hello))
+        .route("/control", get(control))
+        .route("/events", get(events))
+        .route("/upgrade", post(activate_upgrade))
+        .route("/upgrade/confirm", post(confirm_upgrade))
+        .route("/configuration", get(configuration).put(configure))
+        .route("/processes", get(list_processes).post(spawn))
+        .route("/processes/{id}", get(process).delete(remove_process))
+        .route("/processes/{id}/output", get(attach))
+        .route("/processes/{id}/stdin", put(write_stdin))
+        .route("/processes/{id}/signals", post(signal))
+        .route("/files/{*path}", get(get_file).head(head_file).put(put_file))
+        .route("/entries/", get(get_entry).delete(delete_entry).patch(patch_entry))
+        .route("/entries/{*path}", get(get_entry).delete(delete_entry).patch(patch_entry))
+        .route("/dirs/", get(get_dir))
+        .route("/dirs/{*path}", get(get_dir).put(put_dir))
+        .route("/links/{*path}", put(put_link))
+        .route("/trees/{*path}", put(put_tree))
+        .route("/renames", post(post_rename))
+        .route("/uploads/{sha256}", head(upload_offset).patch(append_upload).delete(remove_upload))
+        .route("/blobs/{sha256}", head(blob_size).put(create_upload).delete(remove_blob))
+        .route("/artifacts", get(crate::artifacts::list_artifacts))
+        .route(
+            "/artifacts/{sha256}",
+            get(crate::artifacts::get_artifact).put(crate::artifacts::put_artifact).delete(crate::artifacts::delete_artifact),
+        )
+        .route("/artifacts/{sha256}/links/{*path}", put(crate::artifacts::put_artifact_link))
+        .route("/forwards/outward", get(outward_forwards))
+        .route("/forwards/outward/{id}", get(outward_forward).put(put_outward).delete(remove_outward))
+        .route("/forwards/outward/{id}/connections/{connection}", get(crate::streams::claim).connect(crate::streams::claim))
+        .route("/forwards/inward", get(inward_forwards))
+        .route("/forwards/inward/{id}", get(inward_forward).put(put_inward).delete(remove_inward))
+        .route("/forwards/inward/{id}/stream", get(crate::streams::open_inward).connect(crate::streams::open_inward))
+        // A deliberate cap on JSON control bodies only; streamed bodies have none.
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(structured))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(crate::rest::panicked))
+        .with_state(shared)
 }
 
 /// Transient accept failures: the listener stays bound and is served again.
@@ -364,7 +381,7 @@ async fn configure(State(s): State<Arc<Shared>>, headers: HeaderMap, Json(config
         _ => None,
     };
     let installed: Refusal<()> = async {
-        if config.egress.is_none() && settings.capture.is_none() {
+        if config.egress.is_none() && settings.capture.is_none() && !settings.inherited {
             return Ok(());
         }
         let exempt = settings.exemptions("", None);
@@ -401,6 +418,7 @@ async fn configure(State(s): State<Arc<Shared>>, headers: HeaderMap, Json(config
     } else if let Some(capture) = settings.capture.take() {
         capture.stop().await;
     }
+    settings.inherited = false;
     let tag = configuration_tag(&s, &config);
     settings.config = config;
     Ok((StatusCode::NO_CONTENT, [(header::ETAG, header_value(tag))]).into_response())
@@ -720,16 +738,72 @@ async fn remove_blob(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn activate_upgrade(State(s): State<Arc<Shared>>, Query(query): Query<DigestQuery>) -> Refusal<StatusCode> {
+/// `POST /upgrade?sha256=`, with an optional JSON [`Activation`] body: make
+/// the completed upload the candidate, drain, then re-exec. Part of the
+/// frozen upgrade path, so the body ignores fields it does not know.
+async fn activate_upgrade(State(s): State<Arc<Shared>>, Query(query): Query<DigestQuery>, body: bytes::Bytes) -> Refusal<Response> {
+    const OP: &str = "upgrade.activate";
+    let activation: Activation = if body.is_empty() {
+        Activation::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AgentError::new(OP, "body", ErrorKind::InvalidInput, format!("malformed activation: {e}")))?
+    };
     let _guard = s.upgrade.lock().await;
     let path = crate::upgrade::activate(&s.executable, &s.store, &query.sha256).await?;
+    let running = s.processes.drain(std::time::Duration::from_millis(activation.drain_ms)).await;
+    if !running.is_empty() {
+        tracing::warn!(count = running.len(), "processes still running at the drain limit lose their handles at re-exec");
+    }
+    let running = running.into_iter().map(|p| RunningProcess { id: p.id, pid: p.pid, program: p.program }).collect();
     let tx = s.restart.clone();
     tokio::spawn(async move {
         // Activation acknowledgement is advisory: clients reconnect and verify hello.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _ = tx.send(path).await;
     });
-    Ok(StatusCode::ACCEPTED)
+    Ok((StatusCode::ACCEPTED, Json(Activated { sha256: query.sha256, running })).into_response())
+}
+/// `GET /control` with `Upgrade: drydock-control` on HTTP/1.1: the
+/// connection becomes one serving every route, HTTP/1.1 or HTTP/2 as its
+/// next bytes say. A host that has read a matching hello over the frozen
+/// upgrade path carries on over the current wire on the same connection.
+async fn control(State(s): State<Arc<Shared>>, mut request: axum::extract::Request) -> Refusal<Response> {
+    let refused = || {
+        AgentError::new(
+            "control.upgrade",
+            "/control",
+            ErrorKind::InvalidInput,
+            format!("the control connection is a GET with Connection: upgrade and Upgrade: {CONTROL}"),
+        )
+    };
+    let token = |name: header::HeaderName, token: &str| {
+        request
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value.split(',').any(|item| item.trim().eq_ignore_ascii_case(token)))
+    };
+    if !token(header::CONNECTION, "upgrade") || !token(header::UPGRADE, CONTROL) {
+        return Err(refused());
+    }
+    let on_upgrade = request.extensions_mut().remove::<hyper::upgrade::OnUpgrade>().ok_or_else(refused)?;
+    let router = router(s.clone());
+    let mut controls = s.controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Reap finished connections without retaining an unbounded history.
+    while controls.try_join_next().is_some() {}
+    controls.spawn(async move {
+        match http::upgraded(on_upgrade).await {
+            Ok(stream) => {
+                if let Err(error) = http::serve(stream, router).await {
+                    tracing::debug!(%error, "control connection ended");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "control connection did not upgrade"),
+        }
+    });
+    Ok((StatusCode::SWITCHING_PROTOCOLS, [(header::CONNECTION, "upgrade"), (header::UPGRADE, CONTROL)]).into_response())
 }
 async fn confirm_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
     let _guard = s.upgrade.lock().await;
@@ -797,7 +871,7 @@ mod tests {
         let blob = agent.shared.store.blob(&digest).unwrap();
         std::fs::write(&blob, b"new image").unwrap();
         let query = || Query(DigestQuery { sha256: digest.clone() });
-        let refused = activate_upgrade(State(agent.shared.clone()), query()).await.unwrap_err();
+        let refused = activate_upgrade(State(agent.shared.clone()), query(), bytes::Bytes::new()).await.unwrap_err();
         assert_eq!(refused.operation, "upgrade.activate");
         assert_eq!(refused.kind, ErrorKind::NotFound);
         assert!(refused.subject.ends_with("agent"), "{refused}");
@@ -805,31 +879,61 @@ mod tests {
         assert_eq!(std::fs::read(&blob).unwrap(), b"new image", "the upload must survive failed linking");
         assert_eq!(std::fs::read(&previous).unwrap(), b"previous rollback");
         std::fs::write(&executable, b"current image").unwrap();
-        activate_upgrade(State(agent.shared.clone()), query()).await.unwrap();
+        activate_upgrade(State(agent.shared.clone()), query(), bytes::Bytes::new()).await.unwrap();
         assert_eq!(std::fs::read(&executable).unwrap(), b"current image");
         assert_eq!(std::fs::read(&upgrade).unwrap(), b"new image");
         assert_eq!(std::fs::read(previous).unwrap(), b"current image");
     }
 
-    // Redirects never outlive the configuration that installed them: an agent
-    // starts with empty configuration, so it first removes any capture table a
-    // crashed predecessor left behind. The nft stand-in records transactions.
+    // Egress stays enforced across an upgrade: neither the re-exec nor the
+    // next agent's startup removes the capture table. The new agent takes it
+    // over, and the first configuration replaces it, here with open egress,
+    // which removes the redirects once. The nft stand-in records transactions.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn startup_removes_redirects_left_by_a_previous_agent() {
+    async fn redirects_stay_across_reexec_until_a_configuration_replaces_them() {
+        use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
-        let (_host, mut agent) = agent(dir.path()).await;
         let nft = dir.path().join("nft");
-        std::fs::write(&nft, "#!/bin/sh\ncat >> \"$0.log\"\n").unwrap();
+        std::fs::write(&nft, "#!/bin/sh\ncat >> \"$0.log\"\nprintf -- '--\\n' >> \"$0.log\"\n").unwrap();
         std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Arc::get_mut(&mut agent.shared).unwrap().egress_system = crate::egress::System { nft: nft.clone(), ca: dir.path().join("ca.pem") };
-        let running = tokio::spawn(agent.run());
         let log = nft.with_extension("log");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !std::fs::read_to_string(&log).is_ok_and(|log| log.contains("delete table inet drydock_egress")) {
-            assert!(std::time::Instant::now() < deadline, "startup must remove the capture table");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let transactions = || std::fs::read_to_string(&log).unwrap_or_default();
+        let stand_in = || crate::egress::System { nft: nft.clone(), ca: dir.path().join("ca.pem") };
+        let started = |agent: &Agent| {
+            let shared = agent.shared.clone();
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !shared.settings.lock().await.inherited {
+                    assert!(std::time::Instant::now() < deadline, "the agent never took the redirects over");
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        };
+        std::fs::write(dir.path().join("agent"), b"current image").unwrap();
+        let (_host, mut first) = agent(dir.path()).await;
+        Arc::get_mut(&mut first.shared).unwrap().egress_system = stand_in();
+        let shared = first.shared.clone();
+        let wait = started(&first);
+        let running = tokio::spawn(first.run());
+        wait.await;
+        let digest = format!("{:x}", Sha256::digest(b"new image"));
+        std::fs::write(shared.store.blob(&digest).unwrap(), b"new image").unwrap();
+        activate_upgrade(State(shared.clone()), Query(DigestQuery { sha256: digest }), bytes::Bytes::new()).await.unwrap();
+        let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), running).await.unwrap().unwrap().unwrap();
+        assert_eq!(candidate, dir.path().join("agent.upgrade"));
+        assert_eq!(transactions(), "", "neither startup nor the re-exec may remove redirects");
+        let (_host, mut next) = agent(dir.path()).await;
+        Arc::get_mut(&mut next.shared).unwrap().egress_system = stand_in();
+        let shared = next.shared.clone();
+        let wait = started(&next);
+        let running = tokio::spawn(next.run());
+        wait.await;
+        assert_eq!(transactions(), "", "the next agent takes the redirects over");
+        configure(State(shared.clone()), HeaderMap::new(), Json(Configuration::default())).await.unwrap();
+        assert_eq!(transactions(), "add table inet drydock_egress\nflush table inet drydock_egress\n--\n");
+        configure(State(shared.clone()), HeaderMap::new(), Json(Configuration::default())).await.unwrap();
+        assert_eq!(transactions().matches("--").count(), 1, "replaced redirects are no longer inherited");
         running.abort();
     }
     // Activation rehashes the upload as it copies it out of the store, so
@@ -844,7 +948,9 @@ mod tests {
         std::fs::write(&executable, b"current image").unwrap();
         let digest = format!("{:x}", Sha256::digest(b"new image"));
         std::fs::write(agent.shared.store.blob(&digest).unwrap(), b"bad image").unwrap();
-        let refused = activate_upgrade(State(agent.shared.clone()), Query(DigestQuery { sha256: digest.clone() })).await.unwrap_err();
+        let refused = activate_upgrade(State(agent.shared.clone()), Query(DigestQuery { sha256: digest.clone() }), bytes::Bytes::new())
+            .await
+            .unwrap_err();
         assert_eq!((refused.operation.as_str(), refused.kind, refused.status), ("upgrade.activate", ErrorKind::DigestMismatch, 422));
         assert!(refused.message.contains(&digest), "{refused}");
         assert_eq!(agent.shared.store.blob_size(&digest).await.unwrap(), None, "the corrupted upload is discarded");

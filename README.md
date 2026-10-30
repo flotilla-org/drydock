@@ -62,8 +62,9 @@ settings = {
 
 Every drydock build uses the checked-in [tools image pin](crates/drydock/tools-image.txt),
 including `cargo install` and Git dependencies. `DRYDOCK_TOOLS_IMAGE` can override
-it at build time. The pin can lag the host build: after hello, the host pushes
-and re-execs its current agent when fingerprints differ. Before the first image
+it at build time. The pin can lag the host build: the agent in an image is
+only a cache, and after hello the host pushes and re-execs its own agent
+build when fingerprints differ, through the agent's frozen upgrade path. Before the first image
 is published the pin reads `unpublished`; publish through the operator workflow
 and merge its generated pin PR before using `launch` or `prepare` (or compile
 with a published image override). See the [tools image and module guide](ci/tools-image/README.md).
@@ -126,9 +127,12 @@ reaches it with one HTTP/2 connection through an SSH local forward, which every
 SSH server allows, Daytona's gateway included. Embedding clients reach an agent
 through `drydock::agent::AgentReach`. It applies the provider's declared
 `agent` capability and its reach, and reports what it chose as an
-`AgentReport`: the provider, its module, the vessel and the endpoint. An agent
-too old to speak plain HTTP cannot be reached: the vessel is reported
-unreachable until its operator restarts it from a current tools image.
+`AgentReport`: the provider, its module, the vessel and the endpoint. Every
+agent since #152 serves a [frozen upgrade path](crates/drydock-agent/README.md#the-frozen-upgrade-path)
+over plain HTTP/1.1, so drydock brings an agent of any later release to its
+own build before relying on anything else. Images prepared before it carry
+an older agent and are prepared again, once: the prepared form's key no
+longer includes the tools image.
 
 The daemon discovers loadable modules from host `hello`, then sends only the
 providers assigned to each host. A failed optional host is logged and skipped;
