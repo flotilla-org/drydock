@@ -282,6 +282,8 @@ impl Local {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(unavailable(format!("create environment directory: {e}")));
         }
+        // Reads take no lock, so a list during this start can show the new environment as
+        // stopped, and as gone again if the start fails. Acceptable for a fixture.
         if let Err(error) = self.start(&id).await {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             return Err(error);
@@ -526,6 +528,7 @@ impl SuspendResume for Local {
             return Err(refused("invalid resume token for this provider/environment"));
         }
         let dir = self.dir(id);
+        // A failed start leaves the suspension marker: the environment stays suspended.
         if !running(&dir, &self.socket(id)).await {
             self.start(id).await?;
         }
