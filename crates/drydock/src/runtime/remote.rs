@@ -89,7 +89,14 @@ impl Provider for RemoteProvider {
         if !matches!(readiness, Readiness::Ready | Readiness::MissingCredential { .. }) {
             return readiness;
         }
-        if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
+        // A host that reports a provider ready without having been given a credential
+        // is one that needs none. Modules that need one must report MissingCredential until
+        // it arrives, as the trait's default does; the mixed-config test in tests/local.rs pins that.
+        if c.token().is_some() || matches!(readiness, Readiness::Ready) {
+            Readiness::Ready
+        } else {
+            Readiness::MissingCredential { reason: "credential not delivered".into() }
+        }
     }
     async fn refresh_readiness(&self, c: &Credentials) {
         let readiness = match self.host(c).provider(self.name()).await {

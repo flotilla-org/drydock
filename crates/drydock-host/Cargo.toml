@@ -8,6 +8,9 @@ license.workspace = true
 drydock-provider = { path = "../drydock-provider" }
 reqwest = { workspace = true, features = ["json", "query"] }
 sha2.workspace = true
+libc = "0.2"
+rigging-paths.workspace = true
+rigging-process.workspace = true
 drydock-protocol = { path = "../drydock-protocol" }
 futures = "0.3"
 rigging-http-client.workspace = true
@@ -17,7 +20,7 @@ async-trait = "0.1"
 axum = "0.8"
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal", "process", "fs"] }
 chrono = "0.4"
 url = "2"
 base64 = "0.22"
@@ -28,7 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 drydock-client = { version = "0.1.0", path = "../drydock-client" }
 
 [dev-dependencies]
-libc = "0.2"
 drydock = { path = "../drydock" }
 tokio = { version = "1", features = ["process", "test-util"] }
 rigging-tls.workspace = true
@@ -38,3 +40,4 @@ reqwest = { workspace = true, features = ["json", "stream", "query"] }
 hegeltest = "=0.48.1"
 http.workspace = true
 bytes = "1"
+drydock-agent = { path = "../drydock-agent" }
