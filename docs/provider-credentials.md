@@ -6,15 +6,18 @@ What each provider module needs from its credential. Mint keys with exactly thes
 
 Credential: an API key, as a plain token file. Configuration also needs `organization_id` and `ssh_host_key`.
 
-Create it on the Daytona website (Dashboard → API Keys); the CLI can't create keys.
+Create it on the Daytona website (Dashboard → API Keys → Restricted); the CLI can't create keys. Read on sandboxes, snapshots, registries and regions is always granted.
 
-| Resource | Needs | Used for |
-|---|---|---|
-| Sandboxes | read, write, delete | `GET /sandbox` (inventory, adoption, orphan sweeps), `GET /sandbox/{id}`, create, start, stop, exec, delete |
-| Snapshots | read, write, delete | `GET /snapshots/{name}`, create, activate (prepare) |
-| Organization usage | read | `GET /organizations/{id}/usage` (quota) and the analytics usage aggregate |
+| Permission | Used for |
+|---|---|
+| Sandboxes: Write, Delete | create, start, stop, exec, delete |
+| Snapshots: Write, Delete | create and activate (prepare) |
+| Limits: Read | `GET /organizations/{id}/usage` (quota) |
+| Billing: Read | the analytics usage aggregate (usage) |
 
-Without sandbox read, `GET /sandbox` returns an empty list rather than an error, so drydock can't see the sandboxes it made, including leaked ones (found 2026-10-30). Fetching one sandbox by ID or name still works.
+Leave the rest off.
+
+Known problem (2026-10-30): `GET /sandbox` returned an empty list for our key while sandboxes were live, so drydock couldn't see the sandboxes it made, including leaked ones. Read on sandboxes is always granted, so the key's permissions aren't the cause; it is not yet understood. Fetching one sandbox by ID or name works.
 
 ## Namespace (`namespace`, TypeScript host)
 
