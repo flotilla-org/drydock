@@ -378,6 +378,27 @@ async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
 }
+/// Give the owner write access to every directory below `dir`, so that its
+/// entries can be removed. Symbolic links are not followed.
+fn owner_writable(dir: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))?;
+    }
+    for entry in std::fs::read_dir(dir)? {
+        owner_writable(&entry?.path())?;
+    }
+    Ok(())
+}
+
 /// Whether the agent at `socket` answers `GET /hello`, which it serves over plain HTTP/1.1.
 async fn hello(socket: &Path) -> bool {
     let attempt = async {
@@ -487,6 +508,12 @@ impl Provider for Local {
         let _changing = self.lifecycle.lock().await;
         let dir = self.dir(id);
         stop(&dir, &self.socket(id)).await?;
+        // The agent's artifact store keeps its unpacked trees read-only.
+        let writable = dir.clone();
+        tokio::task::spawn_blocking(move || owner_writable(&writable))
+            .await
+            .map_err(|e| internal(format!("make environment directory writable: {e}")))?
+            .map_err(|e| unavailable(format!("make environment directory writable: {e}")))?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

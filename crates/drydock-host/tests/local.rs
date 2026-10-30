@@ -297,6 +297,25 @@ async fn destroy_kills_the_agent_and_its_process_group() {
     assert!(matches!(p.inspect(&environment.id, &credentials()).await, Err(ProtocolError::NotFound { .. })));
 }
 
+// Destroy removes what the vessel left read-only, as the agent's artifact
+// store leaves its unpacked trees.
+#[tokio::test]
+async fn destroy_removes_read_only_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "frozen").await;
+    let tree = root.path().join(&environment.id).join("store/tree");
+    std::fs::create_dir_all(tree.join("nested")).unwrap();
+    std::fs::write(tree.join("nested/file"), "frozen").unwrap();
+    for dir in [tree.join("nested"), tree.clone()] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    assert!(!root.path().join(&environment.id).exists());
+}
+
 // Environments are their directories: a host that starts over finds them,
 // agents still running, and can destroy them.
 #[tokio::test]
@@ -420,7 +439,6 @@ async fn local_passes_conformance() {
         fixture_configuration: None,
         billing_sample_millis: 25,
         billing_settle_millis: 0,
-        null_environment_id: Some("local-aaaaaaaaaaaa".into()),
         auth_audit: None,
         timeouts: Default::default(),
         echo_relay: false,
