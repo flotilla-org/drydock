@@ -316,8 +316,8 @@ Provider-level prepare, credential, usage and quota stay directly under
 without colliding with provider-level operations. There are no route aliases.
 Hosts serve every route except the server-only credential and event extensions.
 
-Optional fields serialize as explicit `null`; absent optional fields are accepted
-as `None`. Unknown object fields are ignored for additive compatibility. Unknown
+Absent optional fields are omitted from JSON; readers accept both a missing field
+and `null` as absent. Unknown object fields are ignored for additive compatibility. Unknown
 enum variants are rejected, including readiness and loss causes: hosts must
 negotiate the protocol version and report mismatches as not ready. Incompatible
 new variants require a protocol version bump. OpenAPI info.version equals the
@@ -518,7 +518,7 @@ requires a client connected as an unauthorized UID.
 
 Select groups with `"scenarios": ["prepare", "lifecycle", "observation", "destroy"]`.
 The available groups are `capabilities`, `authentication`, `prepare`, `lifecycle`,
-`observation`, `semantics`, `nulls`, `reach`, `refusal`, `egress`, `destroy`,
+`observation`, `semantics`, `reach`, `refusal`, `egress`, `destroy`,
 `metering`, and `host_fixtures`. An omitted/empty list selects the provider suite
 excluding host fixtures. Dependencies (for example provisioning for observation)
 are still run; unrelated verdicts are omitted. A capabilities-only selection
@@ -529,13 +529,11 @@ with two fixture-capable providers. It exercises configuration atomicity,
 credential refresh, all typed error classes/statuses/retry headers, provider
 isolation, modelled create/delete sequences, stream upgrades, and deterministic
 poll recovery, timestamps, pause/halt billing and typed loss causes. Its exec
-control vocabulary is `drydock-fixture` plus `null_environment`, `forget`,
+control vocabulary is `drydock-fixture` plus `forget`,
 `state`, `timestamp`, `inventory_error`, or `pause`. Reference settings must
 explicitly enable `fixture`; vendor providers must not enable this profile.
 
-Environment null checks require a genuinely unlabeled environment with unknown
-granted size: use the fixture profile or supply `null_environment_id`. Without
-such evidence the verdict fails. Quota nulls are checked separately. Each invalid
+Each invalid
 CPU, memory, disk, destination and usage-period request gets its own verdict.
 Billing checks require the exact stopped cause and vendor usage facts over a
 sample window (`billing_sample_millis`, default 25); use a distinct granted size

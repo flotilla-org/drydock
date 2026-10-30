@@ -22,7 +22,6 @@ pub struct Options {
     pub scenarios: Vec<Scenario>,
     /// Full non-secret fixture configuration, only used by the host-contract suite.
     pub fixture_configuration: Option<Configuration>,
-    pub null_environment_id: Option<String>,
     pub auth_audit: Option<Vec<String>>,
     #[serde(default = "default_sample_millis")]
     pub billing_sample_millis: u64,
@@ -51,7 +50,6 @@ pub enum Scenario {
     Lifecycle,
     Observation,
     Semantics,
-    Nulls,
     Reach,
     Refusal,
     Egress,
@@ -67,7 +65,6 @@ impl Scenario {
         Self::Lifecycle,
         Self::Observation,
         Self::Semantics,
-        Self::Nulls,
         Self::Reach,
         Self::Refusal,
         Self::Egress,
@@ -351,7 +348,6 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     let needs_environment = [
         Scenario::Lifecycle,
         Scenario::Observation,
-        Scenario::Nulls,
         Scenario::Reach,
         Scenario::Refusal,
         Scenario::Egress,
@@ -382,9 +378,6 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         }
         let mut resumed =
             if options.selected(Scenario::Observation) { target.observation(environment, &mut report, &mut records).await } else { None };
-        if options.selected(Scenario::Nulls) {
-            target.explicit_nulls(environment, &mut report, &mut owned_ids).await;
-        }
         if options.selected(Scenario::Reach) {
             report.record("reach_byte_stream", reach(client, provider, &environment.id, &options).await);
         }
@@ -797,58 +790,6 @@ impl Target<'_> {
             }
         }
         resumed_records
-    }
-}
-
-impl Target<'_> {
-    async fn explicit_nulls(&self, environment: &Environment, report: &mut Report, owned_ids: &mut Resources) -> () {
-        let client = self.client;
-        let provider = self.provider;
-        let caps = self.caps;
-
-        report.record(
-            "environment_nulls",
-            async {
-                let null_id = if self.options.fixture_configuration.is_some() {
-                    let value = fixture(client, provider, &environment.id, &["null_environment".into()]).await?;
-                    let id = value["id"].as_str().ok_or("fixture omitted null environment id")?.to_owned();
-                    owned_ids.insert(id.clone());
-                    id
-                } else {
-                    self.options
-                        .null_environment_id
-                        .clone()
-                        .ok_or("null-field check requires an unlabelled, unknown-size environment or fixture controls")?
-                };
-                let (status, value) = client
-                    .wire(Method::GET, &["v1", "providers", provider, "environments", &null_id], &[], None)
-                    .await
-                    .map_err(SafeError::category)?;
-                require(
-                    status == 200
-                        && value.get("label").is_some_and(serde_json::Value::is_null)
-                        && value.get("granted_size").is_some_and(serde_json::Value::is_null),
-                    "environment must emit explicit null label and granted_size",
-                )?;
-                Ok(())
-            }
-            .await,
-        );
-        if caps.quota {
-            report.record(
-                "quota_nulls",
-                async {
-                    let (status, value) =
-                        client.wire(Method::GET, &["v1", "providers", provider, "quota"], &[], None).await.map_err(SafeError::category)?;
-                    require(status == 200, "quota refused")?;
-                    for field in ["credits_remaining", "credit_unit", "concurrency_in_use", "concurrency_limit"] {
-                        require(value.get(field).is_some(), "optional quota field omitted instead of null")?;
-                    }
-                    Ok(())
-                }
-                .await,
-            );
-        }
     }
 }
 
@@ -1306,8 +1247,8 @@ mod tests {
 }
 
 mod host;
+use host::host_fixtures;
 pub use host::{configuration_contract, error_contract, lifecycle_sequence, optional_contract, poll_contract, stream_contract};
-use host::{fixture, host_fixtures};
 
 mod tools;
 pub use tools::{ToolsEvidence, vessel_tools};

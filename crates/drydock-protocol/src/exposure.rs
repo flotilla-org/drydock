@@ -51,7 +51,7 @@ pub struct Inward {
     pub local: Local,
     pub ready: bool,
     /// Why the exposure is not working, when `ready` is false.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ExposureError>,
 }
 
@@ -91,16 +91,16 @@ pub struct Outward {
     pub guest: Guest,
     pub destination: OutwardDestination,
     /// For a guest name: the loopback address and port it was given in the vessel.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub address: Option<SocketAddr>,
     /// For a TCP destination: the address it resolved to when set.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub resolved: Option<SocketAddr>,
     pub ready: bool,
     /// Why the exposure is not working, when `ready` is false.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ExposureError>,
 }
 

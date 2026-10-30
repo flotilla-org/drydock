@@ -74,7 +74,6 @@ async fn reference_binary_passes_conformance() {
         fixture_configuration: Some(configuration),
         billing_sample_millis: 25,
         billing_settle_millis: 0,
-        null_environment_id: None,
         auth_audit: Some(vec![
             "python3".into(),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/auth-audit.py").into(),
@@ -186,7 +185,6 @@ async fn python_report_selection(
         fixture_configuration: Some(fixture_configuration()),
         billing_sample_millis: 25,
         billing_settle_millis: 0,
-        null_environment_id: None,
         auth_audit: Some(vec![
             "python3".into(),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/auth-audit.py").into(),

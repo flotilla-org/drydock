@@ -1936,7 +1936,6 @@ async fn conformance_waits_for_settled_billing_windows() {
             request: request(prep, "settled-billing"),
             scenarios: vec![Scenario::Observation],
             fixture_configuration: None,
-            null_environment_id: None,
             auth_audit: None,
             billing_sample_millis: 25,
             billing_settle_millis: settle,

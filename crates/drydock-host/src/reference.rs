@@ -270,22 +270,6 @@ impl Exec for Reference {
                         "challenge": r.command.get(3).ok_or_else(|| refused("missing tools probe challenge"))?
                     })
                 }
-                "null_environment" => {
-                    let row = Environment {
-                        id: format!("null-{id}"),
-                        label: None,
-                        provider: self.name.clone(),
-                        state: Observation::Unknown { reason: UnknownReason::ProviderApiError },
-                        granted_size: None,
-                        egress: Enforcement::Advisory,
-                        platform: None,
-                        egress_measured: false,
-                        egress_policy: None,
-                        timestamp: None,
-                    };
-                    state.environments.insert(row.id.clone(), row.clone());
-                    serde_json::to_value(row).expect("environment")
-                }
                 "forget" => {
                     state.stop_billing(target);
                     state.environments.remove(target);

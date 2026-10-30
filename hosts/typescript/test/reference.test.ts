@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import reference from "../dist/reference.js";
 import { serve } from "../dist/server.js";
+import { bodySchema, compile } from "../dist/validation.js";
 // Main-server conformance owns lifecycle, idempotency and polling/replay.
 // This trait-level scenario covers only reference-owned settings, canonical
 // prepared keys and clone isolation across reordered object members.
@@ -71,4 +72,46 @@ test("a user module named reference is refused at startup", async (t) => {
     serve([reference, { ...reference }], `${dir}/host.sock`),
     /duplicate module/,
   );
+});
+// Absent optional fields are omitted from the written JSON, never `null`.
+test("reference writes omit absent optional fields", async () => {
+  const abort = new AbortController(),
+    provider = await reference.configure(
+      "a",
+      { module: "reference", settings: { seed_unlabelled: true } },
+      abort.signal,
+    ),
+    row = await provider.inspect("unlabelled", {
+      credential: "test-only",
+      signal: abort.signal,
+    }),
+    written = JSON.parse(JSON.stringify(row));
+  for (const field of ["label", "granted_size", "platform", "timestamp"])
+    assert.equal(field in written, false, field);
+  assert.equal(written.id, "unlabelled");
+});
+// Readers take a missing optional field and an explicit `null` as the same absence.
+test("readers accept omitted and null optional fields", () => {
+  const environment = compile(bodySchema("Environment")),
+    quota = compile(bodySchema("Quota")),
+    omitted = {
+      id: "e",
+      provider: "a",
+      state: { state: "running" },
+      egress: "advisory",
+    };
+  assert.equal(environment(omitted), true);
+  assert.equal(
+    environment({
+      ...omitted,
+      label: null,
+      granted_size: null,
+      platform: null,
+      timestamp: null,
+      egress_policy: null,
+    }),
+    true,
+  );
+  assert.equal(quota({}), true);
+  assert.equal(quota({ credits_remaining: null, credit_unit: null }), true);
 });
