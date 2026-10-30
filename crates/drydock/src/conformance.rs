@@ -515,15 +515,23 @@ impl Target<'_> {
             }
         };
         if let Some(records) = records.as_mut() {
+            // A server merging several hosts sends each host's snapshot, which
+            // marks the other hosts' providers unavailable; the provider's own
+            // host's snapshot must follow before any event.
+            let initial = async {
+                loop {
+                    match next(records, timeouts).await? {
+                        ObserveRecord::Snapshot { unavailable_providers, .. } if unavailable_providers.contains_key(provider) => {}
+                        ObserveRecord::Snapshot { .. } => return Ok(()),
+                        ObserveRecord::Event { .. } => return Err("initial observation must mark a snapshot".into()),
+                    }
+                }
+            };
             report.record(
                 "initial_snapshot",
-                match next(records, timeouts).await {
-                    Ok(ObserveRecord::Snapshot { unavailable_providers, .. }) => {
-                        require(!unavailable_providers.contains_key(provider), "provider inventory unavailable")
-                    }
-                    Ok(_) => Err("initial observation must mark a snapshot".into()),
-                    Err(error) => Err(error),
-                },
+                tokio::time::timeout(Duration::from_secs(timeouts.record_seconds), initial)
+                    .await
+                    .unwrap_or_else(|_| Err("provider inventory unavailable".into())),
             );
         }
         records
