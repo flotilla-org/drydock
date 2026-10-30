@@ -130,6 +130,7 @@ no build reports `missing_tool`.
 - **Capabilities** declare no usage, quota or export. Conformance reports the
   checks that follow from that as not applicable.
 
+Each agent's output is appended to `agent.log` in its directory, unrotated.
 Process tracking reads procfs, so the module is ready only on Linux (elsewhere
 it reports `missing_tool`). Nothing is held in memory: environments are found by their directories, so they
 survive a restart of the host, and agents keep running meanwhile. An agent that
