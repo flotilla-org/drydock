@@ -188,8 +188,9 @@ impl Local {
         let mut found = vec![];
         while let Some(entry) = entries.next_entry().await.map_err(|e| unavailable(format!("read local root: {e}")))? {
             let Some(id) = entry.file_name().to_str().filter(|id| valid_id(id)).map(str::to_owned) else { continue };
-            if let Ok(record) = self.record(&id).await {
-                found.push((id, record));
+            match self.record(&id).await {
+                Ok(record) => found.push((id, record)),
+                Err(error) => tracing::warn!(%id, ?error, "skipping a local environment whose record cannot be read"),
             }
         }
         found.sort_by(|a, b| a.0.cmp(&b.0));
@@ -341,32 +342,35 @@ fn session(leader: i32) -> Vec<i32> {
 /// Kill the agent and everything in its session, and wait until they are gone.
 async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     let Some(pid) = agent_pid(dir).await else { return Ok(()) };
-    if process(pid, socket) != Process::Other {
-        let signal_all = |signal: i32| {
-            // The group is the agent's only while the agent is: its PID may have been recycled
-            // since. Session members are matched by session id, so they are always ours.
-            if process(pid, socket) == Process::Agent {
-                // SAFETY: signals the process group the agent leads.
-                unsafe { libc::kill(-pid, signal) };
-            }
-            for member in session(pid) {
-                // SAFETY: signals a process found in the agent's session; ESRCH when it has gone.
-                unsafe { libc::kill(member, signal) };
-            }
-        };
-        let gone = |limit: Duration| async move {
-            let deadline = tokio::time::Instant::now() + limit;
-            while (process(pid, socket) == Process::Agent || !session(pid).is_empty()) && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        signal_all(libc::SIGTERM);
-        gone(TERMINATION_GRACE).await;
-        signal_all(libc::SIGKILL);
-        gone(Duration::from_secs(5)).await;
-        if process(pid, socket) == Process::Agent || !session(pid).is_empty() {
-            return Err(unavailable("the agent or its processes survived SIGKILL"));
+    // What is left of the agent's session. If its PID has been recycled, the new holder
+    // is not ours, but the rest of the session still is.
+    let members = || -> Vec<i32> {
+        let recycled = process(pid, socket) == Process::Other;
+        session(pid).into_iter().filter(|member| !(recycled && *member == pid)).collect()
+    };
+    let signal_all = |signal: i32| {
+        // The group is the agent's only while the agent is: its PID may have been recycled.
+        if process(pid, socket) == Process::Agent {
+            // SAFETY: signals the process group the agent leads.
+            unsafe { libc::kill(-pid, signal) };
         }
+        for member in members() {
+            // SAFETY: signals a process found in the agent's session; ESRCH when it has gone.
+            unsafe { libc::kill(member, signal) };
+        }
+    };
+    let gone = |limit: Duration| async move {
+        let deadline = tokio::time::Instant::now() + limit;
+        while (process(pid, socket) == Process::Agent || !members().is_empty()) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    signal_all(libc::SIGTERM);
+    gone(TERMINATION_GRACE).await;
+    signal_all(libc::SIGKILL);
+    gone(Duration::from_secs(5)).await;
+    if process(pid, socket) == Process::Agent || !members().is_empty() {
+        return Err(unavailable("the agent or its processes survived SIGKILL"));
     }
     let _ = tokio::fs::remove_file(dir.join(PID)).await;
     let _ = tokio::fs::remove_file(socket).await;
