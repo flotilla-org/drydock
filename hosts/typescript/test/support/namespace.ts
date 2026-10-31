@@ -300,6 +300,9 @@ export class Registries {
     authorization: string | null;
   }[] = [];
 
+  /** Answers every upload request with a 307 to the same path plus `hop=N`, up to this many hops. */
+  uploadRedirects = 0;
+
   store(host: string): Store {
     let store = this.stores.get(host);
     if (!store) {
@@ -339,6 +342,20 @@ export class Registries {
           headers: { "www-authenticate": 'Basic realm="nscr.io"' },
         });
     }
+    const hop = Number(url.searchParams.get("hop") ?? 0);
+    if (
+      url.host === "nscr.io" &&
+      /\/blobs\/uploads\//.test(url.pathname) &&
+      hop < this.uploadRedirects
+    ) {
+      const next = new URL(url);
+      next.searchParams.set("hop", String(hop + 1));
+      return new Response(null, {
+        status: 307,
+        headers: { location: next.pathname + next.search },
+      });
+    }
+    url.searchParams.delete("hop");
     const store = this.store(url.host);
     const match = /^\/v2\/(.+)\/(manifests|blobs)\/(.*)$/.exec(url.pathname);
     if (!match) return new Response(null, { status: 404 });

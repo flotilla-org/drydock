@@ -88,6 +88,23 @@ test("configure validates settings; readiness needs a bearer token document", as
   );
 });
 
+// nscr.io answers upload requests with a 307; the push follows it, resending
+// the same method and body, with the token only on the registry's own origin.
+test("prepare follows upload redirects within a bound", async () => {
+  const { registries, provider, context, request } = await setup();
+  registries.uploadRedirects = 2;
+  const prepared = await provider.prepare(request, context);
+  assert.match(prepared.id, /^nscr\.io\/acme\/drydock-vessel@sha256:/);
+  assert.ok(registries.store("nscr.io").manifests.size > 0);
+
+  const endless = await setup();
+  endless.registries.uploadRedirects = 1000;
+  await assert.rejects(
+    endless.provider.prepare(endless.request, endless.context),
+    (e: any) => /redirected too often/.test(e.detail?.reason),
+  );
+});
+
 // Prepare layers the tools image onto the base by digest, pushes it to the
 // workspace's nscr.io repository with the token as password (and nowhere
 // else), and registers it by digest. Re-preparing finds the registration.

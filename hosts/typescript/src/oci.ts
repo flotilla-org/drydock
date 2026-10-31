@@ -245,6 +245,8 @@ export type RegistryCredential = { username: string; secret: string };
  * registry's own challenge: Basic, or a bearer token from its realm. The
  * credential never leaves the registry's origin (or Docker Hub's token service).
  */
+const MAX_REDIRECTS = 5;
+
 export class Registry {
   readonly origin: URL;
   private authorizations = new Map<string, string>();
@@ -377,8 +379,9 @@ export class Registry {
     headers: Record<string, string>,
     body: Uint8Array | undefined,
     what: string,
+    follow = false,
   ): Promise<Response> {
-    for (let challenged = false; ; challenged = true) {
+    for (let hops = 0, challenged = false; ; ) {
       const sameOrigin = this.sameOrigin(url);
       const authorization = sameOrigin
         ? this.authorizations.get(scope)
@@ -401,6 +404,23 @@ export class Registry {
             response.headers.get("www-authenticate"),
           ),
         );
+        challenged = true;
+        continue;
+      }
+      // Upload requests may be redirected (307/308 keep method and body).
+      // Authorization is attached per request only for this registry's origin.
+      if ([307, 308].includes(response.status) && follow) {
+        const location = response.headers.get("location");
+        await response.body?.cancel();
+        if (!location) throw malformed("redirect without location");
+        if (++hops > MAX_REDIRECTS)
+          throw new ProtocolFailure({
+            kind: "internal",
+            reason: `registry ${this.host} ${what} redirected too often`,
+            provider_error: "",
+          });
+        url = new URL(location, url);
+        challenged = false;
         continue;
       }
       return response;
@@ -532,6 +552,7 @@ export class Registry {
       {},
       new Uint8Array(),
       "upload",
+      true,
     );
     await response.body?.cancel();
     this.check(response, [202], "upload");
@@ -553,6 +574,7 @@ export class Registry {
       { "content-type": "application/octet-stream" },
       body,
       "upload",
+      true,
     );
     await response.body?.cancel();
     this.check(response, [201], "upload");
@@ -631,6 +653,7 @@ export async function copyBlob(
       },
       bytes,
       "upload",
+      true,
     );
     await patched.body?.cancel();
     target.check(patched, [202], "upload");
