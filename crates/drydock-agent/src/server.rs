@@ -250,6 +250,8 @@ impl Agent {
             tokio::select! {
                 path = self.restart.recv() => {
                     tasks.shutdown().await;
+                    // The guard would abort these on return; aborting here ends
+                    // control connections before the outward listeners stop.
                     self.shared.controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).abort_all();
                     // Remove owned guest socket paths before exec discards the
                     // runtime. Aborting tasks alone does not synchronously drop them.

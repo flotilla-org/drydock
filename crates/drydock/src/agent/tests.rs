@@ -152,10 +152,16 @@ async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
     }
 }
 
-/// A connection to a real agent served in memory.
+/// A connection to a real agent served in memory. The agent task keeps a
+/// dialer, so its listener stays open and the agent outlives this dial.
 async fn served(fingerprint: String) -> io::Result<drydock_transport::ByteStream> {
     let (dialer, listener) = drydock_transport::memory();
-    tokio::spawn(drydock_agent::Agent::new(listener, fingerprint, "/unused".into()).run());
+    let agent = drydock_agent::Agent::new(listener, fingerprint, "/unused".into());
+    let held = dialer.clone();
+    tokio::spawn(async move {
+        let _held = held;
+        agent.run().await
+    });
     dialer.connect().await
 }
 
