@@ -2436,5 +2436,6 @@ async fn adoption_by_name_returns_a_destroyed_sandbox_as_observed() {
     http.0.lock().unwrap().rows.get_mut(&id).unwrap()["state"] = json!("destroyed");
     let adopted = p.provision(r, &c).await.unwrap();
     assert!(matches!(adopted, Provisioned::Existing(ref e) if matches!(e.state, Observation::Gone { .. })));
+    // Still the one initial create: re-adoption did not create again.
     assert_eq!(http.0.lock().unwrap().creates, 1);
 }
