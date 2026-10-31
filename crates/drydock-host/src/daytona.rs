@@ -186,16 +186,13 @@ impl Daytona {
             provider_error: "response was not valid JSON".into(),
         })
     }
-    async fn inventory(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Value>> {
+    async fn inventory(&self, c: &Credentials) -> Result<Vec<Value>> {
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         loop {
             let mut url = self.path(&self.settings.api_url, &["sandbox"])?;
             url.query_pairs_mut().append_pair("limit", "200");
-            if let Some(label) = label {
-                url.query_pairs_mut().append_pair("labels", &json!({"flotilla.label":label}).to_string());
-            }
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
@@ -207,6 +204,20 @@ impl Daytona {
                 _ => return Err(bad_response()),
             }
         }
+    }
+    /// Daytona's `GET /sandbox/{idOrName}` accepts the name derived from a label.
+    async fn by_label_name(&self, label: &str, c: &Credentials) -> Result<Option<Value>> {
+        let url = self.sandbox_url(&name("environment", label), None)?;
+        let v = match self.call(Method::GET, url, None, c).await {
+            Ok(v) => v,
+            Err(ProtocolError::NotFound { .. }) => return Ok(None),
+            // Anything but a 404 fails provision; the caller retries it.
+            Err(e) => return Err(e),
+        };
+        if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(label) {
+            return Err(refused("Daytona sandbox name belongs to a different label"));
+        }
+        Ok(Some(v))
     }
     fn environment(&self, v: Value) -> Result<Environment> {
         let state = match text(&v, "state")? {
@@ -710,15 +721,14 @@ impl Provider for Daytona {
         if r.prepared.id != snapshot_name(&r.prepared.image_digest, &r.prepared.platform, size) {
             return Err(refused("Daytona size does not match the prepared snapshot"));
         }
-        if let Some(v) = self
-            .inventory(Some(&r.label), c)
-            .await?
-            .into_iter()
-            .find(|v| v.pointer("/labels/flotilla.label").and_then(Value::as_str) == Some(&r.label))
-        {
+        // The sandbox name derives from the label, so re-adoption is a direct read:
+        // the list lags creation by seconds, so a quick retry must not rely on it.
+        if let Some(v) = self.by_label_name(&r.label, c).await? {
             self.check_existing_request(&v, size, &policy)?;
             // Re-adoption returns the observed stopped/error state unchanged;
-            // provision does not implicitly resume an existing label.
+            // provision does not implicitly resume an existing label. A sandbox still
+            // starting is likewise returned as observed (unlike the create-conflict
+            // path below, which waits): the caller polls it.
             let mut row = self.environment(v)?;
             if matches!(row.state, Observation::Running) {
                 // Every Running re-adoption bootstraps; the guest supervisor's
@@ -737,10 +747,10 @@ impl Provider for Daytona {
         let created = self.create(self.path(&self.settings.api_url, &["sandbox"])?, body, c).await?;
         let v = match created {
             None => {
-                let v = self.call(Method::GET, self.sandbox_url(&name("environment", &r.label), None)?, None, c).await?;
-                if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(&r.label) {
-                    return Err(refused("Daytona sandbox name belongs to a different label"));
-                }
+                let v = self
+                    .by_label_name(&r.label, c)
+                    .await?
+                    .ok_or_else(|| ProtocolError::NotFound { reason: "Daytona sandbox vanished after a name conflict".into() })?;
                 self.check_existing_request(&v, size, &policy)?;
                 let existing = self.environment(v.clone())?;
                 if matches!(existing.state, Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }) {
@@ -763,7 +773,7 @@ impl Provider for Daytona {
         // sandbox mid-destroy is absent from `list`, while `inspect` still reports
         // `Destroying`.
         let mut rows = Vec::new();
-        for v in self.inventory(None, c).await? {
+        for v in self.inventory(c).await? {
             let row = self.environment(v)?;
             if !matches!(
                 row.state,

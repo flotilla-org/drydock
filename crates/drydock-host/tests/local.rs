@@ -420,7 +420,6 @@ async fn local_passes_conformance() {
         fixture_configuration: None,
         billing_sample_millis: 25,
         billing_settle_millis: 0,
-        null_environment_id: Some("local-aaaaaaaaaaaa".into()),
         auth_audit: None,
         timeouts: Default::default(),
         echo_relay: false,
