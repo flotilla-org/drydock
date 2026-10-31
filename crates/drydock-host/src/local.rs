@@ -378,6 +378,36 @@ async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
 }
+
+/// Give the owner write access to every directory below `dir`, so that its
+/// entries can be removed. Symbolic links are not followed. Best effort: a
+/// directory it cannot change or read is logged and skipped, and removing the
+/// tree reports what is in the way.
+fn owner_writable(dir: &Path) {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => metadata,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "cannot read a local environment directory before removing it");
+                continue;
+            }
+        };
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700
+            && let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode | 0o700))
+        {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot make a local environment directory writable");
+        }
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => pending.extend(entries.flatten().map(|entry| entry.path())),
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "cannot list a local environment directory before removing it"),
+        }
+    }
+}
+
 /// Whether the agent at `socket` answers `GET /hello`, which it serves over plain HTTP/1.1.
 async fn hello(socket: &Path) -> bool {
     let attempt = async {
@@ -419,6 +449,8 @@ impl Provider for Local {
             }],
             usage: false,
             quota: false,
+            // Vessels are directories on this machine: guest paths are its own.
+            host_filesystem: true,
         }
     }
     fn observation(&self) -> ObservationMode {
@@ -487,6 +519,11 @@ impl Provider for Local {
         let _changing = self.lifecycle.lock().await;
         let dir = self.dir(id);
         stop(&dir, &self.socket(id)).await?;
+        // The agent's artifact store keeps its unpacked trees read-only.
+        let writable = dir.clone();
+        tokio::task::spawn_blocking(move || owner_writable(&writable))
+            .await
+            .map_err(|e| internal(format!("make environment directory writable: {e}")))?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

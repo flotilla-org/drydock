@@ -186,6 +186,11 @@ pub struct Capabilities {
     pub image_routes: Vec<ImageRoute>,
     pub usage: bool,
     pub quota: bool,
+    /// Vessels run on the host's own filesystem, shared with the host and with
+    /// one another: a guest path is a host path. A client lays each vessel out
+    /// below paths it can write, never at fixed guest locations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_filesystem: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

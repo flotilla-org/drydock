@@ -881,5 +881,6 @@ fn conservative_capabilities() -> Capabilities {
         image_routes: vec![],
         usage: false,
         quota: false,
+        host_filesystem: false,
     }
 }

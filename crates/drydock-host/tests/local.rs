@@ -125,7 +125,8 @@ async fn prepare_records_the_request_without_pulling() {
 }
 
 // The declaration says what a local vessel is: no isolation, the host's platform,
-// open egress that is only advisory, and no usage or quota to report.
+// open egress that is only advisory, no usage or quota to report, and the
+// host's own filesystem.
 #[tokio::test]
 async fn capabilities_are_honest_about_having_no_isolation() {
     let root = Root::new();
@@ -137,6 +138,7 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     assert!(c.suspend_resume && c.suspend_preserves_memory == Some(false));
     assert!(!c.usage && !c.quota && !c.export && !c.fallback_runner);
     assert_eq!(c.workspace_root, root.path().to_str().unwrap());
+    assert!(c.host_filesystem, "vessels share this machine's filesystem");
     let ports = Ports::from(p.operations());
     assert_eq!(ports, Ports { suspend_resume: true, ..Ports::default() });
     assert_eq!(p.readiness(&credentials()), Readiness::Ready);
@@ -295,6 +297,47 @@ async fn destroy_kills_the_agent_and_its_process_group() {
     assert!(!root.path().join(&environment.id).exists());
     assert!(p.list(&credentials()).await.unwrap().is_empty());
     assert!(matches!(p.inspect(&environment.id, &credentials()).await, Err(ProtocolError::NotFound { .. })));
+}
+
+// Destroy removes what the vessel left read-only, as the agent's artifact
+// store leaves its unpacked trees.
+#[tokio::test]
+async fn destroy_removes_read_only_contents() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "frozen").await;
+    let tree = root.path().join(&environment.id).join("store/tree");
+    std::fs::create_dir_all(tree.join("nested")).unwrap();
+    std::fs::write(tree.join("nested/file"), "frozen").unwrap();
+    for dir in [tree.join("nested"), tree.clone()] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    assert!(!root.path().join(&environment.id).exists());
+}
+
+// Destroy follows no link out of the environment: a read-only directory a link
+// names keeps its permissions and contents.
+#[tokio::test]
+async fn destroy_leaves_what_a_link_names_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = Root::new();
+    let outside = tempfile::tempdir().unwrap();
+    let kept = outside.path().join("kept");
+    std::fs::create_dir(&kept).unwrap();
+    std::fs::write(kept.join("file"), "kept").unwrap();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "linked").await;
+    std::os::unix::fs::symlink(&kept, root.path().join(&environment.id).join("link")).unwrap();
+
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    assert!(!root.path().join(&environment.id).exists());
+    assert_eq!(std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o555);
+    assert_eq!(std::fs::read_to_string(kept.join("file")).unwrap(), "kept");
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 // Environments are their directories: a host that starts over finds them,

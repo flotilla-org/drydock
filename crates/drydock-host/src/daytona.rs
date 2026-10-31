@@ -587,6 +587,7 @@ impl Provider for Daytona {
             ],
             usage: true,
             quota: true,
+            host_filesystem: false,
         }
     }
     fn observation(&self) -> ObservationMode {

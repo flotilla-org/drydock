@@ -52,6 +52,10 @@ struct ReferenceSettings {
     /// test host point it at a directory of their own.
     #[serde(default = "default_workspace_root")]
     workspace_root: String,
+    /// Declare that vessels run on the host's own filesystem, for tests whose
+    /// stand-in vessel is the test host.
+    #[serde(default)]
+    host_filesystem: bool,
 }
 fn default_workspace_root() -> String {
     "/workspace".into()
@@ -132,6 +136,7 @@ impl Provider for Reference {
             }],
             usage: true,
             quota: true,
+            host_filesystem: self.settings.host_filesystem,
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

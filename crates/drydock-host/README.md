@@ -123,12 +123,15 @@ no build reports `missing_tool`.
   through the agent like on any provider.
 - **Suspend** kills the agent and everything in its session and keeps the
   directory; **resume** starts the agent again. Memory and processes are not kept.
-- **Destroy** kills the agent and its session, then removes the directory. Anything
+- **Destroy** kills the agent and its session, then removes the directory, read-only
+  contents (such as the agent's artifact store) included. Anything
   that started its own session escapes.
 - **Egress** is declared open and advisory. A deny-all request is refused with a
   reason, because the host's network cannot be restricted per vessel.
-- **Capabilities** declare no usage, quota or export. Conformance reports the
-  checks that follow from that as not applicable.
+- **Capabilities** declare `host_filesystem`: a guest path is a host path, so a
+  client lays each vessel out below paths it can write, never at fixed guest
+  locations such as `/opt`. They declare no usage, quota or export; conformance
+  reports the checks that follow from that as not applicable.
 
 Each agent's output is appended to `agent.log` in its directory, unrotated.
 Process tracking reads procfs, so the module is ready only on Linux (elsewhere

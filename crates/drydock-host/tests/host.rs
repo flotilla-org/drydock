@@ -129,6 +129,18 @@ async fn binary_sigterm_drains_and_removes_socket() {
     assert!(!socket.exists());
 }
 
+// The reference module declares the host's own filesystem only when a test's
+// stand-in vessel is the test host, and the host serves the declaration.
+#[tokio::test]
+async fn reference_declares_the_host_filesystem_when_told() {
+    let (_dir, client) = serve(drydock_host::Host::new(drydock_host::reference::registry())).await;
+    let document =
+        serde_json::json!({"providers":{"guest":{"module":"reference"},"host":{"module":"reference","settings":{"host_filesystem":true}}}});
+    client.configure(ConfigUpdate::Replace(configuration(document))).await.unwrap();
+    let declared: Vec<_> = client.providers().await.unwrap().into_iter().map(|d| (d.provider, d.capabilities.host_filesystem)).collect();
+    assert_eq!(declared, [("guest".into(), false), ("host".into(), true)]);
+}
+
 // The host takes the configuration document by PUT and merge-patch PATCH. An
 // unchanged entry keeps its provider, and with it its in-memory resources; a
 // document naming a server-only credential is refused without applying any of it.
