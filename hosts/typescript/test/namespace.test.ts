@@ -88,6 +88,50 @@ test("configure validates settings; readiness needs a bearer token document", as
   );
 });
 
+// nscr.io answers upload requests with a 307; the push follows it, resending
+// the same method and body, with the token only on the registry's own origin.
+test("prepare follows upload redirects within a bound", async () => {
+  const { registries, provider, context, request } = await setup();
+  registries.uploadRedirects = 2;
+  const prepared = await provider.prepare(request, context);
+  assert.match(prepared.id, /^nscr\.io\/acme\/drydock-vessel@sha256:/);
+  assert.ok(registries.store("nscr.io").manifests.size > 0);
+
+  const endless = await setup();
+  endless.registries.uploadRedirects = 1000;
+  await assert.rejects(
+    endless.provider.prepare(endless.request, endless.context),
+    (e: any) => /redirected too often/.test(e.detail?.reason),
+  );
+});
+
+test("upload redirects: 308 followed, no Location refused, other origins never see the token", async () => {
+  const permanent = await setup();
+  permanent.registries.uploadRedirects = 1;
+  permanent.registries.redirectStatus = 308;
+  await permanent.provider.prepare(permanent.request, permanent.context);
+
+  const bare = await setup();
+  bare.registries.uploadRedirects = 1;
+  bare.registries.redirectWithoutLocation = true;
+  await assert.rejects(
+    bare.provider.prepare(bare.request, bare.context),
+    (e: any) => /redirect without location/.test(e.detail?.reason),
+  );
+
+  const away = await setup();
+  away.registries.redirectStartTo = "uploads.test";
+  await away.provider.prepare(away.request, away.context);
+  const elsewhere = away.registries.requests.filter(
+    (r) => r.host === "uploads.test",
+  );
+  assert.ok(elsewhere.length > 0, "the redirect was followed");
+  assert.ok(
+    elsewhere.every((r) => r.authorization === null),
+    "the token never reaches the redirect target",
+  );
+});
+
 // Prepare layers the tools image onto the base by digest, pushes it to the
 // workspace's nscr.io repository with the token as password (and nowhere
 // else), and registers it by digest. Re-preparing finds the registration.

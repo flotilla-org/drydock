@@ -300,6 +300,15 @@ export class Registries {
     authorization: string | null;
   }[] = [];
 
+  /** Answers every upload request with a 307 to the same path plus `hop=N`, up to this many hops. */
+  uploadRedirects = 0;
+  /** Status of those redirects. */
+  redirectStatus = 307;
+  /** When set, starting an upload is redirected to this host, which opens the session on nscr.io. */
+  redirectStartTo: string | undefined;
+  /** Drops the Location header from redirects. */
+  redirectWithoutLocation = false;
+
   store(host: string): Store {
     let store = this.stores.get(host);
     if (!store) {
@@ -339,6 +348,49 @@ export class Registries {
           headers: { "www-authenticate": 'Basic realm="nscr.io"' },
         });
     }
+    if (url.host === this.redirectStartTo) {
+      const repository = /^\/v2\/(.+)\/blobs\/uploads\/$/.exec(
+        url.pathname,
+      )![1];
+      const nscr = this.store("nscr.io");
+      const id = String(nscr.uploads.size);
+      nscr.uploads.set(id, []);
+      return new Response(null, {
+        status: 202,
+        headers: {
+          location: `https://nscr.io/v2/${repository}/blobs/uploads/${id}`,
+        },
+      });
+    }
+    if (
+      this.redirectStartTo &&
+      url.host === "nscr.io" &&
+      method === "POST" &&
+      url.pathname.endsWith("/blobs/uploads/")
+    ) {
+      const next = new URL(url);
+      next.host = this.redirectStartTo;
+      return new Response(null, {
+        status: this.redirectStatus,
+        headers: { location: next.href },
+      });
+    }
+    const hop = Number(url.searchParams.get("hop") ?? 0);
+    if (
+      url.host === "nscr.io" &&
+      /\/blobs\/uploads\//.test(url.pathname) &&
+      hop < this.uploadRedirects
+    ) {
+      const next = new URL(url);
+      next.searchParams.set("hop", String(hop + 1));
+      return new Response(null, {
+        status: this.redirectStatus,
+        headers: this.redirectWithoutLocation
+          ? {}
+          : { location: next.pathname + next.search },
+      });
+    }
+    url.searchParams.delete("hop");
     const store = this.store(url.host);
     const match = /^\/v2\/(.+)\/(manifests|blobs)\/(.*)$/.exec(url.pathname);
     if (!match) return new Response(null, { status: 404 });
