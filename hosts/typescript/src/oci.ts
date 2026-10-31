@@ -240,13 +240,13 @@ const pushScope = (repository: string) => `repository:${repository}:pull,push`;
 
 export type RegistryCredential = { username: string; secret: string };
 
+const MAX_REDIRECTS = 5;
+
 /**
  * One registry, with pull or push access. Authentication follows the
  * registry's own challenge: Basic, or a bearer token from its realm. The
  * credential never leaves the registry's origin (or Docker Hub's token service).
  */
-const MAX_REDIRECTS = 5;
-
 export class Registry {
   readonly origin: URL;
   private authorizations = new Map<string, string>();
@@ -437,7 +437,7 @@ export class Registry {
     headers: Record<string, string>,
     what: string,
   ): Promise<Response> {
-    for (let hops = 0; hops < 5; hops++) {
+    for (let hops = 0; hops < MAX_REDIRECTS; hops++) {
       const response = this.sameOrigin(url)
         ? await this.send(scope, "GET", url, headers, undefined, what)
         : await this.execute(url, { headers }, what);
