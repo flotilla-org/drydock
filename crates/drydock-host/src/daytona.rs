@@ -10,11 +10,7 @@ use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
 
 pub struct DaytonaModule;
@@ -100,17 +96,13 @@ impl Module for DaytonaModule {
         for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
             endpoint_url(endpoint, true)?;
         }
-        Ok(Arc::new(Daytona { name: name.to_owned(), settings, http, known: Mutex::default() }))
+        Ok(Arc::new(Daytona { name: name.to_owned(), settings, http }))
     }
 }
 pub struct Daytona {
     name: String,
     settings: Settings,
     http: Arc<dyn HttpClient>,
-    /// Sandboxes this provider provisioned or adopted. Daytona's organisation-wide
-    /// list can come back empty while sandboxes are live, so an empty list is
-    /// believed only when none of these still exists.
-    known: Mutex<BTreeSet<String>>,
 }
 /// Bounds destroy's wait for an in-progress state change to about 8s (4 sleeps), long
 /// enough for a just-resumed sandbox to settle without stalling the caller.
@@ -215,32 +207,6 @@ impl Daytona {
                 _ => return Err(bad_response()),
             }
         }
-    }
-    fn remember(&self, id: &str) {
-        self.known.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned());
-    }
-    /// An empty list is a fact only if every sandbox this provider knows is gone.
-    /// Otherwise the vendor is hiding live sandboxes and a sweep over the list
-    /// would read as "nothing exists", so the provider reports itself unavailable.
-    /// The known set is per process: a freshly started host with a blind list has
-    /// nothing to vouch against, and its record-holding caller must cross-check.
-    async fn vouch_for_empty_list(&self, c: &Credentials) -> Result<()> {
-        let known: Vec<String> = self.known.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
-        for id in known {
-            match self.call(Method::GET, self.sandbox_url(&id, None)?, None, c).await {
-                Err(ProtocolError::NotFound { .. }) => {}
-                Ok(v) if matches!(self.environment(v.clone())?.state, Observation::Gone { .. }) => {}
-                Ok(_) => {
-                    return Err(ProtocolError::unavailable(
-                        "Daytona sandbox list is empty while known sandboxes are live; this provider's inventory cannot be enumerated",
-                        None,
-                    ));
-                }
-                Err(e) => return Err(e),
-            }
-            self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-        }
-        Ok(())
     }
     fn environment(&self, v: Value) -> Result<Environment> {
         let state = match text(&v, "state")? {
@@ -745,8 +711,8 @@ impl Provider for Daytona {
             return Err(refused("Daytona size does not match the prepared snapshot"));
         }
         // The sandbox name derives from the label, so re-adoption is a direct read:
-        // Daytona's list is not trusted to show a live sandbox.
-        // Daytona's `GET /sandbox/{idOrName}` accepts the derived name.
+        // Daytona's `GET /sandbox/{idOrName}` accepts the derived name. The list lags
+        // creation by seconds, so a quick retry must not rely on it.
         let derived = name("environment", &r.label);
         let found = match self.call(Method::GET, self.sandbox_url(&derived, None)?, None, c).await {
             Ok(v) => Some(v),
@@ -761,7 +727,6 @@ impl Provider for Daytona {
             // Re-adoption returns the observed stopped/error state unchanged;
             // provision does not implicitly resume an existing label.
             let mut row = self.environment(v)?;
-            self.remember(&row.id);
             if matches!(row.state, Observation::Running) {
                 // Every Running re-adoption bootstraps; the guest supervisor's
                 // lock makes this idempotent even across concurrent hosts.
@@ -785,7 +750,6 @@ impl Provider for Daytona {
                 }
                 self.check_existing_request(&v, size, &policy)?;
                 let existing = self.environment(v.clone())?;
-                self.remember(&existing.id);
                 if matches!(existing.state, Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }) {
                     return Ok(Provisioned::Existing(existing));
                 }
@@ -796,7 +760,6 @@ impl Provider for Daytona {
             }
             Some(v) => v,
         };
-        self.remember(text(&v, "id")?);
         let row = self.wait_started(text(&v, "id")?, c).await?;
         self.bootstrap(&row.id, c).await?;
         Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
@@ -806,14 +769,9 @@ impl Provider for Daytona {
         // once destroy has returned it must not read as present. Intended contract: a
         // sandbox mid-destroy is absent from `list`, while `inspect` still reports
         // `Destroying`.
-        let inventory = self.inventory(None, c).await?;
-        if inventory.is_empty() {
-            self.vouch_for_empty_list(c).await?;
-        }
         let mut rows = Vec::new();
-        for v in inventory {
+        for v in self.inventory(None, c).await? {
             let row = self.environment(v)?;
-            self.remember(&row.id);
             if !matches!(
                 row.state,
                 Observation::Transitioning { phase: TransitionPhase::Destroying }
@@ -842,10 +800,7 @@ impl Provider for Daytona {
         for attempt in 1..=DESTROY_ATTEMPTS {
             let url = self.sandbox_url(id, None)?;
             match self.request(Method::DELETE, url, None, c, true, ResponseFormat::Json).await {
-                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => {
-                    self.known.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-                    return Ok(());
-                }
+                Ok(Some(_)) | Err(ProtocolError::NotFound { .. }) => return Ok(()),
                 Ok(None) if attempt < DESTROY_ATTEMPTS => tokio::time::sleep(DESTROY_RETRY_DELAY).await,
                 Ok(None) => break,
                 Err(e) => return Err(e),

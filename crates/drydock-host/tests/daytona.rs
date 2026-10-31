@@ -2391,54 +2391,18 @@ async fn list_omits_sandbox_being_destroyed() {
     assert_eq!(ids, vec!["evicted".to_string(), "live".to_string()]);
 }
 
-// Daytona's list has been seen returning nothing while sandboxes are live.
-fn blind_list(http: &StandIn) {
-    http.0.lock().unwrap().list_blind = true;
-}
-
-// A fresh process re-adopts a label by its derived name, not by listing.
+// The sandbox list lags creation, so re-adoption reads the derived name directly.
 #[tokio::test]
-async fn adoption_by_label_needs_no_list() {
+async fn adoption_by_label_reads_the_derived_name_not_the_list() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
-    let r = request(prep, "blind");
+    let r = request(prep, "lagging");
     let id = row(p.provision(r.clone(), &c).await.unwrap()).id;
-    blind_list(&http);
-    let restarted = provider(http.clone()).await;
-    let adopted = restarted.provision(r, &c).await.unwrap();
+    http.0.lock().unwrap().list_blind = true;
+    let adopted = p.provision(r, &c).await.unwrap();
     assert!(matches!(adopted, Provisioned::Existing(_)));
     assert_eq!(row(adopted).id, id);
     assert_eq!(http.0.lock().unwrap().creates, 1);
-}
-
-// Teardown after a restart works from the id alone.
-#[tokio::test]
-async fn destroy_after_restart_needs_no_list() {
-    let http = Arc::new(StandIn::default());
-    let p = provider(http.clone()).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    let id = row(p.provision(request(prep, "doomed"), &c).await.unwrap()).id;
-    blind_list(&http);
-    let restarted = provider(http.clone()).await;
-    restarted.destroy(&id, &c).await.unwrap();
-    assert!(http.0.lock().unwrap().rows.is_empty());
-}
-
-// An empty list while a known sandbox is live reads as "cannot see", not "none".
-#[tokio::test]
-async fn empty_list_with_live_sandbox_is_unavailable() {
-    let http = Arc::new(StandIn::default());
-    let p = provider(http.clone()).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    let id = row(p.provision(request(prep, "hidden"), &c).await.unwrap()).id;
-    assert_eq!(p.list(&c).await.unwrap().len(), 1);
-    blind_list(&http);
-    assert_eq!(p.list(&c).await.unwrap_err().class(), "unavailable");
-    // Once the sandbox is really gone the empty list is believed.
-    p.destroy(&id, &c).await.unwrap();
-    assert!(p.list(&c).await.unwrap().is_empty());
 }
