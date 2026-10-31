@@ -211,6 +211,7 @@ impl Daytona {
         let v = match self.call(Method::GET, url, None, c).await {
             Ok(v) => v,
             Err(ProtocolError::NotFound { .. }) => return Ok(None),
+            // Anything but a 404 fails provision; the caller retries it.
             Err(e) => return Err(e),
         };
         if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(label) {
