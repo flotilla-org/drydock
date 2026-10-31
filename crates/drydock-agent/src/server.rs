@@ -195,6 +195,13 @@ impl Agent {
     /// Returns the probation candidate on upgrade. The composition root re-execs
     /// with its original fixed flags; dropping this future drops all agent streams.
     pub async fn run(mut self) -> io::Result<PathBuf> {
+        struct AbortControls(Arc<Shared>);
+        impl Drop for AbortControls {
+            fn drop(&mut self) {
+                self.0.controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).abort_all();
+            }
+        }
+        let _controls = AbortControls(self.shared.clone());
         // Redirects an earlier agent left stay in place: this process takes
         // them over, and the next configuration replaces them.
         if self.shared.egress_system.installed().await {
@@ -859,6 +866,23 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    // Dropping the run future ends the control connections it served, as the
+    // agent process dying would: a host's client stops getting answers.
+    #[tokio::test]
+    async fn dropping_run_closes_control_connections() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let (host, listener) = drydock_transport::memory();
+        let agent = Agent::new(listener, format!("{:x}", Sha256::digest(b"agent")), dir.path().join("agent"));
+        let run = tokio::spawn(agent.run());
+        let timeout = std::time::Duration::from_secs(5);
+        let client = crate::Client::connect_current(|| host.connect(), &Platform::current(), b"agent", timeout).await.unwrap();
+        client.processes().await.unwrap();
+        run.abort();
+        let _ = run.await;
+        let after = tokio::time::timeout(std::time::Duration::from_secs(2), client.processes()).await;
+        assert!(after.expect("a request to a dropped agent never hangs").is_err());
     }
     // Real filesystem boundary: if backup linking fails, activation must retain
     // both the uploaded image and previous rollback, and activation alone retries.
