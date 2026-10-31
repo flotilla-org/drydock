@@ -208,6 +208,19 @@ impl Daytona {
             }
         }
     }
+    /// Daytona's `GET /sandbox/{idOrName}` accepts the name derived from a label.
+    async fn by_label_name(&self, label: &str, c: &Credentials) -> Result<Option<Value>> {
+        let url = self.sandbox_url(&name("environment", label), None)?;
+        let v = match self.call(Method::GET, url, None, c).await {
+            Ok(v) => v,
+            Err(ProtocolError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(label) {
+            return Err(refused("Daytona sandbox name belongs to a different label"));
+        }
+        Ok(Some(v))
+    }
     fn environment(&self, v: Value) -> Result<Environment> {
         let state = match text(&v, "state")? {
             "started" => Observation::Running,
@@ -711,21 +724,13 @@ impl Provider for Daytona {
             return Err(refused("Daytona size does not match the prepared snapshot"));
         }
         // The sandbox name derives from the label, so re-adoption is a direct read:
-        // Daytona's `GET /sandbox/{idOrName}` accepts the derived name. The list lags
-        // creation by seconds, so a quick retry must not rely on it.
-        let derived = name("environment", &r.label);
-        let found = match self.call(Method::GET, self.sandbox_url(&derived, None)?, None, c).await {
-            Ok(v) => Some(v),
-            Err(ProtocolError::NotFound { .. }) => None,
-            Err(e) => return Err(e),
-        };
-        if let Some(v) = found {
-            if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(&r.label) {
-                return Err(refused("Daytona sandbox name belongs to a different label"));
-            }
+        // the list lags creation by seconds, so a quick retry must not rely on it.
+        if let Some(v) = self.by_label_name(&r.label, c).await? {
             self.check_existing_request(&v, size, &policy)?;
             // Re-adoption returns the observed stopped/error state unchanged;
-            // provision does not implicitly resume an existing label.
+            // provision does not implicitly resume an existing label. A sandbox still
+            // starting is likewise returned as observed (unlike the create-conflict
+            // path below, which waits): the caller polls it.
             let mut row = self.environment(v)?;
             if matches!(row.state, Observation::Running) {
                 // Every Running re-adoption bootstraps; the guest supervisor's
@@ -744,10 +749,10 @@ impl Provider for Daytona {
         let created = self.create(self.path(&self.settings.api_url, &["sandbox"])?, body, c).await?;
         let v = match created {
             None => {
-                let v = self.call(Method::GET, self.sandbox_url(&name("environment", &r.label), None)?, None, c).await?;
-                if v.pointer("/labels/flotilla.label").and_then(Value::as_str) != Some(&r.label) {
-                    return Err(refused("Daytona sandbox name belongs to a different label"));
-                }
+                let v = self
+                    .by_label_name(&r.label, c)
+                    .await?
+                    .ok_or_else(|| ProtocolError::NotFound { reason: "Daytona sandbox vanished after a name conflict".into() })?;
                 self.check_existing_request(&v, size, &policy)?;
                 let existing = self.environment(v.clone())?;
                 if matches!(existing.state, Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }) {

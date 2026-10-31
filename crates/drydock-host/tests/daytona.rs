@@ -2406,3 +2406,20 @@ async fn adoption_by_label_reads_the_derived_name_not_the_list() {
     assert_eq!(row(adopted).id, id);
     assert_eq!(http.0.lock().unwrap().creates, 1);
 }
+
+// A sandbox squatting on a label's derived name is never adopted.
+#[tokio::test]
+async fn derived_name_held_by_another_label_is_refused() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials();
+    let prep = prepared(p.as_ref(), &c).await;
+    let r = request(prep, "mine");
+    let derived = format!("drydock-environment-{}", &format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"mine"))[..40]);
+    http.0.lock().unwrap().rows.insert(
+        "squatter".into(),
+        json!({"id":"squatter","name":derived,"labels":{"flotilla.label":"theirs"},"state":"started","cpu":1,"memory":1,"disk":3}),
+    );
+    assert_eq!(p.provision(r, &c).await.unwrap_err().class(), "refused");
+    assert_eq!(http.0.lock().unwrap().creates, 0);
+}
