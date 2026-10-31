@@ -2423,3 +2423,18 @@ async fn derived_name_held_by_another_label_is_refused() {
     assert_eq!(p.provision(r, &c).await.unwrap_err().class(), "refused");
     assert_eq!(http.0.lock().unwrap().creates, 0);
 }
+
+// Re-adoption by name returns a destroyed sandbox as observed; it does not create over it.
+#[tokio::test]
+async fn adoption_by_name_returns_a_destroyed_sandbox_as_observed() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials();
+    let prep = prepared(p.as_ref(), &c).await;
+    let r = request(prep, "ended");
+    let id = row(p.provision(r.clone(), &c).await.unwrap()).id;
+    http.0.lock().unwrap().rows.get_mut(&id).unwrap()["state"] = json!("destroyed");
+    let adopted = p.provision(r, &c).await.unwrap();
+    assert!(matches!(adopted, Provisioned::Existing(ref e) if matches!(e.state, Observation::Gone { .. })));
+    assert_eq!(http.0.lock().unwrap().creates, 1);
+}

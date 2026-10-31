@@ -186,16 +186,13 @@ impl Daytona {
             provider_error: "response was not valid JSON".into(),
         })
     }
-    async fn inventory(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Value>> {
+    async fn inventory(&self, c: &Credentials) -> Result<Vec<Value>> {
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
         loop {
             let mut url = self.path(&self.settings.api_url, &["sandbox"])?;
             url.query_pairs_mut().append_pair("limit", "200");
-            if let Some(label) = label {
-                url.query_pairs_mut().append_pair("labels", &json!({"flotilla.label":label}).to_string());
-            }
             if let Some(cursor) = &cursor {
                 url.query_pairs_mut().append_pair("cursor", cursor);
             }
@@ -775,7 +772,7 @@ impl Provider for Daytona {
         // sandbox mid-destroy is absent from `list`, while `inspect` still reports
         // `Destroying`.
         let mut rows = Vec::new();
-        for v in self.inventory(None, c).await? {
+        for v in self.inventory(c).await? {
             let row = self.environment(v)?;
             if !matches!(
                 row.state,
