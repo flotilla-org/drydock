@@ -88,8 +88,8 @@ test("configure validates settings; readiness needs a bearer token document", as
   );
 });
 
-// nscr.io answers upload requests with a 307; the push follows it, resending
-// the same method and body, with the token only on the registry's own origin.
+// Upload requests are redirected within a bound, resending the same method and
+// body, with the token only on the registry's own origin.
 test("prepare follows upload redirects within a bound", async () => {
   const { registries, provider, context, request } = await setup();
   registries.uploadRedirects = 2;
@@ -118,17 +118,50 @@ test("upload redirects: 308 followed, no Location refused, other origins never s
     bare.provider.prepare(bare.request, bare.context),
     (e: any) => /redirect without location/.test(e.detail?.reason),
   );
+});
 
-  const away = await setup();
-  away.registries.redirectStartTo = "uploads.test";
-  await away.provider.prepare(away.request, away.context);
-  const elsewhere = away.registries.requests.filter(
-    (r) => r.host === "uploads.test",
+// nscr.io redirects some upload starts to a presigned URL on a regional host
+// (zrh.nscr.io), which then serves the whole session anonymously.
+test("prepare uploads through nscr.io's presigned regional redirect", async () => {
+  const { registries, provider, context, request } = await setup();
+  registries.regional = "zrh.nscr.io";
+  const prepared = await provider.prepare(request, context);
+  assert.match(prepared.id, /^nscr\.io\/acme\/drydock-vessel@sha256:/);
+  const regional = registries.requests.filter((r) => r.host === "zrh.nscr.io");
+  assert.deepEqual(
+    [...new Set(regional.map((r) => r.method))].sort(),
+    ["PATCH", "POST", "PUT"],
+    "the session's chunks and commit go to the regional host",
   );
-  assert.ok(elsewhere.length > 0, "the redirect was followed");
   assert.ok(
-    elsewhere.every((r) => r.authorization === null),
-    "the token never reaches the redirect target",
+    regional.every((r) => r.authorization === null),
+    "the token never reaches the regional host",
+  );
+});
+
+test("regional uploads: refused off https, and a session stays on the regional host", async () => {
+  const cleartext = await setup();
+  cleartext.registries.regional = "zrh.nscr.io";
+  cleartext.registries.regionalScheme = "http:";
+  await assert.rejects(
+    cleartext.provider.prepare(cleartext.request, cleartext.context),
+    (e: any) => /redirected off https/.test(e.detail?.reason),
+  );
+  assert.ok(
+    cleartext.registries.requests.every((r) => r.host !== "zrh.nscr.io"),
+    "nothing is sent in cleartext",
+  );
+
+  const hop = await setup();
+  hop.registries.regional = "zrh.nscr.io";
+  hop.registries.regionalSessionHost = "elsewhere.test";
+  await assert.rejects(
+    hop.provider.prepare(hop.request, hop.context),
+    (e: any) => /upload location on another origin/.test(e.detail?.reason),
+  );
+  assert.ok(
+    hop.registries.requests.every((r) => r.host !== "elsewhere.test"),
+    "the session never moves to another origin",
   );
 });
 

@@ -379,9 +379,8 @@ export class Registry {
     headers: Record<string, string>,
     body: Uint8Array | undefined,
     what: string,
-    follow = false,
   ): Promise<Response> {
-    for (let hops = 0, challenged = false; ; ) {
+    for (let challenged = false; ; challenged = true) {
       const sameOrigin = this.sameOrigin(url);
       const authorization = sameOrigin
         ? this.authorizations.get(scope)
@@ -404,27 +403,54 @@ export class Registry {
             response.headers.get("www-authenticate"),
           ),
         );
-        challenged = true;
-        continue;
-      }
-      // Upload requests may be redirected (307/308 keep method and body).
-      // Authorization is attached per request only for this registry's origin.
-      if ([307, 308].includes(response.status) && follow) {
-        const location = response.headers.get("location");
-        await response.body?.cancel();
-        if (!location) throw malformed("redirect without location");
-        if (++hops > MAX_REDIRECTS)
-          throw new ProtocolFailure({
-            kind: "internal",
-            reason: `registry ${this.host} ${what} redirected too often`,
-            provider_error: "",
-          });
-        url = new URL(location, url);
-        challenged = false;
         continue;
       }
       return response;
     }
+  }
+
+  /**
+   * An upload request, following 307 and 308 redirects (which keep the method
+   * and body) within a bound. nscr.io redirects some upload starts to a
+   * presigned regional URL such as zrh.nscr.io, which needs no credential;
+   * `send` attaches ours only on this registry's origin. A redirect may not
+   * leave https, which would expose the bytes and the presigned signature.
+   * Returns the response with the URL that gave it, which the session's next
+   * location resolves against.
+   */
+  async upload(
+    scope: string,
+    method: string,
+    url: URL,
+    headers: Record<string, string>,
+    body: Uint8Array,
+  ): Promise<{ response: Response; url: URL }> {
+    for (let hops = 0; hops < MAX_REDIRECTS; hops++) {
+      const response = await this.send(
+        scope,
+        method,
+        url,
+        headers,
+        body,
+        "upload",
+      );
+      if (![307, 308].includes(response.status)) return { response, url };
+      const location = response.headers.get("location");
+      await response.body?.cancel();
+      if (!location) throw malformed("redirect without location");
+      url = new URL(location, url);
+      if (url.protocol !== "https:")
+        throw new ProtocolFailure({
+          kind: "internal",
+          reason: `registry ${this.host} upload redirected off https`,
+          provider_error: "",
+        });
+    }
+    throw new ProtocolFailure({
+      kind: "internal",
+      reason: `registry ${this.host} upload redirected too often`,
+      provider_error: "",
+    });
   }
 
   /**
@@ -534,29 +560,29 @@ export class Registry {
     return true;
   }
 
-  location(response: Response): URL {
+  /** The upload session's next URL, from the response `from` gave. */
+  location(response: Response, from: URL): URL {
     const location = response.headers.get("location");
     if (!location) throw malformed("upload without location");
-    const url = new URL(location, this.origin);
-    // Upload sessions carry our authorization, so they stay on this registry.
-    if (!this.sameOrigin(url))
+    const url = new URL(location, from);
+    // A session stays on the origin that opened it: this registry, or the
+    // presigned URL it redirected to, which never gets our authorization.
+    if (url.origin !== from.origin)
       throw malformed("upload location on another origin");
     return url;
   }
 
   async startUpload(repository: string): Promise<URL> {
-    const response = await this.send(
+    const { response, url: from } = await this.upload(
       pushScope(repository),
       "POST",
       this.url(repository, "blobs", "uploads", ""),
       {},
       new Uint8Array(),
-      "upload",
-      true,
     );
     await response.body?.cancel();
     this.check(response, [202], "upload");
-    return this.location(response);
+    return this.location(response, from);
   }
 
   async finishUpload(
@@ -567,14 +593,12 @@ export class Registry {
   ) {
     const url = new URL(location);
     url.searchParams.append("digest", digest);
-    const response = await this.send(
+    const { response } = await this.upload(
       pushScope(repository),
       "PUT",
       url,
       { "content-type": "application/octet-stream" },
       body,
-      "upload",
-      true,
     );
     await response.body?.cancel();
     this.check(response, [201], "upload");
@@ -643,7 +667,7 @@ export async function copyBlob(
       throw malformed("blob size does not match its descriptor");
     hash.update(bytes);
     const last = offset + bytes.length - 1;
-    const patched = await target.send(
+    const { response: patched, url: from } = await target.upload(
       pushScope(targetRepository),
       "PATCH",
       location,
@@ -652,12 +676,10 @@ export async function copyBlob(
         "content-range": `${offset}-${last}`,
       },
       bytes,
-      "upload",
-      true,
     );
     await patched.body?.cancel();
     target.check(patched, [202], "upload");
-    location = target.location(patched);
+    location = target.location(patched, from);
     offset = last + 1;
   }
   if (`sha256:${hash.digest("hex")}` !== layer.digest)

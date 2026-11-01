@@ -304,8 +304,16 @@ export class Registries {
   uploadRedirects = 0;
   /** Status of those redirects. */
   redirectStatus = 307;
-  /** When set, starting an upload is redirected to this host, which opens the session on nscr.io. */
-  redirectStartTo: string | undefined;
+  /**
+   * As nscr.io does on some connections: starting an upload is redirected to
+   * a presigned URL on this regional host, which serves the session itself,
+   * anonymously, and stores into nscr.io.
+   */
+  regional: string | undefined;
+  /** Scheme of the redirect to the regional host. */
+  regionalScheme = "https:";
+  /** When set, the regional host names upload sessions on this host instead of itself. */
+  regionalSessionHost: string | undefined;
   /** Drops the Location header from redirects. */
   redirectWithoutLocation = false;
 
@@ -348,28 +356,23 @@ export class Registries {
           headers: { "www-authenticate": 'Basic realm="nscr.io"' },
         });
     }
-    if (url.host === this.redirectStartTo) {
-      const repository = /^\/v2\/(.+)\/blobs\/uploads\/$/.exec(
-        url.pathname,
-      )![1];
-      const nscr = this.store("nscr.io");
-      const id = String(nscr.uploads.size);
-      nscr.uploads.set(id, []);
-      return new Response(null, {
-        status: 202,
-        headers: {
-          location: `https://nscr.io/v2/${repository}/blobs/uploads/${id}`,
-        },
-      });
-    }
+    // The signature is the regional host's only authorization.
+    const presigned = url.host === this.regional ? "?presigned=sig" : "";
     if (
-      this.redirectStartTo &&
+      url.host === this.regional &&
+      url.searchParams.get("presigned") !== "sig"
+    )
+      return new Response(null, { status: 401 });
+    if (
+      this.regional &&
       url.host === "nscr.io" &&
       method === "POST" &&
       url.pathname.endsWith("/blobs/uploads/")
     ) {
       const next = new URL(url);
-      next.host = this.redirectStartTo;
+      next.host = this.regional;
+      next.protocol = this.regionalScheme;
+      next.searchParams.set("presigned", "sig");
       return new Response(null, {
         status: this.redirectStatus,
         headers: { location: next.href },
@@ -391,7 +394,7 @@ export class Registries {
       });
     }
     url.searchParams.delete("hop");
-    const store = this.store(url.host);
+    const store = this.store(url.host === this.regional ? "nscr.io" : url.host);
     const match = /^\/v2\/(.+)\/(manifests|blobs)\/(.*)$/.exec(url.pathname);
     if (!match) return new Response(null, { status: 404 });
     const [, repository, kind, rest] = match;
@@ -422,7 +425,9 @@ export class Registries {
       store.uploads.set(id, []);
       return new Response(null, {
         status: 202,
-        headers: { location: `/v2/${repository}/blobs/uploads/${id}` },
+        headers: {
+          location: `https://${(presigned && this.regionalSessionHost) || url.host}/v2/${repository}/blobs/uploads/${id}${presigned}`,
+        },
       });
     }
     const upload = /^uploads\/(\d+)$/.exec(rest);
@@ -432,7 +437,7 @@ export class Registries {
       if (method === "PATCH")
         return new Response(null, {
           status: 202,
-          headers: { location: url.pathname },
+          headers: { location: url.pathname + presigned },
         });
       const bytes = Buffer.concat(parts);
       if (digest(bytes) !== url.searchParams.get("digest"))
