@@ -54,7 +54,9 @@ as base64url (`Token::generate`). Startup refuses anything else, as does
 `--supervise` before it detaches. The token is never on argv or in the agent's
 environment, which other users read through `/proc`; the module writes the file
 through its root exec or file push before starting the agent, and reads it back
-the same way on re-adoption. `Token`'s `Debug` output is redacted.
+the same way on re-adoption. The agent reads the file once at startup (and
+again on each re-exec); a new token takes effect when the agent restarts.
+Under `--supervise` the path must be absolute. `Token`'s `Debug` output is redacted.
 
 Each TCP connection starts with one HTTP/1.1 request:
 

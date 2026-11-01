@@ -22,6 +22,7 @@ fn socket(args: &[OsString]) -> io::Result<PathBuf> {
         || options.len() % 2 != 0
         || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
         || (1..names.len()).any(|i| names[..i].contains(&names[i]))
+        || args.chunks(2).any(|pair| pair[1].as_encoded_bytes().starts_with(b"--"))
     {
         return Err(usage());
     }
@@ -39,7 +40,13 @@ fn check_tcp(args: &[OsString]) -> io::Result<()> {
                 .to_str()
                 .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
                 .ok_or_else(|| io::Error::other("--tcp requires ADDR:PORT"))?;
-            drydock_agent::tcp::Token::read(std::path::Path::new(path)).map(drop)
+            // Every agent the supervisor restarts reads it again, so it must
+            // not depend on the directory bootstrap ran in.
+            let path = std::path::Path::new(path);
+            if !path.is_absolute() {
+                return Err(io::Error::other("--supervise requires an absolute --tcp-token-file"));
+            }
+            drydock_agent::tcp::Token::read(path).map(drop)
         }
         (None, None) => Ok(()),
         (Some(_), None) => Err(io::Error::other("--tcp requires --tcp-token-file")),

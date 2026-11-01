@@ -332,6 +332,9 @@ fn supervision_refuses_options_it_would_not_pass_on() {
         &["--store", "/d", "--store", "/e", "--socket", "/s"],
         &["--socket", "/s", "--tcp", "127.0.0.1:1", "--tcp-token-file", "/t"],
         &["--tcp", "127.0.0.1:1", "--socket", "/s"],
+        &["--store", "--tcp", "127.0.0.1:1", "--socket", "/s"],
+        &["--store", "/d", "--socket", "--tcp"],
+        &["--tcp", "127.0.0.1:1", "--tcp-token-file", "relative.token", "--socket", "/s"],
     ] {
         let status = Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
             .arg("--supervise")
