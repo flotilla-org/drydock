@@ -342,7 +342,16 @@ fn read_only(root: &Path) -> io::Result<()> {
 /// needed once unpacked. A refused unpack keeps the blob, so asking again
 /// reads it instead of downloading it.
 async fn materialize(store: &Store, digest: &str, unpack: Unpack) -> Result<Artifact, Failure> {
-    let disk = |error: io::Error| Failure { fatal: true, ..Failure::new("disk", error.kind().into(), error.to_string()) };
+    let disk = |error: io::Error| {
+        let message = match error.kind() {
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                let free = crate::store::free_space(store.root()).map_or("unknown".into(), |free| free.to_string());
+                format!("{error}; {free} bytes free on the filesystem of the store at {}", store.root().display())
+            }
+            _ => error.to_string(),
+        };
+        Failure { fatal: true, ..Failure::new("disk", error.kind().into(), message) }
+    };
     let blob = store.blob(digest).map_err(disk)?;
     let size = std::fs::metadata(&blob).map_err(disk)?.len();
     let directory = entries(store).map_err(disk)?;
