@@ -486,3 +486,31 @@ async fn a_collection_keeps_what_live_agents_link_and_removes_the_rest() {
     let collected = drydock_agent::collect(root.clone(), &[], hour).await.unwrap();
     assert_eq!((collected.artifacts.len(), &collected.blobs[..]), (0, std::slice::from_ref(&blob_digest)), "a hit renews the entry");
 }
+
+// Two retirements collecting one shared store at once: each digest is held as
+// it is looked at, so an entry goes exactly once and neither collection fails.
+#[tokio::test]
+async fn concurrent_collections_remove_each_entry_once() {
+    let shared = tempfile::tempdir().unwrap();
+    let root = shared.path().join("store");
+    let h = harness_with(false, "test-build", {
+        let root = root.clone();
+        move |guest, dir| drydock_agent::Agent::new(guest, "test-build".into(), dir.join("agent")).with_store(root)
+    })
+    .await;
+    let mut digests = Vec::new();
+    for seed in 0..8 {
+        let content = pattern(seed, 2000);
+        let digest = sha256(&content);
+        let host = download_host(content).await;
+        h.client.fetch_artifact(&digest, &fetch(vec![upstream(host.url("/download"))], file(0o444))).await.unwrap();
+        digests.push(digest);
+    }
+    let idle = std::time::Duration::ZERO;
+    let (first, second) = tokio::join!(drydock_agent::collect(root.clone(), &[], idle), drydock_agent::collect(root.clone(), &[], idle));
+    let mut removed = [first.unwrap().artifacts, second.unwrap().artifacts].concat();
+    removed.sort();
+    digests.sort();
+    assert_eq!(removed, digests);
+    assert!(h.client.artifacts().await.unwrap().is_empty());
+}
