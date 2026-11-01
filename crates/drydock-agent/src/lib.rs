@@ -19,6 +19,7 @@ pub mod socket;
 pub mod stand_in;
 mod store;
 mod streams;
+pub mod tcp;
 pub use streams::{CLAIM_DEADLINE, CONNECT_DEADLINE};
 pub mod upgrade;
 pub use artifacts::{Collected, collect};

@@ -7,10 +7,11 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 ## Runtime and trust
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
-[--vsock-port PORT] [--store DIR]` alongside the image's own processes. It must not be PID 1.
+[--vsock-port PORT] [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH]` alongside the image's own processes. It must not be PID 1.
 Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`;
 `--supervise --store DIR --socket PATH` passes the store on to every agent the
-supervisor starts. The socket comes last: every process of one agent ends its
+supervisor starts, and `--tcp ADDR:PORT --tcp-token-file PATH` before the
+socket passes on the TCP listener below. The socket comes last: every process of one agent ends its
 argv with `--socket PATH`, so a host can find them all.
 Namespace runs it as a devbox service (its own agent is PID 1, and restarts
 the service on boot). `drydock-agent --bridge [--socket PATH]` joins its stdin
@@ -28,7 +29,7 @@ unavailable until the next bootstrap; the provider's init does not restart it.
 The agent creates its dedicated run directory with mode 0700 and protects its
 Unix sockets with mode 0600, correcting existing owned directory permissions.
 Symlink, foreign-owned and sticky run directories are refused. The provider
-protects vsock access where used. There is no token or per-vessel startup configuration.
+protects vsock access where used. The socket and vsock take no token.
 Every connection to the socket (and to vsock, Linux-only) is plain HTTP/1.1 or
 HTTP/2 without TLS, from its first byte, so `curl --unix-socket
 /run/drydock/agent.sock http://agent/hello` works as well as drydock's client.
@@ -39,6 +40,42 @@ upgrade path below (#152), in images prepared before it, cannot be relied
 on to take an upgrade; those images are prepared again, once. Live provider
 isolation and startup/supervision are verified in the provider integration
 work (#54).
+
+### The TCP listener
+
+Some providers reach only a guest TCP port, through a port proxy (E2B) or a
+tunnel (Runtime, Tensorlake). `--tcp ADDR:PORT` listens there: loopback where
+the provider's tunnel delivers to loopback, another address where its proxy
+needs one. A guest TCP port is open to every guest user, crew included, so the
+listener requires the vessel's token (`drydock_agent::tcp`).
+`--tcp-token-file PATH` is required with `--tcp` and names a regular file
+owned by the agent's user, mode 0600 exactly, holding at least 32 random bytes
+as base64url (`Token::generate`). Startup refuses anything else, as does
+`--supervise` before it detaches. The token is never on argv or in the agent's
+environment, which other users read through `/proc`; the module writes the file
+through its root exec or file push before starting the agent, and reads it back
+the same way on re-adoption. `Token`'s `Debug` output is redacted.
+
+Each TCP connection starts with one HTTP/1.1 request:
+
+```text
+GET /v1/connect HTTP/1.1
+Host: <anything>
+Connection: Upgrade
+Upgrade: drydock-agent          (or websocket, for proxies that pass only that)
+Authorization: Bearer <token>
+```
+
+The agent answers `101 Switching Protocols` with the `Upgrade` token the client
+chose, and the connection then carries exactly what the Unix socket carries,
+raw, with no WebSocket framing whichever token was used. A missing or wrong
+token gets `401` with `{"error":"unauthorized"}`, a warning naming the peer, and
+a closed connection; any other request gets `404` and is closed. The token is
+compared in constant time, and a connection that has not finished its handshake
+within 10 seconds is closed. `tcp::connect` is the client's side: it takes a
+connection to the listener, direct or inside a provider's tunnel, and returns
+one [`Client::connect`] accepts. `scripts/live-tcp-listener.py` checks it
+live through a provider tunnel.
 
 ### The frozen upgrade path
 
@@ -663,7 +700,9 @@ fetches by digest from upstream, OCI and push sources against in-process
 stand-ins, with resume, fall-through, unpack refusals and links
 (`tests/artifacts.rs`); a streamed transfer and a fetch larger than 512 MiB
 in bounded memory (`tests/large_files.rs`, `tests/large_fetch.rs`);
-and every refusal as a structured error. `tests/frozen.rs` upgrades a released
+and every refusal as a structured error. `tests/tcp.rs` covers the TCP
+listener's handshake, its refusals and the token's absence from `/proc`.
+`tests/frozen.rs` upgrades a released
 agent through the frozen upgrade path, drains a running process and reports
 one past the limit, and reads hello's fields over HTTP/1.1 with curl.
 Subprocess tests push a distinct ELF

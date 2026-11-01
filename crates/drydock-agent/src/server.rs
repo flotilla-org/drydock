@@ -326,7 +326,7 @@ fn router(shared: Arc<Shared>) -> Router {
 }
 
 /// Transient accept failures: the listener stays bound and is served again.
-fn retryable(error: &io::Error) -> bool {
+pub(crate) fn retryable(error: &io::Error) -> bool {
     matches!(
         error.kind(),
         io::ErrorKind::Interrupted

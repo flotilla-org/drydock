@@ -287,10 +287,52 @@ async fn supervised_agents_keep_the_named_store_across_restarts() {
     }
 }
 
-// Options other than `--store`, or a socket that is not last, are refused.
+// Supervision passes a TCP listener on to every agent it starts, still with
+// `--socket PATH` last; the listener answers the token's handshake.
+#[tokio::test]
+async fn supervised_agents_keep_the_tcp_listener() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("run/agent.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let token = drydock_agent::tcp::Token::generate().unwrap();
+    let file = directory.path().join("tcp.token");
+    std::fs::write(&file, token.secret()).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let address = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let _supervisor = ProcessGroup(spawn(
+        Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+            .arg("--supervisor")
+            .args(["--tcp", &address.to_string(), "--tcp-token-file"])
+            .arg(&file)
+            .arg("--socket")
+            .arg(&socket)
+            .env("PATH", "/nonexistent")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ));
+    let fingerprint = hello(&socket).await;
+    assert_eq!(agents(&socket).len(), 1);
+    let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let stream = drydock_agent::tcp::connect(Box::new(stream), &token).await.unwrap();
+    let client = drydock_agent::Client::connect(stream, "any").await.unwrap();
+    assert_eq!(client.hello().fingerprint, fingerprint);
+}
+
+// Options other than `--store` and the TCP pair, a repeated option, or a
+// socket that is not last, are refused.
 #[test]
 fn supervision_refuses_options_it_would_not_pass_on() {
-    for args in [&["--socket", "/s", "--store", "/d"][..], &["--store", "/d"], &["--idle", "1", "--socket", "/s"]] {
+    for args in [
+        &["--socket", "/s", "--store", "/d"][..],
+        &["--store", "/d"],
+        &["--idle", "1", "--socket", "/s"],
+        &["--store", "/d", "--store", "/e", "--socket", "/s"],
+        &["--socket", "/s", "--tcp", "127.0.0.1:1", "--tcp-token-file", "/t"],
+        &["--tcp", "127.0.0.1:1", "--socket", "/s"],
+    ] {
         let status = Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
             .arg("--supervise")
             .args(args)
