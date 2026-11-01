@@ -10,16 +10,16 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flotilla-org/drydock"
 
 [workspace.dependencies]
-rigging-paths = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
+rigging-paths = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 reqwest = { version = "0.13", default-features = false }
 http = "1"
 sha2 = "0.10"
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "8cc41c32d79f61a77c2566ae98817b5a619d60fe" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "3c60c7ae62a1b93f910b7049d90ae97bf8275837" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 utoipa = "5.4"
