@@ -427,3 +427,93 @@ async fn agents_sharing_a_store_fetch_once() {
     assert_eq!(origins, [Served::Source(0), Served::Index]);
     assert_eq!(host.requests().len(), 1);
 }
+
+// #4087 (flotilla): agents sharing a store each name themselves. Retiring one
+// releases only its uses: the entry another agent still links stays, and once
+// every user is released a collection removes it, read-only tree and all.
+// Entries stored, hit or uploaded within the idle time are left for later.
+#[tokio::test]
+async fn a_collection_keeps_what_live_agents_link_and_removes_the_rest() {
+    let shared = tempfile::tempdir().unwrap();
+    let root = shared.path().join("store");
+    let (content, _) = package(7);
+    let digest = sha256(&content);
+    let host = download_host(content).await;
+    let request = fetch(vec![upstream(host.url("/download"))], Unpack::TarGz);
+    let mut agents = Vec::new();
+    for holder in ["/run/v/a/agent.sock", "/run/v/b/agent.sock"] {
+        let root = root.clone();
+        let h = harness_with(false, "test-build", move |guest, dir| {
+            drydock_agent::Agent::new(guest, "test-build".into(), dir.join("agent")).with_store(root).with_holder(holder.into())
+        })
+        .await;
+        h.client.fetch_artifact(&digest, &request).await.unwrap();
+        let link = shared.path().join(format!("home-{}/harness", agents.len()));
+        h.client.link_artifact(&link, &digest, Path::new(""), &FileOptions { parents: true, ..FileOptions::default() }).await.unwrap();
+        agents.push((h, link));
+    }
+    assert_eq!(host.requests().len(), 1, "the second agent's fetch is a lookup");
+    let entry = root.join("artifacts").join(&digest);
+    let idle = std::time::Duration::ZERO;
+
+    // A holder whose record never landed (a crash between the writes) goes.
+    let orphan = root.join("uses").join(&digest).join(format!("{}.holder", "f".repeat(64)));
+    std::fs::write(&orphan, "/run/v/c/agent.sock").unwrap();
+    let collected = drydock_agent::collect(root.clone(), &["/run/v/a/agent.sock".into()], idle).await.unwrap();
+    assert!(!orphan.exists(), "an orphan holder is dropped");
+    assert_eq!((collected.released, collected.artifacts.len()), (1, 0), "{collected:?}");
+    assert!(entry.exists() && agents[1].1.join("codex/bin/codex").exists(), "the live agent's link still resolves");
+
+    let collected = drydock_agent::collect(root.clone(), &["/run/v/b/agent.sock".into()], idle).await.unwrap();
+    assert_eq!((collected.released, &collected.artifacts[..]), (1, std::slice::from_ref(&digest)), "{collected:?}");
+    assert!(!entry.exists(), "the read-only entry is removed");
+    assert!(std::fs::symlink_metadata(&agents[0].1).is_ok(), "a retired agent's link is left where it was, dangling");
+
+    // A fresh entry, or one just hit, stays for the idle time; an idle upload
+    // nothing made an entry of goes once idle.
+    let h = &agents[0].0;
+    h.client.fetch_artifact(&digest, &request).await.unwrap();
+    let blob = pattern(3, 1000);
+    let blob_digest = sha256(&blob);
+    h.client.upload(&blob_digest, blob.len() as u64, std::io::Cursor::new(blob)).await.unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    assert_eq!(drydock_agent::collect(root.clone(), &[], hour).await.unwrap(), drydock_agent::Collected::default());
+    let long_ago = std::time::SystemTime::now() - 2 * hour;
+    for path in [root.join("index").join(&digest), root.join("blobs").join(&blob_digest)] {
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(long_ago).unwrap();
+    }
+    h.client.fetch_artifact(&digest, &request).await.unwrap();
+    let collected = drydock_agent::collect(root.clone(), &[], hour).await.unwrap();
+    assert_eq!((collected.artifacts.len(), &collected.blobs[..]), (0, std::slice::from_ref(&blob_digest)), "a hit renews the entry");
+}
+
+// Two retirements collecting one shared store at once: each digest is held as
+// it is looked at, so an entry goes exactly once and neither collection fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_collections_remove_each_entry_once() {
+    let shared = tempfile::tempdir().unwrap();
+    let root = shared.path().join("store");
+    let h = harness_with(false, "test-build", {
+        let root = root.clone();
+        move |guest, dir| drydock_agent::Agent::new(guest, "test-build".into(), dir.join("agent")).with_store(root)
+    })
+    .await;
+    let mut digests = Vec::new();
+    for seed in 0..8 {
+        let content = pattern(seed, 2000);
+        let digest = sha256(&content);
+        let host = download_host(content).await;
+        h.client.fetch_artifact(&digest, &fetch(vec![upstream(host.url("/download"))], file(0o444))).await.unwrap();
+        digests.push(digest);
+    }
+    let idle = std::time::Duration::ZERO;
+    let collections = [0, 1].map(|_| tokio::spawn(drydock_agent::collect(root.clone(), &[], idle)));
+    let mut removed = Vec::new();
+    for collection in collections {
+        removed.extend(collection.await.unwrap().unwrap().artifacts);
+    }
+    removed.sort();
+    digests.sort();
+    assert_eq!(removed, digests);
+    assert!(h.client.artifacts().await.unwrap().is_empty());
+}

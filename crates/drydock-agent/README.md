@@ -8,7 +8,10 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
 [--vsock-port PORT] [--store DIR]` alongside the image's own processes. It must not be PID 1.
-Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`.
+Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`;
+`--supervise --store DIR --socket PATH` passes the store on to every agent the
+supervisor starts. The socket comes last: every process of one agent ends its
+argv with `--socket PATH`, so a host can find them all.
 Namespace runs it as a devbox service (its own agent is PID 1, and restarts
 the service on boot). `drydock-agent --bridge [--socket PATH]` joins its stdin
 and stdout to a running agent's socket and exits when the agent closes; the end
@@ -320,8 +323,8 @@ URL (without user information or query), the step that failed (`request`,
 `egress`, `connect`, `tls`, `http`, `auth`, `download`, `verify`, `unpack`,
 `disk`, `push`) and why. With several sources the message says all failed
 and `causes` holds one line per source; the last failure gives the kind and
-status. A full disk (507) or an unpack refusal stops the fetch, since no
-other source can help.
+status. A full disk (507, naming the store and its free bytes) or an unpack
+refusal stops the fetch, since no other source can help.
 
 `PUT /artifacts/{sha256}/links/{path}` with `{"member": "bin/codex"}` (empty
 for the entry itself) and the link query of `/links` places a symlink to
@@ -331,6 +334,21 @@ so the path never goes missing. The link is recorded as a use of the entry.
 points into it (409, naming the links); links since removed or pointed
 elsewhere no longer count. `GET /artifacts` lists complete entries with
 their live links. Links made through plain `/links` are not recorded.
+
+`drydock-agent` records its socket path beside each link it places, as the
+link's holder. `drydock-agent --collect --store DIR [--release SOCKET]...
+[--idle SECONDS]` is one bounded pass over a store other agents may be
+using: it drops the recorded uses of each released holder (an agent retired
+for good; its links stay where they are), then removes every entry no
+remaining link uses and every completed upload, except those stored, hit or
+uploaded within the idle time (600 seconds by default), and prints what it
+removed as JSON. It holds each digest as it looks at it, as agents do.
+Release only an agent that is stopped, and whose socket no new agent takes
+before the collection ends: a holder is matched by name. Uses recorded with
+no holder (an agent started without naming itself) are never released;
+`DELETE /artifacts/{sha256}` removes what they link. A store that does not
+exist yet is reported on stderr and collects nothing. The idle window is
+measured by each index record's modification time.
 
 ### Processes
 

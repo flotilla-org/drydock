@@ -96,6 +96,8 @@ pub(crate) struct Shared {
     /// Connections turned into the current wire by `GET /control`.
     controls: std::sync::Mutex<JoinSet<()>>,
     pub(crate) store: crate::store::Store,
+    /// The name this agent records beside the links it places.
+    pub(crate) holder: Option<String>,
     processes: crate::process::Processes,
 }
 impl Shared {
@@ -159,6 +161,7 @@ impl Agent {
             settings: Mutex::new(Settings::default()),
             controls: std::sync::Mutex::new(JoinSet::new()),
             store: crate::store::Store::new(crate::upgrade::sidecar(&executable, "store")),
+            holder: None,
             executable,
             upgrade: Mutex::new(()),
             restart: tx,
@@ -176,6 +179,13 @@ impl Agent {
     /// fetched is a lookup for the next.
     pub fn with_store(mut self, root: PathBuf) -> Self {
         Arc::get_mut(&mut self.shared).expect("the store is chosen before the agent runs").store = crate::store::Store::new(root);
+        self
+    }
+    /// Record `holder` beside every link this agent places, so a collection
+    /// over a shared store can release this agent's uses once it is retired
+    /// ([`crate::collect`]). `drydock-agent` names itself by its socket.
+    pub fn with_holder(mut self, holder: String) -> Self {
+        Arc::get_mut(&mut self.shared).expect("the holder is chosen before the agent runs").holder = Some(holder);
         self
     }
     /// Report `platform` in the hello instead of this build's own. Only

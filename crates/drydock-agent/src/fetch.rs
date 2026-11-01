@@ -426,10 +426,13 @@ impl Fetcher {
                     restart(staging, hasher, offset).await?;
                     continue;
                 }
-                if let Some(free) = staging.parent().and_then(free_space)
+                if let Some(partial) = staging.parent()
+                    && let Some(free) = free_space(partial)
                     && total - *offset > free
                 {
-                    let message = format!("{} more bytes do not fit in the {free} free on the store's filesystem", total - *offset);
+                    let store = partial.parent().unwrap_or(partial).display();
+                    let message =
+                        format!("{} more bytes do not fit in the {free} free on the filesystem of the store at {store}", total - *offset);
                     return Err(Failure { fatal: true, ..Failure::new("disk", ErrorKind::StorageFull, message) });
                 }
             }

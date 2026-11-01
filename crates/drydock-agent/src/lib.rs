@@ -21,6 +21,7 @@ mod store;
 mod streams;
 pub use streams::{CLAIM_DEADLINE, CONNECT_DEADLINE};
 pub mod upgrade;
+pub use artifacts::{Collected, collect};
 pub use client::{Client, Download, ExecOutput, Process};
 use drydock_transport::ByteStream;
 use serde::{Deserialize, Serialize};
