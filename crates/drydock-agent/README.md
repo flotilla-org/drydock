@@ -56,7 +56,10 @@ environment, which other users read through `/proc`; the module writes the file
 through its root exec or file push before starting the agent, and reads it back
 the same way on re-adoption. The agent reads the file once at startup (and
 again on each re-exec); a new token takes effect when the agent restarts.
-Under `--supervise` the path must be absolute. `Token`'s `Debug` output is redacted.
+Under `--supervise` the path must be absolute. Keep the file in a private directory such
+as `/run/drydock`: the agent checks the file, not its parent, so in a directory
+other users can write to, they could swap it out (the swapped file then fails
+the owner check and the agent refuses to start). `Token`'s `Debug` output is redacted.
 
 Each TCP connection starts with one HTTP/1.1 request:
 

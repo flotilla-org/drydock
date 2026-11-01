@@ -22,9 +22,15 @@ fn socket(args: &[OsString]) -> io::Result<PathBuf> {
         || options.len() % 2 != 0
         || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
         || (1..names.len()).any(|i| names[..i].contains(&names[i]))
-        || args.chunks(2).any(|pair| pair[1].as_encoded_bytes().starts_with(b"--"))
     {
         return Err(usage());
+    }
+    if let Some(pair) = args.chunks(2).find(|pair| pair[1].as_encoded_bytes().starts_with(b"--")) {
+        return Err(io::Error::other(format!(
+            "{} takes a value, not {:?}; name a path beginning with -- as ./--…",
+            pair[0].display(),
+            pair[1]
+        )));
     }
     Ok(path.into())
 }
