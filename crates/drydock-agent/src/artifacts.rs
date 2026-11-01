@@ -9,7 +9,11 @@
 //!
 //! Links placed through the agent are recorded under `uses/<sha256>/`, and
 //! an entry is in use while any recorded link still points into it. Removal
-//! refuses an entry in use.
+//! refuses an entry in use. An agent that names itself (its holder, as
+//! `drydock-agent` names it by its socket) records that name beside each
+//! link it places, so that once it is retired a collection
+//! ([`collect`]) can release its uses without touching the links of the
+//! agents still sharing the store.
 use crate::{
     AgentError, Artifact, ArtifactLink, ArtifactSource, ErrorKind, Fetch, Fetched, Origin, Unpack,
     durable::{rename_noreplace, replace, sync_directory},
@@ -104,16 +108,29 @@ fn links(store: &Store, digest: &str, entry: &Path) -> io::Result<Vec<(PathBuf, 
     let mut live = Vec::new();
     for record in records {
         let record = record?.path();
+        if is_holder(&record) {
+            continue;
+        }
         let link = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(std::fs::read(&record)?));
         match std::fs::read_link(&link) {
             Ok(target) if target.starts_with(entry) => live.push((record, link)),
-            _ => {
-                let _ = std::fs::remove_file(&record);
-            }
+            _ => forget_use(&record),
         }
     }
     live.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(live)
+}
+/// The holder recorded beside the use `record`.
+fn holder_of(record: &Path) -> PathBuf {
+    crate::upgrade::sidecar(record, "holder")
+}
+fn is_holder(record: &Path) -> bool {
+    record.extension().is_some_and(|extension| extension == "holder")
+}
+/// Drop a use record and the holder beside it.
+fn forget_use(record: &Path) {
+    let _ = std::fs::remove_file(record);
+    let _ = std::fs::remove_file(holder_of(record));
 }
 /// Remove an entry, write-protected as it is.
 fn remove_entry(path: &Path) -> io::Result<()> {
@@ -417,6 +434,9 @@ async fn fetch(store: Store, network: Network, digest: String, request: Fetch) -
             let message = format!("already stored as {:?}; remove it to store it differently", artifact.unpack);
             return Err(AgentError::new(OP, &digest, ErrorKind::Conflict, message));
         }
+        // A hit is a use about to be linked: a collection leaves the entry
+        // alone for a while after it (see [`collect`]).
+        touch(&record_path(&store, &digest).map_err(at)?);
         return Ok(Fetched { artifact, origin: Origin::Index });
     }
     // Anything here without a record is the remains of an interrupted
@@ -528,23 +548,105 @@ pub(crate) async fn list_artifacts(State(shared): State<Arc<Shared>>) -> Refusal
 /// Remove an entry no link uses (409 naming the links otherwise).
 pub(crate) async fn delete_artifact(State(shared): State<Arc<Shared>>, Route(digest): Route<String>) -> Refusal<StatusCode> {
     const OP: &str = "artifact.remove";
-    let store = &shared.store;
-    let at = |e| AgentError::io(OP, &digest, e);
-    let _held = store.wait_for(OP, &digest).await?;
-    let Some(artifact) = indexed(store, OP, &digest)? else {
-        return Err(AgentError::new(OP, &digest, ErrorKind::NotFound, "no stored artifact of this digest"));
+    let _held = shared.store.wait_for(OP, &digest).await?;
+    remove_unused(&shared.store, OP, &digest)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+/// Remove the entry for `digest`, held by the caller, unless a link uses it.
+fn remove_unused(store: &Store, operation: &str, digest: &str) -> Refusal<()> {
+    let at = |e| AgentError::io(operation, digest, e);
+    let Some(artifact) = indexed(store, operation, digest)? else {
+        return Err(AgentError::new(operation, digest, ErrorKind::NotFound, "no stored artifact of this digest"));
     };
     if !artifact.links.is_empty() {
         let names: Vec<String> = artifact.links.iter().map(|link| link.display().to_string()).collect();
-        return Err(AgentError::new(OP, &digest, ErrorKind::ResourceBusy, format!("in use by {}", names.join(", "))));
+        return Err(AgentError::new(operation, digest, ErrorKind::ResourceBusy, format!("in use by {}", names.join(", "))));
     }
     // The record goes first: from then on the entry is no longer a hit.
-    let record = record_path(store, &digest).map_err(at)?;
+    let record = record_path(store, digest).map_err(at)?;
     std::fs::remove_file(&record).map_err(at)?;
     sync_directory(record.parent().unwrap()).map_err(at)?;
     remove_entry(&artifact.path).map_err(at)?;
-    let _ = std::fs::remove_dir_all(uses(store, &digest).map_err(at)?);
-    Ok(StatusCode::NO_CONTENT)
+    let _ = std::fs::remove_dir_all(uses(store, digest).map_err(at)?);
+    Ok(())
+}
+/// Set a file's modification time to now, if it is there.
+fn touch(path: &Path) {
+    if let Ok(file) = std::fs::File::options().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+/// What one [`collect`] removed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Collected {
+    /// Entries removed, by digest.
+    pub artifacts: Vec<String>,
+    /// Completed uploads removed, by digest.
+    pub blobs: Vec<String>,
+    /// Uses of the released holders that were dropped.
+    pub released: usize,
+}
+/// One bounded pass over the store at `root`, which other agents may be
+/// using. First the uses recorded by any of `released` (agents retired for
+/// good) are dropped; their links stay where they are. Then every entry no
+/// remaining link uses goes, and every completed upload nothing made an
+/// entry of, unless it was stored, hit or uploaded within `idle`: a fetch
+/// that has just hit an entry links it next, and an upload just completed is
+/// fetched or activated next. Each digest is held while it is looked at, as
+/// every agent sharing the store holds it, so no fetch, link or upload
+/// interleaves. Entries are removed write-protected as they are.
+pub async fn collect(root: PathBuf, released: &[String], idle: std::time::Duration) -> io::Result<Collected> {
+    const OP: &str = "artifact.collect";
+    let store = Store::new(root);
+    let idle_for = |path: &Path| {
+        std::fs::metadata(path).and_then(|m| m.modified()).is_ok_and(|modified| modified.elapsed().is_ok_and(|elapsed| elapsed >= idle))
+    };
+    let digests = |directory: &str| -> io::Result<Vec<String>> {
+        let mut names: Vec<String> = match std::fs::read_dir(store.root().join(directory)) {
+            Ok(entries) => entries.filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned())).collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => vec![],
+            Err(error) => return Err(error),
+        };
+        names.retain(|name| crate::check_sha256(name).is_ok());
+        names.sort();
+        Ok(names)
+    };
+    let mut collected = Collected::default();
+    for digest in digests("uses")? {
+        let _held = store.wait_for(OP, &digest).await.map_err(AgentError::into_io)?;
+        let Ok(records) = std::fs::read_dir(uses(&store, &digest)?) else { continue };
+        for record in records.flatten().map(|record| record.path()).filter(|record| !is_holder(record)) {
+            let holder = std::fs::read(holder_of(&record)).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            if holder.is_some_and(|holder| released.contains(&holder)) {
+                forget_use(&record);
+                collected.released += 1;
+            }
+        }
+    }
+    // One entry that cannot be looked at or removed does not stop the rest.
+    for digest in digests("index")? {
+        let _held = store.wait_for(OP, &digest).await.map_err(AgentError::into_io)?;
+        if !idle_for(&record_path(&store, &digest)?) {
+            continue;
+        }
+        match remove_unused(&store, OP, &digest) {
+            Ok(()) => collected.artifacts.push(digest),
+            Err(error) if matches!(error.kind, ErrorKind::ResourceBusy | ErrorKind::NotFound) => {}
+            Err(error) => tracing::warn!(%error, "could not collect an artifact"),
+        }
+    }
+    for digest in digests("blobs")? {
+        let _held = store.wait_for(OP, &digest).await.map_err(AgentError::into_io)?;
+        let blob = store.blob(&digest)?;
+        if idle_for(&blob) {
+            match std::fs::remove_file(&blob) {
+                Ok(()) => collected.blobs.push(digest),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(%error, %digest, "could not collect a completed upload"),
+            }
+        }
+    }
+    Ok(collected)
 }
 /// Place a symlink to an entry, or to a member inside it, atomically, and
 /// record it as a use of the entry.
@@ -575,7 +677,14 @@ pub(crate) async fn put_artifact_link(
     let records = uses(store, &digest).map_err(|e| AgentError::io(OP, &digest, e))?;
     std::fs::create_dir_all(&records).map_err(|e| AgentError::io(OP, records.display(), e))?;
     let name = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
-    replace(&records.join(name), path.as_os_str().as_encoded_bytes(), 0o600).map_err(|e| AgentError::io(OP, records.display(), e))?;
+    let record = records.join(name);
+    let recorded = match &shared.holder {
+        Some(holder) => replace(&holder_of(&record), holder.as_bytes(), 0o600),
+        None => std::fs::remove_file(holder_of(&record)).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
+    };
+    recorded
+        .and_then(|()| replace(&record, path.as_os_str().as_encoded_bytes(), 0o600))
+        .map_err(|e| AgentError::io(OP, records.display(), e))?;
     let existed = place_link(OP, &path, &target, &query)?;
     Ok(if existed { StatusCode::OK } else { StatusCode::CREATED }.into_response())
 }

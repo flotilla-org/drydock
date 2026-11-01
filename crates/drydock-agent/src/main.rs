@@ -27,6 +27,9 @@ async fn main() -> io::Result<()> {
     if args.first().is_some_and(|a| a == "--supervisor") {
         return supervisor::run(&args[1..]).await;
     }
+    if args.first().is_some_and(|a| a == "--collect") {
+        return collect(&args[1..]).await;
+    }
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
     let mut store = None;
@@ -75,7 +78,7 @@ async fn main() -> io::Result<()> {
     let fingerprint = drydock_agent::fingerprint()?;
     let executable = drydock_agent::upgrade::startup(&current)
         .map_err(|e| io::Error::new(e.kind(), format!("recover agent {}: {e}", current.display())))?;
-    let mut agent = Agent::new(listener, fingerprint, executable.clone());
+    let mut agent = Agent::new(listener, fingerprint, executable.clone()).with_holder(socket.to_string_lossy().into_owned());
     if let Some(store) = store {
         agent = agent.with_store(store);
     }
@@ -94,6 +97,36 @@ async fn main() -> io::Result<()> {
         return Err(replace_image(&executable, &args));
     }
     Err(error)
+}
+
+/// `--collect --store DIR [--release SOCKET]... [--idle SECONDS]`: one
+/// collection over a store other agents may share, run while they serve.
+/// Each `--release` names the socket of an agent retired for good, whose
+/// links no longer keep entries. Prints what it removed as JSON.
+async fn collect(args: &[std::ffi::OsString]) -> io::Result<()> {
+    const USAGE: &str = "usage: drydock-agent --collect --store DIR [--release SOCKET]... [--idle SECONDS]";
+    let (mut store, mut released, mut idle) = (None, Vec::new(), std::time::Duration::from_secs(600));
+    let mut options = args.iter();
+    while let Some(flag) = options.next() {
+        let mut value = || options.next().ok_or_else(|| io::Error::other(USAGE));
+        match flag.to_str() {
+            Some("--store") => store = Some(PathBuf::from(value()?)),
+            Some("--release") => released.push(value()?.to_string_lossy().into_owned()),
+            Some("--idle") => {
+                idle =
+                    std::time::Duration::from_secs(value()?.to_str().and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::other(USAGE))?)
+            }
+            _ => return Err(io::Error::other(USAGE)),
+        }
+    }
+    let store = store.ok_or_else(|| io::Error::other(USAGE))?;
+    if !store.exists() {
+        println!("{}", serde_json::to_string(&drydock_agent::Collected::default()).map_err(io::Error::other)?);
+        return Ok(());
+    }
+    let collected = drydock_agent::collect(store, &released, idle).await?;
+    println!("{}", serde_json::to_string(&collected).map_err(io::Error::other)?);
+    Ok(())
 }
 
 // Re-exec keeps the PID and its children, but loses Tokio's old Child handles.

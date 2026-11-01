@@ -8,10 +8,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The supervised socket, which comes last: every process of a vessel's
+/// agent ends its argv with `--socket PATH`, so a host can find them all by
+/// it. Options before it (`--store DIR`) are the agent's, passed on to every
+/// agent the supervisor starts.
 fn socket(args: &[OsString]) -> io::Result<PathBuf> {
     match args {
-        [flag, path] if flag == "--socket" => Ok(path.into()),
-        _ => Err(io::Error::other("usage: drydock-agent --supervise --socket PATH")),
+        [options @ .., flag, path]
+            if flag == "--socket" && matches!(options, [] | [_, _]) && options.first().is_none_or(|o| o == "--store") =>
+        {
+            Ok(path.into())
+        }
+        _ => Err(io::Error::other("usage: drydock-agent --supervise [--store DIR] --socket PATH")),
     }
 }
 

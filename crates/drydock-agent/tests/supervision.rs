@@ -245,3 +245,81 @@ async fn bootstrap_beside_orphan_preserves_live_socket_and_recovers_after_exit()
     assert_eq!(recovered.len(), 1);
     assert_ne!(recovered, orphan);
 }
+
+// Vessels on one host share a store (`--supervise --store DIR --socket PATH`).
+// Every agent the supervisor starts, a restart included, keeps that store, and
+// each still ends its argv with `--socket PATH`, as hosts find them by it.
+#[tokio::test]
+async fn supervised_agents_keep_the_named_store_across_restarts() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::process::CommandExt;
+    let directory = tempfile::tempdir().unwrap();
+    let (socket, store) = (directory.path().join("run/agent.sock"), directory.path().join("shared/store"));
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _supervisor = ProcessGroup(spawn(
+        Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+            .arg("--supervisor")
+            .arg("--store")
+            .arg(&store)
+            .arg("--socket")
+            .arg(&socket)
+            .env("PATH", "/nonexistent")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ));
+    for round in 0..2u8 {
+        hello(&socket).await;
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let client = drydock_agent::Client::connect(Box::new(stream), "any").await.unwrap();
+        let content = vec![round; 4096];
+        let digest = format!("{:x}", Sha256::digest(&content));
+        client.upload(&digest, content.len() as u64, std::io::Cursor::new(content)).await.unwrap();
+        assert!(store.join("blobs").join(&digest).is_file(), "round {round}: the upload lands in the named store");
+        assert!(!socket.parent().unwrap().join("drydock-agent.store").exists());
+        drop(client);
+        let agents = agents(&socket);
+        assert_eq!(agents.len(), 1, "round {round}");
+        // SAFETY: PID is the child belonging to this test's private socket.
+        assert_eq!(unsafe { libc::kill(agents[0], libc::SIGKILL) }, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+// Options other than `--store`, or a socket that is not last, are refused.
+#[test]
+fn supervision_refuses_options_it_would_not_pass_on() {
+    for args in [&["--socket", "/s", "--store", "/d"][..], &["--store", "/d"], &["--idle", "1", "--socket", "/s"]] {
+        let status = Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+            .arg("--supervise")
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "{args:?}");
+    }
+}
+
+// `--collect` runs one collection and reports it as JSON: over a store no
+// agent made yet it removes nothing, and bad options are refused.
+#[test]
+fn collect_reports_what_it_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    let collect = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_drydock-agent")).arg("--collect").args(args).stdin(Stdio::null()).output().unwrap()
+    };
+    let store = directory.path().join("store");
+    std::fs::create_dir_all(store.join("blobs")).unwrap();
+    std::fs::write(store.join("blobs").join("a".repeat(64)), b"abandoned").unwrap();
+    for (root, removed) in [(directory.path().join("absent"), 0), (store, 1)] {
+        let output = collect(&["--store", root.to_str().unwrap(), "--release", "/run/v/a/agent.sock", "--idle", "0"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let collected: drydock_agent::Collected = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(collected.blobs.len(), removed, "{collected:?}");
+    }
+    for args in [&[][..], &["--store"], &["--store", "/s", "--idle", "soon"], &["--store", "/s", "--holder", "x"]] {
+        assert!(!collect(args).status.success(), "{args:?}");
+    }
+}

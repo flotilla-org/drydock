@@ -304,7 +304,11 @@ impl Store {
             && let Some(free) = free_space(path.parent().unwrap())
             && length.saturating_sub(start) > free
         {
-            let message = format!("{} more bytes do not fit in the {free} free on the store's filesystem", length - start);
+            let message = format!(
+                "{} more bytes do not fit in the {free} free on the filesystem of the store at {}",
+                length - start,
+                self.root.display()
+            );
             return Err(AgentError::new(OP, digest, ErrorKind::StorageFull, message));
         }
         if recorded.is_none()
