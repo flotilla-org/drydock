@@ -456,7 +456,11 @@ async fn a_collection_keeps_what_live_agents_link_and_removes_the_rest() {
     let entry = root.join("artifacts").join(&digest);
     let idle = std::time::Duration::ZERO;
 
+    // A holder whose record never landed (a crash between the writes) goes.
+    let orphan = root.join("uses").join(&digest).join(format!("{}.holder", "f".repeat(64)));
+    std::fs::write(&orphan, "/run/v/c/agent.sock").unwrap();
     let collected = drydock_agent::collect(root.clone(), &["/run/v/a/agent.sock".into()], idle).await.unwrap();
+    assert!(!orphan.exists(), "an orphan holder is dropped");
     assert_eq!((collected.released, collected.artifacts.len()), (1, 0), "{collected:?}");
     assert!(entry.exists() && agents[1].1.join("codex/bin/codex").exists(), "the live agent's link still resolves");
 

@@ -121,6 +121,7 @@ async fn collect(args: &[std::ffi::OsString]) -> io::Result<()> {
     }
     let store = store.ok_or_else(|| io::Error::other(USAGE))?;
     if !store.exists() {
+        eprintln!("drydock-agent --collect: no store at {}; nothing to collect", store.display());
         println!("{}", serde_json::to_string(&drydock_agent::Collected::default()).map_err(io::Error::other)?);
         return Ok(());
     }

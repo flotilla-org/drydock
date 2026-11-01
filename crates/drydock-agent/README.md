@@ -343,6 +343,12 @@ for good; its links stay where they are), then removes every entry no
 remaining link uses and every completed upload, except those stored, hit or
 uploaded within the idle time (600 seconds by default), and prints what it
 removed as JSON. It holds each digest as it looks at it, as agents do.
+Release only an agent that is stopped, and whose socket no new agent takes
+before the collection ends: a holder is matched by name. Uses recorded with
+no holder (an agent started without naming itself) are never released;
+`DELETE /artifacts/{sha256}` removes what they link. A store that does not
+exist yet is reported on stderr and collects nothing. The idle window is
+measured by each index record's modification time.
 
 ### Processes
 

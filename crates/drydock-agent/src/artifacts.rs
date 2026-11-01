@@ -579,7 +579,9 @@ fn remove_unused(store: &Store, operation: &str, digest: &str) -> Refusal<()> {
     let _ = std::fs::remove_dir_all(uses(store, digest).map_err(at)?);
     Ok(())
 }
-/// Set a file's modification time to now, if it is there.
+/// Set a file's modification time to now, if it is there. An index record's
+/// modification time is the clock of a collection's idle window, so a tool
+/// that rewrites the store's mtimes moves that window.
 fn touch(path: &Path) {
     if let Ok(file) = std::fs::File::options().write(true).open(path) {
         let _ = file.set_modified(std::time::SystemTime::now());
@@ -604,6 +606,11 @@ pub struct Collected {
 /// fetched or activated next. Each digest is held while it is looked at, as
 /// every agent sharing the store holds it, so no fetch, link or upload
 /// interleaves. Entries are removed write-protected as they are.
+///
+/// A holder is released by name, so the caller releases only an agent that
+/// is stopped and whose name no new agent takes before the collection ends.
+/// Uses recorded with no holder (an agent that never named itself) are never
+/// released; only `DELETE /artifacts/{sha256}` removes what they link.
 pub async fn collect(root: PathBuf, released: &[String], idle: std::time::Duration) -> io::Result<Collected> {
     const OP: &str = "artifact.collect";
     let store = Store::new(root);
@@ -624,7 +631,16 @@ pub async fn collect(root: PathBuf, released: &[String], idle: std::time::Durati
     for digest in digests("uses")? {
         let _held = store.wait_for(OP, &digest).await.map_err(AgentError::into_io)?;
         let Ok(records) = std::fs::read_dir(uses(&store, &digest)?) else { continue };
-        for record in records.flatten().map(|record| record.path()).filter(|record| !is_holder(record)) {
+        for record in records.flatten().map(|record| record.path()) {
+            if is_holder(&record) {
+                // A holder whose record never landed (a crash between the two
+                // writes) names no use.
+                let named = record.with_extension("");
+                if !exists(&named) {
+                    let _ = std::fs::remove_file(&record);
+                }
+                continue;
+            }
             let holder = std::fs::read(holder_of(&record)).ok().map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
             if holder.is_some_and(|holder| released.contains(&holder)) {
                 forget_use(&record);

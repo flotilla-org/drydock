@@ -14,11 +14,7 @@ use std::{
 /// agent the supervisor starts.
 fn socket(args: &[OsString]) -> io::Result<PathBuf> {
     match args {
-        [options @ .., flag, path]
-            if flag == "--socket" && matches!(options, [] | [_, _]) && options.first().is_none_or(|o| o == "--store") =>
-        {
-            Ok(path.into())
-        }
+        [socket, path] | [_, _, socket, path] if socket == "--socket" && (args.len() == 2 || args[0] == "--store") => Ok(path.into()),
         _ => Err(io::Error::other("usage: drydock-agent --supervise [--store DIR] --socket PATH")),
     }
 }
