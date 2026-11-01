@@ -78,6 +78,15 @@ fn uses(store: &Store, digest: &str) -> io::Result<PathBuf> {
 fn holder_tag(holder: &Path) -> String {
     format!("{:x}", Sha256::digest(holder.as_os_str().as_encoded_bytes()))[..16].to_owned()
 }
+/// Hold the holder named `tag` while its name is checked, written or
+/// removed, so a collection never forgets a holder a link is naming.
+fn lock_holder(store: &Store, tag: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = store.directory("locks")?.join(format!("holder-{tag}"));
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(path)?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)?;
+    Ok(file)
+}
 /// Whether the holder a record names still exists. A tag whose holder is no
 /// longer recorded has been collected: its holder is gone.
 fn holder_lives(store: &Store, tag: &str) -> io::Result<bool> {
@@ -600,17 +609,28 @@ pub struct Collected {
     pub entries: usize,
     /// Completed uploads, such as agent upgrade images.
     pub blobs: usize,
+    /// Digests left as they were because they could not be examined; each
+    /// is logged with why, and the next collection tries it again.
+    pub skipped: usize,
 }
 
 /// Remove from the store at `root` every entry that no live record links
-/// and whose record nobody fetched within `grace`, every blob as old, and
-/// the records of holders since gone. Each digest is taken as the agents
-/// sharing the store take it, so a collection never interleaves with their
-/// fetches and links. Write-protected entries are opened up first.
+/// and whose record nobody fetched within `grace`, every completed upload
+/// (blob) untouched as long, and the records of holders since gone. Each
+/// digest is taken as the agents sharing the store take it, so a collection
+/// waits for their fetches and links rather than interleaving with them.
+/// Write-protected entries are opened up first. Links placed without the
+/// agent (plain `/links`) are not uses: an entry only they reach is removed.
+/// A digest that cannot be examined is skipped, logged, and counted.
 pub async fn collect(root: PathBuf, grace: Duration) -> io::Result<Collected> {
     const OP: &str = "store.collect";
     let store = Store::new(root);
     let held = |error: AgentError| io::Error::new(io::ErrorKind::from(error.kind), error.to_string());
+    let mut collected = Collected::default();
+    let mut skip = |digest: &str, error: io::Error| {
+        tracing::warn!(%digest, %error, "could not collect a digest; skipping it");
+        collected.skipped += 1;
+    };
     let names = |directory: &str| -> io::Result<Vec<String>> {
         let directory = store.root().join(directory);
         match std::fs::read_dir(&directory) {
@@ -625,46 +645,74 @@ pub async fn collect(root: PathBuf, grace: Duration) -> io::Result<Collected> {
     let mut digests: Vec<String> = names("index")?.into_iter().chain(names("artifacts")?).chain(names("uses")?).collect();
     digests.sort();
     digests.dedup();
-    let mut collected = Collected::default();
+    let mut entries_removed = 0;
     for digest in digests {
-        let _held = store.wait_for(OP, &digest).await.map_err(held)?;
-        let (record, path) = (record_path(&store, &digest)?, entries(&store)?.join(&digest));
-        if !links(&store, &digest, &path)?.is_empty() || !untouched_for(&record, grace)? {
-            continue;
+        let removed = async {
+            let _held = store.wait_for(OP, &digest).await.map_err(held)?;
+            let (record, path) = (record_path(&store, &digest)?, entries(&store)?.join(&digest));
+            if !links(&store, &digest, &path)?.is_empty() || !untouched_for(&record, grace)? {
+                return Ok(false);
+            }
+            // The record goes first: from then on the entry is no longer a hit.
+            let had_entry = exists(&record) || exists(&path);
+            match std::fs::remove_file(&record) {
+                Ok(()) => sync_directory(record.parent().unwrap())?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            remove_entry(&path)?;
+            match std::fs::remove_dir_all(uses(&store, &digest)?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            Ok::<_, io::Error>(had_entry)
         }
-        // The record goes first: from then on the entry is no longer a hit.
-        let had_entry = exists(&record) || exists(&path);
-        match std::fs::remove_file(&record) {
-            Ok(()) => sync_directory(record.parent().unwrap())?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        .await;
+        match removed {
+            Ok(removed) => entries_removed += usize::from(removed),
+            Err(error) => skip(&digest, error),
         }
-        remove_entry(&path)?;
-        match std::fs::remove_dir_all(uses(&store, &digest)?) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        collected.entries += usize::from(had_entry);
     }
+    let mut blobs_removed = 0;
     for digest in names("blobs")? {
-        let _held = store.wait_for(OP, &digest).await.map_err(held)?;
-        let blob = store.blob(&digest)?;
-        if untouched_for(&blob, grace)? && exists(&blob) {
-            std::fs::remove_file(&blob)?;
-            collected.blobs += 1;
+        let removed = async {
+            let _held = store.wait_for(OP, &digest).await.map_err(held)?;
+            let blob = store.blob(&digest)?;
+            if untouched_for(&blob, grace)? && exists(&blob) {
+                std::fs::remove_file(&blob)?;
+                return Ok(true);
+            }
+            Ok::<_, io::Error>(false)
+        }
+        .await;
+        match removed {
+            Ok(removed) => blobs_removed += usize::from(removed),
+            Err(error) => skip(&digest, error),
         }
     }
-    // Every record of a gone holder was dropped above, so its name goes too.
+    // Every record of a gone holder was dropped above, so its name goes too,
+    // unless a link names the holder again meanwhile.
     let holders = store.root().join("holders");
     if let Ok(tags) = std::fs::read_dir(&holders) {
         for tag in tags.flatten() {
             let tag = tag.file_name().to_string_lossy().into_owned();
-            if !tag.starts_with('.') && !holder_lives(&store, &tag)? {
-                let _ = std::fs::remove_file(holders.join(&tag));
+            if tag.starts_with('.') {
+                continue;
+            }
+            let forgotten = lock_holder(&store, &tag).and_then(|_lock| {
+                if !holder_lives(&store, &tag)? {
+                    std::fs::remove_file(holders.join(&tag))?;
+                }
+                Ok(())
+            });
+            if let Err(error) = forgotten {
+                skip(&tag, error);
             }
         }
     }
+    collected.entries = entries_removed;
+    collected.blobs = blobs_removed;
     store.sweep(crate::store::ABANDONED)?;
     store.sweep_staging(crate::store::ABANDONED)?;
     Ok(collected)
@@ -699,12 +747,16 @@ pub(crate) async fn put_artifact_link(
     let records = uses(store, &digest).map_err(|e| AgentError::io(OP, &digest, e))?;
     std::fs::create_dir_all(&records).map_err(|e| AgentError::io(OP, records.display(), e))?;
     let mut name = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    // Held until the record is written: a collection checks the holder only
+    // before or after both its name and the record are in place.
+    let mut _holder_lock = None;
     if let Some(holder) = store.holder() {
+        let tag = holder_tag(holder);
+        _holder_lock = Some(lock_holder(store, &tag).map_err(|e| AgentError::io(OP, holder.display(), e))?);
         // A use recorded for a holder already gone would never count.
         if !std::fs::symlink_metadata(holder).is_ok_and(|metadata| metadata.is_dir()) {
             return Err(AgentError::new(OP, holder.display(), ErrorKind::NotFound, "this agent's holder directory is gone"));
         }
-        let tag = holder_tag(holder);
         let named = store.directory("holders").map(|holders| holders.join(&tag)).map_err(|e| AgentError::io(OP, holder.display(), e))?;
         if std::fs::read(&named).ok().as_deref() != Some(holder.as_os_str().as_encoded_bytes()) {
             replace(&named, holder.as_os_str().as_encoded_bytes(), 0o600).map_err(|e| AgentError::io(OP, named.display(), e))?;

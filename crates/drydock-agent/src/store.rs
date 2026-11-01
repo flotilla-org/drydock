@@ -161,6 +161,11 @@ impl Store {
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path)?;
         Ok(path)
     }
+    /// The store holding the staging at `partial`, as [`Store::partial`]
+    /// names it: `<store>/partial/<digest>`.
+    pub(crate) fn of_partial(partial: &Path) -> &Path {
+        partial.parent().and_then(Path::parent).unwrap_or(partial)
+    }
     pub(crate) fn partial(&self, digest: &str) -> io::Result<PathBuf> {
         Ok(self.directory("partial")?.join(digest))
     }

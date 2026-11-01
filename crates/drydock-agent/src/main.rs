@@ -114,25 +114,30 @@ const COLLECT_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
 /// `--collect --store DIR [--grace SECONDS]`: remove what nothing in the
 /// store uses, then report what went on stdout.
 async fn collect(args: &[std::ffi::OsString]) -> io::Result<()> {
-    const USAGE: &str = "usage: drydock-agent --collect --store DIR [--grace SECONDS]";
+    const USAGE: &str = "usage: drydock-agent --collect --store DIR [--grace SECONDS] \
+        (removes entries no live holder links, unfetched for the grace, and completed uploads untouched as long; \
+        the grace defaults to 3600 seconds, and 0 removes every completed upload)";
+    let refuse = |why: String| io::Error::new(io::ErrorKind::InvalidInput, format!("{why}; {USAGE}"));
     let mut store = None;
     let mut grace = COLLECT_GRACE;
     let mut options = args.iter();
     while let Some(flag) = options.next() {
         match flag.to_str() {
-            Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other(USAGE))?)),
+            Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| refuse("--store requires a directory".into()))?)),
             Some("--grace") => {
-                let seconds = options.next().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok());
-                grace = std::time::Duration::from_secs(seconds.ok_or_else(|| io::Error::other(USAGE))?);
+                let value = options.next().ok_or_else(|| refuse("--grace requires a number of seconds".into()))?;
+                let seconds = value.to_str().and_then(|s| s.parse::<u64>().ok());
+                let seconds = seconds.ok_or_else(|| refuse(format!("--grace {} is not a number of seconds", value.to_string_lossy())))?;
+                grace = std::time::Duration::from_secs(seconds);
             }
-            _ => return Err(io::Error::other(USAGE)),
+            _ => return Err(refuse(format!("unknown option {}", flag.to_string_lossy()))),
         }
     }
-    let store = store.ok_or_else(|| io::Error::other(USAGE))?;
+    let store = store.ok_or_else(|| refuse("--store is required".into()))?;
     let collected = drydock_agent::collect(store.clone(), grace)
         .await
         .map_err(|e| io::Error::new(e.kind(), format!("collect store {}: {e}", store.display())))?;
-    println!("removed {} entries and {} blobs from {}", collected.entries, collected.blobs, store.display());
+    println!("removed {} entries and {} blobs from {}; skipped {}", collected.entries, collected.blobs, store.display(), collected.skipped);
     Ok(())
 }
 

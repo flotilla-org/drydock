@@ -299,6 +299,25 @@ async fn a_supervised_agent_shares_the_named_store_and_collect_empties_it() {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8_lossy(&output.stdout).starts_with("removed 1 entries and 0 blobs"), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("removed 1 entries and 0 blobs"), "{output:?}");
     assert!(!store.join("artifacts").join(&digest).exists());
+}
+
+// `--collect` and `--supervise` refuse malformed options, saying which part
+// was wrong, and remove nothing.
+#[test]
+fn malformed_store_options_are_refused_with_the_reason() {
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_drydock-agent")).args(args).output().unwrap();
+        assert!(!output.status.success(), "{args:?} was accepted");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(run(&["--collect"]).contains("--store is required"));
+    assert!(run(&["--collect", "--store"]).contains("--store requires a directory"));
+    assert!(run(&["--collect", "--store", "/nonexistent", "--grace", "soon"]).contains("--grace soon is not a number of seconds"));
+    assert!(run(&["--collect", "--store", "/nonexistent", "--holder", "/h"]).contains("unknown option --holder"));
+    assert!(run(&["--supervise", "--store", "--socket", "/tmp/x.sock"]).contains("--store requires a directory"));
+    assert!(run(&["--supervise", "--socket", "/tmp/x.sock", "--store", "/s"]).contains("--socket PATH must come last"));
+    assert!(run(&["--supervise", "--store", "--holder", "--socket", "/tmp/x.sock"]).contains("--store requires a directory"));
+    assert!(run(&["--supervise", "--vsock-port", "1", "--socket", "/tmp/x.sock"]).contains("unknown option --vsock-port"));
 }

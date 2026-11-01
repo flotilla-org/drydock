@@ -255,10 +255,16 @@ directory. The links an agent places count as uses only while its holder
 exists, so removing the holder releases them, wherever the links themselves
 live. `drydock-agent --collect --store DIR [--grace SECONDS]` then removes
 every entry no live use links and nobody fetched within the grace (an hour
-by default), every completed upload as old, and the names of holders since
-gone, taking each digest's lock as the agents do; it reports what went. A
-fetch answered from the index refreshes the entry's grace, so a collection
-cannot remove an entry between a fetch and the link that follows it.
+by default), every completed upload untouched as long (so `--grace 0`
+removes them all), and the names of holders since gone. It takes each
+digest's lock as the agents do, waiting out a fetch in progress; a digest
+it cannot examine is skipped and logged. It reports what went and how many
+it skipped. A fetch answered from the index refreshes the entry's grace,
+so a collection cannot remove an entry between a fetch and the link that
+follows it. Links placed with plain `/links` are not recorded and so are
+not uses: an entry only they reach is collected, leaving them dangling.
+A holder's name is checked and written under its own lock, so a holder
+directory recreated during a collection keeps the uses linked after.
 
 ### Artifacts: fetch by digest
 
@@ -342,8 +348,9 @@ the entry, or to a member inside it, by renaming a new link over the path,
 so the path never goes missing. The link is recorded as a use of the entry.
 `DELETE /artifacts/{sha256}` refuses an entry while any recorded link still
 points into it (409, naming the links); links since removed or pointed
-elsewhere, or placed by a holder since gone, no longer count. An agent
-whose holder is gone refuses to place a link (404). `GET /artifacts` lists complete entries with
+elsewhere, or placed by a holder since gone, no longer count.
+
+An agent whose holder is gone refuses to place a link (404). `GET /artifacts` lists complete entries with
 their live links. Links made through plain `/links` are not recorded.
 
 ### Processes

@@ -489,6 +489,6 @@ async fn a_collection_removes_what_no_live_holder_uses() {
     assert_eq!(drydock_agent::collect(root.clone(), hour).await.unwrap(), drydock_agent::Collected::default());
     assert_eq!(agent.client.blob_size(&sha256(&image)).await.unwrap(), Some(image.len() as u64));
     let collected = drydock_agent::collect(root.clone(), std::time::Duration::ZERO).await.unwrap();
-    assert_eq!(collected, drydock_agent::Collected { entries: 1, blobs: 1 });
+    assert_eq!(collected, drydock_agent::Collected { entries: 1, blobs: 1, skipped: 0 });
     assert_eq!(agent.client.blob_size(&sha256(&image)).await.unwrap(), None);
 }

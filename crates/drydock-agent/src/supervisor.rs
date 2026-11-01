@@ -12,13 +12,21 @@ use std::{
 /// agent it starts: the store options, then the socket last, so that the
 /// processes serving one socket all end their argv with `--socket PATH`.
 fn socket(args: &[OsString]) -> io::Result<PathBuf> {
-    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--holder DIR] --socket PATH");
-    let [options @ .., flag, path] = args else { return Err(usage()) };
-    if flag != "--socket" || options.len() % 2 != 0 {
-        return Err(usage());
+    let usage =
+        |why: String| io::Error::other(format!("{why}; usage: drydock-agent --supervise [--store DIR] [--holder DIR] --socket PATH"));
+    let [options @ .., flag, path] = args else { return Err(usage("--socket PATH must come last".into())) };
+    if flag != "--socket" {
+        return Err(usage("--socket PATH must come last".into()));
     }
-    if !options.chunks(2).all(|option| option[0] == "--store" || option[0] == "--holder") {
-        return Err(usage());
+    let mut options = options.iter();
+    while let Some(option) = options.next() {
+        if option != "--store" && option != "--holder" {
+            return Err(usage(format!("unknown option {}", option.to_string_lossy())));
+        }
+        match options.next() {
+            Some(value) if !value.to_string_lossy().starts_with("--") => {}
+            _ => return Err(usage(format!("{} requires a directory", option.to_string_lossy()))),
+        }
     }
     Ok(path.into())
 }

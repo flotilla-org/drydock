@@ -429,8 +429,7 @@ impl Fetcher {
                 if let Some(free) = staging.parent().and_then(free_space)
                     && total - *offset > free
                 {
-                    // Staging is `<store>/partial/<digest>`.
-                    let store = staging.ancestors().nth(2).unwrap_or(staging);
+                    let store = crate::store::Store::of_partial(staging);
                     let message = format!(
                         "{} more bytes do not fit in the {free} free on the filesystem of the store {}",
                         total - *offset,
