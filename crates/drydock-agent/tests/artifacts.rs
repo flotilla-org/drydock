@@ -489,7 +489,7 @@ async fn a_collection_keeps_what_live_agents_link_and_removes_the_rest() {
 
 // Two retirements collecting one shared store at once: each digest is held as
 // it is looked at, so an entry goes exactly once and neither collection fails.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_collections_remove_each_entry_once() {
     let shared = tempfile::tempdir().unwrap();
     let root = shared.path().join("store");
@@ -507,8 +507,11 @@ async fn concurrent_collections_remove_each_entry_once() {
         digests.push(digest);
     }
     let idle = std::time::Duration::ZERO;
-    let (first, second) = tokio::join!(drydock_agent::collect(root.clone(), &[], idle), drydock_agent::collect(root.clone(), &[], idle));
-    let mut removed = [first.unwrap().artifacts, second.unwrap().artifacts].concat();
+    let collections = [0, 1].map(|_| tokio::spawn(drydock_agent::collect(root.clone(), &[], idle)));
+    let mut removed = Vec::new();
+    for collection in collections {
+        removed.extend(collection.await.unwrap().unwrap().artifacts);
+    }
     removed.sort();
     digests.sort();
     assert_eq!(removed, digests);
