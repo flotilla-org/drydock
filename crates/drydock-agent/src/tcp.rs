@@ -276,7 +276,7 @@ impl TokenListener {
         }
         let local = listener.local_addr()?;
         let (sender, admitted) = mpsc::channel(16);
-        Ok(Self { admitted, local, acceptor: tokio::spawn(accept(listener, token, sender)) })
+        Ok(Self { admitted, local, acceptor: tokio::spawn(accept(listener, token, sender, Limits::default())) })
     }
     /// The bound address, with the port chosen when bound to port 0.
     pub fn local_addr(&self) -> SocketAddr {
@@ -290,7 +290,19 @@ impl Listener for TokenListener {
     }
 }
 
-async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::Result<ByteStream>>) {
+/// How long a handshake may take, and how many run at once.
+#[derive(Clone, Copy)]
+struct Limits {
+    deadline: Duration,
+    handshakes: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self { deadline: HANDSHAKE_DEADLINE, handshakes: HANDSHAKES }
+    }
+}
+
+async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::Result<ByteStream>>, limits: Limits) {
     let mut handshakes = JoinSet::new();
     let refusals = Arc::new(Refusals::default());
     let mut backoff = Duration::from_millis(100);
@@ -298,12 +310,12 @@ async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::
         tokio::select! {
             Some(_) = handshakes.join_next(), if !handshakes.is_empty() => {}
             _ = admitted.closed() => return,
-            accepted = listener.accept(), if handshakes.len() < HANDSHAKES => match accepted {
+            accepted = listener.accept(), if handshakes.len() < limits.handshakes => match accepted {
                 Ok((stream, peer)) => {
                     backoff = Duration::from_millis(100);
                     let (token, admitted, refusals) = (token.clone(), admitted.clone(), refusals.clone());
                     handshakes.spawn(async move {
-                        match tokio::time::timeout(HANDSHAKE_DEADLINE, handshake(stream, peer, &token, &refusals)).await {
+                        match tokio::time::timeout(limits.deadline, handshake(stream, peer, &token, &refusals)).await {
                             Ok(Ok(Some(stream))) => {
                                 // Holds its handshake slot until the agent takes
                                 // the connection: when the agent is slow to accept,
@@ -430,6 +442,52 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(Token::read(&link).is_err());
+    }
+
+    // A connection that sends no handshake is closed at the deadline, and
+    // only so many handshakes run at once: one more connection gets no answer
+    // until a slot frees, then switches as usual. Real time, small limits.
+    #[tokio::test]
+    async fn idle_handshakes_are_bounded_in_time_and_number() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let limits = Limits { deadline: Duration::from_millis(300), handshakes: 4 };
+        let token = Token::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut admitted) = mpsc::channel(16);
+        tokio::spawn(accept(listener, token.clone(), sender, limits));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(stream) = admitted.recv().await {
+                held.push(stream);
+            }
+        });
+        let mut idle = Vec::new();
+        for _ in 0..limits.handshakes {
+            idle.push(tokio::net::TcpStream::connect(address).await.unwrap());
+        }
+        let mut waiting = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET /v1/connect HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: drydock-agent\r\nAuthorization: Bearer {}\r\n\r\n",
+            token.secret()
+        );
+        waiting.write_all(request.as_bytes()).await.unwrap();
+        let started = std::time::Instant::now();
+        // The idle handshakes started before this one connected, so none has
+        // freed its slot before the deadline has passed since then.
+        let mut byte = [0u8; 1];
+        assert!(tokio::time::timeout(limits.deadline / 2, waiting.read(&mut byte)).await.is_err(), "one more waits for a slot");
+        for stream in &mut idle {
+            let mut rest = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest)).await;
+            assert!(matches!(read, Ok(Ok(0))), "an idle handshake is closed at its deadline: {read:?}");
+        }
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(tokio::time::timeout(Duration::from_secs(10), waiting.read_u8()).await.unwrap().unwrap());
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101 "), "{}", String::from_utf8_lossy(&head));
+        assert!(started.elapsed() >= limits.deadline / 2);
     }
 
     // Refusals within a second of a logged one only count, and the next one

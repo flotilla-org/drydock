@@ -230,38 +230,3 @@ async fn the_agent_keeps_its_token_off_argv_and_environment() {
     assert!(stderr.contains("tcp connection refused") && stderr.contains("127.0.0.1:"), "{stderr}");
     assert!(!stderr.contains(token.secret()));
 }
-
-// A connection that sends no handshake is closed at the 10-second deadline,
-// and at most 64 handshakes run at once: the 65th connection gets no answer
-// until a slot frees, then switches as usual.
-#[tokio::test(start_paused = true)]
-async fn idle_handshakes_are_bounded_in_time_and_number() {
-    let token = Token::generate().unwrap();
-    let mut listener = TokenListener::bind("127.0.0.1:0".parse().unwrap(), token.clone()).await.unwrap();
-    let address = listener.local_addr();
-    tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok(stream) = drydock_transport::Listener::accept(&mut listener).await {
-            held.push(stream);
-        }
-    });
-    let mut idle = Vec::new();
-    for _ in 0..64 {
-        idle.push(TcpStream::connect(address).await.unwrap());
-    }
-    tokio::task::yield_now().await;
-    let mut waiting = TcpStream::connect(address).await.unwrap();
-    waiting.write_all(handshake(Some(&format!("Bearer {}", token.secret())), "drydock-agent").as_bytes()).await.unwrap();
-    let mut byte = [0u8; 1];
-    assert!(tokio::time::timeout(Duration::from_secs(5), waiting.read(&mut byte)).await.is_err(), "the 65th waits for a slot");
-    for stream in &mut idle {
-        let mut rest = Vec::new();
-        let read = tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut rest)).await;
-        assert!(matches!(read, Ok(Ok(0))), "an idle handshake is closed at its deadline: {read:?}");
-    }
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        head.push(tokio::time::timeout(Duration::from_secs(20), waiting.read_u8()).await.unwrap().unwrap());
-    }
-    assert!(head.starts_with(b"HTTP/1.1 101 "), "{}", String::from_utf8_lossy(&head));
-}
