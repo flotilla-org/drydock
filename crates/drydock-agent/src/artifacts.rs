@@ -9,7 +9,12 @@
 //!
 //! Links placed through the agent are recorded under `uses/<sha256>/`, and
 //! an entry is in use while any recorded link still points into it. Removal
-//! refuses an entry in use.
+//! refuses an entry in use. An agent with a holder tags its records with
+//! it (`<record>.<tag>`, the holder's path kept in `holders/<tag>`); a
+//! tagged record counts only while its holder directory exists.
+//!
+//! [`collect`] removes what nothing uses: entries no live record links, once
+//! untouched for a grace period, and blobs as old.
 use crate::{
     AgentError, Artifact, ArtifactLink, ArtifactSource, ErrorKind, Fetch, Fetched, Origin, Unpack,
     durable::{rename_noreplace, replace, sync_directory},
@@ -33,6 +38,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 type Refusal<T> = Result<T, AgentError>;
@@ -68,6 +74,25 @@ fn record_path(store: &Store, digest: &str) -> io::Result<PathBuf> {
 fn uses(store: &Store, digest: &str) -> io::Result<PathBuf> {
     Ok(store.directory("uses")?.join(digest))
 }
+/// A holder's short name in record names: its path, hashed.
+fn holder_tag(holder: &Path) -> String {
+    format!("{:x}", Sha256::digest(holder.as_os_str().as_encoded_bytes()))[..16].to_owned()
+}
+/// Whether the holder a record names still exists. A tag whose holder is no
+/// longer recorded has been collected: its holder is gone.
+fn holder_lives(store: &Store, tag: &str) -> io::Result<bool> {
+    let path = store.directory("holders")?.join(tag);
+    let holder = match std::fs::read(&path) {
+        Ok(bytes) => PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match std::fs::symlink_metadata(&holder) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
@@ -93,7 +118,8 @@ fn indexed(store: &Store, operation: &str, digest: &str) -> Refusal<Option<Artif
     Ok(Some(Artifact { sha256: record.sha256, size: record.size, unpack: record.unpack, path, links }))
 }
 /// Recorded links still pointing into `entry`, with their record files.
-/// Records of links since removed or pointed elsewhere are dropped.
+/// Records of links since removed or pointed elsewhere, and of holders
+/// since gone, are dropped.
 fn links(store: &Store, digest: &str, entry: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
     let directory = uses(store, digest)?;
     let records = match std::fs::read_dir(&directory) {
@@ -104,6 +130,13 @@ fn links(store: &Store, digest: &str, entry: &Path) -> io::Result<Vec<(PathBuf, 
     let mut live = Vec::new();
     for record in records {
         let record = record?.path();
+        let tag = record.file_name().and_then(|name| name.to_str()).and_then(|name| name.split_once('.')).map(|(_, tag)| tag.to_owned());
+        if let Some(tag) = tag
+            && !holder_lives(store, &tag)?
+        {
+            let _ = std::fs::remove_file(&record);
+            continue;
+        }
         let link = PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(std::fs::read(&record)?));
         match std::fs::read_link(&link) {
             Ok(target) if target.starts_with(entry) => live.push((record, link)),
@@ -417,6 +450,9 @@ async fn fetch(store: Store, network: Network, digest: String, request: Fetch) -
             let message = format!("already stored as {:?}; remove it to store it differently", artifact.unpack);
             return Err(AgentError::new(OP, &digest, ErrorKind::Conflict, message));
         }
+        // A fetch is usually followed by a link: the touch keeps a collection
+        // in another agent's grace from removing the entry in between.
+        touch(&record_path(&store, &digest).map_err(at)?).map_err(at)?;
         return Ok(Fetched { artifact, origin: Origin::Index });
     }
     // Anything here without a record is the remains of an interrupted
@@ -546,6 +582,94 @@ pub(crate) async fn delete_artifact(State(shared): State<Arc<Shared>>, Route(dig
     let _ = std::fs::remove_dir_all(uses(store, &digest).map_err(at)?);
     Ok(StatusCode::NO_CONTENT)
 }
+fn touch(path: &Path) -> io::Result<()> {
+    std::fs::File::options().write(true).open(path)?.set_modified(std::time::SystemTime::now())
+}
+fn untouched_for(path: &Path, grace: Duration) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.modified()?.elapsed().is_ok_and(|elapsed| elapsed >= grace)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// What a [`collect`] removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Collected {
+    /// Artifact entries, with their records.
+    pub entries: usize,
+    /// Completed uploads, such as agent upgrade images.
+    pub blobs: usize,
+}
+
+/// Remove from the store at `root` every entry that no live record links
+/// and whose record nobody fetched within `grace`, every blob as old, and
+/// the records of holders since gone. Each digest is taken as the agents
+/// sharing the store take it, so a collection never interleaves with their
+/// fetches and links. Write-protected entries are opened up first.
+pub async fn collect(root: PathBuf, grace: Duration) -> io::Result<Collected> {
+    const OP: &str = "store.collect";
+    let store = Store::new(root);
+    let held = |error: AgentError| io::Error::new(io::ErrorKind::from(error.kind), error.to_string());
+    let names = |directory: &str| -> io::Result<Vec<String>> {
+        let directory = store.root().join(directory);
+        match std::fs::read_dir(&directory) {
+            Ok(entries) => Ok(entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .filter(|name| crate::check_sha256(name).is_ok())
+                .collect()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(vec![]),
+            Err(error) => Err(error),
+        }
+    };
+    let mut digests: Vec<String> = names("index")?.into_iter().chain(names("artifacts")?).chain(names("uses")?).collect();
+    digests.sort();
+    digests.dedup();
+    let mut collected = Collected::default();
+    for digest in digests {
+        let _held = store.wait_for(OP, &digest).await.map_err(held)?;
+        let (record, path) = (record_path(&store, &digest)?, entries(&store)?.join(&digest));
+        if !links(&store, &digest, &path)?.is_empty() || !untouched_for(&record, grace)? {
+            continue;
+        }
+        // The record goes first: from then on the entry is no longer a hit.
+        let had_entry = exists(&record) || exists(&path);
+        match std::fs::remove_file(&record) {
+            Ok(()) => sync_directory(record.parent().unwrap())?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        remove_entry(&path)?;
+        match std::fs::remove_dir_all(uses(&store, &digest)?) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        collected.entries += usize::from(had_entry);
+    }
+    for digest in names("blobs")? {
+        let _held = store.wait_for(OP, &digest).await.map_err(held)?;
+        let blob = store.blob(&digest)?;
+        if untouched_for(&blob, grace)? && exists(&blob) {
+            std::fs::remove_file(&blob)?;
+            collected.blobs += 1;
+        }
+    }
+    // Every record of a gone holder was dropped above, so its name goes too.
+    let holders = store.root().join("holders");
+    if let Ok(tags) = std::fs::read_dir(&holders) {
+        for tag in tags.flatten() {
+            let tag = tag.file_name().to_string_lossy().into_owned();
+            if !tag.starts_with('.') && !holder_lives(&store, &tag)? {
+                let _ = std::fs::remove_file(holders.join(&tag));
+            }
+        }
+    }
+    store.sweep(crate::store::ABANDONED)?;
+    store.sweep_staging(crate::store::ABANDONED)?;
+    Ok(collected)
+}
+
 /// Place a symlink to an entry, or to a member inside it, atomically, and
 /// record it as a use of the entry.
 pub(crate) async fn put_artifact_link(
@@ -574,7 +698,19 @@ pub(crate) async fn put_artifact_link(
     // The use is recorded before the link exists, so no removal can miss it.
     let records = uses(store, &digest).map_err(|e| AgentError::io(OP, &digest, e))?;
     std::fs::create_dir_all(&records).map_err(|e| AgentError::io(OP, records.display(), e))?;
-    let name = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    let mut name = format!("{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes()));
+    if let Some(holder) = store.holder() {
+        // A use recorded for a holder already gone would never count.
+        if !std::fs::symlink_metadata(holder).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(AgentError::new(OP, holder.display(), ErrorKind::NotFound, "this agent's holder directory is gone"));
+        }
+        let tag = holder_tag(holder);
+        let named = store.directory("holders").map(|holders| holders.join(&tag)).map_err(|e| AgentError::io(OP, holder.display(), e))?;
+        if std::fs::read(&named).ok().as_deref() != Some(holder.as_os_str().as_encoded_bytes()) {
+            replace(&named, holder.as_os_str().as_encoded_bytes(), 0o600).map_err(|e| AgentError::io(OP, named.display(), e))?;
+        }
+        name = format!("{name}.{tag}");
+    }
     replace(&records.join(name), path.as_os_str().as_encoded_bytes(), 0o600).map_err(|e| AgentError::io(OP, records.display(), e))?;
     let existed = place_link(OP, &path, &target, &query)?;
     Ok(if existed { StatusCode::OK } else { StatusCode::CREATED }.into_response())

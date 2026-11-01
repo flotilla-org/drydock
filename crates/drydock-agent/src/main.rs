@@ -27,14 +27,19 @@ async fn main() -> io::Result<()> {
     if args.first().is_some_and(|a| a == "--supervisor") {
         return supervisor::run(&args[1..]).await;
     }
+    if args.first().is_some_and(|a| a == "--collect") {
+        return collect(&args[1..]).await;
+    }
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
     let mut store = None;
+    let mut holder = None;
     let mut options = args.iter();
     while let Some(flag) = options.next() {
         match flag.to_str() {
             Some("--socket") => socket = options.next().ok_or_else(|| io::Error::other("--socket requires a path"))?.into(),
             Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other("--store requires a path"))?)),
+            Some("--holder") => holder = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other("--holder requires a path"))?)),
             Some("--vsock-port") => {
                 vsock = Some(
                     options
@@ -44,7 +49,7 @@ async fn main() -> io::Result<()> {
                         .ok_or_else(|| io::Error::other("--vsock-port requires a port"))?,
                 )
             }
-            _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT] [--store DIR]")),
+            _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT] [--store DIR] [--holder DIR]")),
         }
     }
     drydock_agent::socket::private_directory(
@@ -79,6 +84,12 @@ async fn main() -> io::Result<()> {
     if let Some(store) = store {
         agent = agent.with_store(store);
     }
+    if let Some(holder) = holder {
+        if !holder.is_absolute() {
+            return Err(io::Error::other(format!("holder {} must be an absolute path", holder.display())));
+        }
+        agent = agent.with_holder(holder);
+    }
     #[cfg(target_os = "linux")]
     if let Some(port) = vsock {
         agent.add_listener(tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(tokio_vsock::VMADDR_CID_ANY, port))?);
@@ -94,6 +105,35 @@ async fn main() -> io::Result<()> {
         return Err(replace_image(&executable, &args));
     }
     Err(error)
+}
+
+/// How long an entry nobody links stays after its last fetch, unless
+/// `--grace` says otherwise: longer than any fetch waits for its link.
+const COLLECT_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `--collect --store DIR [--grace SECONDS]`: remove what nothing in the
+/// store uses, then report what went on stdout.
+async fn collect(args: &[std::ffi::OsString]) -> io::Result<()> {
+    const USAGE: &str = "usage: drydock-agent --collect --store DIR [--grace SECONDS]";
+    let mut store = None;
+    let mut grace = COLLECT_GRACE;
+    let mut options = args.iter();
+    while let Some(flag) = options.next() {
+        match flag.to_str() {
+            Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other(USAGE))?)),
+            Some("--grace") => {
+                let seconds = options.next().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok());
+                grace = std::time::Duration::from_secs(seconds.ok_or_else(|| io::Error::other(USAGE))?);
+            }
+            _ => return Err(io::Error::other(USAGE)),
+        }
+    }
+    let store = store.ok_or_else(|| io::Error::other(USAGE))?;
+    let collected = drydock_agent::collect(store.clone(), grace)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("collect store {}: {e}", store.display())))?;
+    println!("removed {} entries and {} blobs from {}", collected.entries, collected.blobs, store.display());
+    Ok(())
 }
 
 // Re-exec keeps the PID and its children, but loses Tokio's old Child handles.

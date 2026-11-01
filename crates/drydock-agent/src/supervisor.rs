@@ -8,11 +8,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The agent's socket. The supervisor passes its arguments on to every
+/// agent it starts: the store options, then the socket last, so that the
+/// processes serving one socket all end their argv with `--socket PATH`.
 fn socket(args: &[OsString]) -> io::Result<PathBuf> {
-    match args {
-        [flag, path] if flag == "--socket" => Ok(path.into()),
-        _ => Err(io::Error::other("usage: drydock-agent --supervise --socket PATH")),
+    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--holder DIR] --socket PATH");
+    let [options @ .., flag, path] = args else { return Err(usage()) };
+    if flag != "--socket" || options.len() % 2 != 0 {
+        return Err(usage());
     }
+    if !options.chunks(2).all(|option| option[0] == "--store" || option[0] == "--holder") {
+        return Err(usage());
+    }
+    Ok(path.into())
 }
 
 pub fn start(args: &[OsString]) -> io::Result<()> {

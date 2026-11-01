@@ -11,7 +11,10 @@
 //! Several agents may share one store (`--store`), as vessels on one host
 //! do. Each digest then also has a lock file under `locks/`, held by
 //! whichever agent is using that digest, so their uploads, fetches and
-//! artifact entries never interleave.
+//! artifact entries never interleave. An agent sharing a store names a
+//! holder (`--holder DIR`): the links it places are uses only while that
+//! directory exists, so retiring a vessel releases its uses and a
+//! collection ([`crate::collect`]) can remove what no live holder uses.
 use crate::{
     AgentError, ErrorKind, check_sha256,
     durable::sync_directory,
@@ -43,6 +46,8 @@ struct Slot {
 pub(crate) struct Store {
     root: PathBuf,
     slots: Arc<Mutex<HashMap<String, Slot>>>,
+    /// The directory whose existence keeps this agent's links in use.
+    holder: Option<PathBuf>,
 }
 /// The use of one digest's upload, ended early when `superseded` fires.
 pub(crate) struct Held {
@@ -88,10 +93,16 @@ pub(crate) fn free_space(path: &Path) -> Option<u64> {
 }
 impl Store {
     pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root, slots: Arc::default() }
+        Self { root, slots: Arc::default(), holder: None }
+    }
+    pub(crate) fn with_holder(self, holder: PathBuf) -> Self {
+        Self { holder: Some(holder), ..self }
     }
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+    pub(crate) fn holder(&self) -> Option<&Path> {
+        self.holder.as_deref()
     }
     /// Remove partial uploads not appended to for `age`, with their recorded
     /// lengths. Returns how many uploads went.
@@ -304,7 +315,11 @@ impl Store {
             && let Some(free) = free_space(path.parent().unwrap())
             && length.saturating_sub(start) > free
         {
-            let message = format!("{} more bytes do not fit in the {free} free on the store's filesystem", length - start);
+            let message = format!(
+                "{} more bytes do not fit in the {free} free on the filesystem of the store {}",
+                length - start,
+                self.root.display()
+            );
             return Err(AgentError::new(OP, digest, ErrorKind::StorageFull, message));
         }
         if recorded.is_none()

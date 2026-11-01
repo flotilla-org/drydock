@@ -429,7 +429,13 @@ impl Fetcher {
                 if let Some(free) = staging.parent().and_then(free_space)
                     && total - *offset > free
                 {
-                    let message = format!("{} more bytes do not fit in the {free} free on the store's filesystem", total - *offset);
+                    // Staging is `<store>/partial/<digest>`.
+                    let store = staging.ancestors().nth(2).unwrap_or(staging);
+                    let message = format!(
+                        "{} more bytes do not fit in the {free} free on the filesystem of the store {}",
+                        total - *offset,
+                        store.display()
+                    );
                     return Err(Failure { fatal: true, ..Failure::new("disk", ErrorKind::StorageFull, message) });
                 }
             }

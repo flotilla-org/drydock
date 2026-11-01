@@ -1,6 +1,7 @@
 //! Drydock's vessel control API and host client. The agent's socket is the
 //! trust boundary: only drydock may reach it; outward forwards carry opaque IDs.
 mod artifacts;
+pub use artifacts::{Collected, collect};
 mod client;
 mod durable;
 mod egress;

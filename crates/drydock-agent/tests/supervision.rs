@@ -245,3 +245,60 @@ async fn bootstrap_beside_orphan_preserves_live_socket_and_recovers_after_exit()
     assert_eq!(recovered.len(), 1);
     assert_ne!(recovered, orphan);
 }
+
+// #4087: a supervisor passes `--store` and `--holder` on to its agent, which
+// keeps what it is given in that shared store and records its links for
+// that holder; the agent's argv still ends with its socket, as teardown
+// matches it. Once the holder is gone and the agents have stopped,
+// `--collect` removes the entry only that holder linked.
+#[tokio::test]
+async fn a_supervised_agent_shares_the_named_store_and_collect_empties_it() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::process::CommandExt;
+    let directory = tempfile::tempdir().unwrap();
+    let (socket, store, holder) =
+        (directory.path().join("run/agent.sock"), directory.path().join("store"), directory.path().join("holder"));
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::fs::create_dir(&holder).unwrap();
+    let supervisor = ProcessGroup(spawn(
+        Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+            .arg("--supervisor")
+            .arg("--store")
+            .arg(&store)
+            .arg("--holder")
+            .arg(&holder)
+            .arg("--socket")
+            .arg(&socket)
+            .env("PATH", "/nonexistent")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    ));
+    let fingerprint = hello(&socket).await;
+    assert_eq!(agents(&socket).len(), 1);
+    let client =
+        drydock_agent::Client::connect(Box::new(tokio::net::UnixStream::connect(&socket).await.unwrap()), fingerprint).await.unwrap();
+    let tool = b"#!/bin/sh\necho shared\n".to_vec();
+    let digest = format!("{:x}", Sha256::digest(&tool));
+    let request =
+        drydock_agent::Fetch { sources: vec![drydock_agent::ArtifactSource::Push], unpack: drydock_agent::Unpack::File { mode: 0o555 } };
+    client.fetch_artifact_or_push(&digest, &request, tool.len() as u64, std::io::Cursor::new(tool)).await.unwrap();
+    let link = directory.path().join("home/tool");
+    let options = drydock_agent::FileOptions { parents: true, ..Default::default() };
+    client.link_artifact(&link, &digest, Path::new(""), &options).await.unwrap();
+    assert!(store.join("artifacts").join(&digest).exists(), "the entry is in the named store");
+    drop((client, supervisor));
+
+    std::fs::remove_dir(&holder).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_drydock-agent"))
+        .arg("--collect")
+        .arg("--store")
+        .arg(&store)
+        .args(["--grace", "0"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("removed 1 entries and 0 blobs"), "{output:?}");
+    assert!(!store.join("artifacts").join(&digest).exists());
+}

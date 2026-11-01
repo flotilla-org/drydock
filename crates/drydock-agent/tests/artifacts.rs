@@ -427,3 +427,68 @@ async fn agents_sharing_a_store_fetch_once() {
     assert_eq!(origins, [Served::Source(0), Served::Index]);
     assert_eq!(host.requests().len(), 1);
 }
+
+// #4087: agents sharing a store each name a holder directory, as vessels on
+// one host name their state directories. An entry linked through two
+// holders survives a collection while either lives; once both are gone a
+// collection removes it, read-only tree and all, with its record, so the
+// next fetch downloads again. An entry fetched within the grace survives a
+// collection unlinked, and goes once the grace is spent, as does a
+// completed upload such as an agent upgrade image. Mutation check: counting
+// a gone holder's records as uses keeps the entry and fails this scenario.
+#[tokio::test]
+async fn a_collection_removes_what_no_live_holder_uses() {
+    let shared = tempfile::tempdir().unwrap();
+    let root = shared.path().join("store");
+    let (package, _) = package(11);
+    let digest = sha256(&package);
+    let host = download_host(package).await;
+    let request = fetch(vec![upstream(host.url("/download"))], Unpack::TarGz);
+    let mut vessels = Vec::new();
+    for name in ["a", "b"] {
+        let holder = shared.path().join(name);
+        std::fs::create_dir(&holder).unwrap();
+        let root = root.clone();
+        let agent = {
+            let holder = holder.clone();
+            harness_with(false, "test-build", move |guest, dir| {
+                drydock_agent::Agent::new(guest, "test-build".into(), dir.join("agent")).with_store(root).with_holder(holder)
+            })
+            .await
+        };
+        agent.client.fetch_artifact(&digest, &request).await.unwrap();
+        let link = agent.vessel().join("home/codex");
+        agent.client.link_artifact(&link, &digest, Path::new(""), &FileOptions { parents: true, ..FileOptions::default() }).await.unwrap();
+        vessels.push((agent, holder, link));
+    }
+    let entry = vessels[0].0.client.artifact(&digest).await.unwrap();
+    assert_eq!(entry.links.len(), 2);
+    assert_eq!(host.requests().len(), 1, "the second agent's fetch is a lookup");
+
+    std::fs::remove_dir(&vessels[0].1).unwrap();
+    assert_eq!(drydock_agent::collect(root.clone(), std::time::Duration::ZERO).await.unwrap().entries, 0);
+    assert_eq!(vessels[1].0.client.artifact(&digest).await.unwrap().links, vec![vessels[1].2.clone()]);
+    // A gone holder's agent places no use that would never count.
+    let refused = failed(vessels[0].0.client.link_artifact(&vessels[0].2, &digest, Path::new(""), &FileOptions::default()).await);
+    assert_eq!(kind(&refused), ErrorKind::NotFound);
+
+    std::fs::remove_dir(&vessels[1].1).unwrap();
+    let collected = drydock_agent::collect(root.clone(), std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(collected.entries, 1);
+    assert!(!entry.path.exists());
+    assert_eq!(vessels[1].0.client.artifacts().await.unwrap(), vec![]);
+    assert!(std::fs::read_dir(root.join("holders")).unwrap().next().is_none(), "gone holders are forgotten");
+
+    // Unlinked: kept within the grace after its fetch, then removed.
+    let (agent, holder, _) = &vessels[1];
+    std::fs::create_dir(holder).unwrap();
+    assert_eq!(agent.client.fetch_artifact(&digest, &request).await.unwrap().origin, Served::Source(0));
+    let image = pattern(12, 4096);
+    agent.client.resume_upload(&sha256(&image), image.len() as u64, io::Cursor::new(image.clone())).await.unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    assert_eq!(drydock_agent::collect(root.clone(), hour).await.unwrap(), drydock_agent::Collected::default());
+    assert_eq!(agent.client.blob_size(&sha256(&image)).await.unwrap(), Some(image.len() as u64));
+    let collected = drydock_agent::collect(root.clone(), std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(collected, drydock_agent::Collected { entries: 1, blobs: 1 });
+    assert_eq!(agent.client.blob_size(&sha256(&image)).await.unwrap(), None);
+}

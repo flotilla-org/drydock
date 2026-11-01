@@ -175,7 +175,21 @@ impl Agent {
     /// Agents on one host may share a store, so that an artifact one vessel
     /// fetched is a lookup for the next.
     pub fn with_store(mut self, root: PathBuf) -> Self {
-        Arc::get_mut(&mut self.shared).expect("the store is chosen before the agent runs").store = crate::store::Store::new(root);
+        let store = &mut Arc::get_mut(&mut self.shared).expect("the store is chosen before the agent runs").store;
+        let holder = store.holder().map(std::path::Path::to_path_buf);
+        *store = crate::store::Store::new(root);
+        if let Some(holder) = holder {
+            *store = store.clone().with_holder(holder);
+        }
+        self
+    }
+    /// Count the links this agent places as uses only while `holder`, an
+    /// existing directory, does. Agents sharing a store each name their own,
+    /// such as their vessel's state directory: once it is removed, the
+    /// entries only it linked are left for [`crate::collect`].
+    pub fn with_holder(mut self, holder: PathBuf) -> Self {
+        let store = &mut Arc::get_mut(&mut self.shared).expect("the holder is chosen before the agent runs").store;
+        *store = store.clone().with_holder(holder);
         self
     }
     /// Report `platform` in the hello instead of this build's own. Only

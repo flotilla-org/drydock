@@ -7,8 +7,10 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 ## Runtime and trust
 
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
-[--vsock-port PORT] [--store DIR]` alongside the image's own processes. It must not be PID 1.
-Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`.
+[--vsock-port PORT] [--store DIR] [--holder DIR]` alongside the image's own processes. It must not be PID 1.
+Daytona starts the same binary with `--supervise --socket /run/drydock/agent.sock`;
+`--supervise [--store DIR] [--holder DIR] --socket PATH` passes the store
+options on to every agent it starts, the socket last.
 Namespace runs it as a devbox service (its own agent is PID 1, and restarts
 the service on boot). `drydock-agent --bridge [--socket PATH]` joins its stdin
 and stdout to a running agent's socket and exits when the agent closes; the end
@@ -245,7 +247,18 @@ The store lives beside the executable (`<executable>.store`) unless
 `--store DIR` names another. Agents may share one store, as vessels on one
 host do: each digest also has a lock file under `locks/`, so their uploads,
 fetches and entries never interleave, and what one agent fetched is a
-lookup for the next.
+lookup for the next. A failure to fit names the store and its free space.
+
+Agents sharing a store each name a holder, `--holder DIR`: an existing
+directory that outlives the agent's restarts, such as its vessel's state
+directory. The links an agent places count as uses only while its holder
+exists, so removing the holder releases them, wherever the links themselves
+live. `drydock-agent --collect --store DIR [--grace SECONDS]` then removes
+every entry no live use links and nobody fetched within the grace (an hour
+by default), every completed upload as old, and the names of holders since
+gone, taking each digest's lock as the agents do; it reports what went. A
+fetch answered from the index refreshes the entry's grace, so a collection
+cannot remove an entry between a fetch and the link that follows it.
 
 ### Artifacts: fetch by digest
 
@@ -329,7 +342,8 @@ the entry, or to a member inside it, by renaming a new link over the path,
 so the path never goes missing. The link is recorded as a use of the entry.
 `DELETE /artifacts/{sha256}` refuses an entry while any recorded link still
 points into it (409, naming the links); links since removed or pointed
-elsewhere no longer count. `GET /artifacts` lists complete entries with
+elsewhere, or placed by a holder since gone, no longer count. An agent
+whose holder is gone refuses to place a link (404). `GET /artifacts` lists complete entries with
 their live links. Links made through plain `/links` are not recorded.
 
 ### Processes
