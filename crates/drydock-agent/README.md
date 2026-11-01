@@ -72,7 +72,11 @@ raw, with no WebSocket framing whichever token was used. A missing or wrong
 token gets `401` with `{"error":"unauthorized"}`, a warning naming the peer, and
 a closed connection; any other request gets `404` and is closed. The token is
 compared in constant time, and a connection that has not finished its handshake
-within 10 seconds is closed. `tcp::connect` is the client's side: it takes a
+within 10 seconds is closed. Refusals are logged at most once a second, with
+a count of those left out. The listener speaks no TLS: the provider's tunnel or
+proxy carries the token encrypted up to the guest, and inside the guest it
+travels in plaintext, so the agent warns at startup when `--tcp` binds beyond
+loopback. A token file's padded or unpadded form is accepted either way. `tcp::connect` is the client's side: it takes a
 connection to the listener, direct or inside a provider's tunnel, and returns
 one [`Client::connect`] accepts. `scripts/live-tcp-listener.py` checks it
 live through a provider tunnel.

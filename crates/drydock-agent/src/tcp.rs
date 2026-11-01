@@ -57,7 +57,8 @@ impl Token {
         Ok(Self(base64url(&bytes).into()))
     }
     /// A token's text: unpadded or padded base64url of at least 32 bytes.
-    /// Surrounding whitespace, such as a file's final newline, is ignored.
+    /// Surrounding whitespace, such as a file's final newline, is ignored, and
+    /// the token is kept unpadded: a client may present either form.
     pub fn parse(text: &str) -> io::Result<Self> {
         let text = text.trim_ascii();
         let digits = text.trim_end_matches('=');
@@ -71,7 +72,7 @@ impl Token {
         if digits.len() * 6 / 8 < TOKEN_BYTES {
             return Err(invalid("must hold at least 32 bytes"));
         }
-        Ok(Self(text.into()))
+        Ok(Self(digits.into()))
     }
     /// Reads the token file at `path`, which must be a regular file owned by
     /// the agent's effective user with mode 0600. Anything else is refused,
@@ -107,6 +108,10 @@ impl Token {
     /// so neither the token's length nor a matching prefix shows in timing.
     fn admits(&self, presented: &[u8]) -> bool {
         use sha2::{Digest, Sha256};
+        let mut presented = presented.trim_ascii();
+        while let [rest @ .., b'='] = presented {
+            presented = rest;
+        }
         let (expected, presented) = (Sha256::digest(self.0.as_bytes()), Sha256::digest(presented));
         std::hint::black_box(expected.iter().zip(presented.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b))) == 0
     }
@@ -134,6 +139,25 @@ fn base64url(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+/// Refusals are logged at most once a second, with how many went unlogged
+/// since, so a guest user hammering the port cannot flood the agent's log.
+#[derive(Default)]
+struct Refusals(std::sync::Mutex<(Option<std::time::Instant>, u64)>);
+impl Refusals {
+    fn record(&self, peer: SocketAddr) {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        if state.0.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1)) {
+            let suppressed = std::mem::take(&mut state.1);
+            state.0 = Some(now);
+            tracing::warn!(%peer, suppressed, "tcp connection refused: missing or wrong token");
+        } else {
+            state.1 += 1;
+            tracing::debug!(%peer, "tcp connection refused: missing or wrong token");
+        }
+    }
 }
 
 /// What the agent answers a handshake request.
@@ -191,7 +215,7 @@ fn refusal(status: StatusCode, error: &str) -> Response<Full<Bytes>> {
 
 /// Serves one connection's handshake. `Some` is the connection, switched to
 /// raw bytes; `None` is a connection refused or closed before it asked.
-async fn handshake(stream: tokio::net::TcpStream, peer: SocketAddr, token: &Token) -> io::Result<Option<ByteStream>> {
+async fn handshake(stream: tokio::net::TcpStream, peer: SocketAddr, token: &Token, refusals: &Refusals) -> io::Result<Option<ByteStream>> {
     let (admitted, upgrade) = tokio::sync::oneshot::channel();
     let admitted = std::sync::Mutex::new(Some(admitted));
     let service = hyper::service::service_fn(|mut request: Request<hyper::body::Incoming>| {
@@ -207,7 +231,7 @@ async fn handshake(stream: tokio::net::TcpStream, peer: SocketAddr, token: &Toke
                 response
             }
             Verdict::Unauthorized => {
-                tracing::warn!(%peer, "tcp connection refused: missing or wrong token");
+                refusals.record(peer);
                 refusal(StatusCode::UNAUTHORIZED, "unauthorized")
             }
             Verdict::NotFound => {
@@ -244,6 +268,12 @@ impl Drop for TokenListener {
 impl TokenListener {
     pub async fn bind(address: SocketAddr, token: Token) -> io::Result<Self> {
         let listener = TcpListener::bind(address).await.map_err(|e| context("tcp.bind", address, e))?;
+        if !address.ip().is_loopback() {
+            tracing::warn!(
+                %address,
+                "tcp listener beyond loopback: the token and the agent's traffic cross the guest network unencrypted, so the provider's proxy must carry them"
+            );
+        }
         let local = listener.local_addr()?;
         let (sender, admitted) = mpsc::channel(16);
         Ok(Self { admitted, local, acceptor: tokio::spawn(accept(listener, token, sender)) })
@@ -262,6 +292,7 @@ impl Listener for TokenListener {
 
 async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::Result<ByteStream>>) {
     let mut handshakes = JoinSet::new();
+    let refusals = Arc::new(Refusals::default());
     let mut backoff = Duration::from_millis(100);
     loop {
         tokio::select! {
@@ -270,10 +301,14 @@ async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::
             accepted = listener.accept(), if handshakes.len() < HANDSHAKES => match accepted {
                 Ok((stream, peer)) => {
                     backoff = Duration::from_millis(100);
-                    let (token, admitted) = (token.clone(), admitted.clone());
+                    let (token, admitted, refusals) = (token.clone(), admitted.clone(), refusals.clone());
                     handshakes.spawn(async move {
-                        match tokio::time::timeout(HANDSHAKE_DEADLINE, handshake(stream, peer, &token)).await {
+                        match tokio::time::timeout(HANDSHAKE_DEADLINE, handshake(stream, peer, &token, &refusals)).await {
                             Ok(Ok(Some(stream))) => {
+                                // Holds its handshake slot until the agent takes
+                                // the connection: when the agent is slow to accept,
+                                // new connections wait in the kernel's backlog
+                                // rather than piling up here.
                                 let _ = admitted.send(Ok(stream)).await;
                             }
                             Ok(Ok(None)) => {}
@@ -303,7 +338,15 @@ async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::
 /// `PermissionDenied`.
 pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream> {
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(io::Error::other)?;
-    let driver = tokio::spawn(connection.with_upgrades());
+    // The connection task ends by handing its bytes to the upgrade; on any
+    // early return it is aborted.
+    struct Abort(tokio::task::JoinHandle<Result<(), hyper::Error>>);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _driver = Abort(tokio::spawn(connection.with_upgrades()));
     let request = Request::get(CONNECT_PATH)
         .header(header::HOST, PROTOCOL)
         .header(header::CONNECTION, "upgrade")
@@ -315,11 +358,9 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
     match response.status() {
         StatusCode::SWITCHING_PROTOCOLS => {}
         StatusCode::UNAUTHORIZED => {
-            driver.abort();
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token"));
         }
         status => {
-            driver.abort();
             return Err(io::Error::other(format!("the agent's tcp listener answered {status}")));
         }
     }
@@ -348,6 +389,8 @@ mod tests {
         assert_eq!(parsed.is_ok(), bytes.len() >= 32, "{} bytes", bytes.len());
         if let Ok(token) = parsed {
             assert!(token.admits(text.as_bytes()));
+            assert!(token.admits(text.trim_end_matches('=').as_bytes()));
+            assert!(!token.secret().contains('='));
             assert!(!token.admits(format!("{text}A").as_bytes()));
             assert!(!token.admits(b""));
             assert!(!format!("{token:?}").contains(&text));
@@ -387,6 +430,21 @@ mod tests {
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(Token::read(&link).is_err());
+    }
+
+    // Refusals within a second of a logged one only count, and the next one
+    // logged after it reports that count.
+    #[test]
+    fn refusals_are_logged_at_most_once_a_second() {
+        let refusals = Refusals::default();
+        let peer = "127.0.0.1:1".parse().unwrap();
+        for _ in 0..5 {
+            refusals.record(peer);
+        }
+        assert_eq!(refusals.0.lock().unwrap().1, 4);
+        refusals.0.lock().unwrap().0 = Some(std::time::Instant::now() - Duration::from_secs(1));
+        refusals.record(peer);
+        assert_eq!(refusals.0.lock().unwrap().1, 0);
     }
 
     // Only `GET /v1/connect` with Connection: upgrade, an accepted Upgrade
