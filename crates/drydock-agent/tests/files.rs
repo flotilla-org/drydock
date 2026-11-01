@@ -707,7 +707,8 @@ async fn upload_protocol_and_refusals() {
     let huge = sha256(b"never sent");
     let error = h.client.create_upload(&huge, Some(1 << 48), tokio::io::empty(), false).await.unwrap_err();
     assert_eq!(kind(&error), ErrorKind::StorageFull);
-    assert!(agent_error(&error).message.contains("free"), "{error}");
+    let store = h.dir.path().join("agent.store");
+    assert!(agent_error(&error).message.contains("free") && agent_error(&error).message.contains(&store.display().to_string()), "{error}");
     assert_eq!(h.client.upload_offset(&huge).await.unwrap(), (0, false));
 
     // Bytes resumed under the wrong digest are checked once, at the end.
