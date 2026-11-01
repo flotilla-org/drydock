@@ -413,8 +413,10 @@ export class Registry {
    * An upload request, following 307 and 308 redirects (which keep the method
    * and body) within a bound. nscr.io redirects some upload starts to a
    * presigned regional URL such as zrh.nscr.io, which needs no credential;
-   * `send` attaches ours only on this registry's origin. Returns the response
-   * with the URL that gave it, which the session's next location resolves against.
+   * `send` attaches ours only on this registry's origin. A redirect may not
+   * leave https, which would expose the bytes and the presigned signature.
+   * Returns the response with the URL that gave it, which the session's next
+   * location resolves against.
    */
   async upload(
     scope: string,
@@ -422,7 +424,7 @@ export class Registry {
     url: URL,
     headers: Record<string, string>,
     body: Uint8Array,
-  ): Promise<[Response, URL]> {
+  ): Promise<{ response: Response; url: URL }> {
     for (let hops = 0; hops < MAX_REDIRECTS; hops++) {
       const response = await this.send(
         scope,
@@ -432,11 +434,17 @@ export class Registry {
         body,
         "upload",
       );
-      if (![307, 308].includes(response.status)) return [response, url];
+      if (![307, 308].includes(response.status)) return { response, url };
       const location = response.headers.get("location");
       await response.body?.cancel();
       if (!location) throw malformed("redirect without location");
       url = new URL(location, url);
+      if (url.protocol !== "https:")
+        throw new ProtocolFailure({
+          kind: "internal",
+          reason: `registry ${this.host} upload redirected off https`,
+          provider_error: "",
+        });
     }
     throw new ProtocolFailure({
       kind: "internal",
@@ -565,7 +573,7 @@ export class Registry {
   }
 
   async startUpload(repository: string): Promise<URL> {
-    const [response, from] = await this.upload(
+    const { response, url: from } = await this.upload(
       pushScope(repository),
       "POST",
       this.url(repository, "blobs", "uploads", ""),
@@ -585,7 +593,7 @@ export class Registry {
   ) {
     const url = new URL(location);
     url.searchParams.append("digest", digest);
-    const [response] = await this.upload(
+    const { response } = await this.upload(
       pushScope(repository),
       "PUT",
       url,
@@ -659,7 +667,7 @@ export async function copyBlob(
       throw malformed("blob size does not match its descriptor");
     hash.update(bytes);
     const last = offset + bytes.length - 1;
-    const [patched, from] = await target.upload(
+    const { response: patched, url: from } = await target.upload(
       pushScope(targetRepository),
       "PATCH",
       location,

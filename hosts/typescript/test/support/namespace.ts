@@ -310,6 +310,10 @@ export class Registries {
    * anonymously, and stores into nscr.io.
    */
   regional: string | undefined;
+  /** Scheme of the redirect to the regional host. */
+  regionalScheme = "https:";
+  /** When set, the regional host names upload sessions on this host instead of itself. */
+  regionalSessionHost: string | undefined;
   /** Drops the Location header from redirects. */
   redirectWithoutLocation = false;
 
@@ -367,6 +371,7 @@ export class Registries {
     ) {
       const next = new URL(url);
       next.host = this.regional;
+      next.protocol = this.regionalScheme;
       next.searchParams.set("presigned", "sig");
       return new Response(null, {
         status: this.redirectStatus,
@@ -421,7 +426,7 @@ export class Registries {
       return new Response(null, {
         status: 202,
         headers: {
-          location: `https://${url.host}/v2/${repository}/blobs/uploads/${id}${presigned}`,
+          location: `https://${(presigned && this.regionalSessionHost) || url.host}/v2/${repository}/blobs/uploads/${id}${presigned}`,
         },
       });
     }

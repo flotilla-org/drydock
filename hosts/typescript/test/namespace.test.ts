@@ -139,6 +139,32 @@ test("prepare uploads through nscr.io's presigned regional redirect", async () =
   );
 });
 
+test("regional uploads: refused off https, and a session stays on the regional host", async () => {
+  const cleartext = await setup();
+  cleartext.registries.regional = "zrh.nscr.io";
+  cleartext.registries.regionalScheme = "http:";
+  await assert.rejects(
+    cleartext.provider.prepare(cleartext.request, cleartext.context),
+    (e: any) => /redirected off https/.test(e.detail?.reason),
+  );
+  assert.ok(
+    cleartext.registries.requests.every((r) => r.host !== "zrh.nscr.io"),
+    "nothing is sent in cleartext",
+  );
+
+  const hop = await setup();
+  hop.registries.regional = "zrh.nscr.io";
+  hop.registries.regionalSessionHost = "elsewhere.test";
+  await assert.rejects(
+    hop.provider.prepare(hop.request, hop.context),
+    (e: any) => /upload location on another origin/.test(e.detail?.reason),
+  );
+  assert.ok(
+    hop.registries.requests.every((r) => r.host !== "elsewhere.test"),
+    "the session never moves to another origin",
+  );
+});
+
 // Prepare layers the tools image onto the base by digest, pushes it to the
 // workspace's nscr.io repository with the token as password (and nowhere
 // else), and registers it by digest. Re-preparing finds the registration.
