@@ -1,0 +1,21 @@
+[package]
+name = "drydock-oci"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+drydock-protocol = { path = "../drydock-protocol" }
+rigging-http-client.workspace = true
+reqwest.workspace = true
+http.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+bytes = "1"
+chrono = "0.4"
+
+[dev-dependencies]
+async-trait = "0.1"
+hegeltest = "=0.48.1"
+tokio = { version = "1", features = ["macros", "rt"] }

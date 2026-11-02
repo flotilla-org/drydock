@@ -450,12 +450,14 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
  "drydock-agent",
  "drydock-client",
  "drydock-host",
+ "drydock-oci",
  "drydock-protocol",
  "drydock-provider",
  "drydock-transport",
@@ -574,6 +576,7 @@ dependencies = [
  "drydock",
  "drydock-agent",
  "drydock-client",
+ "drydock-oci",
  "drydock-protocol",
  "drydock-provider",
  "futures",
@@ -596,6 +599,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "drydock-oci"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "drydock-protocol",
+ "hegeltest",
+ "http",
+ "reqwest",
+ "rigging-http-client",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

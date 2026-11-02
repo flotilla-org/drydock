@@ -3059,6 +3059,25 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "The staging registry drydock copies the image into, so this provider\ncan pull it, refused the copy. `registry` is its configured name; the\nreason says why (authentication, permission, quota).",
+            "required": [
+              "registry",
+              "cause"
+            ],
+            "properties": {
+              "cause": {
+                "type": "string",
+                "enum": [
+                  "staging_refused"
+                ]
+              },
+              "registry": {
+                "type": "string"
+              }
+            }
           }
         ],
         "description": "Why a provider cannot take an image. Stable codes for client policy."

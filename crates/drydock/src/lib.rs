@@ -11,6 +11,7 @@ pub mod launch;
 pub mod local;
 pub mod runtime;
 pub mod shell;
+pub mod staging;
 use api::{ConfigUpdate, ProviderApi};
 use client::Client;
 use credentials::*;

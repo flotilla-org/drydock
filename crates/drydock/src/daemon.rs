@@ -99,6 +99,7 @@ pub struct Inner {
     dialer: Arc<dyn crate::agent::SshDialer>,
     builds: Arc<dyn AgentBuilds>,
     exposures: crate::exposures::Exposures,
+    staging: crate::staging::Staging,
     /// One lock per label, so two first provisions of a label share one key
     /// and provisions of other labels never wait on it.
     keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
@@ -115,6 +116,8 @@ pub struct Seams {
     /// Where exposures put things in a vessel.
     pub guest: crate::exposures::GuestLayout,
     pub timing: crate::exposures::Timing,
+    /// Registries, as staging reaches them.
+    pub registries: crate::staging::Transfer,
 }
 impl Seams {
     pub fn new(resolver: Arc<dyn ImageResolver>) -> Self {
@@ -124,6 +127,7 @@ impl Seams {
             builds: Arc::new(InstalledBuilds),
             guest: Default::default(),
             timing: Default::default(),
+            registries: Default::default(),
         }
     }
 }
@@ -168,7 +172,7 @@ impl Daemon {
         options: Vec<HostOption>,
         seams: Seams,
     ) -> Result<Arc<Self>, String> {
-        let Seams { resolver, dialer, builds, guest, timing } = seams;
+        let Seams { resolver, dialer, builds, guest, timing, registries } = seams;
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
@@ -255,8 +259,10 @@ impl Daemon {
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
+        let staging = crate::staging::Staging::new(registries, config.registries.clone());
         let inner = Arc::new_cyclic(|weak| Inner {
             config,
+            staging,
             modules,
             hosts,
             placements,
@@ -406,8 +412,26 @@ impl Daemon {
         let request =
             launch::prepare_request(&self.config.providers[provider], &self.placements[provider].minimum, options, self.resolver.as_ref())
                 .await?;
+        let request = self.staged(provider, request).await?;
         let prepared = host.handle.client.credentialed(self.credential.clone()).prepare(provider, &request).await?;
         Ok((prepared, request.size))
+    }
+    /// The prepare request with its image staged, when this instance pulls
+    /// from declared registries and prepares by the registry-pull route. A
+    /// route or platform the provider does not declare is the host's to refuse.
+    async fn staged(&self, provider: &str, request: PrepareRequest) -> Result<PrepareRequest, Error> {
+        let pull_from = self.config.providers.get(provider).map(|p| p.pull_from.as_slice()).unwrap_or_default();
+        if pull_from.is_empty() {
+            return Ok(request);
+        }
+        let status = self.ready_host(provider)?.handle.status.borrow().clone();
+        let Some(declaration) = status.providers.iter().find(|d| d.provider == provider) else { return Ok(request) };
+        let capabilities = &declaration.capabilities;
+        let route = crate::runtime::module::resolve_route(request.route, &capabilities.image_routes);
+        let platform = crate::runtime::module::resolve_platform(request.platform.clone(), &capabilities.platforms);
+        let (Ok(ImageRouteKind::RegistryPull), Ok(platform)) = (route, platform) else { return Ok(request) };
+        let request = PrepareRequest { route: Some(ImageRouteKind::RegistryPull), ..request };
+        Ok(self.staging.stage(pull_from, request, &platform).await?)
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
         let (prepared, size) = self.prepare(provider, options).await?;
@@ -607,7 +631,8 @@ impl ProviderApi for Daemon {
         Ok(self.observation_stream(since))
     }
     async fn prepare(&self, p: &str, request: &PrepareRequest) -> Result<Prepared, Error> {
-        self.runtime(p)?.prepare(p, request).await
+        let request = self.staged(p, request.clone()).await?;
+        self.runtime(p)?.prepare(p, &request).await
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
         let keyed = self.keyed(p, request).await?;

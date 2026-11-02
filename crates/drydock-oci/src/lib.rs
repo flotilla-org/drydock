@@ -1,8 +1,9 @@
-//! OCI distribution client and host-side layering, for image routes whose tools
-//! layer is added on our side. A manifest and blob operation only: no container
-//! build and no local Docker. Distribution spec v1.1:
+//! OCI distribution client shared by drydockd and the Rust host: host-side
+//! layering for image routes whose tools layer is added on our side, and the
+//! verbatim copies that stage an image in a registry a provider can pull from.
+//! A manifest and blob operation only: no container build and no local Docker.
+//! Distribution spec v1.1:
 //! https://github.com/opencontainers/distribution-spec/blob/v1.1.0/spec.md
-use crate::module::{Result, refused};
 use base64::Engine;
 use bytes::Bytes;
 use drydock_protocol::*;
@@ -27,6 +28,11 @@ const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gz
 /// Registry calls are bounded by the HTTP client's per-request deadline; stop
 /// using a push credential this long before it expires.
 const EXPIRY_MARGIN: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
+
+pub type Result<T> = std::result::Result<T, ProtocolError>;
+fn refused(reason: impl Into<String>) -> ProtocolError {
+    ProtocolError::Refused { reason: reason.into() }
+}
 
 /// A base or tools image reference pinned by digest.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,13 +89,16 @@ pub fn sha256(bytes: &[u8]) -> String {
 pub struct Manifest {
     pub media_type: String,
     pub json: Value,
+    /// The stored bytes, which a copy puts verbatim so its digest is kept.
+    pub bytes: Bytes,
+    pub digest: String,
 }
 impl Manifest {
     pub fn parse(bytes: &[u8], content_type: Option<&str>) -> Result<Self> {
         let json: Value = serde_json::from_slice(bytes).map_err(|_| malformed("manifest is not JSON"))?;
         let media_type =
             json.get("mediaType").and_then(Value::as_str).or(content_type).ok_or_else(|| malformed("manifest has no media type"))?;
-        Ok(Self { media_type: media_type.to_owned(), json })
+        Ok(Self { media_type: media_type.to_owned(), json, bytes: Bytes::copy_from_slice(bytes), digest: sha256(bytes) })
     }
     fn config(&self) -> Result<Descriptor> {
         Descriptor::parse(&self.json["config"])
@@ -206,6 +215,8 @@ pub struct Registry {
     credential: Option<RegistryCredential>,
     /// Minted push credentials expire; calls stop short of expiry with a typed refusal.
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The configured name of a staging registry, whose refusals are its own.
+    staging: Option<String>,
     authorizations: Mutex<BTreeMap<String, HeaderValue>>,
 }
 impl Registry {
@@ -220,10 +231,31 @@ impl Registry {
         if origin.host_str().is_none() || origin.path() != "/" {
             return Err(refused("invalid registry host"));
         }
-        Ok(Self { http, host: registry.to_owned(), origin, credential, expires_at, authorizations: Mutex::default() })
+        Ok(Self { http, host: registry.to_owned(), origin, credential, expires_at, staging: None, authorizations: Mutex::default() })
+    }
+    /// A staging registry declared under `name`. Its errors name it, and a
+    /// refusal (an auth failure, a quota, any other 4xx) is the typed staging
+    /// refusal rather than anything a provider said.
+    pub fn staging(mut self, name: &str) -> Self {
+        self.staging = Some(name.to_owned());
+        self
     }
     pub fn host(&self) -> &str {
         &self.host
+    }
+    /// How errors name this registry.
+    fn described(&self) -> String {
+        match &self.staging {
+            Some(name) => format!("staging registry {name} ({})", self.host),
+            None => format!("registry {}", self.host),
+        }
+    }
+    /// The registry turned the request down; retrying the same call will not help.
+    fn refusal(&self, reason: String) -> ProtocolError {
+        match &self.staging {
+            Some(name) => ProtocolError::ImageRefused { reason, refusal: ImageRefusal::StagingRefused { registry: name.clone() } },
+            None => ProtocolError::CredentialRejected { reason },
+        }
     }
     fn url(&self, repository: &str, tail: &[&str]) -> Url {
         let mut url = self.origin.clone();
@@ -241,13 +273,14 @@ impl Registry {
     }
     /// Never carries a registry body: those can echo credentials.
     fn status_error(&self, status: u16, what: &str, retry_after: Option<u64>) -> ProtocolError {
-        let reason = format!("registry {} {what} HTTP {status}", self.host);
+        let reason = format!("{} {what} HTTP {status}", self.described());
         match status {
             401 | 403 if self.expired() => self.expired_error(),
-            401 | 403 => ProtocolError::CredentialRejected { reason },
+            401 | 403 => self.refusal(reason),
             404 => ProtocolError::NotFound { reason },
             429 => ProtocolError::RateLimited { reason, retry_after },
             408 | 500..=599 => ProtocolError::unavailable(reason, retry_after),
+            400..=499 if self.staging.is_some() => self.refusal(reason),
             _ => ProtocolError::Internal { reason, provider_error: String::new() },
         }
     }
@@ -262,7 +295,7 @@ impl Registry {
     }
     async fn execute(&self, request: reqwest::Request, what: &str) -> Result<http::Response<Bytes>> {
         rigging_http_client::http_execute!(self.http, request)
-            .map_err(|_| ProtocolError::unavailable(format!("registry {} {what} transport failed", self.host), None))
+            .map_err(|_| ProtocolError::unavailable(format!("{} {what} transport failed", self.described()), None))
     }
     /// Sends with this registry's authorization for `scope`, authenticating
     /// once on a challenge. Authorization never leaves the registry's origin.
@@ -310,7 +343,7 @@ impl Registry {
         Some(value)
     }
     async fn authenticate(&self, scope: &str, headers: &header::HeaderMap) -> Result<HeaderValue> {
-        let rejected = || ProtocolError::CredentialRejected { reason: format!("registry {} refused access to {scope}", self.host) };
+        let rejected = || self.refusal(format!("{} refused access to {scope}", self.described()));
         let challenge = headers.get(header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).ok_or_else(rejected)?;
         let (scheme, params) = challenge.trim().split_once(' ').unwrap_or((challenge.trim(), ""));
         if scheme.eq_ignore_ascii_case("basic") {
@@ -366,10 +399,7 @@ impl Registry {
                 .ok_or_else(|| malformed("redirect without location"))?;
             url = url.join(location).map_err(|_| malformed("invalid redirect"))?;
         }
-        Err(ProtocolError::Internal {
-            reason: format!("registry {} {what} redirected too often", self.host),
-            provider_error: String::new(),
-        })
+        Err(ProtocolError::Internal { reason: format!("{} {what} redirected too often", self.described()), provider_error: String::new() })
     }
     fn check(&self, response: &http::Response<Bytes>, expected: &[u16], what: &str) -> Result<()> {
         let status = response.status().as_u16();
@@ -471,15 +501,15 @@ impl Registry {
         let location = self.start_upload(repository).await?;
         self.finish_upload(repository, location, digest, body).await
     }
-    pub async fn put_manifest(&self, repository: &str, tag: &str, composed: &Composed) -> Result<()> {
-        let headers = [(header::CONTENT_TYPE, composed.media_type.clone())];
-        let url = self.url(repository, &["manifests", tag]);
-        let response = self
-            .send(&push_scope(repository), Method::PUT, url, &headers, Some(Bytes::from(composed.manifest.clone())), "manifest")
-            .await?;
+    /// Puts manifest bytes under `reference`, a tag or the bytes' own digest.
+    pub async fn put_manifest(&self, repository: &str, reference: &str, media_type: &str, manifest: Bytes) -> Result<()> {
+        let digest = sha256(&manifest);
+        let headers = [(header::CONTENT_TYPE, media_type.to_owned())];
+        let url = self.url(repository, &["manifests", reference]);
+        let response = self.send(&push_scope(repository), Method::PUT, url, &headers, Some(manifest), "manifest").await?;
         self.check(&response, &[201], "manifest")?;
         match response.headers().get("docker-content-digest").and_then(|v| v.to_str().ok()) {
-            Some(digest) if digest != composed.digest => Err(malformed("registry stored a different manifest digest")),
+            Some(stored) if stored != digest => Err(malformed("registry stored a different manifest digest")),
             _ => Ok(()),
         }
     }
@@ -563,6 +593,28 @@ pub async fn copy_blob(
         return Err(malformed("blob content does not match its digest"));
     }
     target.finish_upload(target_repository, location, &layer.digest, Bytes::new()).await
+}
+
+/// Copies one platform's image into `target_repository` by digest: its config
+/// and layers, then the manifest bytes verbatim, so the digest is unchanged.
+/// A manifest already there is the whole image, and nothing is copied.
+/// Returns whether anything was copied.
+pub async fn copy_image(
+    source: &Registry,
+    source_repository: &str,
+    manifest: &Manifest,
+    target: &Registry,
+    target_repository: &str,
+    chunk: u64,
+) -> Result<bool> {
+    if target.manifest_visible(target_repository, &manifest.digest).await? {
+        return Ok(false);
+    }
+    for blob in std::iter::once(manifest.config()?).chain(manifest.layers()?) {
+        copy_blob(source, source_repository, target, target_repository, &blob, chunk).await?;
+    }
+    target.put_manifest(target_repository, &manifest.digest, &manifest.media_type, manifest.bytes.clone()).await?;
+    Ok(true)
 }
 
 #[cfg(test)]

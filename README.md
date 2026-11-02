@@ -98,6 +98,37 @@ drydock and reach only the module. Credentials are `{ env = "NAME" }` or
 `{"bearer_token": …}`). Only the resolved value is delivered
 by credential refresh on the authenticated host connection.
 
+#### Staging registries
+
+A provider that pulls images over the public internet cannot reach a private
+lab registry. Declare a registry it can pull from once, and list it in each
+instance's `pull_from`; an unknown name fails at load:
+
+```toml
+[registries.ghcr]
+repository = "ghcr.io/flotilla-org/drydock-staging"   # host/path; images go under it by digest
+push = { username = "flotilla-bot", credential = { file = "~/.config/drydock/ghcr-push.token" } }
+pull = { username = "flotilla-bot", credential = { file = "~/.config/drydock/ghcr-pull.token" } }
+
+[providers.e2b]
+module = "e2b"
+pull_from = ["ghcr"]
+```
+
+When such an instance prepares by the `registry_pull` route and the image is in
+none of its `pull_from` registries (a reference naming the repository or a path
+below it), drydockd first copies the platform's manifest, config and layers into
+the first one listed, as `<repository>@<digest>`, reading the source with the
+request's `image_pull` credential only. The manifest bytes are kept, so the
+digest is too, and an image already there is not copied again, whichever
+instance asked first. The host is handed the staged reference with the
+registry's `pull` credential (anonymous when `pull` is absent) and never learns
+staging happened. The tools image is never staged. A registry that refuses the
+copy is the `staging_refused` image refusal, naming it. drydockd logs each
+staging and its duration. Staged images are not yet garbage-collected
+(drydock#61); `scripts/live-staging-registry.py` checks staging against a real
+private GHCR package.
+
 Rigging resolves XDG paths: `XDG_CONFIG_HOME/drydock/drydock.toml`, falling back
 to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
 (config under `$DRYDOCK_ROOT/config`). The socket intentionally lives at

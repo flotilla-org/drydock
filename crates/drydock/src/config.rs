@@ -15,6 +15,10 @@ use std::{
 pub struct Config {
     #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
+    /// Registries images are staged in, declared once and shared by every
+    /// provider instance that lists them in `pull_from`.
+    #[serde(default)]
+    pub registries: BTreeMap<String, Registry>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +31,38 @@ pub struct Provider {
     #[serde(default)]
     pub size: SizeDefaults,
     pub egress: Option<Egress>,
+    /// Registries this instance can pull from. On the registry-pull route an
+    /// image in none of them is first staged in the first one listed.
+    #[serde(default)]
+    pub pull_from: Vec<String>,
+}
+/// A registry drydock can copy images into and providers can pull them from.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registry {
+    /// `host/path`. Images are staged under it by digest, and an image whose
+    /// reference names it, or a path below it, is already in this registry.
+    pub repository: String,
+    pub push: RegistryAccess,
+    /// Absent: providers pull anonymously.
+    pub pull: Option<RegistryAccess>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryAccess {
+    pub username: String,
+    pub credential: CredentialLocation,
+}
+impl Registry {
+    /// The repository's host and path, provided it names both and no tag.
+    pub fn location(&self) -> Result<(String, String), String> {
+        let invalid = || format!("registry repository {:?} must be host/path", self.repository);
+        let image = drydock_oci::ImageRef::parse(&format!("{}@sha256:{}", self.repository, "0".repeat(64))).map_err(|_| invalid())?;
+        if format!("{}/{}", image.registry, image.repository) != self.repository {
+            return Err(invalid());
+        }
+        Ok((image.registry, image.repository))
+    }
 }
 impl Config {
     /// The configuration document, without the launch defaults.
@@ -125,6 +161,12 @@ impl Config {
                 return Err("provider and module names must not be empty".into());
             }
             p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 })?;
+            if let Some(unknown) = p.pull_from.iter().find(|r| !config.registries.contains_key(*r)) {
+                return Err(format!("provider {name} pulls from unknown registry {unknown:?}"));
+            }
+        }
+        for (name, registry) in &config.registries {
+            registry.location().map_err(|e| format!("registry {name}: {e}"))?;
         }
         Ok(config)
     }
@@ -214,6 +256,22 @@ settings = {{
             p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 9 }).unwrap(),
             Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 9 }
         );
+    }
+    // Every `pull_from` name is a declared registry, and every registry's
+    // repository names a host and a path: anything else fails at load.
+    #[test]
+    fn staging_registries_are_checked_at_load() {
+        let registry = |repository: &str| {
+            format!("[registries.ghcr]\nrepository='{repository}'\npush={{username='bot', credential={{env='PUSH'}}}}\n")
+        };
+        let provider = |pull_from: &str| format!("[providers.e2b]\nmodule='e2b'\npull_from=[{pull_from}]\n");
+        let config = Config::parse(&(registry("ghcr.io/org/staging") + &provider("'ghcr'"))).unwrap();
+        assert_eq!(config.providers["e2b"].pull_from, ["ghcr"]);
+        assert!(Config::parse(&(registry("ghcr.io/org/staging") + &provider("'ghcr', 'quay'"))).is_err());
+        assert!(Config::parse(&provider("'ghcr'")).is_err());
+        for repository in ["org/staging", "ghcr.io", "ghcr.io/org/staging:tag", "ghcr.io/Org/staging"] {
+            assert!(Config::parse(&(registry(repository) + &provider("'ghcr'"))).is_err(), "{repository}");
+        }
     }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]
