@@ -28,6 +28,10 @@ async fn main() -> std::process::ExitCode {
 }
 async fn run() -> Result<(), String> {
     let args = Args::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_writer(std::io::stderr)
+        .init();
     let (config, socket) = resolve_paths(args.config, args.socket, &rigging_process::ProcessEnvVars)?;
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let run = socket.parent().ok_or("socket needs parent directory")?;

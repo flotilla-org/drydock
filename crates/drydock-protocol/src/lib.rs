@@ -336,6 +336,10 @@ pub enum ImageRefusal {
     /// A minted push credential expired before the upload finished. Retrying
     /// mints a new one and resumes from the blobs already uploaded.
     PushCredentialExpired,
+    /// The staging registry drydock copies the image into, so this provider
+    /// can pull it, refused the copy. `registry` is its configured name; the
+    /// reason says why (authentication, permission, quota).
+    StagingRefused { registry: String },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EgressCapability {

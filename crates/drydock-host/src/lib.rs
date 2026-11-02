@@ -2,7 +2,7 @@
 pub mod daytona;
 pub use drydock_provider as module;
 pub mod local;
-pub mod oci;
+pub use drydock_oci as oci;
 pub mod reference;
 use axum::{
     Router,

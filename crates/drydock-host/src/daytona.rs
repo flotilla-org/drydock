@@ -425,7 +425,7 @@ impl Daytona {
         }
         target.put_blob(&repository, &composed.config_digest, composed.config.clone().into()).await?;
         // Tagged so the registry retains it; Daytona itself is given the digest.
-        target.put_manifest(&repository, tag, &composed).await?;
+        target.put_manifest(&repository, tag, &composed.media_type, composed.manifest.clone().into()).await?;
         // Daytona's registry serves a new manifest only after a delay, and its
         // builder pulls once at snapshot creation (cf. `daytona snapshot push`).
         for _ in 0..60 {
