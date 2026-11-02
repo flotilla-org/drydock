@@ -27,7 +27,9 @@ which is checked to be the package by digest. Then a pull of that digest from
 GHCR anonymously must fail (the package is private), a pull with the pull
 token must succeed with the same bytes, and preparing for the second instance
 must reuse the copy without uploading. The staged package version is deleted
-at the end, whatever happened. Exit status 0 means every check passed.
+at the end, whatever happened; GitHub never deletes a package's last version,
+so when the staged one is the only one, an empty image tagged `{PLACEHOLDER}`
+is pushed first and kept. Exit status 0 means every check passed.
 """
 import argparse
 import base64
@@ -49,6 +51,8 @@ MANIFESTS = ", ".join([
     "application/vnd.docker.distribution.manifest.v2+json",
 ])
 TOOLS = "ghcr.io/flotilla-org/drydock-tools@sha256:" + "0" * 64
+PLACEHOLDER = "drydock-placeholder"
+__doc__ = __doc__.replace("{PLACEHOLDER}", PLACEHOLDER)
 
 
 def check(condition, message):
@@ -78,24 +82,29 @@ def daemon(sock, method, path, body=None):
     return response.status, json.loads(payload or b"null")
 
 
-def https(method, url, headers=None):
-    request = urllib.request.Request(url, method=method, headers=headers or {})
+def https(method, url, headers=None, data=None, with_headers=False):
+    request = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            return response.status, response.read()
+            result = response.status, response.read(), response.headers
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        result = error.code, error.read(), error.headers
+    return result if with_headers else result[:2]
+
+
+def ghcr_token(path, actions, basic=None):
+    query = urllib.parse.urlencode({"service": "ghcr.io", "scope": f"repository:{path}:{actions}"})
+    headers = {"Authorization": "Basic " + base64.b64encode(basic.encode()).decode()} if basic else {}
+    status, body = https("GET", f"https://ghcr.io/token?{query}", headers)
+    return status, json.loads(body).get("token", "") if status == 200 else ""
 
 
 def ghcr_manifest(path, digest, basic=None):
     """Pulls a manifest by digest the way a provider does: a token for the
     pull scope (anonymous, or with Basic credentials), then the manifest."""
-    query = urllib.parse.urlencode({"service": "ghcr.io", "scope": f"repository:{path}:pull"})
-    headers = {"Authorization": "Basic " + base64.b64encode(basic.encode()).decode()} if basic else {}
-    status, body = https("GET", f"https://ghcr.io/token?{query}", headers)
+    status, token = ghcr_token(path, "pull", basic)
     if status != 200:
         return status, b""
-    token = json.loads(body).get("token", "")
     return https("GET", f"https://ghcr.io/v2/{path}/manifests/{digest}",
                  {"Authorization": f"Bearer {token}", "Accept": MANIFESTS})
 
@@ -108,14 +117,49 @@ def github(method, path, token):
     })
 
 
-def delete_version(owner, package, digest, token):
+def push_placeholder(path, username, secret):
+    """Pushes an empty image (a `{}` config, no layers) tagged PLACEHOLDER,
+    so the package keeps a version once the staged one is deleted."""
+    status, token = ghcr_token(path, "pull,push", f"{username}:{secret}")
+    if status != 200:
+        return f"token HTTP {status}"
+    bearer = {"Authorization": f"Bearer {token}"}
+    config = b"{}"
+    digest = "sha256:" + hashlib.sha256(config).hexdigest()
+    status, body, headers = https("POST", f"https://ghcr.io/v2/{path}/blobs/uploads/", bearer, b"", with_headers=True)
+    if status != 202:
+        return f"upload HTTP {status} {body[:200]!r}"
+    location = urllib.parse.urljoin("https://ghcr.io/", headers["Location"])
+    location += ("&" if "?" in location else "?") + urllib.parse.urlencode({"digest": digest})
+    status, body = https("PUT", location, dict(bearer, **{"Content-Type": "application/octet-stream"}), config)
+    if status != 201:
+        return f"config HTTP {status} {body[:200]!r}"
+    manifest = json.dumps({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest, "size": len(config)},
+        "layers": [],
+    }).encode()
+    status, body = https("PUT", f"https://ghcr.io/v2/{path}/manifests/{PLACEHOLDER}",
+                         dict(bearer, **{"Content-Type": "application/vnd.oci.image.manifest.v1+json"}), manifest)
+    return None if status == 201 else f"manifest HTTP {status} {body[:200]!r}"
+
+
+def delete_version(owner, package, digest, username, token):
+    path = f"{owner}/{package}"
     name = urllib.parse.quote(package, safe="")
     for scope in (f"/orgs/{owner}", f"/users/{owner}"):
         status, body = github("GET", f"{scope}/packages/container/{name}/versions?per_page=100", token)
         if status != 200:
             continue
-        for version in json.loads(body):
+        versions = json.loads(body)
+        for version in versions:
             if version.get("name") == digest:
+                if len(versions) == 1:
+                    # GitHub refuses to delete a package's last version.
+                    failed = push_placeholder(path, username, token)
+                    if failed:
+                        return False, f"the staged version is the package's only one, and pushing {PLACEHOLDER} failed: {failed}"
                 status, body = github("DELETE", f"{scope}/packages/container/{name}/versions/{version['id']}", token)
                 return status == 204, f"HTTP {status} {body[:200]!r}"
         return False, "no package version with that digest"
@@ -229,7 +273,7 @@ settings = {{ platforms = {platforms} }}
         except subprocess.TimeoutExpired:
             process.kill()
         if staged:
-            deleted, detail = delete_version(owner, package, staged, read_secret(push_file))
+            deleted, detail = delete_version(owner, package, staged, args.username, read_secret(push_file))
             print(("PASS " if deleted else "FAIL ") + f"deleted the staged package version {staged}: {detail}", flush=True)
             if not deleted:
                 print(f"     delete it by hand: https://github.com/{owner}?tab=packages (package {package})")

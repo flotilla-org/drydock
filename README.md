@@ -124,13 +124,16 @@ digest is too, and an image already there is not copied again, whichever
 instance asked first. The host is handed the staged reference with the
 registry's `pull` credential (anonymous when `pull` is absent) and never learns
 staging happened. The tools image is never staged. Staging runs inside the
-prepare call, one layer at a time in 16 MiB requests, so a cold prepare of a
+prepare call, one layer at a time in 4 MiB requests (GHCR's limit; set
+`chunk_bytes` on a registry with another), so a cold prepare of a
 large image takes as long as the copy; concurrent prepares of one image copy
 it once. A prepare abandoned midway resumes cheaply, since blobs already in the
 registry are not uploaded again. Registry requests ignore ambient proxy
 settings, as drydock's other registry clients do, and trust the built-in CA
 roots. A registry that refuses the
-copy is the `staging_refused` image refusal, naming it. drydockd logs each
+copy is the `staging_refused` image refusal, naming it and quoting the
+registry's own error message (cut short, and left out if it repeats the push
+secret). drydockd logs each
 staging and its duration. Staged images are not yet garbage-collected
 (drydock#61); `scripts/live-staging-registry.py` checks staging against a real
 private GHCR package.

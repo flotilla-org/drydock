@@ -46,6 +46,9 @@ pub struct Registry {
     pub push: RegistryAccess,
     /// Absent: providers pull anonymously.
     pub pull: Option<RegistryAccess>,
+    /// The most bytes one upload request to this registry carries, for a
+    /// registry whose limit differs from the default (4 MiB, GHCR's).
+    pub chunk_bytes: Option<u64>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +170,9 @@ impl Config {
         }
         for (name, registry) in &config.registries {
             registry.location().map_err(|e| format!("registry {name}: {e}"))?;
+            if registry.chunk_bytes == Some(0) {
+                return Err(format!("registry {name}: chunk_bytes must be positive"));
+            }
         }
         Ok(config)
     }
@@ -257,8 +263,9 @@ settings = {{
             Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 9 }
         );
     }
-    // Every `pull_from` name is a declared registry, and every registry's
-    // repository names a host and a path: anything else fails at load.
+    // Every `pull_from` name is a declared registry, every registry's
+    // repository names a host and a path, and an upload chunk carries at
+    // least one byte: anything else fails at load.
     #[test]
     fn staging_registries_are_checked_at_load() {
         let registry = |repository: &str| {
@@ -272,6 +279,7 @@ settings = {{
         for repository in ["org/staging", "ghcr.io", "ghcr.io/org/staging:tag", "ghcr.io/Org/staging"] {
             assert!(Config::parse(&(registry(repository) + &provider("'ghcr'"))).is_err(), "{repository}");
         }
+        assert!(Config::parse(&(registry("ghcr.io/org/staging") + "chunk_bytes=0\n" + &provider("'ghcr'"))).is_err());
     }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]

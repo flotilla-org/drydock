@@ -21,13 +21,16 @@ type Result<T> = std::result::Result<T, ProtocolError>;
 pub struct Transfer {
     pub http: Arc<dyn HttpClient>,
     /// The most bytes one blob read or upload request carries, so each request
-    /// fits the client's deadline however large the layer is.
+    /// fits the client's deadline however large the layer is, and the
+    /// registry's own limit; a registry's `chunk_bytes` overrides it.
     pub chunk_bytes: u64,
 }
+/// GHCR refuses an upload request over 4 MiB with 416.
+pub const CHUNK_BYTES: u64 = 4 << 20;
 impl Default for Transfer {
     fn default() -> Self {
         let http = rigging_http_client::ReqwestHttpClient::restricted(None, None).expect("a client without proxy or CA builds");
-        Self { http: Arc::new(http), chunk_bytes: 16 << 20 }
+        Self { http: Arc::new(http), chunk_bytes: CHUNK_BYTES }
     }
 }
 
@@ -81,12 +84,13 @@ impl Staging {
         let http = self.transfer.http.clone();
         let from = Registry::new(http.clone(), &source.registry, request.image_pull.take(), None)?;
         let to = Registry::new(http, &host, Some(push), None)?.staging(name);
+        let chunk = declared.chunk_bytes.unwrap_or(self.transfer.chunk_bytes);
         let started = Instant::now();
         let manifest = from.platform_manifest(&source, platform).await?;
         let staged = format!("{}@{}", declared.repository, manifest.digest);
         let lock = self.lock(&staged);
         let _copying = lock.lock().await;
-        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, &to, &repository, self.transfer.chunk_bytes).await?;
+        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, &to, &repository, chunk).await?;
         tracing::info!(
             registry = %name,
             image = %request.image_digest,

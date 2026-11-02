@@ -29,6 +29,9 @@ const DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gz
 /// using a push credential this long before it expires.
 const EXPIRY_MARGIN: chrono::TimeDelta = chrono::TimeDelta::seconds(30);
 
+/// The most of a registry's error message a refusal repeats.
+const MESSAGE_CHARS: usize = 200;
+
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
@@ -271,9 +274,12 @@ impl Registry {
             refusal: ImageRefusal::PushCredentialExpired,
         }
     }
-    /// Never carries a registry body: those can echo credentials.
-    fn status_error(&self, status: u16, what: &str, retry_after: Option<u64>) -> ProtocolError {
-        let reason = format!("{} {what} HTTP {status}", self.described());
+    /// Carries no more of the registry's body than [`Self::registry_message`] allows.
+    fn status_error(&self, status: u16, what: &str, retry_after: Option<u64>, message: Option<String>) -> ProtocolError {
+        let mut reason = format!("{} {what} HTTP {status}", self.described());
+        if let Some(message) = message {
+            reason = format!("{reason}: {message}");
+        }
         match status {
             401 | 403 if self.expired() => self.expired_error(),
             401 | 403 => self.refusal(reason),
@@ -367,7 +373,7 @@ impl Registry {
         }
         let response = self.execute(request, "token").await?;
         if !response.status().is_success() {
-            return Err(self.status_error(response.status().as_u16(), "token", None));
+            return Err(self.status_error(response.status().as_u16(), "token", None, None));
         }
         let body: Value = serde_json::from_slice(response.body()).map_err(|_| rejected())?;
         let token = body.get("token").or_else(|| body.get("access_token")).and_then(Value::as_str).ok_or_else(rejected)?;
@@ -408,7 +414,23 @@ impl Registry {
         }
         // Integer seconds only; an HTTP-date leaves the retry hint unset.
         let retry_after = response.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
-        Err(self.status_error(status, what, retry_after))
+        let message = (400..500).contains(&status).then(|| self.registry_message(response.body())).flatten();
+        Err(self.status_error(status, what, retry_after, message))
+    }
+    /// Why the registry refused, from the first OCI error's message: one line,
+    /// at most [`MESSAGE_CHARS`] characters, and nothing at all when it
+    /// repeats this registry's secret.
+    fn registry_message(&self, body: &[u8]) -> Option<String> {
+        let errors: Value = serde_json::from_slice(body).ok()?;
+        let message = errors["errors"][0]["message"].as_str()?.trim();
+        if message.is_empty() || self.credential.as_ref().is_some_and(|c| message.contains(c.secret.expose())) {
+            return None;
+        }
+        let line: String = message.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        Some(match line.char_indices().nth(MESSAGE_CHARS) {
+            Some((at, _)) => format!("{}…", &line[..at]),
+            None => line,
+        })
     }
     /// The image manifest for `platform`, choosing from an index when the
     /// reference names one. Content is verified against its digest.

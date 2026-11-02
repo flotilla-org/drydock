@@ -9,7 +9,7 @@ use drydock::{
     HostConnection,
     config::Config,
     daemon::{Daemon, HostOption, ProviderApi, Seams},
-    staging::Transfer,
+    staging::{CHUNK_BYTES, Transfer},
 };
 use drydock_host::module::{ByteStream, Credentials, HttpClient, Module, Provider, Result as ModuleResult};
 use drydock_protocol::*;
@@ -27,6 +27,8 @@ const STAGE: &str = "stage.test";
 const STAGED: &str = "stage.test/org/staging";
 const MIRROR: &str = "quay.test/org/mirror";
 const CHUNK: u64 = 256;
+/// GHCR's limit on one upload request's body.
+const PATCH_LIMIT: usize = 4 << 20;
 
 fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
@@ -66,6 +68,8 @@ struct Oci {
     signins: Vec<(String, &'static str)>,
     /// The staging registry answers uploads with this status.
     refuse_push: Option<u16>,
+    /// The message it refuses with, when not the usual one.
+    refusal_message: Option<&'static str>,
     violations: Vec<String>,
 }
 /// Stands in for the network boundary to every registry: the OCI distribution
@@ -145,7 +149,8 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
         if let Some(status) = s.refuse_push {
             let challenge = format!(r#"Bearer realm="https://{host}/token",service="{host}""#);
             let headers = if status == 401 { vec![("www-authenticate", challenge)] } else { vec![] };
-            return reply(status, &headers, Bytes::from_static(br#"{"errors":[{"code":"DENIED"}]}"#));
+            let message = s.refusal_message.unwrap_or("permission_denied: write_package");
+            return reply(status, &headers, Bytes::from(json!({"errors":[{"code":"DENIED","message":message}]}).to_string()));
         }
         let location = |id: &str| format!("/v2/{repository}/blobs/uploads/{id}");
         if method == "POST" {
@@ -155,13 +160,15 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
         }
         let Some(data) = s.uploads.get_mut(id) else { return reply(404, &[], Bytes::new()) };
         if method == "PATCH" {
+            // As GHCR answers an upload request over its limit.
+            if body.len() > PATCH_LIMIT {
+                let error = r#"{"errors":[{"code":"REQUESTED_RANGE_NOT_SATISFIABLE","message":"the request body is too large and exceeds the maximum permissible limit of 4.00MiB"}]}"#;
+                return reply(416, &[], Bytes::from_static(error.as_bytes()));
+            }
             let expected = format!("{}-{}", data.len(), data.len() + body.len() - 1);
             if request.headers().get("content-range").and_then(|v| v.to_str().ok()) != Some(&expected) {
                 s.violations.push(format!("chunk out of order; expected {expected}"));
                 return reply(416, &[], Bytes::new());
-            }
-            if body.len() as u64 > CHUNK {
-                s.violations.push("chunk larger than the transfer allows".into());
             }
             data.extend_from_slice(&body);
             return reply(202, &[("location", location(id)), ("range", format!("0-{}", data.len() - 1))], Bytes::new());
@@ -194,11 +201,21 @@ impl Registries {
     /// and returns its reference and the amd64 manifest's digest. Layers span
     /// several transfer chunks.
     fn seed(&self, host: &str, repository: &str) -> (String, String) {
+        self.seed_with(host, repository, 0)
+    }
+    /// As [`Self::seed`], with `padding` more bytes in each image's first layer.
+    fn seed_with(&self, host: &str, repository: &str, padding: usize) -> (String, String) {
         let mut s = self.0.lock().unwrap();
         let mut entries = vec![];
         let mut amd64 = String::new();
         for arch in ["amd64", "arm64"] {
-            let layers: Vec<Bytes> = (0..3).map(|i| Bytes::from(format!("{repository}:{arch}:{i}:").repeat(40))).collect();
+            let layers: Vec<Bytes> = (0..3)
+                .map(|i| {
+                    let mut layer = format!("{repository}:{arch}:{i}:").repeat(40).into_bytes();
+                    layer.resize(layer.len() + if i == 0 { padding } else { 0 }, b'.');
+                    Bytes::from(layer)
+                })
+                .collect();
             let config = Bytes::from(
                 json!({"os":"linux","architecture":arch,"rootfs":{"type":"layers","diff_ids":layers.iter().map(|l| sha256(l)).collect::<Vec<_>>()}})
                     .to_string(),
@@ -325,6 +342,11 @@ impl drydock::launch::ImageResolver for Digests {
 /// staging registry, with its push and pull credentials in files; `e2b`
 /// can also pull from `quay`.
 async fn start(dir: &Path, registries: &Registries, module: &Pulling) -> Arc<Daemon> {
+    start_with(dir, registries, module, CHUNK, "").await
+}
+/// As [`start`], uploading `chunk` bytes per request by default and with
+/// `ghcr` extra settings for the `ghcr` registry.
+async fn start_with(dir: &Path, registries: &Registries, module: &Pulling, chunk: u64, ghcr: &str) -> Arc<Daemon> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.join("host.sock");
@@ -345,6 +367,7 @@ async fn start(dir: &Path, registries: &Registries, module: &Pulling) -> Arc<Dae
 repository = "{STAGED}"
 push = {{ username = "bot", credential = {{ file = "{push}" }} }}
 pull = {{ username = "bot", credential = {{ file = "{pull}" }} }}
+{ghcr}
 [registries.quay]
 repository = "{MIRROR}"
 push = {{ username = "bot", credential = {{ file = "{push}" }} }}
@@ -360,7 +383,7 @@ pull_from = ["ghcr"]
     );
     let run = dir.join("run");
     let option = HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } };
-    let seams = Seams { registries: Transfer { http: Arc::new(registries.clone()), chunk_bytes: CHUNK }, ..Seams::new(Arc::new(Digests)) };
+    let seams = Seams { registries: Transfer { http: Arc::new(registries.clone()), chunk_bytes: chunk }, ..Seams::new(Arc::new(Digests)) };
     Daemon::start_with_seams(Config::parse(&text).unwrap(), &run, run.join("keys"), vec![option], seams).await.unwrap()
 }
 fn tools() -> String {
@@ -473,7 +496,8 @@ async fn a_push_refusal_names_the_staging_registry() {
                 reason,
             }) => {
                 assert_eq!(registry, "ghcr");
-                assert!(reason.contains(&status.to_string()), "{status}: {reason}");
+                // The caller learns why from the registry itself.
+                assert!(reason.contains(&status.to_string()) && reason.contains("permission_denied: write_package"), "{status}: {reason}");
             }
             other => panic!("{status}: {other:?}"),
         }
@@ -499,4 +523,57 @@ async fn concurrent_prepares_copy_once() {
     // An amd64 image is a config and three layers.
     assert_eq!(count("POST", "/blobs/uploads/"), 4);
     assert_eq!(count("PUT", "/manifests/"), 1);
+}
+
+// A layer larger than one upload request is sent in requests the registry
+// accepts: by default within GHCR's 4 MiB, otherwise within the staging
+// registry's own `chunk_bytes`. A registry that refuses a request as too large
+// says why in the staging refusal.
+#[tokio::test]
+async fn uploads_fit_the_registry_request_limit() {
+    for (ghcr, accepted) in [("", true), ("chunk_bytes = 1048576", true), ("chunk_bytes = 8388608", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let registries = Registries::default();
+        let module = Pulling::default();
+        // The first layer is just over two default requests.
+        let (image, amd64) = registries.seed_with(LAB, "crew/large", 2 * PATCH_LIMIT + 1);
+        let daemon = start_with(dir.path(), &registries, &module, CHUNK_BYTES, ghcr).await;
+
+        let result = ProviderApi::prepare(&*daemon, "e2b", &request(&image, Some(credential("lab-user", "lab-secret")))).await;
+        match (accepted, result) {
+            (true, Ok(prepared)) => assert_eq!(prepared.image_digest, format!("{STAGED}@{amd64}"), "{ghcr}"),
+            (
+                false,
+                Err(drydock::client::Error::Protocol(ProtocolError::ImageRefused {
+                    refusal: ImageRefusal::StagingRefused { registry },
+                    reason,
+                })),
+            ) => {
+                assert_eq!(registry, "ghcr");
+                assert!(reason.contains("416") && reason.contains("exceeds the maximum permissible limit"), "{reason}");
+            }
+            (_, other) => panic!("{ghcr}: {other:?}"),
+        }
+        assert_eq!(registries.violations(), Vec::<String>::new());
+    }
+}
+
+// A registry message that repeats the push credential's secret is left out of
+// the refusal: the reason travels to callers that must never see it.
+#[tokio::test]
+async fn a_refusal_never_repeats_the_push_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    {
+        let mut s = registries.0.lock().unwrap();
+        s.refuse_push = Some(403);
+        s.refusal_message = Some("token push-token may not write here");
+    }
+    let module = Pulling::default();
+    let (image, _) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+
+    let error = ProviderApi::prepare(&*daemon, "e2b", &request(&image, Some(credential("lab-user", "lab-secret")))).await.unwrap_err();
+    assert!(matches!(&error, drydock::client::Error::Protocol(ProtocolError::ImageRefused { .. })), "{error:?}");
+    assert!(!format!("{error:?}").contains("push-token"), "{error:?}");
 }
