@@ -28,6 +28,10 @@ pub type WebSocket = tokio_tungstenite::WebSocketStream<ByteStream>;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most of a refused upgrade's body a [`DialError`] keeps.
 const REFUSAL_BODY_LIMIT: usize = 4096;
+/// The largest message, and frame, accepted from the far end. A tunnel's
+/// proxy relays TCP reads, far smaller than this; the bound keeps a peer
+/// from making the reader buffer tungstenite's default 64 MiB.
+const MAX_INCOMING: usize = 4 << 20;
 
 /// Why a dial failed.
 #[derive(Debug)]
@@ -67,7 +71,9 @@ impl From<tungstenite::Error> for DialError {
 }
 
 /// Opens WebSockets. `headers` join the upgrade request, e.g. the provider's
-/// `Authorization`; mark secret values sensitive.
+/// `Authorization`; mark secret values sensitive. A header named there
+/// replaces the one WebSocket's own handshake would send under that name.
+/// Redirects are not followed: a 3xx answer is [`DialError::Refused`].
 #[async_trait]
 pub trait WebSocketDialer: Send + Sync {
     async fn dial(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError>;
@@ -80,12 +86,19 @@ fn request(url: &str, headers: HeaderMap) -> Result<tungstenite::handshake::clie
     Ok(request)
 }
 async fn handshake(url: &str, headers: HeaderMap, stream: ByteStream) -> Result<WebSocket, DialError> {
-    Ok(tokio_tungstenite::client_async(request(url, headers)?, stream).await?.0)
+    let config = tungstenite::protocol::WebSocketConfig::default().max_message_size(Some(MAX_INCOMING)).max_frame_size(Some(MAX_INCOMING));
+    Ok(tokio_tungstenite::client_async_with_config(request(url, headers)?, stream, Some(config)).await?.0)
+}
+/// `url` without its query, which may carry a credential, for error text.
+fn shown(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(base, _)| base)
 }
 
-/// Dials `ws://` and `wss://` URLs over TCP, verifying TLS servers as the
-/// host's HTTP client does: against the platform's trust store. No proxy is
-/// consulted, and the whole dial is bounded by 30 seconds.
+/// Dials `wss://` URLs over TCP, verifying TLS servers as the host's HTTP
+/// client does: against the platform's trust store. `ws://` is dialled only
+/// to a loopback address, so headers such as a provider's key never cross a
+/// network in cleartext. No proxy is consulted, and the whole dial is
+/// bounded by 30 seconds.
 pub struct TlsDialer {
     tls: Arc<rustls::ClientConfig>,
 }
@@ -102,7 +115,7 @@ impl TlsDialer {
         Ok(Self { tls: Arc::new(config) })
     }
     async fn open(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
-        let invalid = |reason: &str| DialError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("{reason}: {url}")));
+        let invalid = |reason: &str| DialError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("{reason}: {}", shown(url))));
         let uri: Uri = url.parse().map_err(|_| invalid("not a URL"))?;
         let secure = match uri.scheme_str() {
             Some("wss") => true,
@@ -111,6 +124,9 @@ impl TlsDialer {
         };
         let host = uri.host().ok_or_else(|| invalid("no host"))?;
         let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+        if !secure && !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+            return Err(invalid("ws:// only to a loopback address"));
+        }
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
         let tcp = tokio::net::TcpStream::connect((host, port)).await?;
         tcp.set_nodelay(true)?;
@@ -139,8 +155,7 @@ impl WebSocketDialer for TlsDialer {
 #[async_trait]
 impl WebSocketDialer for MemoryDialer {
     async fn dial(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
-        let request = request(url, headers)?;
-        Ok(tokio_tungstenite::client_async(request, self.connect().await?).await?.0)
+        handshake(url, headers, self.connect().await?).await
     }
 }
 
@@ -151,6 +166,9 @@ impl WebSocketDialer for MemoryDialer {
 /// tunnel's proxy need not complete the close handshake. Any other close
 /// code, or a text message, is an error. Shutting the stream down sends a
 /// normal close; a WebSocket has no half-close, so the peer's half ends too.
+/// Writes after the close are `BrokenPipe`.
+///
+/// A write may only queue its frame: flush before awaiting an answer to it.
 pub fn stream(socket: WebSocket, max_frame: usize) -> ByteStream {
     assert!(max_frame > 0, "a tunnel frame carries at least one byte");
     Box::new(Tunnel { socket, max_frame, pending: bytes::Bytes::new(), ended: false })
@@ -165,8 +183,14 @@ struct Tunnel {
 }
 
 fn io_error(error: tungstenite::Error) -> io::Error {
+    use tungstenite::error::ProtocolError;
     match error {
         tungstenite::Error::Io(error) => error,
+        tungstenite::Error::AlreadyClosed
+        | tungstenite::Error::ConnectionClosed
+        | tungstenite::Error::Protocol(ProtocolError::SendAfterClosing) => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "the tunnel is closed")
+        }
         other => io::Error::other(other),
     }
 }

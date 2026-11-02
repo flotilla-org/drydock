@@ -128,16 +128,19 @@ enum Ending {
     Dropped,
     Error,
     Text,
+    /// A message over the dialers' 4 MiB incoming limit.
+    Oversized,
 }
 
 // A normal close, a close without a code and a dropped connection end the
 // byte stream after every byte sent before them; another close code or a
-// text message is an error, after those bytes too. Every ending is run
+// text message is an error, after those bytes too, and so is a message
+// over the incoming limit. Every ending is run
 // for each drawn payload, empty included.
 #[hegel::test]
 fn tunnels_end_at_normal_and_abnormal_closes(tc: hegel::TestCase) {
     let sent = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(100));
-    for ending in [Ending::Normal, Ending::CloseWithoutCode, Ending::Dropped, Ending::Error, Ending::Text] {
+    for ending in [Ending::Normal, Ending::CloseWithoutCode, Ending::Dropped, Ending::Error, Ending::Text, Ending::Oversized] {
         runtime().block_on(ends(ending, &sent));
     }
 }
@@ -153,6 +156,9 @@ async fn ends(ending: Ending, sent: &[u8]) {
             Ending::CloseWithoutCode => socket.send(Message::Close(None)).await.unwrap(),
             Ending::Error => socket.send(close(CloseCode::Error, "agent gone")).await.unwrap(),
             Ending::Text => socket.send(Message::text("hello")).await.unwrap(),
+            Ending::Oversized => {
+                let _ = socket.send(Message::Binary(vec![0; (4 << 20) + 1].into())).await;
+            }
             Ending::Dropped => {}
         }
         drop(socket);
@@ -165,7 +171,7 @@ async fn ends(ending: Ending, sent: &[u8]) {
     let end = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest)).await.unwrap();
     match ending {
         Ending::Normal | Ending::CloseWithoutCode | Ending::Dropped => assert!(end.is_ok() && rest.is_empty(), "{end:?}"),
-        Ending::Error | Ending::Text => assert!(end.is_err(), "{ending:?} reads as {end:?}"),
+        Ending::Error | Ending::Text | Ending::Oversized => assert!(end.is_err(), "{ending:?} reads as {end:?}"),
     }
 }
 
@@ -213,7 +219,7 @@ async fn a_truncated_tls_connection_ends_the_tunnel() {
 }
 
 // Shutting the stream down sends a normal close, so the far end sees the
-// tunnel end rather than a dropped connection.
+// tunnel end rather than a dropped connection; later writes are BrokenPipe.
 #[tokio::test]
 async fn shutdown_sends_a_normal_close() {
     let (closed, received) = tokio::sync::oneshot::channel();
@@ -227,6 +233,8 @@ async fn shutdown_sends_a_normal_close() {
     .await;
     stream.write_all(b"bye").await.unwrap();
     stream.shutdown().await.unwrap();
+    let after = stream.write_all(b"more").await.unwrap_err();
+    assert_eq!(after.kind(), std::io::ErrorKind::BrokenPipe, "{after}");
     let last = tokio::time::timeout(Duration::from_secs(10), received).await.unwrap().unwrap();
     assert!(
         matches!(last, Some(Message::Close(None)) | Some(Message::Close(Some(CloseFrame { code: CloseCode::Normal, .. })))),
@@ -237,7 +245,7 @@ async fn shutdown_sends_a_normal_close() {
 // Both dialers send the given headers with the upgrade: with the key the
 // server switches, and without it the refusal's status and body come back
 // as `DialError::Refused`. The TLS dialer is exercised over plain `ws://`
-// to a real TCP listener; TLS itself is left to the live check.
+// to a real loopback TCP listener; TLS itself is left to the live check.
 #[tokio::test]
 async fn dials_carry_headers_and_report_refusals() {
     let (memory, mut memory_listener) = drydock_transport::memory();
@@ -262,4 +270,13 @@ async fn dials_carry_headers_and_report_refusals() {
         }
     }
     assert!(matches!(tls.dial("https://example.invalid/", HeaderMap::new()).await, Err(DialError::Io(_))));
+    // Cleartext beyond loopback is refused before any connection, and the
+    // refusal leaves out the query, which may carry a credential.
+    match tls.dial("ws://192.0.2.1/api/v1/tunnels/tcp?token=secret", authorized()).await {
+        Err(DialError::Io(error)) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+        other => panic!("{:?}", other.map(drop)),
+    }
 }
