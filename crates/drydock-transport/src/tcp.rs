@@ -101,6 +101,46 @@ fn base64url(bytes: &[u8]) -> String {
 /// does, so the agent's client takes it. A refused token is
 /// `PermissionDenied`.
 pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream> {
+    match handshake(stream, CONNECT_PATH, PROTOCOL, token).await? {
+        Ok(stream) => Ok(stream),
+        Err((StatusCode::UNAUTHORIZED, _)) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token")),
+        Err((status, _)) => Err(io::Error::other(format!("the agent's tcp listener answered {status}"))),
+    }
+}
+
+/// [`connect`] through an HTTP proxy in front of the listener, such as a
+/// provider's edge that forwards a request to a guest port and splices the
+/// bytes after the agent's 101: the request goes to `url`'s path and query
+/// (the path must be [`CONNECT_PATH`] when it reaches the agent) with its
+/// authority as `Host`. A credential the proxy wants rides in the query, since
+/// `Authorization` carries the agent's token. A 401 or 403, the agent's or
+/// the proxy's, is `PermissionDenied`; its text names the status and the
+/// start of the answer, never `url`.
+pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Result<ByteStream> {
+    let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("agent url {reason}"));
+    let uri: hyper::Uri = url.parse().map_err(|_| invalid("is not a URL"))?;
+    let authority = uri.authority().ok_or_else(|| invalid("has no host"))?.as_str();
+    let target = uri.path_and_query().map_or(CONNECT_PATH, |p| p.as_str());
+    match handshake(stream, target, authority, token).await? {
+        Ok(stream) => Ok(stream),
+        Err((status, body)) => {
+            let kind = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => io::ErrorKind::PermissionDenied,
+                _ => io::ErrorKind::Other,
+            };
+            let text = if body.is_empty() { format!("refused with HTTP {status}") } else { format!("refused with HTTP {status}: {body}") };
+            Err(io::Error::new(kind, text))
+        }
+    }
+}
+
+/// The most of a refusal's answer kept, as text.
+const REFUSAL_CHARS: usize = 200;
+
+/// Sends the handshake request for `target` with `host`; the switched stream,
+/// or the status and start of the body that refused it.
+async fn handshake(stream: ByteStream, target: &str, host: &str, token: &Token) -> io::Result<Result<ByteStream, (StatusCode, String)>> {
+    use http_body_util::BodyExt;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(io::Error::other)?;
     // The connection task ends by handing its bytes to the upgrade; on any
     // early return it is aborted.
@@ -111,24 +151,31 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
         }
     }
     let _driver = Abort(tokio::spawn(connection.with_upgrades()));
-    let request = Request::get(CONNECT_PATH)
-        .header(header::HOST, PROTOCOL)
+    let request = Request::get(target)
+        .header(header::HOST, host)
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, PROTOCOL)
         .header(header::AUTHORIZATION, format!("Bearer {}", token.secret()))
         .body(Empty::<Bytes>::new())
         .map_err(io::Error::other)?;
     let mut response = sender.send_request(request).await.map_err(io::Error::other)?;
-    match response.status() {
-        StatusCode::SWITCHING_PROTOCOLS => {}
-        StatusCode::UNAUTHORIZED => {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token"));
-        }
-        status => {
-            return Err(io::Error::other(format!("the agent's tcp listener answered {status}")));
-        }
+    let status = response.status();
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(Ok(crate::http::upgraded(hyper::upgrade::on(&mut response)).await?));
     }
-    crate::http::upgraded(hyper::upgrade::on(&mut response)).await
+    // The start of the answer, read briefly: a refusal need not end its body.
+    let mut body = Vec::new();
+    let mut incoming = response.into_body();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while body.len() < 4096
+            && let Some(Ok(frame)) = incoming.frame().await
+        {
+            body.extend_from_slice(frame.data_ref().map_or(&[][..], |d| d.as_ref()));
+        }
+    })
+    .await;
+    let text: String = String::from_utf8_lossy(&body).trim().chars().take(REFUSAL_CHARS).collect();
+    Ok(Err((status, text)))
 }
 
 #[cfg(test)]

@@ -114,6 +114,45 @@ async fn connects_through_the_providers_relay_and_reports_it() {
     agent.abort();
 }
 
+// Behaviour: a dial reach is followed to the agent's TCP listener at the
+// reach's URL, with its token as the agent's; nothing is dialled over SSH,
+// and drydock reports the URL without its query, where a provider's edge
+// credential rides. A wrong token is the agent's refusal, reported masked.
+#[tokio::test]
+async fn connects_through_a_dial_reach_and_reports_it() {
+    let token = drydock_transport::tcp::Token::generate().unwrap();
+    let listener = drydock_agent::tcp::TokenListener::bind("127.0.0.1:0".parse().unwrap(), token.clone()).await.unwrap();
+    let address = listener.local_addr();
+    let agent = tokio::spawn(drydock_agent::Agent::new(listener, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
+    let url = format!("http://{address}/v1/connect?_edge=edge-credential");
+    let expires_at: drydock_protocol::Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+    for (presented, refused) in
+        [(token.secret().to_owned(), false), (drydock_transport::tcp::Token::generate().unwrap().secret().into(), true)]
+    {
+        let dial = Reach::Dial { url: url.clone(), token: Secret::new(presented), expires_at: expires_at.clone() };
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (api, environment) = provider(true, dial).await;
+        let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+        let identity = directory.path().join("id_ed25519");
+        let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+        let timeout = Duration::from_secs(if refused { 2 } else { 10 });
+        let result = AgentReach::new().with_dialer(gateway.clone()).with_timeout(timeout).connect(&api, &vessel).await;
+        assert_eq!(gateway.dials(), 0);
+        if refused {
+            let error = result.err().unwrap().to_string();
+            assert!(error.contains("401") && !error.contains("edge-credential"), "{error}");
+            continue;
+        }
+        let connected = result.unwrap();
+        assert_eq!(connected.report.endpoint, format!("http://{address}/v1/connect"));
+        assert_eq!(
+            connected.report.to_string(),
+            format!("dial http://{address}/v1/connect to reference vessel {environment} (provider a)")
+        );
+    }
+    agent.abort();
+}
+
 // A gateway started for a platform stands in for a guest of that platform on
 // any test host: a vessel prepared for it connects, and the agent reports it.
 #[tokio::test]
@@ -131,14 +170,13 @@ async fn a_gateway_stands_in_for_the_platform_it_was_started_as() {
 }
 
 // What the client cannot follow is refused at once, without dialling: a
-// provider whose declaration has no agent, and a reach that is not SSH.
+// provider whose declaration has no agent, and a dial reach whose token
+// cannot be an agent's.
 #[tokio::test]
 async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
     let dial =
-        Reach::Dial { url: "wss://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
-    for (agent, reach, refusal) in
-        [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "agent hello requires an SSH or relay reach")]
-    {
+        Reach::Dial { url: "https://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+    for (agent, reach, refusal) in [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "dial reach token")] {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(agent, reach).await;
         let gateway = Gateway::start(directory.path(), BUILD).unwrap();

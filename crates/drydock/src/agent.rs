@@ -5,7 +5,7 @@
 use crate::{api::ProviderApi, client::Error};
 use async_trait::async_trait;
 use drydock_protocol::{DiagnosticMasker, Platform, ProtocolError, Reach};
-use drydock_transport::{ByteStream, ssh::SshConfig};
+use drydock_transport::{ByteStream, ssh::SshConfig, websocket::StreamDialer};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -26,6 +26,24 @@ pub const AGENT_SOCKET: &str = "/run/drydock/agent.sock";
 #[async_trait]
 pub trait SshDialer: Send + Sync {
     async fn dial(&self, config: SshConfig) -> io::Result<ByteStream>;
+}
+
+/// The production dialer for a dial reach, made on first use: building its
+/// TLS configuration reads the platform's trust store.
+struct Tls(std::sync::OnceLock<drydock_transport::websocket::TlsDialer>);
+
+#[async_trait]
+impl StreamDialer for Tls {
+    async fn connect(&self, url: &str) -> io::Result<ByteStream> {
+        let dialer = match self.0.get() {
+            Some(dialer) => dialer,
+            None => {
+                let dialer = drydock_transport::websocket::TlsDialer::new()?;
+                self.0.get_or_init(|| dialer)
+            }
+        };
+        dialer.connect(url).await
+    }
 }
 
 /// Drydock's OpenSSH transport.
@@ -61,8 +79,9 @@ pub struct AgentReport {
     pub module: String,
     /// The provider's environment ID for the vessel.
     pub environment: String,
-    /// The SSH endpoint the agent is reached through, without credentials, or
-    /// [`RELAY`] when the provider's host carries the connection.
+    /// The SSH endpoint the agent is reached through, without credentials;
+    /// [`RELAY`] when the provider's host carries the connection; or a dial
+    /// reach's URL without its query.
     pub endpoint: String,
 }
 
@@ -73,6 +92,7 @@ impl std::fmt::Display for AgentReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.endpoint.as_str() {
             RELAY => write!(f, "relay"),
+            endpoint if endpoint.contains("://") => write!(f, "dial {endpoint}"),
             endpoint => write!(f, "ssh {endpoint}"),
         }?;
         write!(f, " to {} vessel {} (provider {})", self.module, self.environment, self.provider)
@@ -89,6 +109,7 @@ pub struct ConnectedAgent {
 #[derive(Clone)]
 pub struct AgentReach {
     dialer: Arc<dyn SshDialer>,
+    streams: Arc<dyn StreamDialer>,
     timeout: Duration,
 }
 
@@ -100,11 +121,17 @@ impl Default for AgentReach {
 
 impl AgentReach {
     pub fn new() -> Self {
-        Self { dialer: Arc::new(OpenSsh), timeout: Duration::from_secs(60) }
+        Self { dialer: Arc::new(OpenSsh), streams: Arc::new(Tls(Default::default())), timeout: Duration::from_secs(60) }
     }
 
     pub fn with_dialer(mut self, dialer: Arc<dyn SshDialer>) -> Self {
         self.dialer = dialer;
+        self
+    }
+
+    /// The dialer a dial reach's connections are opened with.
+    pub fn with_streams(mut self, streams: Arc<dyn StreamDialer>) -> Self {
+        self.streams = streams;
         self
     }
 
@@ -148,8 +175,19 @@ impl AgentReach {
                     *choice.lock().unwrap() = Some(RELAY.to_owned());
                     return Ok(Box::new(stream) as ByteStream);
                 }
-                Reach::Dial { .. } => {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, "agent hello requires an SSH or relay reach"));
+                // The agent's TCP listener behind the provider's edge, which
+                // takes its own credential from the URL's query.
+                Reach::Dial { url, token, .. } => {
+                    let shown = url.split_once('?').map_or(url.as_str(), |(base, _)| base).to_owned();
+                    if let Some((_, query)) = url.split_once('?') {
+                        masker.lock().unwrap().remember(query);
+                    }
+                    let token = drydock_transport::tcp::Token::parse(token.expose())
+                        .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, format!("dial reach token: {e}")))?;
+                    let stream = self.streams.connect(&url).await?;
+                    let stream = drydock_transport::tcp::connect_at(stream, &url, &token).await?;
+                    *choice.lock().unwrap() = Some(shown);
+                    return Ok(stream);
                 }
             };
             masker.lock().unwrap().remember(user.expose());

@@ -39,3 +39,7 @@ hegeltest = "=0.48.1"
 [[test]]
 name = "websocket"
 required-features = ["websocket"]
+
+[[test]]
+name = "upgrade"
+required-features = ["websocket"]

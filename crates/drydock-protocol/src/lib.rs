@@ -555,9 +555,18 @@ pub enum Reach {
         #[serde(default)]
         reverse_forwards: bool,
     },
+    /// The agent's token-gated TCP listener behind a provider's HTTP edge:
+    /// drydock opens `url` (`https://`, or `http://` to a loopback address)
+    /// and asks for the agent's handshake at its path and query with `token`
+    /// as the Bearer; the bytes after the agent's 101 are its socket's. A
+    /// credential the edge wants rides in `url`'s query, which drydock never
+    /// shows.
     Dial {
         url: String,
+        /// The agent's TCP token.
         token: Secret,
+        /// When `url`'s credential stops working; drydock asks for a fresh
+        /// reach for each connection.
         #[schema(format = DateTime)]
         expires_at: Timestamp,
     },
