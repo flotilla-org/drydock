@@ -252,8 +252,10 @@ impl StandIn {
                 response(200, snapshot)
             }
             ("GET", "/api/docker-registry/registry-push-access") => {
-                if !request.url().query_pairs().any(|(k, v)| k == "regionId" && v == "eu") {
-                    reject!("push access must name the region");
+                // Daytona looks `regionId` up among the organisation's own regions only;
+                // a shared region such as eu is not found.
+                if request.url().query_pairs().any(|(k, _)| k == "regionId") {
+                    return response(404, json!({"statusCode":404,"error":"Not Found","message":"Region not found"}));
                 }
                 s.oci.mints += 1;
                 let username = format!("robot$push-{}", s.oci.mints);
@@ -2317,11 +2319,9 @@ async fn standin_enforces_push_contract() {
     let http = StandIn::default();
     let client = reqwest::Client::new();
     let send = |request: reqwest::Request| http.execute(request, &ChannelLabel::Default);
-    let access = send(
-        client.get("https://app.daytona.io/api/docker-registry/registry-push-access?regionId=eu").bearer_auth("key-a").build().unwrap(),
-    )
-    .await
-    .unwrap();
+    let access = send(client.get("https://app.daytona.io/api/docker-registry/registry-push-access").bearer_auth("key-a").build().unwrap())
+        .await
+        .unwrap();
     let access: Value = serde_json::from_slice(access.body()).unwrap();
     let robot =
         |user: &str, secret: &str| client.get("https://harbor.invalid/service/token").basic_auth(user, Some(secret)).build().unwrap();
