@@ -28,6 +28,8 @@ pub type WebSocket = tokio_tungstenite::WebSocketStream<ByteStream>;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most of a refused upgrade's body a [`DialError`] keeps.
 const REFUSAL_BODY_LIMIT: usize = 4096;
+/// The most of that body its `Display` shows.
+const REFUSAL_DISPLAY_CHARS: usize = 200;
 /// The largest message, and frame, accepted from the far end. A tunnel's
 /// proxy relays TCP reads, far smaller than this; the bound keeps a peer
 /// from making the reader buffer tungstenite's default 64 MiB.
@@ -46,7 +48,13 @@ impl fmt::Display for DialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused { status, body } if body.is_empty() => write!(f, "upgrade refused with HTTP {status}"),
-            Self::Refused { status, body } => write!(f, "upgrade refused with HTTP {status}: {body}"),
+            // A proxy may echo the request into its answer, so text bound
+            // for logs keeps only its start; `body` holds the rest.
+            Self::Refused { status, body } => {
+                let shown: String = body.chars().take(REFUSAL_DISPLAY_CHARS).collect();
+                let more = if shown.len() < body.len() { "…" } else { "" };
+                write!(f, "upgrade refused with HTTP {status}: {shown}{more}")
+            }
             Self::Io(error) => write!(f, "{error}"),
         }
     }
@@ -96,7 +104,7 @@ fn shown(url: &str) -> &str {
 
 /// Dials `wss://` URLs over TCP, verifying TLS servers as the host's HTTP
 /// client does: against the platform's trust store. `ws://` is dialled only
-/// to a loopback address, so headers such as a provider's key never cross a
+/// to a loopback IP address (not the name `localhost`), so headers such as a provider's key never cross a
 /// network in cleartext. No proxy is consulted, and the whole dial is
 /// bounded by 30 seconds.
 pub struct TlsDialer {
@@ -125,7 +133,7 @@ impl TlsDialer {
         let host = uri.host().ok_or_else(|| invalid("no host"))?;
         let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
         if !secure && !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
-            return Err(invalid("ws:// only to a loopback address"));
+            return Err(invalid("ws:// only to a loopback IP address"));
         }
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
         let tcp = tokio::net::TcpStream::connect((host, port)).await?;
@@ -259,6 +267,23 @@ impl AsyncWrite for Tunnel {
         match ready!(Pin::new(&mut self.socket).poll_close(cx)) {
             Err(tungstenite::Error::AlreadyClosed) => Poll::Ready(Ok(())),
             result => Poll::Ready(result.map_err(io_error)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // A refusal's text for logs shows at most the first 200 characters of
+    // the body, marking a cut; the error itself keeps the whole body.
+    #[test]
+    fn refusal_text_shows_only_the_start_of_the_body() {
+        for length in [0, 1, REFUSAL_DISPLAY_CHARS, REFUSAL_DISPLAY_CHARS + 1, REFUSAL_BODY_LIMIT] {
+            let body = "é".repeat(length);
+            let text = DialError::Refused { status: 401, body: body.clone() }.to_string();
+            let shown = text.chars().filter(|c| *c == 'é').count();
+            assert_eq!(shown, length.min(REFUSAL_DISPLAY_CHARS), "{length}");
+            assert_eq!(text.ends_with('…'), length > REFUSAL_DISPLAY_CHARS, "{length}");
         }
     }
 }
