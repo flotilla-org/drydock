@@ -122,6 +122,8 @@ fn tunnels_carry_bytes_in_bounded_frames(tc: hegel::TestCase) {
 #[derive(Clone, Copy, Debug)]
 enum Ending {
     Normal,
+    /// 1001, as a provider may close on shutdown.
+    GoingAway,
     CloseWithoutCode,
     /// The connection drops with no close frame: 1006, as Tensorlake's
     /// proxy ends a tunnel.
@@ -132,7 +134,7 @@ enum Ending {
     Oversized,
 }
 
-// A normal close, a close without a code and a dropped connection end the
+// A normal close, a going-away close, a close without a code and a dropped connection end the
 // byte stream after every byte sent before them; another close code or a
 // text message is an error, after those bytes too, and so is a message
 // over the incoming limit. Every ending is run
@@ -140,7 +142,9 @@ enum Ending {
 #[hegel::test]
 fn tunnels_end_at_normal_and_abnormal_closes(tc: hegel::TestCase) {
     let sent = tc.draw(gs::vecs(gs::integers::<u8>()).max_size(100));
-    for ending in [Ending::Normal, Ending::CloseWithoutCode, Ending::Dropped, Ending::Error, Ending::Text, Ending::Oversized] {
+    for ending in
+        [Ending::Normal, Ending::GoingAway, Ending::CloseWithoutCode, Ending::Dropped, Ending::Error, Ending::Text, Ending::Oversized]
+    {
         runtime().block_on(ends(ending, &sent));
     }
 }
@@ -153,6 +157,7 @@ async fn ends(ending: Ending, sent: &[u8]) {
         let close = |code, reason: &str| Message::Close(Some(CloseFrame { code, reason: Utf8Bytes::from(reason) }));
         match ending {
             Ending::Normal => socket.send(close(CloseCode::Normal, "")).await.unwrap(),
+            Ending::GoingAway => socket.send(close(CloseCode::Away, "shutting down")).await.unwrap(),
             Ending::CloseWithoutCode => socket.send(Message::Close(None)).await.unwrap(),
             Ending::Error => socket.send(close(CloseCode::Error, "agent gone")).await.unwrap(),
             Ending::Text => socket.send(Message::text("hello")).await.unwrap(),
@@ -170,7 +175,9 @@ async fn ends(ending: Ending, sent: &[u8]) {
     let mut rest = Vec::new();
     let end = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest)).await.unwrap();
     match ending {
-        Ending::Normal | Ending::CloseWithoutCode | Ending::Dropped => assert!(end.is_ok() && rest.is_empty(), "{end:?}"),
+        Ending::Normal | Ending::GoingAway | Ending::CloseWithoutCode | Ending::Dropped => {
+            assert!(end.is_ok() && rest.is_empty(), "{end:?}")
+        }
         Ending::Error | Ending::Text | Ending::Oversized => assert!(end.is_err(), "{ending:?} reads as {end:?}"),
     }
 }

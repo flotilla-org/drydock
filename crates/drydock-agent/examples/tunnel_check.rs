@@ -20,7 +20,6 @@ use std::{io, path::Path, time::Instant};
 
 /// Tensorlake's tunnel proxy drops connections carrying larger frames.
 const MAX_FRAME: usize = 64 << 10;
-const PROBE: &str = "/tmp/drydock-tunnel-check";
 
 fn bearer(key: &str) -> http::HeaderMap {
     let mut value = http::HeaderValue::from_str(&format!("Bearer {key}")).expect("a key fits a header");
@@ -43,12 +42,16 @@ async fn agent(dialer: &TlsDialer, url: &str, key: &str, token: &Token, fingerpr
 }
 
 async fn round_trip(client: &Client) -> io::Result<(f64, bool)> {
+    // Unique per run, so concurrent checks against one sandbox do not collide.
+    let probe =
+        format!("/tmp/drydock-tunnel-check-{}-{}", std::process::id(), std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_nanos());
+    let probe = Path::new(&probe);
     let content: Vec<u8> = (0..4u32 << 20).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
     let started = Instant::now();
-    client.write_bytes(Path::new(PROBE), content.clone(), &FileOptions::default()).await?;
-    let read = client.read_bytes(Path::new(PROBE), 8 << 20).await?;
+    client.write_bytes(probe, content.clone(), &FileOptions::default()).await?;
+    let read = client.read_bytes(probe, 8 << 20).await?;
     let seconds = started.elapsed().as_secs_f64();
-    client.remove(Path::new(PROBE), false).await?;
+    client.remove(probe, false).await?;
     Ok((seconds, read == content))
 }
 

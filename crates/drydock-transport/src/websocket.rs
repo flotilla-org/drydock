@@ -169,8 +169,8 @@ impl WebSocketDialer for MemoryDialer {
 
 /// The byte stream `socket` carries in its binary messages, as a provider's
 /// TCP tunnel relays them. Each write sends one binary message of at most
-/// `max_frame` bytes. The stream ends at a normal close (1000, or a close
-/// without a code) and at a connection dropped without one (1006): a
+/// `max_frame` bytes. The stream ends at a normal close (1000, a going-away
+/// 1001 as a shutting-down sandbox may send, or a close without a code) and at a connection dropped without one (1006): a
 /// tunnel's proxy need not complete the close handshake. Any other close
 /// code, or a text message, is an error. Shutting the stream down sends a
 /// normal close; a WebSocket has no half-close, so the peer's half ends too.
@@ -230,7 +230,7 @@ impl AsyncRead for Tunnel {
                 }
                 Some(Ok(Message::Close(frame))) => {
                     this.ended = true;
-                    if let Some(frame) = frame.filter(|frame| frame.code != CloseCode::Normal) {
+                    if let Some(frame) = frame.filter(|frame| !matches!(frame.code, CloseCode::Normal | CloseCode::Away)) {
                         let reason = format!("tunnel closed with {}: {}", u16::from(frame.code), frame.reason);
                         return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, reason)));
                     }
