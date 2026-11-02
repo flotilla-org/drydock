@@ -1,10 +1,11 @@
 // Modal sandboxes through the JavaScript SDK (owner ruling 2026-11-02: the
-// TypeScript host, reached by the exec bridge). One Modal app per provider
-// instance holds every sandbox. Prepare has Modal build the base by digest
-// with the tools image copied in; provision creates a named, tagged sandbox
-// whose command starts drydock's agent; drydock reaches it through the relay
-// route, which this module carries over an exec of `drydock-agent --bridge`.
-// Sandboxes cannot be suspended, and live at most a day.
+// TypeScript host). One Modal app per provider instance holds every sandbox.
+// Prepare has Modal build the base by digest with the tools image copied in;
+// provision creates a named, tagged sandbox and starts drydock's agent by a
+// root exec, with its token-gated TCP listener; reach is a dial of that
+// listener through Modal's connect-token edge, which drydock makes itself.
+// Exec only runs commands, never agent traffic. Sandboxes cannot be
+// suspended, and live at most a day.
 import { createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
