@@ -432,16 +432,20 @@ impl Tensorlake {
     }
     /// Starts the agent as root, supervised, listening on the guest's
     /// loopback for the tunnel, with a token only root can read. A token file
-    /// already there is kept when it holds a token (one that doesn't would
-    /// stop every agent start, so it is replaced). The write is exclusive
-    /// (`set -C`), so of two concurrent bootstraps one token wins and both
-    /// read it back, so a running agent (after resume, or another
-    /// host's bootstrap) keeps answering to it; whichever token the file
-    /// holds is read back. The supervisor's lock makes this idempotent.
-    /// `--supervise` returns at once: it spawns the supervisor in its own
-    /// process group with stdin closed and output to its log
-    /// (drydock-agent's supervisor.rs, `start`), so the run ends with it.
-    /// Its argv ends with `--socket`, as the supervisor requires.
+    /// already there is kept when it holds a token, so a running agent (after
+    /// resume, or another host's bootstrap) keeps answering to it; whichever
+    /// token the file holds is read back. One that holds no token would stop
+    /// every agent start, so it is replaced. The write is exclusive
+    /// (`set -C`): of two concurrent bootstraps one token wins and both read
+    /// it back. Replacing a file that holds no token is not atomic, so two
+    /// bootstraps racing on one can leave the agent on a token the file no
+    /// longer holds; reach then fails with the agent's refusal, and a
+    /// relaunch recovers (`flock` may be missing from the user's image).
+    /// The supervisor's lock makes this idempotent. `--supervise` returns at
+    /// once: it spawns the supervisor in its own process group with stdin
+    /// closed and output to its log (drydock-agent's supervisor.rs, `start`),
+    /// so the run ends with it. Its argv ends with `--socket`, as the
+    /// supervisor requires.
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
         let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
         let port = self.settings.tunnel_port;
