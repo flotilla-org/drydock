@@ -248,7 +248,7 @@ test("provision creates a tagged sandbox that starts the agent", async () => {
     timeoutMs: LIFETIME_SECONDS * 1000,
     runtime: "vm",
     command: COMMAND,
-    blockNetwork: true,
+    outboundCidrAllowlist: [],
   });
   assert.match(params.name!, /^drydock-[0-9a-f]{24}$/);
   assert.deepEqual(tags, {
@@ -278,7 +278,7 @@ test("provision creates a tagged sandbox that starts the agent", async () => {
       (c) =>
         c.startsWith("exec sh -c") &&
         c.includes(
-          `${AGENT} --supervise --tcp 127.0.0.1:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} `,
+          `${AGENT} --supervise --tcp 0.0.0.0:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} `,
         ),
     ),
   );
@@ -363,12 +363,13 @@ test("provision re-adopts its sandbox and refuses a mismatch", async () => {
 });
 
 // Egress requests map to Modal's create fields; ports and IPv6 are refused,
-// never widened; absent is deny all.
+// never widened; absent is deny all, as an empty CIDR allowlist (Modal gives
+// no connect token to a sandbox with `blockNetwork`).
 test("egress maps to create fields or is refused", () => {
   assert.deepEqual(networkFields({ mode: "open" }), {});
-  assert.deepEqual(networkFields(undefined), { blockNetwork: true });
+  assert.deepEqual(networkFields(undefined), { outboundCidrAllowlist: [] });
   assert.deepEqual(networkFields({ mode: "deny_all", direct: [] }), {
-    blockNetwork: true,
+    outboundCidrAllowlist: [],
   });
   assert.deepEqual(
     networkFields({

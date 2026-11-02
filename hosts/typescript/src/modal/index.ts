@@ -46,7 +46,10 @@ export const AGENT = "/opt/drydock/drydock-agent";
 export const SOCKET = "/run/drydock/agent.sock";
 /** The agent's TCP token, root's alone (0600). */
 export const TOKEN_FILE = "/run/drydock/tcp.token";
-/** The agent's TCP listener, which connect tokens route to. */
+/**
+ * The agent's TCP listener, which connect tokens route to. It listens on all
+ * addresses: Modal's edge cannot reach loopback, and the token gates the port.
+ */
 export const PORT = 7811;
 /** Where the agent's listener takes its handshake (drydock-transport's `CONNECT_PATH`). */
 export const CONNECT_PATH = "/v1/connect";
@@ -71,7 +74,7 @@ export const ENSURE_AGENT = [
   "umask 077",
   "mkdir -p /run/drydock",
   `if [ ! -s ${TOKEN_FILE} ]; then printf %s "$t" > ${TOKEN_FILE}.$$ && ln ${TOKEN_FILE}.$$ ${TOKEN_FILE} 2>/dev/null; rm -f ${TOKEN_FILE}.$$; fi`,
-  `${AGENT} --supervise --tcp 127.0.0.1:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} || exit 1`,
+  `${AGENT} --supervise --tcp 0.0.0.0:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} || exit 1`,
   `for i in $(seq 100); do [ -S ${SOCKET} ] && exec cat ${TOKEN_FILE}; sleep 0.1; done`,
   "exit 1",
 ].join("\n");
@@ -148,8 +151,10 @@ const resolveHost: Resolve = async (host) =>
 
 /**
  * Egress as Modal's create fields. An absent request is the protocol's
- * default, deny all. IPv4 CIDRs and literals become the CIDR allowlist and
- * names the domain allowlist; ports and IPv6 are refused, never widened.
+ * default, deny all: an empty CIDR allowlist, not `blockNetwork`, since Modal
+ * refuses a connect token (so the agent's reach) to a sandbox with a blocked
+ * network. IPv4 CIDRs and literals become the CIDR allowlist and names the
+ * domain allowlist; ports and IPv6 are refused, never widened.
  */
 export function networkFields(
   egress: Types["EgressRequest"] | undefined,
@@ -178,7 +183,7 @@ export function networkFields(
       refused("Modal egress policies cannot allow IPv6");
     else domains.add(host);
   }
-  if (!cidrs.size && !domains.size) return { blockNetwork: true };
+  if (!cidrs.size && !domains.size) return { outboundCidrAllowlist: [] };
   return {
     ...(cidrs.size && { outboundCidrAllowlist: [...cidrs].sort() }),
     ...(domains.size && { outboundDomainAllowlist: [...domains].sort() }),
@@ -187,9 +192,11 @@ export function networkFields(
 
 /** A tag-sized identity of a policy, and whether it denies everything. */
 function policyIdentity(fields: ReturnType<typeof networkFields>) {
-  if (fields.blockNetwork) return "deny";
-  if (!fields.outboundCidrAllowlist && !fields.outboundDomainAllowlist)
-    return "open";
+  const { outboundCidrAllowlist: cidrs, outboundDomainAllowlist: domains } =
+    fields;
+  if (fields.blockNetwork || (cidrs?.length === 0 && !domains?.length))
+    return "deny";
+  if (!cidrs && !domains) return "open";
   return `allow-${hex(JSON.stringify(fields)).slice(0, 24)}`;
 }
 

@@ -15,7 +15,7 @@
 //!
 //! With `--edge`, URL is instead an `https://` URL at the agent's
 //! `/v1/connect` behind a provider's edge that splices bytes after the
-//! agent's 101, its credential in the query (as a Modal connect token's
+//! agent's 101 to a WebSocket upgrade, its credential in the query (as a Modal connect token's
 //! `_modal_connect_token`), as drydockd follows a dial reach. The same checks
 //! run, with no frames, and the wrong key is a wrong query value.
 use drydock_agent::{Client, FileOptions};

@@ -3,7 +3,12 @@
 // observed (drydock#192), so the module fails here as it would there.
 import { createHash } from "node:crypto";
 import { Duplex, PassThrough } from "node:stream";
-import { AlreadyExistsError, InvalidError, NotFoundError } from "modal";
+import {
+  AlreadyExistsError,
+  ConflictError,
+  InvalidError,
+  NotFoundError,
+} from "modal";
 import type {
   App,
   Box,
@@ -290,12 +295,17 @@ export class StandIn implements Vendor {
         standIn.processes.push(process);
         return process;
       },
-      // Modal's edge forwards to `port` in the sandbox, for its token.
+      // Modal's edge forwards to `port` in the sandbox, for its token; never
+      // to a sandbox whose network is blocked.
       async connectToken(port: number) {
         const row = standIn.row(id);
         if (!Number.isInteger(port) || port < 1 || port > 65535)
           throw new InvalidError(`port ${port} out of range`);
         if (row.exit !== null) throw new ClientError(9, "sandbox has finished");
+        if (row.params.blockNetwork)
+          throw new ConflictError(
+            "Cannot create a connect token for a Sandbox with blocked network access",
+          );
         const token = `ct-${standIn.connects.length + 1}`;
         standIn.connects.push({ id, port, token });
         return { url: `https://${id}.modal.test`, token };

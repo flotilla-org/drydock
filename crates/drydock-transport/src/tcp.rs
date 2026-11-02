@@ -84,12 +84,16 @@ impl Token {
 }
 
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    encode(bytes, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+}
+
+/// Unpadded base64 in `alphabet`.
+fn encode(bytes: &[u8], alphabet: &[u8; 64]) -> String {
     let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..=chunk.len() {
-            text.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            text.push(alphabet[(n >> (18 - 6 * i) & 63) as usize] as char);
         }
     }
     text
@@ -101,7 +105,7 @@ fn base64url(bytes: &[u8]) -> String {
 /// does, so the agent's client takes it. A refused token is
 /// `PermissionDenied`.
 pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream> {
-    match handshake(stream, CONNECT_PATH, PROTOCOL, token).await? {
+    match handshake(stream, CONNECT_PATH, PROTOCOL, Upgrade::Agent, token).await? {
         Ok(stream) => Ok(stream),
         Err((StatusCode::UNAUTHORIZED, _)) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token")),
         Err((status, _)) => Err(io::Error::other(format!("the agent's tcp listener answered {status}"))),
@@ -112,7 +116,9 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
 /// provider's edge that forwards a request to a guest port and splices the
 /// bytes after the agent's 101: the request goes to `url`'s path and query
 /// (the path must be [`CONNECT_PATH`] when it reaches the agent) with its
-/// authority as `Host`. A credential the proxy wants rides in the query, since
+/// authority as `Host`. It is a WebSocket upgrade request, since such edges
+/// splice only those (Modal's answers any other upgrade and closes); the
+/// agent accepts it and both ends still carry raw bytes, unframed. A credential the proxy wants rides in the query, since
 /// `Authorization` carries the agent's token. A 401 or 403, the agent's or
 /// the proxy's, is `PermissionDenied`; its text names the status and the
 /// start of the answer, never `url`.
@@ -125,7 +131,7 @@ pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Res
         return Err(invalid("must not carry userinfo"));
     }
     let target = uri.path_and_query().map_or(CONNECT_PATH, |p| p.as_str());
-    match handshake(stream, target, authority.as_str(), token).await? {
+    match handshake(stream, target, authority.as_str(), Upgrade::WebSocket, token).await? {
         Ok(stream) => Ok(stream),
         Err((status, body)) => {
             let kind = match status {
@@ -143,9 +149,26 @@ pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Res
 /// any provider text before logging it.
 const REFUSAL_CHARS: usize = 200;
 
+/// The upgrade a handshake asks for.
+enum Upgrade {
+    /// `Upgrade: drydock-agent`, for the agent's listener itself.
+    Agent,
+    /// A WebSocket upgrade request (RFC 6455: version 13 and a fresh random
+    /// key), for proxies that splice only those. The answer's
+    /// `Sec-WebSocket-Accept` is not checked: the agent sends none, and the
+    /// token, not the key, is what proves the far end.
+    WebSocket,
+}
+
 /// Sends the handshake request for `target` with `host`; the switched stream,
 /// or the status and start of the body that refused it.
-async fn handshake(stream: ByteStream, target: &str, host: &str, token: &Token) -> io::Result<Result<ByteStream, (StatusCode, String)>> {
+async fn handshake(
+    stream: ByteStream,
+    target: &str,
+    host: &str,
+    upgrade: Upgrade,
+    token: &Token,
+) -> io::Result<Result<ByteStream, (StatusCode, String)>> {
     use http_body_util::BodyExt;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(io::Error::other)?;
     // The connection task ends by handing its bytes to the upgrade; on any
@@ -157,10 +180,17 @@ async fn handshake(stream: ByteStream, target: &str, host: &str, token: &Token) 
         }
     }
     let _driver = Abort(tokio::spawn(connection.with_upgrades()));
-    let request = Request::get(target)
-        .header(header::HOST, host)
-        .header(header::CONNECTION, "upgrade")
-        .header(header::UPGRADE, PROTOCOL)
+    let request = Request::get(target).header(header::HOST, host).header(header::CONNECTION, "upgrade");
+    let request = match upgrade {
+        Upgrade::Agent => request.header(header::UPGRADE, PROTOCOL),
+        Upgrade::WebSocket => {
+            let mut key = [0u8; 16];
+            getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
+            let key = encode(&key, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") + "==";
+            request.header(header::UPGRADE, "websocket").header(header::SEC_WEBSOCKET_VERSION, "13").header(header::SEC_WEBSOCKET_KEY, key)
+        }
+    };
+    let request = request
         .header(header::AUTHORIZATION, format!("Bearer {}", token.secret()))
         .body(Empty::<Bytes>::new())
         .map_err(io::Error::other)?;

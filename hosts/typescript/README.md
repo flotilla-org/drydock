@@ -162,8 +162,8 @@ and sandbox backend from those, so run the host without them.
   Either way the module then starts the agent by a root exec that gets a
   fresh TCP token on stdin: it keeps the token already in
   `/run/drydock/tcp.token` (0600) or writes this one, runs
-  `--supervise --tcp 127.0.0.1:7811 --tcp-token-file … --socket …`
-  (idempotent), waits for the socket and prints the token in use, which the
+  `--supervise --tcp 0.0.0.0:7811 --tcp-token-file … --socket …`
+  (idempotent; all addresses, since Modal's edge cannot reach loopback), waits for the socket and prints the token in use, which the
   module remembers. The token is never on an argv, in the environment or in
   Modal's configuration. A sandbox it just created and cannot hand over is
   terminated (if that terminate fails too, the sandbox stays listed: `destroy`
@@ -173,11 +173,13 @@ and sandbox backend from those, so run the host without them.
   which drydock dials itself. Each reach mints a connect token for port 7811
   and returns its URL at `/v1/connect` with the token in the
   `_modal_connect_token` query parameter, and the agent's token as the
-  reach's; the edge splices the bytes after the agent's 101. A host that lost
+  reach's. drydock asks for a WebSocket upgrade, the only kind the edge
+  splices, and both ends carry raw bytes after the agent's 101. A host that lost
   the token (a restart) reads it back by the same exec. Exec carries no agent
   traffic: each stdin write is one round trip, too slow for agent uploads. A
   reach to a terminated sandbox is refused, not retried.
-- Egress: open sets nothing; deny all is `blockNetwork`; IPv4 CIDRs and
+- Egress: open sets nothing; deny all is an empty CIDR allowlist (Modal
+  refuses a connect token to a sandbox with `blockNetwork`); IPv4 CIDRs and
   literals become the CIDR allowlist and names the domain allowlist; ports and
   IPv6 are refused. Destinations are enforced outside the guest, against root,
   by a transparent proxy (a connect succeeds; an unlisted destination is reset

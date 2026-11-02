@@ -195,8 +195,9 @@ print(json.dumps({"uid": os.getuid(), "dns": dns(sys.argv[1]),
                   "tcp": {f"{h}:{p}": tcp(h, int(p)) for h, p in (t.rsplit(":", 1) for t in sys.argv[2:])}}))
 """
 
-# The image's agent and the running agents (not their supervisor), by digest,
-# and whether any process's argv holds the token given on stdin.
+# The installed agent, the one an upgrade replaced (activation keeps it as
+# .prev; null if none did), and the running agents (not their supervisor), by
+# digest, and whether any process's argv holds the token given on stdin.
 AGENTS = r"""
 import hashlib, json, os, sys
 token = sys.stdin.read().strip()
@@ -210,7 +211,9 @@ for pid in filter(str.isdigit, os.listdir("/proc")):
             running.append(digest(f"/proc/{pid}/exe"))
     except OSError:
         pass
-print(json.dumps({"image": digest("/opt/drydock/drydock-agent"), "running": sorted(set(running)), "exposed": exposed}))
+agent = "/opt/drydock/drydock-agent"
+prev = digest(agent + ".prev") if os.path.exists(agent + ".prev") else None
+print(json.dumps({"installed": digest(agent), "prev": prev, "running": sorted(set(running)), "exposed": exposed}))
 """
 PORT = 7811
 TOKEN_FILE = "/run/drydock/tcp.token"
@@ -302,12 +305,21 @@ def main():
         # pushed --agent over it when the image's agent was another build.
         pushed = sha256(options.agent)
         found = agents(client, launched["id"])
-        print(f"agents: image {found and found['image'][:16]}…, running {found and [d[:16] for d in found['running']]}, pushed {pushed[:16]}…", flush=True)
-        if found and found["image"] == pushed:
+        short = lambda d: d and d[:16]
+        print(
+            f"agents: replaced {found and short(found['prev'])}, installed {found and short(found['installed'])}, "
+            f"running {found and [short(d) for d in found['running']]}, pushed {short(pushed)}",
+            flush=True,
+        )
+        if found and found["prev"] is None and found["installed"] == pushed:
             check(False, "an agent upgrade was exercised: the image already holds --agent; build drydockd with a tools image whose agent is older")
         else:
             check(
-                found is not None and found["running"] == [pushed] and launch_seconds < 45,
+                found is not None
+                and found["prev"] not in (None, pushed)
+                and found["installed"] == pushed
+                and found["running"] == [pushed]
+                and launch_seconds < 45,
                 f"the image's agent was upgraded to --agent through the edge within launch's {launch_seconds:.1f}s (under 45 s; drydockd allows 60 s)",
             )
 
@@ -384,7 +396,13 @@ def main():
                 for sandbox in modal.Sandbox.list(app_id=app.app_id, client=client):
                     print(f"terminating leftover sandbox {sandbox.object_id}", flush=True)
                     sandbox.terminate()
-                left = [s.object_id for s in modal.Sandbox.list(app_id=app.app_id, client=client)]
+                # Termination is asynchronous: give the list time to empty.
+                deadline = time.time() + 60
+                while True:
+                    left = [s.object_id for s in modal.Sandbox.list(app_id=app.app_id, client=client)]
+                    if not left or time.time() > deadline:
+                        break
+                    time.sleep(2)
             check(left == [], f"Modal lists no sandboxes in app {options.app}: {left}")
         except Exception as error:
             check(False, f"listing app {options.app} through Modal: {error!r}")
