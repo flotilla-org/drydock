@@ -33,11 +33,24 @@ async fn main() -> io::Result<()> {
     let mut socket = PathBuf::from("/run/drydock/agent.sock");
     let mut vsock = None;
     let mut store = None;
+    let (mut tcp, mut token_file) = (None, None);
     let mut options = args.iter();
     while let Some(flag) = options.next() {
         match flag.to_str() {
             Some("--socket") => socket = options.next().ok_or_else(|| io::Error::other("--socket requires a path"))?.into(),
             Some("--store") => store = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other("--store requires a path"))?)),
+            Some("--tcp") => {
+                tcp = Some(
+                    options
+                        .next()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+                        .ok_or_else(|| io::Error::other("--tcp requires ADDR:PORT"))?,
+                )
+            }
+            Some("--tcp-token-file") => {
+                token_file = Some(PathBuf::from(options.next().ok_or_else(|| io::Error::other("--tcp-token-file requires a path"))?))
+            }
             Some("--vsock-port") => {
                 vsock = Some(
                     options
@@ -47,9 +60,20 @@ async fn main() -> io::Result<()> {
                         .ok_or_else(|| io::Error::other("--vsock-port requires a port"))?,
                 )
             }
-            _ => return Err(io::Error::other("usage: drydock-agent [--socket PATH] [--vsock-port PORT] [--store DIR]")),
+            _ => {
+                return Err(io::Error::other(
+                    "usage: drydock-agent [--socket PATH] [--vsock-port PORT] [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH]",
+                ));
+            }
         }
     }
+    // Read before anything is bound, so a bad token file refuses startup.
+    let tcp = match (tcp, token_file) {
+        (Some(address), Some(path)) => Some((address, drydock_agent::tcp::Token::read(&path)?)),
+        (None, None) => None,
+        (Some(_), None) => return Err(io::Error::other("--tcp requires --tcp-token-file")),
+        (None, Some(_)) => return Err(io::Error::other("--tcp-token-file requires --tcp")),
+    };
     drydock_agent::socket::private_directory(
         socket
             .parent()
@@ -81,6 +105,9 @@ async fn main() -> io::Result<()> {
     let mut agent = Agent::new(listener, fingerprint, executable.clone()).with_holder(socket.to_string_lossy().into_owned());
     if let Some(store) = store {
         agent = agent.with_store(store);
+    }
+    if let Some((address, token)) = tcp {
+        agent.add_listener(drydock_agent::tcp::TokenListener::bind(address, token).await?);
     }
     #[cfg(target_os = "linux")]
     if let Some(port) = vsock {

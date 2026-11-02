@@ -10,17 +10,59 @@ use std::{
 
 /// The supervised socket, which comes last: every process of a vessel's
 /// agent ends its argv with `--socket PATH`, so a host can find them all by
-/// it. Options before it (`--store DIR`) are the agent's, passed on to every
-/// agent the supervisor starts.
+/// it. Options before it (`--store DIR`, `--tcp ADDR:PORT`,
+/// `--tcp-token-file PATH`) are the agent's, passed on to every agent the
+/// supervisor starts.
 fn socket(args: &[OsString]) -> io::Result<PathBuf> {
-    match args {
-        [socket, path] | [_, _, socket, path] if socket == "--socket" && (args.len() == 2 || args[0] == "--store") => Ok(path.into()),
-        _ => Err(io::Error::other("usage: drydock-agent --supervise [--store DIR] --socket PATH")),
+    const OPTIONS: &[&str] = &["--store", "--tcp", "--tcp-token-file"];
+    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH] --socket PATH");
+    let [options @ .., flag, path] = args else { return Err(usage()) };
+    let names: Vec<_> = options.chunks(2).map(|pair| &pair[0]).collect();
+    if flag != "--socket"
+        || options.len() % 2 != 0
+        || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
+        || (1..names.len()).any(|i| names[..i].contains(&names[i]))
+    {
+        return Err(usage());
+    }
+    if let Some(pair) = args.chunks(2).find(|pair| pair[1].as_encoded_bytes().starts_with(b"--")) {
+        return Err(io::Error::other(format!(
+            "{} takes a value, not {:?}; name a path beginning with -- as ./--…",
+            pair[0].display(),
+            pair[1]
+        )));
+    }
+    Ok(path.into())
+}
+
+/// Refuses a TCP listener the agent would refuse, before detaching, so the
+/// provider's bootstrap hears of it rather than a supervisor that restarts
+/// a failing agent for ever.
+fn check_tcp(args: &[OsString]) -> io::Result<()> {
+    let value = |name: &str| args.chunks(2).find(|pair| pair[0] == name).and_then(|pair| pair.get(1));
+    match (value("--tcp"), value("--tcp-token-file")) {
+        (Some(address), Some(path)) => {
+            address
+                .to_str()
+                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                .ok_or_else(|| io::Error::other("--tcp requires ADDR:PORT"))?;
+            // Every agent the supervisor restarts reads it again, so it must
+            // not depend on the directory bootstrap ran in.
+            let path = std::path::Path::new(path);
+            if !path.is_absolute() {
+                return Err(io::Error::other("--supervise requires an absolute --tcp-token-file"));
+            }
+            drydock_agent::tcp::Token::read(path).map(drop)
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(io::Error::other("--tcp requires --tcp-token-file")),
+        (None, Some(_)) => Err(io::Error::other("--tcp-token-file requires --tcp")),
     }
 }
 
 pub fn start(args: &[OsString]) -> io::Result<()> {
     let path = socket(args)?;
+    check_tcp(args)?;
     let parent = path.parent().ok_or_else(|| io::Error::other("socket needs a directory"))?;
     drydock_agent::socket::private_directory(parent)?;
     let log = std::fs::OpenOptions::new()
