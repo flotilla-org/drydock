@@ -432,7 +432,8 @@ impl Tensorlake {
     }
     /// Starts the agent as root, supervised, listening on the guest's
     /// loopback for the tunnel, with a token only root can read. A token file
-    /// already there is kept, so a running agent (after resume, or another
+    /// already there is kept when it holds a token (one that doesn't would
+    /// stop every agent start, so it is replaced), so a running agent (after resume, or another
     /// host's bootstrap) keeps answering to it; whichever token the file
     /// holds is read back. The supervisor's lock makes this idempotent.
     /// `--supervise` returns at once: it spawns the supervisor in its own
@@ -444,7 +445,8 @@ impl Tensorlake {
         let port = self.settings.tunnel_port;
         let script = format!(
             "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
-             if [ ! -s {TOKEN_FILE} ]; then (umask 077; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}); fi && \
+             if ! grep -Eqx '[A-Za-z0-9_-]{{43,}}={{0,2}}' {TOKEN_FILE} 2>/dev/null; then \
+             rm -f {TOKEN_FILE} && (umask 077; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}); fi && \
              echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
              exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
              --tcp 127.0.0.1:{port} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
@@ -1076,6 +1078,9 @@ impl Provider for Tensorlake {
 impl SuspendResume for Tensorlake {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
         let status = text(&self.sandbox(id, c).await?, "status")?.to_owned();
+        if matches!(status.as_str(), "pending" | "resuming") {
+            return Err(ProtocolError::unavailable(format!("Tensorlake sandbox {id} is {status}"), Some(5)));
+        }
         if status == "running" {
             self.call(Method::POST, self.api(&["sandboxes", id, "suspend"])?, None, c).await?;
         }

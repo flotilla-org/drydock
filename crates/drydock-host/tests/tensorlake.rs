@@ -404,6 +404,27 @@ fn dockerfile_in(context: &[u8]) -> std::result::Result<String, String> {
     assert!(entries.next().is_none(), "the context holds only the Dockerfile");
     Ok(text)
 }
+/// The guest's token file after the bootstrap's own shell code (everything
+/// before it execs the agent) runs over it, with /run/drydock moved to a
+/// temporary directory.
+fn token_file_after(script: &str, existing: Option<&str>, token: Option<&Token>) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    let (prefix, _) = script.split_once(" && exec ")?;
+    let prefix = prefix.replace("/run/drydock", run.to_str()?).replace("/workspace", dir.path().join("workspace").to_str()?);
+    if let Some(existing) = existing {
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("tcp.token"), existing).unwrap();
+    }
+    let status = std::process::Command::new("sh")
+        .args(["-c", &prefix])
+        .env("DRYDOCK_TCP_TOKEN", token.map(Token::secret).unwrap_or_default())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "bootstrap's shell code failed: {prefix}");
+    std::fs::read_to_string(run.join("tcp.token")).ok()
+}
 /// What the guest's `drydock-agent --supervise` makes of the bootstrap's
 /// argv, through the supervisor's own parser: the agent's start, or the
 /// output and exit status of its refusal.
@@ -550,6 +571,9 @@ fn guest_plane(s: &mut State, name: &str, method: &str, path: &str, request: &re
         // Bootstrap reaches here only to report the token; StandIn::bootstrap starts the agent.
         let token = format!("drydock-tcp-token {}", sandbox.token_file.clone().unwrap_or_default());
         match supervise(&script) {
+            _ if sandbox.token_file.as_deref().map(Token::parse).is_some_and(|t| t.is_err()) => {
+                (vec![token, "drydock-agent: invalid TCP token file".into()], 1)
+            }
             _ if s.agent_missing => (vec![token, "env: '/opt/drydock/drydock-agent': No such file or directory".into()], 127),
             Ok(()) => (vec![token], 0),
             Err((output, code)) => (vec![token, output], code),
@@ -598,12 +622,10 @@ impl StandIn {
             s.violations.extend(problems);
             let starts = supervise(&script).is_ok() && !s.agent_missing;
             let Some(sandbox) = s.sandboxes.get_mut(&name).filter(|sb| sb.status == "running") else { return };
-            if sandbox.token_file.is_none() {
-                sandbox.token_file = token.map(|t| t.secret().to_owned());
-            }
+            sandbox.token_file = token_file_after(&script, sandbox.token_file.as_deref(), token.as_ref());
             sandbox.agent_port = port;
-            match (&sandbox.guest, &sandbox.token_file) {
-                (None, Some(token)) if starts => Some(Token::parse(token).unwrap()),
+            match (&sandbox.guest, sandbox.token_file.as_deref().map(Token::parse)) {
+                (None, Some(Ok(token))) if starts => Some(token),
                 _ => None,
             }
         };
@@ -1073,7 +1095,9 @@ async fn egress_requests_map_to_network_policies() {
 
 // Suspend waits for `suspended` and returns the deterministic marker; relay
 // to a suspended sandbox is refused rather than waking it; resume runs it
-// again, bootstraps, and the agent, its memory kept, answers.
+// again, bootstraps, and the agent, its memory kept, answers. A token file
+// holding no token is replaced at resume; a suspend while the sandbox is
+// pending is Unavailable.
 #[tokio::test]
 async fn suspend_and_resume_keep_the_agent_without_implicit_wakes() {
     let w = world().await;
@@ -1088,9 +1112,25 @@ async fn suspend_and_resume_keep_the_agent_without_implicit_wakes() {
     assert!(matches!(w.provider.relay(&environment.id, &w.credentials).await, Err(ProtocolError::Refused { .. })));
     let other = ResumeToken { token: Secret::new("tensorlake-resume-other") };
     assert!(port.resume(&environment.id, other, &w.credentials).await.is_err());
+    // A token file that holds no token, with its agent gone, is replaced
+    // at resume: kept, it would stop every agent start.
+    {
+        let mut s = w.stand_in.state();
+        let sandbox = s.sandboxes.get_mut(&environment.id).unwrap();
+        sandbox.token_file = Some("not a token\n".into());
+        sandbox.guest = None;
+    }
     port.resume(&environment.id, token, &w.credentials).await.unwrap();
     assert_eq!(w.provider.inspect(&environment.id, &w.credentials).await.unwrap().state, Observation::Running);
     w.agent(&environment.id).await;
+    // A sandbox still being created or resumed is only transitioning: retry later.
+    {
+        let mut s = w.stand_in.state();
+        let sandbox = s.sandboxes.get_mut(&environment.id).unwrap();
+        sandbox.status = "pending".into();
+        sandbox.pending_reads = u32::MAX;
+    }
+    assert!(matches!(port.suspend(&environment.id, &w.credentials).await, Err(ProtocolError::Unavailable { .. })));
 }
 
 // Destroy deletes the sandbox and every snapshot it left; while a snapshot
