@@ -1,7 +1,8 @@
 use std::{
+    ffi::OsString,
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 /// A dedicated run directory belongs to the agent's effective user. Refuse
 /// symlinks and sticky/shared directories rather than changing their protection.
@@ -51,6 +52,34 @@ where
         }
     }
     output.flush().await
+}
+
+/// The supervised socket, which comes last: every process of a vessel's
+/// agent ends its argv with `--socket PATH`, so a host can find them all by
+/// it. Options before it (`--store DIR`, `--tcp ADDR:PORT`,
+/// `--tcp-token-file PATH`) are the agent's, passed on to every agent the
+/// supervisor starts. `args` are those after `--supervise`; the
+/// supervisor and providers' stand-ins parse them alike.
+pub fn supervised(args: &[OsString]) -> io::Result<PathBuf> {
+    const OPTIONS: &[&str] = &["--store", "--tcp", "--tcp-token-file"];
+    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH] --socket PATH");
+    let [options @ .., flag, path] = args else { return Err(usage()) };
+    let names: Vec<_> = options.chunks(2).map(|pair| &pair[0]).collect();
+    if flag != "--socket"
+        || options.len() % 2 != 0
+        || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
+        || (1..names.len()).any(|i| names[..i].contains(&names[i]))
+    {
+        return Err(usage());
+    }
+    if let Some(pair) = args.chunks(2).find(|pair| pair[1].as_encoded_bytes().starts_with(b"--")) {
+        return Err(io::Error::other(format!(
+            "{} takes a value, not {:?}; name a path beginning with -- as ./--…",
+            pair[0].display(),
+            pair[1]
+        )));
+    }
+    Ok(path.into())
 }
 
 #[cfg(test)]

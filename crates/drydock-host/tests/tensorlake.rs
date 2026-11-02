@@ -95,6 +95,7 @@ struct Build {
     context: Option<Vec<u8>>,
     credentials: Option<Value>,
     polls_left: u32,
+    error: Option<String>,
 }
 
 #[derive(Default)]
@@ -116,6 +117,8 @@ struct State {
     /// Raw bytes an exec prints, and its exit code.
     exec_output: Vec<u8>,
     exec_exit: i64,
+    /// The tools layer is missing from the image, so the bootstrap's exec fails.
+    agent_missing: bool,
     /// Every image name asked for already exists, as after an earlier
     /// prepare; tests of prepare itself start without.
     images_exist: bool,
@@ -324,9 +327,17 @@ impl StandIn {
                 if digest.as_deref() != Some(&actual) {
                     return proxy_error(400, "context digest mismatch");
                 }
-                build.dockerfile = Some(dockerfile_in(context));
+                match dockerfile_in(context) {
+                    Ok(dockerfile) => {
+                        build.dockerfile = Some(dockerfile);
+                        build.status = "running".into();
+                    }
+                    Err(error) => {
+                        build.error = Some(error);
+                        build.status = "failed".into();
+                    }
+                }
                 build.sealed_digest = digest;
-                build.status = "running".into();
                 json_reply(200, json!({"build_id": id, "status": "running"}))
             }
             ("GET", ["images", "v4", "builds", id]) => {
@@ -342,6 +353,7 @@ impl StandIn {
                     }
                 }
                 let (name, status) = (build.name.clone(), build.status.clone());
+                let failure = build.error.clone().or(failure);
                 if status == "succeeded" && !s.images.contains_key(&name) {
                     let id = s.id("image_");
                     s.images.insert(name.clone(), json!({"id": id, "name": name, "snapshot_id": "snap-image", "global": false, "physical_size_bytes": 42, "logical_size_bytes": 10_737_418_240u64, "created_at": "2026-11-02T00:00:00.000Z", "updated_at": "2026-11-02T00:00:00.000Z"}));
@@ -374,16 +386,32 @@ fn find<'a>(s: &'a mut State, key: &str) -> Option<&'a mut Sandbox> {
     let name = s.sandboxes.values().find(|sandbox| sandbox.name == key || sandbox.id == key)?.name.clone();
     s.sandboxes.get_mut(&name)
 }
-/// The Dockerfile from a plain tar build context.
-fn dockerfile_in(context: &[u8]) -> String {
+/// The Dockerfile from a plain tar build context. Tensorlake's builder
+/// decodes every entry's numeric fields, and fails the build on one that
+/// isn't a number.
+fn dockerfile_in(context: &[u8]) -> std::result::Result<String, String> {
     let mut archive = tar::Archive::new(context);
     let mut entries = archive.entries().unwrap();
     let mut entry = entries.next().expect("the context holds the Dockerfile").unwrap();
+    for (field, value) in [("uid", entry.header().uid()), ("gid", entry.header().gid())] {
+        if value.is_err() {
+            return Err(format!("decode {field}: numeric field was not a number"));
+        }
+    }
     assert_eq!(entry.path().unwrap().to_str(), Some("Dockerfile"));
     let mut text = String::new();
     std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
     assert!(entries.next().is_none(), "the context holds only the Dockerfile");
-    text
+    Ok(text)
+}
+/// What the guest's `drydock-agent --supervise` makes of the bootstrap's
+/// argv, through the supervisor's own parser: the agent's start, or the
+/// output and exit status of its refusal.
+fn supervise(script: &str) -> std::result::Result<(), (String, i64)> {
+    const EXEC: &str = "exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise ";
+    let Some((_, argv)) = script.split_once(EXEC) else { return Err((format!("sh: unexpected bootstrap {script}"), 2)) };
+    let argv: Vec<std::ffi::OsString> = argv.split_whitespace().map(Into::into).collect();
+    drydock_agent::socket::supervised(&argv).map(drop).map_err(|e| (e.to_string(), 1))
 }
 fn create(s: &mut State, body: Value) -> http::Response<Bytes> {
     s.creates.push(body.clone());
@@ -520,7 +548,12 @@ fn guest_plane(s: &mut State, name: &str, method: &str, path: &str, request: &re
         (vec![json!({"uid": 0, "unlisted_canary": false, "raw_dns": false, "listed_direct": true}).to_string()], 0)
     } else if script.contains("--supervise") {
         // Bootstrap reaches here only to report the token; StandIn::bootstrap starts the agent.
-        (vec![format!("drydock-tcp-token {}", sandbox.token_file.clone().unwrap_or_default())], 0)
+        let token = format!("drydock-tcp-token {}", sandbox.token_file.clone().unwrap_or_default());
+        match supervise(&script) {
+            _ if s.agent_missing => (vec![token, "env: '/opt/drydock/drydock-agent': No such file or directory".into()], 127),
+            Ok(()) => (vec![token], 0),
+            Err((output, code)) => (vec![token, output], code),
+        }
     } else {
         let output = String::from_utf8_lossy(&s.exec_output).into_owned();
         (output.lines().map(str::to_owned).collect(), s.exec_exit)
@@ -548,8 +581,8 @@ impl StandIn {
             if body["user"] != "root" {
                 problems.push("the agent must start as root".to_owned());
             }
-            if !script.contains("env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock")
-                || !script.contains("--tcp-token-file /run/drydock/tcp.token")
+            if !script.contains("--tcp-token-file /run/drydock/tcp.token")
+                || !script.contains("--socket /run/drydock/agent.sock")
                 || !script.contains("umask 077")
             {
                 problems.push(format!("unexpected bootstrap {script}"));
@@ -563,13 +596,14 @@ impl StandIn {
                 problems.push("the token is on the agent's argv".into());
             }
             s.violations.extend(problems);
+            let starts = supervise(&script).is_ok() && !s.agent_missing;
             let Some(sandbox) = s.sandboxes.get_mut(&name).filter(|sb| sb.status == "running") else { return };
             if sandbox.token_file.is_none() {
                 sandbox.token_file = token.map(|t| t.secret().to_owned());
             }
             sandbox.agent_port = port;
             match (&sandbox.guest, &sandbox.token_file) {
-                (None, Some(token)) => Some(Token::parse(token).unwrap()),
+                (None, Some(token)) if starts => Some(Token::parse(token).unwrap()),
                 _ => None,
             }
         };
@@ -808,6 +842,12 @@ async fn prepare_builds_once_then_finds_the_image_by_name() {
     let again = w.prepared().await;
     assert_eq!(again.id, first.id);
     assert_eq!(w.stand_in.state().builds.len(), 1, "found by name, not rebuilt");
+    // A new tools pin is a new image: one baked with the old tools layer is not reused.
+    let mut retooled = prepare_request(None);
+    retooled.tools_digest = format!("ghcr.io/flotilla-org/drydock-tools@sha256:{}", "5".repeat(64));
+    let retooled = w.provider.prepare(retooled, &w.credentials).await.unwrap();
+    assert_ne!(retooled.id, first.id);
+    assert_eq!(w.stand_in.state().builds.len(), 2);
 }
 
 // A failed build is a refusal carrying the Image Service's error.
@@ -857,6 +897,19 @@ async fn the_pull_credential_names_only_the_base_registry() {
     assert_eq!(auths.keys().collect::<Vec<_>>(), ["registry.example.com"]);
     let auth = base64::engine::general_purpose::STANDARD.decode(auths["registry.example.com"]["auth"].as_str().unwrap()).unwrap();
     assert_eq!(auth, b"robot:pull-secret");
+}
+
+// A bootstrap whose agent doesn't start fails provision with the guest's
+// output as its cause, so drydockd's log says why, and never the token.
+#[tokio::test]
+async fn a_failed_bootstrap_reports_the_guests_output() {
+    let w = world().await;
+    w.stand_in.state().agent_missing = true;
+    let error = w.provision("vessel-1", size(1.0, 1, 10), EgressRequest::Open).await.unwrap_err();
+    let token = w.stand_in.state().sandboxes.values().next().unwrap().token_file.clone().unwrap();
+    let ProtocolError::Internal { provider_error, .. } = &error else { panic!("{error:?}") };
+    assert!(provider_error.contains("drydock-agent': No such file or directory"), "{provider_error}");
+    assert!(!error.to_string().contains(&token), "{error}");
 }
 
 // Provision creates a named sandbox with the plan's longest idle timeout,

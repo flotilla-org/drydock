@@ -43,6 +43,8 @@ const STATE_POLL: Duration = Duration::from_secs(1);
 const STATE_POLLS: u32 = 120;
 /// Guest commands must finish inside the host's 30-second HTTP deadline.
 const RUN_TIMEOUT_SECS: u64 = 25;
+/// How much of a failed bootstrap's output its error carries.
+const OUTPUT_CAUSE_CHARS: usize = 500;
 
 /// The module, with the WebSocket dialer its tunnels use: TLS in production,
 /// an in-process stand-in in tests.
@@ -436,6 +438,7 @@ impl Tensorlake {
     /// `--supervise` returns at once: it spawns the supervisor in its own
     /// process group with stdin closed and output to its log
     /// (drydock-agent's supervisor.rs, `start`), so the run ends with it.
+    /// Its argv ends with `--socket`, as the supervisor requires.
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
         let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
         let port = self.settings.tunnel_port;
@@ -443,10 +446,11 @@ impl Tensorlake {
             "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
              if [ ! -s {TOKEN_FILE} ]; then (umask 077; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}); fi && \
              echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
-             exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock \
-             --tcp 127.0.0.1:{port} --tcp-token-file {TOKEN_FILE}"
+             exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
+             --tcp 127.0.0.1:{port} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
         );
-        let run = self.run(id, &script, BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c).await?.success()?;
+        let run =
+            self.run(id, &script, BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c).await?.started("bootstrap")?;
         let token = run.token()?;
         self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_owned(), token.clone());
         Ok(token)
@@ -455,7 +459,8 @@ impl Tensorlake {
         if let Some(token) = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
             return Ok(token.clone());
         }
-        let token = self.run(id, &format!("echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\""), BTreeMap::new(), c).await?.success()?.token()?;
+        let token =
+            self.run(id, &format!("echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\""), BTreeMap::new(), c).await?.started("token read")?.token()?;
         self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_owned(), token.clone());
         Ok(token)
     }
@@ -597,21 +602,38 @@ impl Run {
     }
     /// Exit 0, or CommandFailed with the merged output.
     fn success(self) -> Result<Self> {
-        match self.exit {
-            Some((Some(0), _)) => Ok(self),
-            exit => {
-                let exit_code = match exit {
-                    Some((Some(code), _)) => i32::try_from(code).unwrap_or(-1),
-                    Some((None, Some(signal))) => 128 + i32::try_from(signal).unwrap_or(0),
-                    _ => -1,
-                };
-                Err(ProtocolError::CommandFailed {
-                    reason: "Tensorlake guest command failed".into(),
-                    exit_code,
-                    output: Secret::new(self.output()),
-                })
-            }
+        if self.exit_code() == 0 {
+            return Ok(self);
         }
+        Err(ProtocolError::CommandFailed {
+            reason: "Tensorlake guest command failed".into(),
+            exit_code: self.exit_code(),
+            output: Secret::new(self.output()),
+        })
+    }
+    /// The shell's convention: the code, 128 + a signal, or -1 when the stream ended without either.
+    fn exit_code(&self) -> i32 {
+        match self.exit {
+            Some((Some(code), _)) => i32::try_from(code).unwrap_or(-1),
+            Some((None, Some(signal))) => 128 + i32::try_from(signal).unwrap_or(0),
+            _ => -1,
+        }
+    }
+    /// Exit 0, or for the module's own guest commands an Internal error
+    /// whose cause is the output's tail, so drydockd's log shows why. Token
+    /// lines are left out.
+    fn started(self, what: &str) -> Result<Self> {
+        if self.exit_code() == 0 {
+            return Ok(self);
+        }
+        let output: Vec<_> =
+            self.lines.iter().map(|(_, line)| line.as_str()).filter(|line| !line.contains(TOKEN_LINE.trim_end())).collect();
+        let output = output.join("\n");
+        let tail: String = output.chars().rev().take(OUTPUT_CAUSE_CHARS).collect::<Vec<_>>().into_iter().rev().collect();
+        Err(ProtocolError::Internal {
+            reason: format!("Tensorlake guest {what} exited {}", self.exit_code()),
+            provider_error: if tail.is_empty() { "no output".into() } else { tail },
+        })
     }
     fn token(&self) -> Result<Token> {
         let line = self.lines.iter().find_map(|(stderr, line)| line.strip_prefix(TOKEN_LINE).filter(|_| !stderr));
@@ -628,6 +650,9 @@ fn build_context(dockerfile: &str) -> Result<Vec<u8>> {
     let mut header = tar::Header::new_ustar();
     header.set_size(dockerfile.len() as u64);
     header.set_mode(0o644);
+    // Tensorlake's builder decodes every numeric field; ustar leaves these NUL.
+    header.set_uid(0);
+    header.set_gid(0);
     header.set_mtime(0);
     header.set_cksum();
     let internal = |e: std::io::Error| ProtocolError::Internal { reason: "build context".into(), provider_error: e.to_string() };
@@ -816,10 +841,11 @@ fn unbase32(text: &str) -> Option<Vec<u8>> {
     // Leftover bits are padding, and must be zero, so each text has one decoding.
     (buffer & ((1 << bits) - 1) == 0).then_some(bytes)
 }
-/// The prepared image's name: one per base image and platform. The tools
-/// image is not part of it; its agent is upgraded at the first hello.
-fn image_name(image: &str, platform: &Platform) -> String {
-    format!("dd-{}", &digest(&format!("{image}\0{platform}"))[..40])
+/// The prepared image's name: one per base image, tools image and
+/// platform, so a new tools pin builds a new image rather than reusing one
+/// baked with the old tools layer.
+fn image_name(image: &str, tools: &str, platform: &Platform) -> String {
+    format!("dd-{}", &digest(&format!("{image}\0{tools}\0{platform}"))[..40])
 }
 fn shell_command(command: &[String]) -> String {
     command.iter().map(|s| format!("'{}'", s.replace('\'', "'\"'\"'"))).collect::<Vec<_>>().join(" ")
@@ -896,7 +922,7 @@ impl Provider for Tensorlake {
             )));
         }
         self.resources(&r.size)?;
-        let name = image_name(&r.image_digest, &platform);
+        let name = image_name(&r.image_digest, &r.tools_digest, &platform);
         if self.image(&name, c).await?.is_none() {
             self.build(&r, &base, &name, c).await?;
         }
@@ -906,7 +932,7 @@ impl Provider for Tensorlake {
         if r.prepared.provider != self.name {
             return Err(refused("prepared image belongs to another provider"));
         }
-        if r.prepared.id != image_name(&r.prepared.image_digest, &r.prepared.platform) {
+        if r.prepared.id != image_name(&r.prepared.image_digest, &r.prepared.tools_digest, &r.prepared.platform) {
             return Err(refused("prepared image is not this provider's"));
         }
         let resources = self.resources(&r.size)?;

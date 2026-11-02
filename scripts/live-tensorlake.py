@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Live check of the Tensorlake module through drydockd and drydock.
 
-    scripts/live-tensorlake.py KEY_FILE --organization-id ID [--bin-dir DIR] [--image IMAGE]
+    scripts/live-tensorlake.py KEY_FILE --organization-id ID [--bin-dir DIR] [--agent PATH] [--image IMAGE]
 
 KEY_FILE holds a Tensorlake project API key; ID is its organization (shown by
 `tl whoami`, or `POST /platform/v1/keys/introspect`). DIR holds drydock,
 drydockd and drydock-host built from this branch (default target/release,
-from `cargo build --release -p drydock -p drydock-host`). IMAGE is a public
+from `cargo build --release -p drydock -p drydock-host -p drydock-agent`).
+PATH is a linux/amd64 drydock-agent, which launch pushes into the vessel; by
+default $DRYDOCK_AGENT_BIN_LINUX_AMD64, else DIR/drydock-agent-linux-amd64,
+else DIR/drydock-agent on a Linux x86_64 host. IMAGE is a public
 linux/amd64 image with a glibc userland, bash and curl, pinned by digest
 (default buildpack-deps:bookworm-curl as of 2026-11-02). Only the Python standard library is needed.
 
@@ -35,6 +38,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 import secrets
 import shutil
 import signal
@@ -54,6 +58,10 @@ PREFIX = f"dd-{hashlib.sha256(INSTANCE.encode()).hexdigest()[:8]}-"
 FAILED = []
 # buildpack-deps:bookworm-curl on 2026-11-02.
 IMAGE = "docker.io/library/buildpack-deps@sha256:f5c5d07ea24ee91272739fe451c280aa4b7fa5120b9278815db5fcd713d83772"
+
+
+class Stop(Exception):
+    """A check failed that later checks depend on; cleanup and the summary still run."""
 
 
 def check(condition, message):
@@ -121,7 +129,7 @@ class UnixConnection(http.client.HTTPConnection):
 
 
 class Drydock:
-    def __init__(self, bin_dir, root, key_file, organization, image):
+    def __init__(self, bin_dir, root, key_file, organization, image, agent):
         self.bin_dir, self.root, self.image = bin_dir, root, image
         self.config = os.path.join(root, "drydock.toml")
         self.socket = os.path.join(root, "run", "drydock.sock")
@@ -138,6 +146,7 @@ class Drydock:
             DRYDOCK_ROOT=root,
             DRYDOCK_DAEMON_BIN=os.path.join(bin_dir, "drydockd"),
             DRYDOCK_HOST_BIN=os.path.join(bin_dir, "drydock-host"),
+            DRYDOCK_AGENT_BIN_LINUX_AMD64=agent,
         )
         log = open(os.path.join(root, "drydockd.log"), "w")
         self.daemon = subprocess.Popen(
@@ -235,6 +244,7 @@ def main():
     parser.add_argument("key_file")
     parser.add_argument("--organization-id", required=True)
     parser.add_argument("--bin-dir", default="target/release")
+    parser.add_argument("--agent", help="a linux/amd64 drydock-agent (Tensorlake's platform)")
     # Pinned: drydock's resolver cannot yet resolve Docker Hub tags (drydock#200).
     parser.add_argument("--image", default=IMAGE)
     parser.add_argument("--allowed-host", default="github.com")
@@ -245,12 +255,21 @@ def main():
     bin_dir = os.path.abspath(options.bin_dir)
     for binary in ("drydock", "drydockd", "drydock-host"):
         if not os.access(os.path.join(bin_dir, binary), os.X_OK):
-            raise SystemExit(f"{bin_dir}/{binary} is missing; cargo build --release -p drydock -p drydock-host")
+            raise SystemExit(f"{bin_dir}/{binary} is missing; cargo build --release -p drydock -p drydock-host -p drydock-agent")
+    agent = options.agent or os.environ.get("DRYDOCK_AGENT_BIN_LINUX_AMD64")
+    if not agent and os.access(os.path.join(bin_dir, "drydock-agent-linux-amd64"), os.X_OK):
+        agent = os.path.join(bin_dir, "drydock-agent-linux-amd64")
+    if not agent and platform.system() == "Linux" and platform.machine() in ("x86_64", "amd64"):
+        agent = os.path.join(bin_dir, "drydock-agent")
+    if not agent or not os.access(agent, os.X_OK):
+        raise SystemExit(f"no linux/amd64 drydock-agent at {agent or bin_dir + '/drydock-agent-linux-amd64'}; "
+                         "pass --agent PATH (the tools-image release artifact carries one)")
+    agent = os.path.abspath(agent)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     # Short, so the daemon's socket path fits a Unix socket address.
     root = tempfile.mkdtemp(prefix="dd-tl-", dir="/tmp")
     os.chmod(root, 0o700)
-    drydock = Drydock(bin_dir, root, key_file, options.organization_id, options.image)
+    drydock = Drydock(bin_dir, root, key_file, options.organization_id, options.image, agent)
     environments, sandbox_ids, prepared = [], set(), None
     try:
         code, providers, error = drydock.cli("providers")
@@ -269,7 +288,7 @@ def main():
         check(bool(launched) and environment.get("state", {}).get("state") == "running",
               f"launch returned after the agent's hello in {time.time() - started:.1f}s: {launched or error}")
         if not launched:
-            return
+            raise Stop
         status, body = tensorlake("GET", f"/sandboxes/{launched}", key)
         if status == 200:
             sandbox_ids.add(json.loads(body)["id"])
@@ -321,6 +340,8 @@ def main():
 
         code, _, error = drydock.cli("destroy", INSTANCE, launched)
         check(code == 0, f"destroyed the vessel: {error}")
+    except Stop:
+        pass
     finally:
         for environment in environments:
             drydock.cli("destroy", INSTANCE, environment, timeout=300)
