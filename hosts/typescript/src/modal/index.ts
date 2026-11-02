@@ -470,7 +470,7 @@ class Modal implements Provider {
     ])
       if (actual[tag] !== wanted[tag])
         refused(
-          `existing Modal sandbox for this label has a different ${what}; provision a new label`,
+          `existing Modal sandbox for this label has a different ${what} (${actual[tag] ?? "none"}, requested ${wanted[tag]}); provision a new label`,
         );
   }
 

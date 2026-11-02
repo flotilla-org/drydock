@@ -327,7 +327,8 @@ test("provision re-adopts its sandbox and refuses a mismatch", async () => {
   await assert.rejects(provision("vessel", { mode: "open" }), kind("refused"));
   await assert.rejects(
     provision("vessel", undefined, { ...SIZE, cpus: 2 }),
-    kind("refused"),
+    (e: any) =>
+      /different size \(1\/2048, requested 2\/2048\)/.test(e.detail?.reason),
   );
   // Another instance in the same app owns a sandbox under this label's name.
   const prepared = await provider.prepare(request, context);
