@@ -6,29 +6,38 @@
 """Live check of the TypeScript host's Modal module, through drydockd and drydock.
 
     scripts/live-modal.py TOKEN_FILE [--bin-dir DIR] [--host PATH] [--agent PATH]
-                          [--image IMAGE] [--app APP] [--environment ENV]
-                          [--runtime vm|gvisor]
+                          [--tunnel-check PATH] [--image IMAGE] [--app APP]
+                          [--environment ENV] [--runtime vm|gvisor]
 
 TOKEN_FILE holds a Modal token pair as JSON, {"token_id": …, "token_secret": …}.
-DIR holds `drydock`, `drydockd` and `drydock-host` from this branch (default
-target/release, from `cargo build --release -p drydock -p drydock-host -p
-drydock-agent`). PATH is the TypeScript host's `dist/main.js` (default
-hosts/typescript/dist/main.js, from `corepack pnpm build` there). `--agent`
-names the linux/amd64 agent drydockd pushes to the vessel at hello (default
-DIR/drydock-agent); it must run on IMAGE's glibc, so a laptop with a newer
-glibc than the image passes the tools-image release's `drydock-agent-linux-amd64`.
+DIR holds `drydock`, `drydockd`, `drydock-host` and `examples/tunnel_check`
+from this branch (default target/release, from `cargo build --release -p
+drydock -p drydock-host -p drydock-agent --example tunnel_check`). PATH is the
+TypeScript host's `dist/main.js` (default hosts/typescript/dist/main.js, from
+`corepack pnpm build` there). `--agent` names the linux/amd64 agent drydockd
+pushes to the vessel at hello (default DIR/drydock-agent); it must run on
+IMAGE's glibc, so a laptop with a newer glibc than the image passes the
+tools-image release's `drydock-agent-linux-amd64`.
+
+The tools image drydockd bakes in must hold an agent with `--tcp` (drydock#187):
+build drydockd with `DRYDOCK_TOOLS_IMAGE=<ref>` if the checked-in pin is older.
+That agent should differ from `--agent`, so launch exercises an upgrade.
 
 It writes a drydock.toml for one provider `modal` into a throwaway
 DRYDOCK_ROOT, runs its own drydockd, and then:
 
 - prepares IMAGE twice (Modal's definition cache gives the same image);
-- launches a deny-all vessel, which returns after the agent's hello over the
-  exec bridge;
+- launches a deny-all vessel, which returns after the agent's hello through
+  Modal's connect-token edge (the module's dial reach; exec carries no agent
+  traffic), and checks that the agent the image held was upgraded to
+  `--agent` within that launch, well inside drydockd's 60 s;
 - runs an egress probe as root in it (a TLS handshake to a denied address and
   name, and a DNS lookup, recorded either way), then in a second vessel
   provisioned with an allowlist (an allowed name and CIDR, a denied address);
-- opens a relay through drydockd, reads the agent's hello over it, sees its
-  bridge process in the sandbox, closes it and sees the bridge gone;
+- mints its own connect token for the agent's port, reads the agent's token
+  from the sandbox, and runs `tunnel_check --edge` through Modal's edge:
+  hello, 4 MiB written and read back, a wrong agent token refused and a
+  wrong connect token refused; and checks the token is on no argv;
 - destroys both vessels, and lists the app's sandboxes through Modal to show
   none are left.
 
@@ -37,6 +46,7 @@ end, whatever happened, so use an app of its own (default drydock-live-check).
 Exit status 0 means every check passed.
 """
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -47,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 
 import modal
@@ -147,18 +158,6 @@ class Drydock:
         connection.close()
         return response.status, json.loads(raw) if raw else None
 
-    def relay(self, id):
-        """A raw relay to the vessel's agent socket, through drydockd."""
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(60)
-        sock.connect(self.socket)
-        sock.sendall(
-            f"GET /v1/providers/{PROVIDER}/environments/{id}/relay HTTP/1.1\r\n"
-            "Host: drydock\r\nConnection: Upgrade\r\nUpgrade: drydock-relay\r\n\r\n".encode()
-        )
-        head, rest = read_head(sock, b"")
-        return sock, head, rest
-
     def stop(self):
         self.daemon.send_signal(signal.SIGTERM)
         try:
@@ -166,32 +165,6 @@ class Drydock:
         except subprocess.TimeoutExpired:
             self.daemon.kill()
         self.log.close()
-
-
-def read_head(sock, buffer):
-    while b"\r\n\r\n" not in buffer:
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        buffer += chunk
-    head, _, rest = buffer.partition(b"\r\n\r\n")
-    return head.decode(errors="replace"), rest
-
-
-def hello_over(sock, rest):
-    """GET /hello as HTTP/1.1 over a switched connection; its JSON body."""
-    sock.sendall(b"GET /hello HTTP/1.1\r\nHost: agent\r\nConnection: keep-alive\r\n\r\n")
-    head, body = read_head(sock, rest)
-    lines = head.split("\r\n")
-    headers = {k.lower(): v.strip() for k, _, v in (line.partition(":") for line in lines[1:])}
-    if "content-length" in headers:
-        while len(body) < int(headers["content-length"]):
-            body += sock.recv(65536)
-    else:
-        while not body.endswith(b"0\r\n\r\n"):
-            body += sock.recv(65536)
-        body = b"".join(body.split(b"\r\n")[1::2])
-    return lines[0], json.loads(body)
 
 
 # Run as root in the vessel: python is in the default image, so no client tools.
@@ -222,19 +195,46 @@ print(json.dumps({"uid": os.getuid(), "dns": dns(sys.argv[1]),
                   "tcp": {f"{h}:{p}": tcp(h, int(p)) for h, p in (t.rsplit(":", 1) for t in sys.argv[2:])}}))
 """
 
-BRIDGES = r"""for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null; echo; done | grep -c -- '--bridg[e]'"""
+# The image's agent and the running agents (not their supervisor), by digest,
+# and whether any process's argv holds the token given on stdin.
+AGENTS = r"""
+import hashlib, json, os, sys
+token = sys.stdin.read().strip()
+digest = lambda path: hashlib.sha256(open(path, "rb").read()).hexdigest()
+running, exposed = [], False
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+        exposed |= bool(token) and any(token.encode() in a for a in argv)
+        if argv[-2:] == [b"/run/drydock/agent.sock", b""] and b"--supervisor" not in argv:
+            running.append(digest(f"/proc/{pid}/exe"))
+    except OSError:
+        pass
+print(json.dumps({"image": digest("/opt/drydock/drydock-agent"), "running": sorted(set(running)), "exposed": exposed}))
+"""
+PORT = 7811
+TOKEN_FILE = "/run/drydock/tcp.token"
 
 
-def run(client, sandbox_id, *argv):
+def run(client, sandbox_id, *argv, stdin=None):
     sandbox = modal.Sandbox.from_id(sandbox_id, client=client)
     process = sandbox.exec(*argv, timeout=120)
+    if stdin is not None:
+        process.stdin.write(stdin)
+        process.stdin.write_eof()
+        process.stdin.drain()
     process.wait()
     return process.returncode, process.stdout.read().strip()
 
 
-def bridges(client, sandbox_id):
-    code, out = run(client, sandbox_id, "sh", "-c", BRIDGES)
-    return int(out or 0)
+def agents(client, sandbox_id, token=""):
+    code, out = run(client, sandbox_id, "python3", "-c", AGENTS, stdin=token)
+    return json.loads(out) if code == 0 else None
+
+
+def sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def egress(client, sandbox_id, name, *targets):
@@ -250,13 +250,15 @@ def main():
     parser.add_argument("--bin-dir", default="target/release")
     parser.add_argument("--host", default="hosts/typescript/dist/main.js")
     parser.add_argument("--agent")
+    parser.add_argument("--tunnel-check")
     parser.add_argument("--image", default="python:3.13-slim")
     parser.add_argument("--app", default="drydock-live-check")
     parser.add_argument("--environment")
     parser.add_argument("--runtime", choices=["vm", "gvisor"], default="vm")
     options = parser.parse_args()
     options.agent = options.agent or os.path.join(options.bin_dir, "drydock-agent")
-    for path in [options.host, options.agent] + [
+    options.tunnel_check = options.tunnel_check or os.path.join(options.bin_dir, "examples", "tunnel_check")
+    for path in [options.host, options.agent, options.tunnel_check] + [
         os.path.join(options.bin_dir, b) for b in ("drydock", "drydockd", "drydock-host")
     ]:
         if not os.path.exists(path):
@@ -292,8 +294,42 @@ def main():
             launched["state"] == {"state": "running"},
             f"launch returned {launched['id']} after the agent's hello, in {time.time() - started:.1f}s",
         )
+        launch_seconds = time.time() - started
         inspected = drydock.cli("inspect", PROVIDER, launched["id"])
         check(inspected["egress_policy"] == "deny", f"inspect: {inspected['state']}, egress {inspected['egress']} ({inspected['egress_policy']})")
+
+        # Launch's hello went through the dial reach, the module's only one. It
+        # pushed --agent over it when the image's agent was another build.
+        pushed = sha256(options.agent)
+        found = agents(client, launched["id"])
+        print(f"agents: image {found and found['image'][:16]}…, running {found and [d[:16] for d in found['running']]}, pushed {pushed[:16]}…", flush=True)
+        if found and found["image"] == pushed:
+            check(False, "an agent upgrade was exercised: the image already holds --agent; build drydockd with a tools image whose agent is older")
+        else:
+            check(
+                found is not None and found["running"] == [pushed] and launch_seconds < 45,
+                f"the image's agent was upgraded to --agent through the edge within launch's {launch_seconds:.1f}s (under 45 s; drydockd allows 60 s)",
+            )
+
+        # The dial route itself: Modal's edge in front of the agent's listener.
+        id = launched["id"]
+        code, token = run(client, id, "cat", TOKEN_FILE)
+        must(code == 0 and len(token) >= 43, f"the agent's token is in {TOKEN_FILE}")
+        found = agents(client, id, token)
+        check(found is not None and not found["exposed"], "the agent's token is on no process's argv")
+        credentials = modal.Sandbox.from_id(id, client=client).create_connect_token(port=PORT)
+        base = urllib.parse.urlsplit(credentials.url)
+        url = urllib.parse.urlunsplit(
+            (base.scheme, base.netloc, "/v1/connect", urllib.parse.urlencode({"_modal_connect_token": credentials.token}), "")
+        )
+        token_file = os.path.join(drydock.root, "tcp.token")
+        with open(os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(token)
+        result = subprocess.run([options.tunnel_check, "--edge", url, token_file], capture_output=True, text=True, timeout=300)
+        lines = [line for line in result.stdout.splitlines() if line.startswith(("PASS ", "FAIL "))]
+        for line in lines:
+            check(line.startswith("PASS "), f"tunnel_check: {line[5:]}")
+        check(len(lines) == 4 and result.returncode == 0, f"tunnel_check ran its four checks: exit {result.returncode} {result.stderr.strip()[-500:]}")
 
         # Deny all: blockNetwork. A denied address and name; DNS recorded either way.
         result = egress(client, launched["id"], "example.com", "1.1.1.1:443", "example.com:443")
@@ -325,23 +361,6 @@ def main():
         check(tcp.get("1.1.1.1:443") == "connected", f"an allowed CIDR connects: {tcp.get('1.1.1.1:443')}")
         check(str(tcp.get("9.9.9.9:443")).startswith("blocked"), f"an unlisted address is blocked: {tcp.get('9.9.9.9:443')}")
         print(f"RECORD allowlist DNS for unlisted example.org: {(result or {}).get('dns')}", flush=True)
-
-        # The relay: hello over a bridge, which is gone once the relay closes.
-        id = launched["id"]
-        deadline = time.time() + 30
-        while (baseline := bridges(client, id)) and time.time() < deadline:
-            time.sleep(1)
-        check(baseline == 0, f"no bridge is left from launch's hello: {baseline}")
-        sock, head, rest = drydock.relay(id)
-        must(head.startswith("HTTP/1.1 101 "), f"drydockd switched to the relay: {head.splitlines()[:1]}")
-        status, hello = hello_over(sock, rest)
-        check(status.startswith("HTTP/1.1 200 ") and bool(hello.get("fingerprint")), f"GET /hello over the relay: {status}, platform {hello.get('platform')}")
-        check(bridges(client, id) == 1, "its bridge runs in the sandbox while the relay is open")
-        sock.close()
-        deadline = time.time() + 30
-        while (left := bridges(client, id)) and time.time() < deadline:
-            time.sleep(1)
-        check(left == 0, f"the bridge is gone after the relay closed: {left} left")
 
         for id in list(vessels):
             drydock.cli("destroy", PROVIDER, id)
