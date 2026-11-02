@@ -5,11 +5,9 @@
 // whose command starts drydock's agent; drydock reaches it through the relay
 // route, which this module carries over an exec of `drydock-agent --bridge`.
 // Sandboxes cannot be suspended, and live at most a day.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
-import { Duplex, Readable, Writable } from "node:stream";
-import type * as web from "node:stream/web";
 import { parseImageRef, type ImageRef } from "../oci.js";
 import {
   ProtocolFailure,
@@ -46,19 +44,39 @@ export const TAGS = {
 } as const;
 export const AGENT = "/opt/drydock/drydock-agent";
 export const SOCKET = "/run/drydock/agent.sock";
+/** The agent's TCP token, root's alone (0600). */
+export const TOKEN_FILE = "/run/drydock/tcp.token";
+/** The agent's TCP listener, which connect tokens route to. */
+export const PORT = 7811;
+/** Where the agent's listener takes its handshake (drydock-transport's `CONNECT_PATH`). */
+export const CONNECT_PATH = "/v1/connect";
+/** Modal's edge takes its connect token here, leaving `Authorization` to the agent. */
+export const CONNECT_TOKEN_PARAM = "_modal_connect_token";
 /** Modal's longest sandbox lifetime; the default is five minutes. */
 export const LIFETIME_SECONDS = 86_400;
 /**
- * The sandbox command (it replaces the image's, and is not an init): our
- * agent's supervisor detaches, and `sleep` keeps the main process alive.
+ * The sandbox command (it replaces the image's, and is not an init). It only
+ * keeps the sandbox alive: the agent needs its token, which reaches it by exec.
  */
-export const COMMAND = [
-  "sh",
-  "-c",
-  `${AGENT} --supervise --socket ${SOCKET}; exec sleep infinity`,
-];
-/** Starts the supervisor again (its lock makes that idempotent) and waits for the socket. */
-const ENSURE_AGENT = `${AGENT} --supervise --socket ${SOCKET} && for i in $(seq 100); do [ -S ${SOCKET} ] && exit 0; sleep 0.1; done; exit 1`;
+export const COMMAND = ["sleep", "infinity"];
+/**
+ * Run as root with a fresh token on stdin: keeps the token already in the
+ * sandbox, if any (written once, atomically, 0600), starts the agent's
+ * supervisor with its TCP listener (its lock makes that idempotent; `--socket`
+ * must come last), waits for the socket, and prints the token in use. The
+ * token is never on an argv or in the environment.
+ */
+export const ENSURE_AGENT = [
+  "t=$(head -c 256)",
+  "umask 077",
+  "mkdir -p /run/drydock",
+  `if [ ! -s ${TOKEN_FILE} ]; then printf %s "$t" > ${TOKEN_FILE}.$$ && ln ${TOKEN_FILE}.$$ ${TOKEN_FILE} 2>/dev/null; rm -f ${TOKEN_FILE}.$$; fi`,
+  `${AGENT} --supervise --tcp 127.0.0.1:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} || exit 1`,
+  `for i in $(seq 100); do [ -S ${SOCKET} ] && exec cat ${TOKEN_FILE}; sleep 0.1; done`,
+  "exit 1",
+].join("\n");
+/** How long a reach's connect token is offered for; drydock dials at once. */
+const DIAL_SECONDS = 300;
 const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 /** Concurrent tag reads while listing. */
 const READS = 8;
@@ -167,40 +185,6 @@ export function networkFields(
   };
 }
 
-/** The most one stdin write carries, as the SDK's streaming writes do. */
-export const STDIN_CHUNK = 256 * 1024;
-
-/**
- * An exec's stdin as a Node stream. Each SDK write is one unary round trip,
- * serialised, so passing drydockd's small writes through one by one caps the
- * relay near a write per round trip. Instead, what queues while one write is
- * in flight goes as the next, up to `STDIN_CHUNK` bytes a write.
- */
-export function stdinWritable(stdin: WritableStream<Uint8Array>): Writable {
-  const writer = stdin.getWriter();
-  return new Writable({
-    // Room for a full write to queue behind the one in flight.
-    highWaterMark: 2 * STDIN_CHUNK,
-    async writev(chunks, callback) {
-      try {
-        const data = Buffer.concat(chunks.map(({ chunk }) => chunk));
-        for (let at = 0; at < data.length; at += STDIN_CHUNK)
-          await writer.write(data.subarray(at, at + STDIN_CHUNK));
-        callback();
-      } catch (error) {
-        callback(error as Error);
-      }
-    },
-    final(callback) {
-      writer.close().then(() => callback(), callback);
-    },
-    destroy(error, callback) {
-      writer.abort(error).catch(() => {});
-      callback(error);
-    },
-  });
-}
-
 /** A tag-sized identity of a policy, and whether it denies everything. */
 function policyIdentity(fields: ReturnType<typeof networkFields>) {
   if (fields.blockNetwork) return "deny";
@@ -301,6 +285,8 @@ class Modal implements Provider {
    * provider. Modal lists no terminated sandboxes, so it stays small.
    */
   private destroyed = new Set<string>();
+  /** Each sandbox's agent TCP token, as `ensureAgent` last read it. */
+  private tokens = new Map<string, string>();
   private appName: string;
 
   constructor(
@@ -510,11 +496,13 @@ class Modal implements Provider {
         );
   }
 
-  /** Runs a command to its end; its exit code and stdout. */
-  private async run(box: Box, argv: string[]) {
+  /** Runs a command to its end, with `input` as its whole stdin; its exit code and stdout. */
+  private async run(box: Box, argv: string[], input = "") {
     const process = await call(() => box.exec(argv));
     // An exec keeps running until its stdin ends.
-    await process.closeStdin();
+    const stdin = process.stdin.getWriter();
+    if (input) await call(() => stdin.write(new TextEncoder().encode(input)));
+    await call(() => stdin.close());
     const [stdout, code] = await Promise.all([
       new Response(process.stdout as ReadableStream).text(),
       call(() => process.wait()),
@@ -522,14 +510,23 @@ class Modal implements Provider {
     return { code, stdout };
   }
 
+  /** Starts the agent if it is not running; the TCP token it holds. */
   private async ensureAgent(box: Box) {
-    const { code } = await this.run(box, ["sh", "-c", ENSURE_AGENT]);
-    if (code !== 0)
+    const fresh = randomBytes(32).toString("base64url");
+    const { code, stdout } = await this.run(
+      box,
+      ["sh", "-c", ENSURE_AGENT],
+      fresh,
+    );
+    const token = stdout.trim();
+    if (code !== 0 || !/^[A-Za-z0-9_-]{43,}$/.test(token))
       throw new ProtocolFailure({
         kind: "internal",
         reason: "drydock's agent did not start in the Modal sandbox",
         provider_error: `exit ${code}`,
       });
+    this.tokens.set(box.sandboxId, token);
+    return token;
   }
 
   private row(
@@ -696,6 +693,7 @@ class Modal implements Provider {
         throw error;
       }
       this.destroyed.add(id);
+      this.tokens.delete(id);
       try {
         await call(() => box.terminate());
       } catch (error) {
@@ -720,50 +718,29 @@ class Modal implements Provider {
     return box;
   }
 
+  // Reach is the agent's TCP listener behind Modal's connect-token edge:
+  // drydock dials it (Reach::Dial). The edge takes its token from the query
+  // and splices the bytes after the agent's 101; `Authorization` carries the
+  // agent's token. Exec carries no agent traffic.
   async reach(id: string, { credential }: Context): Promise<Types["Reach"]> {
-    await this.using(credential, async (vendor) =>
-      (await this.running(vendor, id)).detach(),
-    );
-    const segment = encodeURIComponent;
-    return {
-      kind: "relay",
-      path: `/v1/providers/${segment(this.name)}/environments/${segment(id)}/relay`,
-    };
-  }
-
-  async relay(id: string, { credential }: Context): Promise<Duplex> {
-    // The relay holds its SDK client until the bridge closes.
-    const { vendor, release } = this.clients.acquire(this.key(credential));
-    let box: Box | undefined;
-    try {
-      box = await this.running(vendor, id);
-      const bridge = await call(() =>
-        box!.exec([AGENT, "--bridge", "--socket", SOCKET]),
-      );
-      const writable = stdinWritable(bridge.stdin);
-      // Finishing it closed stdin, which sent the EOF.
-      let ended = false;
-      writable.once("finish", () => (ended = true));
-      const stream = Duplex.from({
-        readable: Readable.fromWeb(bridge.stdout as web.ReadableStream),
-        writable,
-      });
-      const held = box;
-      stream.once("close", () => {
-        // Modal never kills an abandoned exec: the bridge exits on stdin EOF.
-        const eof = ended ? Promise.resolve() : bridge.closeStdin();
-        eof.then(
-          () => held.detach(),
-          () => held.detach(),
-        );
-        release();
-      });
-      return stream;
-    } catch (error) {
-      box?.detach();
-      release();
-      throw error;
-    }
+    return this.using(credential, async (vendor) => {
+      const box = await this.running(vendor, id);
+      try {
+        // After a host restart, the token is read back from the sandbox.
+        const token = this.tokens.get(id) ?? (await this.ensureAgent(box));
+        const connect = await call(() => box.connectToken(PORT));
+        const url = new URL(CONNECT_PATH, connect.url);
+        url.searchParams.set(CONNECT_TOKEN_PARAM, connect.token);
+        return {
+          kind: "dial",
+          url: url.href,
+          token,
+          expires_at: new Date(this.now() + DIAL_SECONDS * 1000).toISOString(),
+        };
+      } finally {
+        box.detach();
+      }
+    });
   }
 
   async quota({ credential }: Context): Promise<Types["Quota"]> {

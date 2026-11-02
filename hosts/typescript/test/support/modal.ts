@@ -40,27 +40,20 @@ type Row = {
   tags: Record<string, string>;
   /** Null while running; else the code `poll` reports. */
   exit: number | null;
+  /** The agent's TCP token file, once the agent start wrote it. */
+  token?: string;
 };
 
-/**
- * One exec. It runs until its stdin ends, as Modal's do: there is no kill.
- * Each stdin write is one unary RPC, serialised, as the SDK's are.
- */
+/** One exec. It runs until its stdin ends, as Modal's do: there is no kill. */
 export class StandInProcess implements Process {
   running = true;
-  /** The size of each stdin write, in order. */
-  writes: number[] = [];
   stdin: WritableStream<Uint8Array>;
   stdout: ReadableStream<Uint8Array>;
   readonly command: string[];
   private exited: Promise<number>;
   private input = new PassThrough();
 
-  constructor(
-    command: string[],
-    serve: (remote: Duplex) => number | void,
-    roundTripMs = 0,
-  ) {
+  constructor(command: string[], serve: (remote: Duplex) => number | void) {
     this.command = command;
     // Stdin and stdout are separate channels: reading less of stdout never
     // ends stdin, and only stdin's end ends the process.
@@ -76,13 +69,10 @@ export class StandInProcess implements Process {
     );
     code = serve(remote) ?? 0;
     this.stdin = new WritableStream({
-      write: async (chunk) => {
-        this.writes.push(chunk.length);
-        await new Promise((resolve) => setTimeout(resolve, roundTripMs));
-        await new Promise<void>((resolve) =>
+      write: (chunk) =>
+        new Promise<void>((resolve) =>
           this.input.write(chunk, () => resolve()),
-        );
-      },
+        ),
       close: () => {
         this.input.end();
       },
@@ -128,8 +118,8 @@ export class StandIn implements Vendor {
   /** Probe output and exit for any other exec. */
   execStdout = "";
   execExit = 0;
-  /** The time each stdin write takes. */
-  roundTripMs = 0;
+  /** Each connect token minted: its sandbox and port. */
+  connects: { id: string; port: number; token: string }[] = [];
   private next = 0;
 
   /** Each bridge is answered by `agent`, standing in for the agent's socket. */
@@ -277,22 +267,38 @@ export class StandIn implements Vendor {
         const row = standIn.row(id);
         if (row.exit !== null) throw new ClientError(9, "sandbox has finished");
         standIn.calls.push(`exec ${command.join(" ")}`);
-        const process = new StandInProcess(
-          command,
-          (remote) => {
-            if (command.includes("--bridge")) return standIn.agent(remote);
-            const agentStart = command.join(" ").includes("--supervise");
-            remote.once("end", () =>
-              remote.end(agentStart ? "" : standIn.execStdout),
+        const process = new StandInProcess(command, (remote) => {
+          if (command.includes("--bridge")) return standIn.agent(remote);
+          // The agent start keeps the token file it finds, else writes stdin
+          // there, and prints the file.
+          const agentStart = command.join(" ").includes("--supervise");
+          let input = "";
+          remote.on("data", (d: Buffer) => (input += d));
+          remote.once("end", () => {
+            if (agentStart && standIn.agentStart === 0) row.token ||= input;
+            remote.end(
+              agentStart
+                ? standIn.agentStart === 0
+                  ? `${row.token}\n`
+                  : ""
+                : standIn.execStdout,
             );
-            remote.resume();
-            return agentStart ? standIn.agentStart : standIn.execExit;
-          },
-          standIn.roundTripMs,
-        );
+          });
+          return agentStart ? standIn.agentStart : standIn.execExit;
+        });
         (process as any).sandbox = id;
         standIn.processes.push(process);
         return process;
+      },
+      // Modal's edge forwards to `port` in the sandbox, for its token.
+      async connectToken(port: number) {
+        const row = standIn.row(id);
+        if (!Number.isInteger(port) || port < 1 || port > 65535)
+          throw new InvalidError(`port ${port} out of range`);
+        if (row.exit !== null) throw new ClientError(9, "sandbox has finished");
+        const token = `ct-${standIn.connects.length + 1}`;
+        standIn.connects.push({ id, port, token });
+        return { url: `https://${id}.modal.test`, token };
       },
       detach() {
         standIn.detached++;

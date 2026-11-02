@@ -44,14 +44,18 @@ export type Create = Pick<
   | "outboundDomainAllowlist"
 >;
 
-/** One exec'd process, binary both ways, stderr discarded. */
+/**
+ * One exec'd process, binary both ways, stderr discarded. Modal never kills
+ * an exec: closing its stdin is how one that reads stdin ends.
+ */
 export interface Process {
   readonly stdin: WritableStream<Uint8Array>;
   readonly stdout: ReadableStream<Uint8Array>;
-  /** Stdin EOF. Modal never kills an exec, so this is how one ends. */
-  closeStdin(): Promise<void>;
   wait(): Promise<number>;
 }
+
+/** A connect token: `url` reaches the port it was made for with `token`. */
+export type Connect = { url: string; token: string };
 
 /** One sandbox, by id. */
 export interface Box {
@@ -61,6 +65,8 @@ export interface Box {
   poll(): Promise<number | null>;
   terminate(): Promise<void>;
   exec(command: string[]): Promise<Process>;
+  /** A fresh connect token to the sandbox's `port`. */
+  connectToken(port: number): Promise<Connect>;
   /** Frees this handle's connections; the sandbox keeps running. */
   detach(): void;
 }
@@ -93,6 +99,7 @@ function box(sandbox: Sandbox): Box {
         stdout: "pipe",
         stderr: "ignore",
       }),
+    connectToken: (port) => sandbox.createConnectToken({ port }),
     detach: () => sandbox.detach(),
   };
 }

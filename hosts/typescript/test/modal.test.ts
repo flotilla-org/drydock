@@ -7,7 +7,10 @@ import {
   COMMAND,
   LIFETIME_SECONDS,
   SOCKET,
-  STDIN_CHUNK,
+  PORT,
+  TOKEN_FILE,
+  CONNECT_PATH,
+  CONNECT_TOKEN_PARAM,
   TAGS,
   modalModule,
   networkFields,
@@ -77,6 +80,7 @@ async function setup(
     provision,
     resolved,
     advance,
+    module,
   };
 }
 
@@ -268,13 +272,18 @@ test("provision creates a tagged sandbox that starts the agent", async () => {
     egress_policy: "deny",
     timestamp: null,
   });
+  // The agent starts with its TCP listener; its token went by stdin alone.
   assert.ok(
     standIn.calls.some(
       (c) =>
         c.startsWith("exec sh -c") &&
-        c.includes(`--supervise --socket ${SOCKET}`),
+        c.includes(
+          `${AGENT} --supervise --tcp 127.0.0.1:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} `,
+        ),
     ),
   );
+  assert.match(row.token!, /^[A-Za-z0-9_-]{43}$/);
+  assert.ok(standIn.calls.every((c) => !c.includes(row.token!)));
   assert.ok(
     standIn.processes.every((p) => !p.running),
     "no exec left running",
@@ -293,14 +302,10 @@ test("provision creates a tagged sandbox that starts the agent", async () => {
   );
 });
 
-// The agent's start is the sandbox command: the supervisor detaches and
-// `sleep` keeps the main process alive. A start that fails is reported.
-test("the sandbox command starts the agent's supervisor", async () => {
-  assert.deepEqual(COMMAND, [
-    "sh",
-    "-c",
-    `${AGENT} --supervise --socket ${SOCKET}; exec sleep infinity`,
-  ]);
+// The sandbox command only keeps it alive: the agent starts by exec, which
+// carries its token. A start that fails is reported.
+test("the agent starts by exec, and a failed start is reported", async () => {
+  assert.deepEqual(COMMAND, ["sleep", "infinity"]);
   const { standIn, provision } = await setup();
   standIn.agentStart = 1;
   await assert.rejects(provision("vessel"), kind("internal"));
@@ -399,87 +404,49 @@ test("egress maps to create fields or is refused", () => {
     );
 });
 
-// Reach is the host's relay route; the relay is an exec of the agent's bridge
-// carrying bytes both ways. Closing it ends the bridge's stdin, since Modal
-// never kills an exec. A terminated sandbox is refused, not retried.
-test("relay bridges bytes, ends the bridge on close, and refuses a terminated sandbox", async () => {
-  const { standIn, provider, context, provision } = await setup();
+// Reach is a dial of the agent's TCP listener through a fresh connect token
+// for its port: the edge's token in the query, the agent's as the reach's
+// token. A host that lost its tokens (a restart) reads the sandbox's back
+// rather than replacing it. A terminated sandbox is refused, not retried.
+test("reach dials the agent through a connect token", async () => {
+  const { standIn, provider, context, provision, module } = await setup();
   const { environment } = await provision("vessel");
-  assert.deepEqual(await provider.reach(environment.id, context), {
-    kind: "relay",
-    path: `/v1/providers/modal/environments/${environment.id}/relay`,
+  const token = standIn.rows.get(environment.id)!.token!;
+  const execs = standIn.processes.length;
+  const reach = await provider.reach(environment.id, context);
+  assert.deepEqual(reach, {
+    kind: "dial",
+    url: `https://${environment.id}.modal.test${CONNECT_PATH}?${CONNECT_TOKEN_PARAM}=ct-1`,
+    token,
+    expires_at: "2026-11-02T12:05:00.000Z",
   });
-  const stream = await provider.relay!(environment.id, context);
-  const bridge = standIn.processes.at(-1)!;
-  assert.deepEqual(bridge.command, [AGENT, "--bridge", "--socket", SOCKET]);
-  const payload = randomBytes(MiB);
-  const echoed = new Promise<Buffer>((resolve) => {
-    const chunks: Buffer[] = [];
-    stream.on("data", (d) => {
-      chunks.push(d);
-      if (Buffer.concat(chunks).length >= payload.length)
-        resolve(Buffer.concat(chunks));
-    });
-  });
-  stream.write(payload);
-  assert.ok((await echoed).equals(payload));
-  assert.equal(bridge.running, true);
-  const closed = new Promise((resolve) => stream.once("close", resolve));
-  // As the host's relay route does: a torn-down side is an ordinary end.
-  stream.on("error", () => {});
-  stream.destroy();
-  await closed;
-  await bridge.wait();
-  assert.equal(bridge.running, false, "the bridge's stdin ended");
+  assert.deepEqual(standIn.connects, [
+    { id: environment.id, port: PORT, token: "ct-1" },
+  ]);
+  assert.equal(standIn.processes.length, execs, "the token was remembered");
+  const again = await provider.reach(environment.id, context);
+  assert.ok(again.kind === "dial" && again.url.endsWith("=ct-2"));
+  assert.equal(provider.relay, undefined, "exec carries no agent traffic");
 
-  // A relay its client half-closes ends the bridge's stdin too.
-  const graceful = await provider.relay!(environment.id, context);
-  graceful.resume();
-  graceful.end();
-  await standIn.processes.at(-1)!.wait();
+  const restarted = await module.configure(
+    "modal",
+    { module: "modal", settings: {} },
+    context.signal,
+  );
+  const reread = await restarted.reach(environment.id, context);
+  assert.ok(reread.kind === "dial" && reread.token === token);
+  assert.equal(standIn.rows.get(environment.id)!.token, token);
+  assert.ok(
+    standIn.processes.every((p) => !p.running),
+    "no exec left running",
+  );
 
   await provider.destroy(environment.id, context);
-  const execs = standIn.processes.length;
-  await assert.rejects(
-    provider.relay!(environment.id, context),
-    kind("refused"),
-  );
   await assert.rejects(
     provider.reach(environment.id, context),
     kind("refused"),
   );
-  assert.equal(standIn.processes.length, execs);
-});
-
-// Each stdin write is one serialised round trip, so the relay sends what
-// queued meanwhile as one write: an agent upload in drydockd's small writes
-// must not take a round trip per write.
-test("relay coalesces small writes into few large stdin writes", async () => {
-  const { standIn, provider, context, provision } = await setup();
-  const { environment } = await provision("vessel");
-  standIn.roundTripMs = 5;
-  const received = new Promise<Buffer>((resolve) => {
-    standIn.agent = (remote) => {
-      const chunks: Buffer[] = [];
-      remote.on("data", (d: Buffer) => chunks.push(d));
-      remote.once("end", () => {
-        resolve(Buffer.concat(chunks));
-        remote.end();
-      });
-    };
-  });
-  const stream = await provider.relay!(environment.id, context);
-  stream.resume();
-  const payload = randomBytes(4 * MiB);
-  for (let at = 0; at < payload.length; at += 16 * 1024)
-    if (!stream.write(payload.subarray(at, at + 16 * 1024)))
-      await new Promise((resolve) => stream.once("drain", resolve));
-  stream.end();
-  assert.ok((await received).equals(payload));
-  const { writes } = standIn.processes.at(-1)!;
-  assert.ok(Math.max(...writes) <= STDIN_CHUNK, "no write over the cap");
-  // 256 small writes go as a few round trips per 256 KiB, not one each.
-  assert.ok(writes.length <= 48, `${writes.length} stdin writes`);
+  assert.equal(standIn.connects.length, 3);
 });
 
 // Destroy terminates and is idempotent; the sandbox then reads as gone by
@@ -635,28 +602,15 @@ test("Modal failures map to protocol errors", async () => {
   await assert.rejects(provider.list(context), kind("credential_rejected"));
 });
 
-// A rotated credential gets a new client; the old one closes once, when the
-// relay holding it ends, even when the bridge's output ends first.
-test("a relay ending from the agent's side releases its client once", async () => {
-  const { standIn, provider, context, provision } = await setup();
-  const { environment } = await provision("vessel");
-  standIn.agent = (stream) => {
-    stream.resume();
-    stream.end("bye");
-  };
-  const relay = await provider.relay!(environment.id, context);
+// A rotated credential gets a new client, and the old one closes.
+test("a rotated credential closes its old client once", async () => {
+  const { standIn, provider, context } = await setup();
+  await provider.list(context);
   const rotated = {
     ...context,
     credential: JSON.stringify({ ...TOKEN, token_secret: "as-rotated" }),
   };
   await provider.list(rotated);
-  assert.equal(standIn.closed, 0, "the relay still holds the old client");
-  const closed = new Promise((resolve) => relay.once("close", resolve));
-  // As the host's relay route does: the agent's end half-closes the client side.
-  relay.once("end", () => relay.end());
-  relay.resume();
-  await closed;
-  await standIn.processes.at(-1)!.wait();
   await provider.list(rotated);
   assert.equal(standIn.closed, 1);
   assert.deepEqual(

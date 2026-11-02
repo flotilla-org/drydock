@@ -44,7 +44,7 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 
 | Role in drydock's environment | Used for |
 |---|---|
-| Contributor | look up or create the app, build images with ephemeral registry secrets, create, exec and terminate sandboxes, list by app and tags |
+| Contributor | look up or create the app, build images with ephemeral registry secrets, create, exec, connect-token and terminate sandboxes, list by app and tags |
 
 - Registry pulls use an ephemeral secret per prepare from the route's credential; nothing persists in the workspace. Modal pulls only from registries on the public internet.
 - The module never deletes built images; Modal keeps them in its cache.

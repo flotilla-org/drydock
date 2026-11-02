@@ -156,26 +156,33 @@ and sandbox backend from those, so run the host without them.
 - Provision creates a sandbox named from the label (unique per app), tagged
   with the instance, the label, its egress policy, size and expiry, with a
   timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory (no disk
-  size), and as its command `sh -c '<agent> --supervise --socket <socket>;
-exec sleep infinity'`. The supervisor detaches; `sleep` keeps the sandbox
-  alive. A label whose name is taken re-adopts that sandbox when its tags say
-  it is this instance's, with the same size and policy, and refuses it
-  otherwise. Either way the module runs `--supervise` again by exec
-  (idempotent) and waits for the agent's socket; a sandbox it just created
-  and cannot hand over is terminated (if that terminate fails too, the
-  sandbox stays listed: `destroy` it). The SDK takes no abort signal, so a
-  cancelled call stops between SDK calls, never during one.
-- Reach is this host's relay route; the relay is an exec of
-  `drydock-agent --bridge`, binary both ways. Each stdin write is one
-  serialised SDK round trip, so the relay sends what queued during one as the
-  next, up to 256 KiB a write. Modal never kills an exec, so closing the relay
-  ends the bridge's stdin, which ends it. A relay to a terminated sandbox is
-  refused, not retried.
+  size), and `sleep infinity` as its command, which only keeps it alive. A
+  label whose name is taken re-adopts that sandbox when its tags say it is
+  this instance's, with the same size and policy, and refuses it otherwise.
+  Either way the module then starts the agent by a root exec that gets a
+  fresh TCP token on stdin: it keeps the token already in
+  `/run/drydock/tcp.token` (0600) or writes this one, runs
+  `--supervise --tcp 127.0.0.1:7811 --tcp-token-file … --socket …`
+  (idempotent), waits for the socket and prints the token in use, which the
+  module remembers. The token is never on an argv, in the environment or in
+  Modal's configuration. A sandbox it just created and cannot hand over is
+  terminated (if that terminate fails too, the sandbox stays listed: `destroy`
+  it). The SDK takes no abort signal, so a cancelled call stops between SDK
+  calls, never during one.
+- Reach is `dial`: the agent's TCP listener behind Modal's connect-token edge,
+  which drydock dials itself. Each reach mints a connect token for port 7811
+  and returns its URL at `/v1/connect` with the token in the
+  `_modal_connect_token` query parameter, and the agent's token as the
+  reach's; the edge splices the bytes after the agent's 101. A host that lost
+  the token (a restart) reads it back by the same exec. Exec carries no agent
+  traffic: each stdin write is one round trip, too slow for agent uploads. A
+  reach to a terminated sandbox is refused, not retried.
 - Egress: open sets nothing; deny all is `blockNetwork`; IPv4 CIDRs and
   literals become the CIDR allowlist and names the domain allowlist; ports and
   IPv6 are refused. Destinations are enforced outside the guest, against root,
   by a transparent proxy (a connect succeeds; an unlisted destination is reset
-  at TLS or HTTP), so the declaration is enforced; DNS resolution is never filtered, and an
+  at TLS or HTTP), so the declaration is enforced; DNS resolution is never
+  filtered, and an
   `egress_probe` that counts it reports that vessel advisory.
 - There is no suspend: snapshots restore under a new id. A sandbox that
   reached its timeout reads as gone at its lifetime cap; one terminated
