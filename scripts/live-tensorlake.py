@@ -38,7 +38,8 @@ each check:
   checks, as root, that the host answers and others do not;
 - suspends and resumes the vessel, then reads the agent's /hello again
   through drydockd's relay;
-- destroys both, and lists sandboxes and snapshots through Tensorlake's API
+- destroys both, reads the destroyed vessel as gone (noting whether
+  Tensorlake's archive answers by name), and lists sandboxes and snapshots through Tensorlake's API
   to show none of drydock's are left.
 
 Cleanup runs whatever happened. The prepared `dd-` image stays: API keys
@@ -353,6 +354,12 @@ def main():
 
         code, _, error = drydock.cli("destroy", INSTANCE, launched)
         check(code == 0, f"destroyed the vessel: {error}")
+        code, inspected, error = drydock.cli("inspect", INSTANCE, launched)
+        check((inspected or {}).get("state", {}).get("state") == "gone", f"a destroyed vessel reads gone: {(inspected or {}).get('state') or error}")
+        # Which archive lookup inspect found it by: by name, or the listing fallback.
+        status, _ = tensorlake("GET", f"/archived-sandboxes/{launched}", key)
+        print(f"NOTE GET /archived-sandboxes/{{name}} answered HTTP {status}"
+              + ("" if status == 200 else "; inspect used the archive listing"), flush=True)
     except Stop:
         pass
     finally:
