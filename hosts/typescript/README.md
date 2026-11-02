@@ -149,9 +149,10 @@ and sandbox backend from those, so run the host without them.
   by digest with `COPY --from=<tools>@sha256 /opt/drydock/ /opt/drydock/`, in
   the module's app; the prepared form's ID is the `im-…` image. Modal caches by
   definition, so the same digests give the same image. A pull credential
-  becomes an ephemeral secret for the base's registry only. A registry that
-  resolves here to a private address is refused before building: Modal pulls
-  only from the public internet.
+  becomes an ephemeral secret for the base's registry only, so the tools image
+  must pull anonymously. A registry that resolves here to a private address is
+  refused before building, since Modal pulls only from the public internet;
+  that is a best-effort check, as Modal resolves the name again itself.
 - Provision creates a sandbox named from the label (unique per app), tagged
   with the instance, the label, its egress policy, size and expiry, with a
   timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory (no disk
@@ -160,7 +161,9 @@ exec sleep infinity'`. The supervisor detaches; `sleep` keeps the sandbox
   alive. A label whose name is taken re-adopts that sandbox when its tags say
   it is this instance's, with the same size and policy, and refuses it
   otherwise. Either way the module runs `--supervise` again by exec
-  (idempotent) and waits for the agent's socket.
+  (idempotent) and waits for the agent's socket; a sandbox it just created
+  and cannot hand over is terminated. The SDK takes no abort signal, so a
+  cancelled call stops between SDK calls, never during one.
 - Reach is this host's relay route; the relay is an exec of
   `drydock-agent --bridge`, binary both ways. Modal never kills an exec, so
   closing the relay ends the bridge's stdin, which ends it. A relay to a

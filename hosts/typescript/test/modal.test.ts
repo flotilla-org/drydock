@@ -303,6 +303,11 @@ test("the sandbox command starts the agent's supervisor", async () => {
   const { standIn, provision } = await setup();
   standIn.agentStart = 1;
   await assert.rejects(provision("vessel"), kind("internal"));
+  // The sandbox it made is not left running for a day.
+  assert.deepEqual(
+    [...standIn.rows.values()].map((r) => r.exit),
+    [137],
+  );
 });
 
 // The label names the sandbox, so provisioning it again finds the same one
@@ -384,6 +389,7 @@ test("egress maps to create fields or is refused", () => {
     { kind: "host_port", host: "a.example", port: 443 },
     { kind: "host", host: "2001:db8::1" },
     { kind: "cidr", cidr: "2001:db8::/32" },
+    { kind: "cidr", cidr: "10.0.0.0/33" },
   ])
     assert.throws(
       () => networkFields({ mode: "deny_all", direct: [entry as any] }),
@@ -460,6 +466,26 @@ test("destroy is idempotent", async () => {
     provider.inspect("sb-missing", context),
     kind("not_found"),
   );
+  // A terminate that failed claims nothing: a later end is the provider's.
+  const other = (await provision("other")).environment;
+  const box = await standIn.fromId(other.id);
+  const fromId = standIn.fromId;
+  standIn.fromId = async (id) => ({
+    ...box,
+    terminate: async () => {
+      throw new ClientError(14, "unavailable");
+    },
+  });
+  await assert.rejects(
+    provider.destroy(other.id, context),
+    kind("unavailable"),
+  );
+  standIn.fromId = fromId;
+  standIn.expire(other.id, 137);
+  assert.deepEqual((await provider.inspect(other.id, context)).state, {
+    state: "gone",
+    cause: { kind: "destroyed_at_provider" },
+  });
 });
 
 // Inventory is this instance's running sandboxes, by app and tag; another
@@ -574,4 +600,34 @@ test("Modal failures map to protocol errors", async () => {
     throw new ClientError(16, "invalid token");
   };
   await assert.rejects(provider.list(context), kind("credential_rejected"));
+});
+
+// A rotated credential gets a new client; the old one closes once, when the
+// relay holding it ends, even when the bridge's output ends first.
+test("a relay ending from the agent's side releases its client once", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
+  standIn.agent = (stream) => {
+    stream.resume();
+    stream.end("bye");
+  };
+  const relay = await provider.relay!(environment.id, context);
+  const rotated = {
+    ...context,
+    credential: JSON.stringify({ ...TOKEN, token_secret: "as-rotated" }),
+  };
+  await provider.list(rotated);
+  assert.equal(standIn.closed, 0, "the relay still holds the old client");
+  const closed = new Promise((resolve) => relay.once("close", resolve));
+  // As the host's relay route does: the agent's end half-closes the client side.
+  relay.once("end", () => relay.end());
+  relay.resume();
+  await closed;
+  await standIn.processes.at(-1)!.wait();
+  await provider.list(rotated);
+  assert.equal(standIn.closed, 1);
+  assert.deepEqual(
+    standIn.tokens.map((t) => t.token_secret),
+    ["as-test-only", "as-rotated"],
+  );
 });

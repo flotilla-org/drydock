@@ -146,8 +146,11 @@ export function networkFields(
     if (entry.kind === "host_port")
       refused("Modal egress policies cannot restrict ports");
     if (entry.kind === "cidr") {
-      if (!isIPv4(entry.cidr.split("/")[0]))
+      const [address, prefix] = entry.cidr.split("/");
+      if (!isIPv4(address))
         refused("Modal egress policies allow IPv4 CIDRs only");
+      if (!/^(?:[0-9]|[12][0-9]|3[0-2])$/.test(prefix ?? ""))
+        refused(`invalid IPv4 CIDR ${entry.cidr}`);
       cidrs.add(entry.cidr);
       continue;
     }
@@ -256,7 +259,11 @@ class Modal implements Provider {
   private clients: Clients<Vendor>;
   /** The app's handle per client; one lookup (or create) each. */
   private apps = new WeakMap<Vendor, Promise<App>>();
-  /** Sandboxes this host terminated, so their end reads as requested. */
+  /**
+   * Sandboxes this host terminated, so their end reads as requested. It is
+   * process-local: after a host restart such an end reads as destroyed at the
+   * provider. Modal lists no terminated sandboxes, so it stays small.
+   */
   private destroyed = new Set<string>();
   private appName: string;
 
@@ -312,7 +319,11 @@ class Modal implements Provider {
     return { status: "ready" };
   }
 
-  /** Refuses a registry Modal's builders cannot reach, before building. */
+  /**
+   * Refuses a registry Modal's builders cannot reach, before building. A
+   * best-effort check of what it resolves to here: Modal resolves again, and
+   * a name unknown here goes on to fail (or not) in Modal's build.
+   */
   private async publicRegistry(ref: ImageRef) {
     const host = ref.registry.replace(/:\d+$/, "");
     let addresses = [host];
@@ -350,6 +361,8 @@ class Modal implements Provider {
     const pull = request.image_pull ?? undefined;
     const id = await this.using(credential, async (vendor) => {
       const app = await this.app(vendor);
+      // The SDK takes no signal: an abort is seen between calls, never
+      // during one, so a build already started runs to its end.
       signal.throwIfAborted();
       // Modal caches by definition, so the same digests give the same image.
       return call(() =>
@@ -429,6 +442,10 @@ class Modal implements Provider {
           created,
           environment: await this.observe(box, actual, signal),
         };
+      } catch (error) {
+        // A sandbox this call made and cannot hand over would run for a day.
+        if (created) await box.terminate().catch(() => {});
+        throw error;
       } finally {
         box.detach();
       }
@@ -447,13 +464,14 @@ class Modal implements Provider {
       refused(
         "a Modal sandbox with this label's name belongs to another provider or label",
       );
-    if (
-      actual[TAGS.egress] !== wanted[TAGS.egress] ||
-      actual[TAGS.size] !== wanted[TAGS.size]
-    )
-      refused(
-        "existing Modal sandbox for this label has a different size or egress policy; provision a new label",
-      );
+    for (const [tag, what] of [
+      [TAGS.size, "size"],
+      [TAGS.egress, "egress policy"],
+    ])
+      if (actual[tag] !== wanted[tag])
+        refused(
+          `existing Modal sandbox for this label has a different ${what}; provision a new label`,
+        );
   }
 
   /** Runs a command to its end; its exit code and stdout. */
@@ -645,7 +663,11 @@ class Modal implements Provider {
       try {
         await call(() => box.terminate());
       } catch (error) {
-        if (protocolError(error).detail.kind !== "not_found") throw error;
+        if (protocolError(error).detail.kind !== "not_found") {
+          // Not ours to claim: a later end is someone else's.
+          this.destroyed.delete(id);
+          throw error;
+        }
       } finally {
         box.detach();
       }
