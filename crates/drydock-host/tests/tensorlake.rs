@@ -227,6 +227,20 @@ impl StandIn {
                 page(rows, request, "sandboxes", "next_cursor")
             }
             ("GET", ["archived-sandboxes"]) => page(s.archived.clone(), request, "sandboxes", "next_cursor"),
+            // By id only, as the SDK addresses them: a name falls back to the list.
+            ("GET", ["archived-sandboxes", id]) => match s.archived.iter().find(|row| row["id"] == *id) {
+                Some(row) => json_reply(200, row.clone()),
+                None => reply(404, "sandbox not found"),
+            },
+            // A sandbox's snapshots, for as long as its record lasts.
+            ("GET", ["sandboxes", id, "snapshots"]) => {
+                let known = s.sandboxes.values().any(|sb| sb.id == *id) || s.archived.iter().any(|row| row["id"] == *id);
+                if !known {
+                    return reply(404, "sandbox not found");
+                }
+                let rows = s.snapshots.values().filter(|snapshot| snapshot["sandbox_id"] == *id).cloned().collect();
+                page(rows, request, "snapshots", "cursor")
+            }
             ("GET", ["sandboxes", key]) => {
                 let Some(sandbox) = find(&mut s, key) else { return reply(404, "sandbox not found") };
                 if sandbox.status == "pending" {
@@ -496,9 +510,6 @@ fn guest_plane(s: &mut State, name: &str, method: &str, path: &str, request: &re
     if body["command"] != "sh" || body["args"][0] != "-c" {
         s.violations.push(format!("unexpected command {body}"));
     }
-    if script.contains('\\') {
-        s.violations.push("a backslash in args".into());
-    }
     let root = body["user"] == "root";
     let (lines, code): (Vec<String>, i64) = if script.starts_with("echo \"drydock-tcp-token $(cat /run/drydock/tcp.token)\"") {
         match (&sandbox.token_file, root) {
@@ -544,6 +555,10 @@ impl StandIn {
                 problems.push(format!("unexpected bootstrap {script}"));
             }
             let token = body["env"]["DRYDOCK_TCP_TOKEN"].as_str().and_then(|t| Token::parse(t).ok());
+            if script.contains('\\') {
+                // POST /processes echoes args unescaped; the bootstrap stays clear of it everywhere.
+                problems.push("a backslash in the bootstrap".into());
+            }
             if token.as_ref().is_some_and(|t| script.contains(t.secret())) {
                 problems.push("the token is on the agent's argv".into());
             }
@@ -1108,7 +1123,9 @@ async fn exec_returns_lossy_text_and_reports_failure() {
     w.stand_in.state().exec_output = b"caf\xc3\xa9\nraw \xff byte\n".to_vec();
     let ports = w.provider.operations();
     let exec = ports.exec.unwrap();
-    let mut stream = exec.exec(&environment.id, ExecRequest { command: vec!["cat".into(), "f".into()] }, &w.credentials).await.unwrap();
+    // Arguments may hold any text, backslashes included.
+    let mut stream =
+        exec.exec(&environment.id, ExecRequest { command: vec!["printf".into(), "a\\nb".into()] }, &w.credentials).await.unwrap();
     let mut output = String::new();
     stream.read_to_string(&mut output).await.unwrap();
     assert_eq!(output, "café\nraw \u{fffd} byte");

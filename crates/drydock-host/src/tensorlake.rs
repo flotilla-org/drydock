@@ -34,8 +34,11 @@ const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
 const TOKEN_FILE: &str = "/run/drydock/tcp.token";
 const TOKEN_LINE: &str = "drydock-tcp-token ";
 /// The Image Service has no rate limits on record; the SDK polls every 3 s.
+/// The daemon gives prepare 600 s, so a build still running after about
+/// 7.5 minutes is Unavailable: the retried prepare rejoins it (409
+/// `image_build_in_progress`) rather than starting another.
 const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 200;
+const BUILD_POLLS: u32 = 150;
 const STATE_POLL: Duration = Duration::from_secs(1);
 const STATE_POLLS: u32 = 120;
 /// Guest commands must finish inside the host's 30-second HTTP deadline.
@@ -160,13 +163,20 @@ enum Body {
     Bytes(Vec<u8>),
 }
 
+/// The most of a refusal's text kept in an error, so a proxy's HTML page
+/// does not fill one.
+const EXPLANATION_CHARS: usize = 500;
 /// The text of a refusal: a guest-plane or Image Service JSON `error` or
-/// `message`, else the control plane's plain text.
+/// `message`, else the control plane's plain text, cut to its start.
 fn explanation(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
+    let text = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v.get("error").or_else(|| v.get("message")).and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned())
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned());
+    match text.char_indices().nth(EXPLANATION_CHARS) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
 }
 /// The status's protocol error. Plan limits arrive as 400 text: a project
 /// at its quota or capacity is QuotaExhausted, any other 400 a refusal.
@@ -226,9 +236,22 @@ impl Tensorlake {
         c: &Credentials,
         bearer: bool,
     ) -> Result<http::Response<bytes::Bytes>> {
+        self.send_with(method, url, body, c, bearer, reqwest::header::HeaderMap::new()).await
+    }
+    /// [`Self::send`], with `extra` headers such as an idempotency key.
+    async fn send_with(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Body>,
+        c: &Credentials,
+        bearer: bool,
+        extra: reqwest::header::HeaderMap,
+    ) -> Result<http::Response<bytes::Bytes>> {
         let operation = format!("{method} {}", url.path());
         let mut request = reqwest::Request::new(method, url);
         let headers = request.headers_mut();
+        headers.extend(extra);
         if bearer {
             let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.key(c)?.expose()))
                 .map_err(|_| refused("invalid Tensorlake API key header"))?;
@@ -294,13 +317,33 @@ impl Tensorlake {
     async fn sandbox(&self, id: &str, c: &Credentials) -> Result<Value> {
         self.call(Method::GET, self.api(&["sandboxes", id])?, None, c).await
     }
-    /// A terminated sandbox's record, kept by Tensorlake for 48 hours.
+    /// A terminated sandbox's record, kept by Tensorlake for 48 hours. It is
+    /// read directly; only when that lookup does not know the name (the
+    /// SDK addresses archived records by id) is the archive listed.
     async fn archived(&self, id: &str, c: &Credentials) -> Result<Option<Value>> {
+        match self.call(Method::GET, self.api(&["archived-sandboxes", id])?, None, c).await {
+            Ok(row) => return Ok(Some(row)),
+            Err(ProtocolError::NotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
         let rows = self.paged(&["archived-sandboxes"], "sandboxes", c).await?;
         Ok(rows.into_iter().find(|row| row.get("name").and_then(Value::as_str) == Some(id)))
     }
+    /// The snapshots `sandbox_id` left: its own list, or, where Tensorlake no
+    /// longer serves that, the project's filtered to it.
+    async fn snapshots(&self, sandbox_id: &str, c: &Credentials) -> Result<Vec<Value>> {
+        let rows = match self.paged(&["sandboxes", sandbox_id, "snapshots"], "snapshots", c).await {
+            Ok(rows) => rows,
+            Err(ProtocolError::NotFound { .. }) => self.paged(&["snapshots"], "snapshots", c).await?,
+            Err(error) => return Err(error),
+        };
+        Ok(rows.into_iter().filter(|s| s.get("sandbox_id").and_then(Value::as_str) == Some(sandbox_id)).collect())
+    }
 
     fn environment(&self, v: &Value) -> Result<Environment> {
+        Ok(self.environment_and_policy(v)?.0)
+    }
+    fn environment_and_policy(&self, v: &Value) -> Result<(Environment, Policy)> {
         let id = text(v, "name")?.to_owned();
         let state = match text(v, "status")? {
             "pending" => Observation::Transitioning { phase: TransitionPhase::Starting },
@@ -319,7 +362,7 @@ impl Tensorlake {
             _ => None,
         };
         let policy = Policy::read(v.get("network_policy"))?;
-        Ok(Environment {
+        let environment = Environment {
             label: label_of(&sandbox_prefix(&self.name), &id),
             id,
             provider: self.name.clone(),
@@ -330,13 +373,13 @@ impl Tensorlake {
             egress_measured: false,
             egress_policy: Some(policy.fingerprint()),
             timestamp: None,
-        })
+        };
+        Ok((environment, policy))
     }
     /// The environment, with its egress claim measured when a probe is
     /// configured and the sandbox runs under a restricted policy.
     async fn observed(&self, v: &Value, c: &Credentials) -> Result<Environment> {
-        let mut row = self.environment(v)?;
-        let policy = Policy::read(v.get("network_policy"))?;
+        let (mut row, policy) = self.environment_and_policy(v)?;
         let (Some(probe), Some(policy), Observation::Running) = (&self.settings.egress_probe, &policy.0, &row.state) else {
             return Ok(row);
         };
@@ -361,11 +404,9 @@ impl Tensorlake {
     /// Runs `sh -c script` in the guest as root, stdin closed. Tensorlake
     /// streams its output as server-sent events of UTF-8 lines (other bytes
     /// arrive replaced), then its exit status.
+    /// (`POST /processes` echoes args unescaped in its 201 answer; this
+    /// endpoint streams events instead, so any args are safe here.)
     async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<Run> {
-        // Tensorlake echoes args unescaped in some answers; send none to escape.
-        if script.contains('\\') {
-            return Err(refused("guest commands for Tensorlake must not contain backslashes"));
-        }
         let body = json!({"command":"sh","args":["-c",script],"user":"root","env":env,"timeout":RUN_TIMEOUT_SECS});
         let url = self.guest(id, &["processes", "run"])?;
         let operation = format!("POST {}", url.path());
@@ -392,6 +433,9 @@ impl Tensorlake {
     /// already there is kept, so a running agent (after resume, or another
     /// host's bootstrap) keeps answering to it; whichever token the file
     /// holds is read back. The supervisor's lock makes this idempotent.
+    /// `--supervise` returns at once: it spawns the supervisor in its own
+    /// process group with stdin closed and output to its log
+    /// (drydock-agent's supervisor.rs, `start`), so the run ends with it.
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
         let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
         let port = self.settings.tunnel_port;
@@ -480,7 +524,8 @@ impl Tensorlake {
         let key = &digest(&format!("{name}\0{}\0{attempt}", r.tools_digest))[..32];
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("idempotency-key", reqwest::header::HeaderValue::from_str(key).map_err(|_| bad_response())?);
-        let response = self.send_with_headers(Method::POST, self.api(&["images", "v4", "builds"])?, body, headers, c).await?;
+        let response =
+            self.send_with(Method::POST, self.api(&["images", "v4", "builds"])?, Some(Body::Json(body)), c, true, headers).await?;
         let build = if response.status() == 409 {
             // Another prepare of the same image is building it: wait for that one.
             let conflict: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
@@ -513,29 +558,6 @@ impl Tensorlake {
             }
         }
         Err(ProtocolError::unavailable(format!("Tensorlake image build {id} is still running"), Some(30)))
-    }
-    async fn send_with_headers(
-        &self,
-        method: Method,
-        url: Url,
-        body: Value,
-        extra: reqwest::header::HeaderMap,
-        c: &Credentials,
-    ) -> Result<http::Response<bytes::Bytes>> {
-        let operation = format!("{method} {}", url.path());
-        let mut request = reqwest::Request::new(method, url);
-        let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.key(c)?.expose()))
-            .map_err(|_| refused("invalid Tensorlake API key header"))?;
-        auth.set_sensitive(true);
-        request.headers_mut().extend(extra);
-        request.headers_mut().insert(reqwest::header::AUTHORIZATION, auth);
-        request.headers_mut().insert(reqwest::header::CONTENT_TYPE, reqwest::header::HeaderValue::from_static("application/json"));
-        *request.body_mut() = Some(body.to_string().into());
-        rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Unavailable {
-            provider_error: Some(error),
-            reason: format!("Tensorlake {operation} transport failed"),
-            retry_after: None,
-        })
     }
     fn resources(&self, size: &Size) -> Result<Value> {
         let memory_mb = size.memory_bytes / MIB;
@@ -959,8 +981,8 @@ impl Provider for Tensorlake {
         self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
         let Some(sandbox_id) = sandbox_id else { return Ok(()) };
         let mut remaining = 0;
-        for snapshot in self.paged(&["snapshots"], "snapshots", c).await? {
-            if snapshot.get("sandbox_id").and_then(Value::as_str) != Some(&sandbox_id) || snapshot["status"] == "deleting" {
+        for snapshot in self.snapshots(&sandbox_id, c).await? {
+            if snapshot["status"] == "deleting" {
                 continue;
             }
             let snapshot_id =
@@ -990,15 +1012,14 @@ impl Provider for Tensorlake {
         }
         let url = self.guest(id, &["tunnels", "tcp"])?;
         let url = format!("wss://{}{}?port={}", url.host_str().ok_or_else(bad_response)?, url.path(), self.settings.tunnel_port);
-        let mut token = self.token(id, c).await?;
-        for attempt in 0..2 {
-            let mut headers = HeaderMap::new();
-            let mut auth = format!("Bearer {}", self.key(c)?.expose())
-                .parse::<http::HeaderValue>()
-                .map_err(|_| refused("invalid Tensorlake API key header"))?;
-            auth.set_sensitive(true);
-            headers.insert(http::header::AUTHORIZATION, auth);
-            let socket = self.dialer.dial(&url, headers).await.map_err(|error| match error {
+        let mut auth = format!("Bearer {}", self.key(c)?.expose())
+            .parse::<http::HeaderValue>()
+            .map_err(|_| refused("invalid Tensorlake API key header"))?;
+        auth.set_sensitive(true);
+        let headers = HeaderMap::from_iter([(http::header::AUTHORIZATION, auth)]);
+        let (url, headers) = (&url, &headers);
+        let connect = |token: Token| async move {
+            let socket = self.dialer.dial(url, headers.clone()).await.map_err(|error| match error {
                 DialError::Refused { status, body } => failure("tunnel", status, body.as_bytes(), None),
                 DialError::Io(error) => ProtocolError::Unavailable {
                     reason: "Tensorlake tunnel transport failed".into(),
@@ -1006,24 +1027,20 @@ impl Provider for Tensorlake {
                     provider_error: Some(error.to_string()),
                 },
             })?;
-            match tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await {
-                // drydock-transport's stream, as the provider interface's.
-                Ok(stream) => return Ok(Box::new(stream)),
-                // A token cached before another bootstrap replaced the file.
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied && attempt == 0 => {
-                    self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
-                    token = self.token(id, c).await?;
-                }
-                Err(error) => {
-                    return Err(ProtocolError::Unavailable {
-                        reason: "the agent's TCP listener did not accept the tunnel".into(),
-                        retry_after: None,
-                        provider_error: Some(error.to_string()),
-                    });
-                }
-            }
+            Ok::<_, ProtocolError>(tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await)
+        };
+        let mut connected = connect(self.token(id, c).await?).await?;
+        // A token cached before another bootstrap replaced the file: read it again, once.
+        if connected.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+            self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+            connected = connect(self.token(id, c).await?).await?;
         }
-        unreachable!("the second attempt returns")
+        // drydock-transport's stream, as the provider interface's.
+        connected.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
+            reason: "the agent's TCP listener did not accept the tunnel".into(),
+            retry_after: None,
+            provider_error: Some(error.to_string()),
+        })
     }
 }
 
@@ -1179,6 +1196,109 @@ mod tests {
         assert_ne!(name, sandbox_name("tensorlake-2", &label));
         assert_ne!(name, sandbox_name("tensorlake", &format!("{label}x")));
     }
+    // A request's network reads back as the same policy, so re-adoption
+    // matches it: CIDRs are masked, IPv4 literals stay addresses, names are
+    // lowercased without a final dot, and any name brings internet access.
+    // Entries span names, literals, CIDRs with host bits set, and duplicates.
+    #[hegel::test]
+    fn network_policies_read_back_as_requested(tc: hegel::TestCase) {
+        let pool = ["example.com", "Example.COM.", "192.0.2.7", "10.1.2.3/8", "10.0.0.0/8", "172.16.5.4/12", "api.github.com"];
+        let picks = tc.draw(gs::vecs(gs::integers::<usize>().max_value(pool.len() - 1)).max_size(5));
+        let direct: Vec<Destination> = picks
+            .iter()
+            .map(|i| match pool[*i] {
+                entry if entry.contains('/') => Destination::Cidr { cidr: serde_json::from_value(json!(entry)).unwrap() },
+                entry => Destination::Host { host: serde_json::from_value(json!(entry)).unwrap() },
+            })
+            .collect();
+        let request = Policy::request(&EgressRequest::DenyAll { direct }).unwrap();
+        let body = request.body().unwrap();
+        let names = picks.iter().any(|i| pool[*i].contains("com"));
+        assert_eq!(body["allow_internet_access"], names);
+        assert_eq!(body.get("allow_out").is_some(), !picks.is_empty());
+        let allow_out: Vec<String> = serde_json::from_value(body.get("allow_out").cloned().unwrap_or(json!([]))).unwrap();
+        assert!(allow_out.iter().all(|e| e == &e.to_ascii_lowercase() && !e.ends_with('.')));
+        assert!(!allow_out.contains(&"10.1.2.3/8".to_owned()) && !allow_out.contains(&"172.16.5.4/12".to_owned()), "{allow_out:?}");
+        let sandbox = json!({"allow_internet_access": body["allow_internet_access"], "allow_out": body.get("allow_out"), "deny_out": []});
+        assert_eq!(Policy::read(Some(&sandbox)).unwrap(), request);
+        assert_eq!(Policy::read(Some(&sandbox)).unwrap().fingerprint(), request.fingerprint());
+        assert_eq!(Policy::request(&EgressRequest::Open).unwrap(), Policy::read(None).unwrap());
+        // A denial drydock never makes keeps the policy distinct from the request.
+        let denied =
+            json!({"allow_internet_access": body["allow_internet_access"], "allow_out": body.get("allow_out"), "deny_out": ["evil.test"]});
+        assert_ne!(Policy::read(Some(&denied)).unwrap(), request);
+    }
+    // Byte quantities: plain bytes, or whole MiB or GiB; anything else, and
+    // overflow, is refused.
+    #[test]
+    fn byte_quantities_parse() {
+        let parse = |v: Value| serde_json::from_value::<ByteQuantity>(v).map(|q| q.0).ok();
+        assert_eq!(parse(json!(1024)), Some(1024));
+        assert_eq!(parse(json!("16GiB")), Some(16 << 30));
+        assert_eq!(parse(json!("512MiB")), Some(512 << 20));
+        assert_eq!(parse(json!("512 MiB")), Some(512 << 20));
+        assert_eq!(parse(json!("2048")), Some(2048));
+        for invalid in [json!("16GB"), json!("1.5GiB"), json!("GiB"), json!("-1GiB"), json!(format!("{}GiB", u64::MAX)), json!(-1)] {
+            assert_eq!(parse(invalid.clone()), None, "{invalid}");
+        }
+    }
+    // Private registries are known without DNS; public names, and digest
+    // pins without whitespace or backslashes, pass.
+    #[test]
+    fn private_registries_and_pins() {
+        for private in [
+            "10.0.0.1",
+            "10.0.0.1:5000",
+            "172.20.1.1",
+            "192.168.0.9",
+            "127.0.0.1:5000",
+            "169.254.1.1",
+            "100.100.1.1",
+            "0.0.0.0",
+            "[::1]:5000",
+            "localhost",
+            "localhost:5000",
+            "registry:5000",
+            "lab.local",
+            "forgejo.internal",
+            "x.home.arpa",
+            "box.lan",
+        ] {
+            assert!(private_registry(private), "{private}");
+        }
+        for public in ["ghcr.io", "docker.io", "registry.example.com:443", "8.8.8.8", "100.128.0.1", "172.32.0.1"] {
+            assert!(!private_registry(public), "{public}");
+        }
+        let hex = "a".repeat(64);
+        assert!(pinned(&format!("ghcr.io/x/y@sha256:{hex}")));
+        for unpinned in [
+            format!("ghcr.io/x/y:{hex}"),
+            format!("@sha256:{hex}"),
+            format!("x@sha256:{}", &hex[1..]),
+            format!("x y@sha256:{hex}"),
+            format!("x\\y@sha256:{hex}"),
+            format!("x@sha256:{}g", &hex[1..]),
+        ] {
+            assert!(!pinned(&unpinned), "{unpinned}");
+        }
+    }
+    // A command's end: exit 0 succeeds; another code is that code; a signal
+    // is 128 plus it, as a shell reports; no exit at all is -1.
+    #[test]
+    fn guest_command_ends() {
+        let run = |exit| Run { lines: vec![(false, "out".into()), (true, "err".into())], exit };
+        assert!(run(Some((Some(0), None))).success().is_ok());
+        let code = |exit| match run(exit).success() {
+            Err(ProtocolError::CommandFailed { exit_code, output, .. }) => {
+                assert_eq!(output.expose(), "out\nerr");
+                exit_code
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+        assert_eq!(code(Some((Some(3), None))), 3);
+        assert_eq!(code(Some((None, Some(9)))), 137);
+        assert_eq!(code(None), -1);
+    }
     // base32 decodes exactly what it encodes, and refuses non-zero padding.
     #[hegel::test]
     fn base32_round_trips(tc: hegel::TestCase) {
@@ -1189,7 +1309,7 @@ mod tests {
     // Two-decimal minor units become exact major amounts, leading zeros and all.
     #[test]
     fn minor_units_become_exact_amounts() {
-        for (minor, amount) in [("0", "0.00"), ("7", "0.07"), ("123", "1.23"), ("100000", "1000.00")] {
+        for (minor, amount) in [("0", "0.00"), ("05", "0.05"), ("7", "0.07"), ("123", "1.23"), ("00123", "1.23"), ("100000", "1000.00")] {
             assert_eq!(minor_to_cost(&json!({"currency":"usd","amountMinor":minor})).unwrap().amount, amount);
         }
         assert!(minor_to_cost(&json!({"currency":"jpy","amountMinor":"5"})).is_err());
