@@ -24,9 +24,9 @@ DRYDOCK_ROOT, runs its own drydockd, and then:
 - prepares IMAGE twice (Modal's definition cache gives the same image);
 - launches a deny-all vessel, which returns after the agent's hello over the
   exec bridge;
-- runs an egress probe as root in it (a denied address and name, and a DNS
-  lookup, recorded either way), then in a second vessel provisioned with an
-  allowlist (an allowed name and CIDR, a denied address);
+- runs an egress probe as root in it (a TLS handshake to a denied address and
+  name, and a DNS lookup, recorded either way), then in a second vessel
+  provisioned with an allowlist (an allowed name and CIDR, a denied address);
 - opens a relay through drydockd, reads the agent's hello over it, sees its
   bridge process in the sandbox, closes it and sees the bridge gone;
 - destroys both vessels, and lists the app's sandboxes through Modal to show
@@ -83,7 +83,8 @@ class Drydock:
     """A throwaway DRYDOCK_ROOT with its own drydockd and the drydock CLI."""
 
     def __init__(self, options, token_file):
-        self.root = tempfile.mkdtemp(prefix="drydock-live-modal-")
+        # Short and under /tmp: macOS's TMPDIR puts the socket past its 104-byte limit.
+        self.root = tempfile.mkdtemp(prefix="dd-modal-", dir="/tmp")
         self.config = os.path.join(self.root, "config", "drydock.toml")
         self.socket = os.path.join(self.root, "config", "run", "drydock.sock")
         os.makedirs(os.path.dirname(self.socket), mode=0o700)
@@ -194,14 +195,24 @@ def hello_over(sock, rest):
 
 
 # Run as root in the vessel: python is in the default image, so no client tools.
+# Modal enforces an allowlist with a transparent proxy: a TCP connect to any
+# address succeeds, and an unlisted destination is reset at TLS. So a target is
+# reached only if a TLS handshake (SNI for a name) completes; every target
+# serves HTTPS on 443. Certificates are not checked: only reach is measured.
 EGRESS = r"""
-import json, os, socket, sys
+import json, os, socket, ssl, sys
 def tcp(host, port):
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    stage = "connect"
     try:
-        socket.create_connection((host, port), timeout=6).close()
-        return "connected"
+        with socket.create_connection((host, port), timeout=6) as raw:
+            stage = "TLS"
+            with context.wrap_socket(raw, server_hostname=host):
+                return "connected"
     except Exception as e:
-        return f"blocked ({type(e).__name__})"
+        return f"blocked at {stage} ({type(e).__name__})"
 def dns(name):
     try:
         return sorted({a[4][0] for a in socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)})
@@ -288,7 +299,7 @@ def main():
         result = egress(client, launched["id"], "example.com", "1.1.1.1:443", "example.com:443")
         print(f"deny-all probe: {result}", flush=True)
         must(result is not None and result["uid"] == 0, "the egress probe ran as root")
-        check(all(v.startswith("blocked") for v in result["tcp"].values()), f"deny-all blocks TCP: {result['tcp']}")
+        check(all(v.startswith("blocked") for v in result["tcp"].values()), f"deny-all blocks TLS: {result['tcp']}")
         print(f"RECORD deny-all DNS for example.com: {result['dns']}", flush=True)
 
         # An allowlist: one name and one CIDR allowed, another address denied.
