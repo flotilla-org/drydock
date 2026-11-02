@@ -136,6 +136,57 @@ wait`, `ingress access` and `containerregistry *`,
 Module tests run against in-process stand-ins for the SDK and OCI registries
 (`test/support/namespace.ts`), never a live token.
 
+The built-in `modal` module drives Modal sandboxes through the JavaScript SDK
+(`modal`, gRPC to `api.modal.com`; `src/modal/`). Settings: `app` (default
+`drydock`: the one app holding every sandbox of the instance, created if
+missing), `environment`, `runtime` (`vm`, the default, or `gvisor`),
+`concurrency_limit` and `egress_probe` (as Namespace's). The credential is
+`{"token_id": …, "token_secret": …}`, handed to the SDK client directly, never
+through `~/.modal.toml` or `MODAL_TOKEN_*`; the SDK still reads its server URL
+and sandbox backend from those, so run the host without them.
+
+- Prepare (route `registry_pull`, linux/amd64 only) has Modal build the base
+  by digest with `COPY --from=<tools>@sha256 /opt/drydock/ /opt/drydock/`, in
+  the module's app; the prepared form's ID is the `im-…` image. Modal caches by
+  definition, so the same digests give the same image. A pull credential
+  becomes an ephemeral secret for the base's registry only. A registry that
+  resolves here to a private address is refused before building: Modal pulls
+  only from the public internet.
+- Provision creates a sandbox named from the label (unique per app), tagged
+  with the instance, the label, its egress policy, size and expiry, with a
+  timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory (no disk
+  size), and as its command `sh -c '<agent> --supervise --socket <socket>;
+exec sleep infinity'`. The supervisor detaches; `sleep` keeps the sandbox
+  alive. A label whose name is taken re-adopts that sandbox when its tags say
+  it is this instance's, with the same size and policy, and refuses it
+  otherwise. Either way the module runs `--supervise` again by exec
+  (idempotent) and waits for the agent's socket.
+- Reach is this host's relay route; the relay is an exec of
+  `drydock-agent --bridge`, binary both ways. Modal never kills an exec, so
+  closing the relay ends the bridge's stdin, which ends it. A relay to a
+  terminated sandbox is refused, not retried.
+- Egress: open sets nothing; deny all is `blockNetwork`; IPv4 CIDRs and
+  literals become the CIDR allowlist and names the domain allowlist; ports and
+  IPv6 are refused. TCP is enforced outside the guest, against root, so the
+  declaration is enforced; DNS resolution is never filtered, and an
+  `egress_probe` that counts it reports that vessel advisory.
+- There is no suspend: snapshots restore under a new id. A sandbox that
+  reached its timeout reads as gone at its lifetime cap; one terminated
+  elsewhere as destroyed at the provider.
+- List is the app's running sandboxes tagged with the instance (Modal lists no
+  terminated ones); inspect and destroy find a sandbox by id, and refuse one
+  without the instance's tag. Destroy terminates and waits; an absent sandbox
+  is already destroyed.
+- Quota is the count of listed sandboxes against `concurrency_limit`; Modal has
+  no quota API. Usage is undeclared: the JavaScript SDK has no billing report.
+- A role lacking a right is a refusal; only an unauthenticated token is a
+  rejected credential. One SDK client is kept per credential, retired as
+  Namespace's are.
+
+Its tests run against an in-process stand-in for the SDK
+(`test/support/modal.ts`) that enforces what Modal documents and the probe in
+drydock#192 observed. `scripts/live-modal.py` checks it against Modal itself.
+
 `corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration test
 against this actual child host through the main Daemon and its existing checker.
 Authentication is exercised by the shared server serving tests; private UDS uses
