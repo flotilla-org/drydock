@@ -9,7 +9,19 @@ drydockd and drydock-host built from this branch (default target/release,
 from `cargo build --release -p drydock -p drydock-host -p drydock-agent`).
 PATH is a linux/amd64 drydock-agent, which launch pushes into the vessel; by
 default $DRYDOCK_AGENT_BIN_LINUX_AMD64, else DIR/drydock-agent-linux-amd64,
-else DIR/drydock-agent on a Linux x86_64 host. IMAGE is a public
+else DIR/drydock-agent on a Linux x86_64 host. Elsewhere, extract the one
+in the pinned tools image:
+
+    id=$(docker create --platform linux/amd64 "$(cat crates/drydock/tools-image.txt)")
+    docker cp "$id":/opt/drydock/drydock-agent target/release/drydock-agent-linux-amd64
+    docker rm "$id"
+
+or cross-build it with cargo-zigbuild:
+
+    cargo zigbuild --release -p drydock-agent --target x86_64-unknown-linux-gnu
+    # then --agent target/x86_64-unknown-linux-gnu/release/drydock-agent
+
+IMAGE is a public
 linux/amd64 image with a glibc userland, bash and curl, pinned by digest
 (default buildpack-deps:bookworm-curl as of 2026-11-02). Only the Python standard library is needed.
 
@@ -263,7 +275,8 @@ def main():
         agent = os.path.join(bin_dir, "drydock-agent")
     if not agent or not os.access(agent, os.X_OK):
         raise SystemExit(f"no linux/amd64 drydock-agent at {agent or bin_dir + '/drydock-agent-linux-amd64'}; "
-                         "pass --agent PATH (the tools-image release artifact carries one)")
+                         "pass --agent PATH: extract /opt/drydock/drydock-agent from the pinned tools image "
+                         "(crates/drydock/tools-image.txt) or cargo zigbuild it; see --help")
     agent = os.path.abspath(agent)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     # Short, so the daemon's socket path fits a Unix socket address.
