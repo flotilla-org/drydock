@@ -400,8 +400,10 @@ pub enum Destination {
 /// under /opt/drydock before the first hello.
 /// Modules choose their own provider-recorded key from the image digest and
 /// any prepare-time constraints (Daytona also includes size). The tools
-/// digest is not part of it, nor is configuration. Provision must match the
-/// recorded prepared form. See ADR 0070 Vessel tools.
+/// digest is not part of it, nor is configuration, unless the baked agent
+/// must carry the first hello itself (Tensorlake's tunnel reaches the
+/// agent's TCP listener, so an agent older than it can never be upgraded).
+/// Provision must match the recorded prepared form. See ADR 0070 Vessel tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PrepareRequest {
     pub size: Size,

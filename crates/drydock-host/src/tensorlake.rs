@@ -843,7 +843,9 @@ fn unbase32(text: &str) -> Option<Vec<u8>> {
 }
 /// The prepared image's name: one per base image, tools image and
 /// platform, so a new tools pin builds a new image rather than reusing one
-/// baked with the old tools layer.
+/// baked with the old tools layer. Unlike Daytona's, the baked agent is no
+/// mere cache: the first hello arrives through its TCP listener, so an agent
+/// too old to listen can't be reached to be upgraded.
 fn image_name(image: &str, tools: &str, platform: &Platform) -> String {
     format!("dd-{}", &digest(&format!("{image}\0{tools}\0{platform}"))[..40])
 }
