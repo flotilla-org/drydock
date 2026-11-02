@@ -25,6 +25,7 @@ use std::{
 const LAB: &str = "lab.test";
 const STAGE: &str = "stage.test";
 const STAGED: &str = "stage.test/org/staging";
+const MIRROR: &str = "quay.test/org/mirror";
 const CHUNK: u64 = 256;
 
 fn sha256(bytes: &[u8]) -> String {
@@ -76,6 +77,9 @@ struct Registries(Arc<Mutex<Oci>>);
 #[async_trait]
 impl HttpClient for Registries {
     async fn execute(&self, request: reqwest::Request, _: &rigging_http_client::ChannelLabel) -> Result<http::Response<Bytes>, String> {
+        // Every registry call yields, as a network call would, so concurrent
+        // prepares interleave between calls.
+        tokio::task::yield_now().await;
         Ok(respond(&mut self.0.lock().unwrap(), &request))
     }
 }
@@ -318,7 +322,8 @@ impl drydock::launch::ImageResolver for Digests {
 }
 
 /// A daemon whose `e2b` and `modal` instances both pull from the `ghcr`
-/// staging registry, with its push and pull credentials in files.
+/// staging registry, with its push and pull credentials in files; `e2b`
+/// can also pull from `quay`.
 async fn start(dir: &Path, registries: &Registries, module: &Pulling) -> Arc<Daemon> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -340,9 +345,12 @@ async fn start(dir: &Path, registries: &Registries, module: &Pulling) -> Arc<Dae
 repository = "{STAGED}"
 push = {{ username = "bot", credential = {{ file = "{push}" }} }}
 pull = {{ username = "bot", credential = {{ file = "{pull}" }} }}
+[registries.quay]
+repository = "{MIRROR}"
+push = {{ username = "bot", credential = {{ file = "{push}" }} }}
 [providers.e2b]
 module = "pulling"
-pull_from = ["ghcr"]
+pull_from = ["ghcr", "quay"]
 [providers.modal]
 module = "pulling"
 pull_from = ["ghcr"]
@@ -411,16 +419,16 @@ async fn staged_once_and_reused_by_another_provider() {
     assert_eq!(registries.violations(), Vec::<String>::new());
 }
 
-// An image already under a registry the provider pulls from (here, a path
-// below the staging repository) reaches the host as requested, with no
-// registry traffic at all.
+// An image already under any registry the provider pulls from (here, a path
+// below its second one) reaches the host as requested, with no registry
+// traffic at all.
 #[tokio::test]
 async fn an_image_in_a_pull_from_registry_passes_through() {
     let dir = tempfile::tempdir().unwrap();
     let registries = Registries::default();
     let module = Pulling::default();
     let daemon = start(dir.path(), &registries, &module).await;
-    let image = format!("{STAGED}/crew@sha256:{}", "1".repeat(64));
+    let image = format!("{MIRROR}/crew@sha256:{}", "1".repeat(64));
     let pull = Some(credential("someone", "their-token"));
 
     ProviderApi::prepare(&*daemon, "e2b", &request(&image, pull.clone())).await.unwrap();
@@ -471,4 +479,24 @@ async fn a_push_refusal_names_the_staging_registry() {
         }
         assert!(module.0.lock().unwrap().is_empty());
     }
+}
+
+// Concurrent prepares of one image, for two providers, copy it once: each
+// blob is uploaded once and the manifest put once.
+#[tokio::test]
+async fn concurrent_prepares_copy_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    let module = Pulling::default();
+    let (image, _) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+
+    let request = request(&image, Some(credential("lab-user", "lab-secret")));
+    let (first, second) = tokio::join!(ProviderApi::prepare(&*daemon, "e2b", &request), ProviderApi::prepare(&*daemon, "modal", &request));
+    assert_eq!(first.unwrap().image_digest, second.unwrap().image_digest);
+    let s = registries.0.lock().unwrap();
+    let count = |method: &str, path: &str| s.requests.iter().filter(|(h, m, p)| h == STAGE && m == method && p.contains(path)).count();
+    // An amd64 image is a config and three layers.
+    assert_eq!(count("POST", "/blobs/uploads/"), 4);
+    assert_eq!(count("PUT", "/manifests/"), 1);
 }

@@ -8,7 +8,11 @@ use crate::{
 use drydock_oci::{ImageRef, Registry};
 use drydock_protocol::*;
 use rigging_http_client::HttpClient;
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, Weak},
+    time::Instant,
+};
 
 type Result<T> = std::result::Result<T, ProtocolError>;
 
@@ -30,10 +34,26 @@ impl Default for Transfer {
 pub(crate) struct Staging {
     transfer: Transfer,
     registries: BTreeMap<String, Declared>,
+    /// One lock per staged reference, so concurrent prepares of one image
+    /// copy it once and prepares of other images never wait on it.
+    copying: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 impl Staging {
     pub(crate) fn new(transfer: Transfer, registries: BTreeMap<String, Declared>) -> Self {
-        Self { transfer, registries }
+        Self { transfer, registries, copying: Mutex::default() }
+    }
+    fn declared(&self, name: &str) -> Result<&Declared> {
+        self.registries.get(name).ok_or_else(|| ProtocolError::Refused { reason: format!("unknown staging registry {name}") })
+    }
+    fn lock(&self, staged: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut copying = self.copying.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        copying.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = copying.get(staged).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        copying.insert(staged.to_owned(), Arc::downgrade(&lock));
+        lock
     }
     /// The request for an instance that pulls from `pull_from`, on the
     /// registry-pull route and `platform`. An image already in one of those
@@ -43,10 +63,12 @@ impl Staging {
         let Some(name) = pull_from.first() else { return Ok(request) };
         let source = ImageRef::parse(&request.image_digest)?;
         let located = format!("{}/{}", source.registry, source.repository);
-        if pull_from.iter().any(|r| within(&located, &self.registries[r].repository)) {
-            return Ok(request);
+        for r in pull_from {
+            if within(&located, &self.declared(r)?.repository) {
+                return Ok(request);
+            }
         }
-        let declared = &self.registries[name];
+        let declared = self.declared(name)?;
         let (host, repository) = declared.location().map_err(|reason| ProtocolError::Refused { reason })?;
         // Every credential is read before anything moves.
         let push = credential(name, "push", &declared.push).await?;
@@ -61,8 +83,10 @@ impl Staging {
         let to = Registry::new(http, &host, Some(push), None)?.staging(name);
         let started = Instant::now();
         let manifest = from.platform_manifest(&source, platform).await?;
-        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, &to, &repository, self.transfer.chunk_bytes).await?;
         let staged = format!("{}@{}", declared.repository, manifest.digest);
+        let lock = self.lock(&staged);
+        let _copying = lock.lock().await;
+        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, &to, &repository, self.transfer.chunk_bytes).await?;
         tracing::info!(
             registry = %name,
             image = %request.image_digest,
