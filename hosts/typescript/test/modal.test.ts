@@ -7,6 +7,7 @@ import {
   COMMAND,
   LIFETIME_SECONDS,
   SOCKET,
+  STDIN_CHUNK,
   TAGS,
   modalModule,
   networkFields,
@@ -448,6 +449,37 @@ test("relay bridges bytes, ends the bridge on close, and refuses a terminated sa
     kind("refused"),
   );
   assert.equal(standIn.processes.length, execs);
+});
+
+// Each stdin write is one serialised round trip, so the relay sends what
+// queued meanwhile as one write: an agent upload in drydockd's small writes
+// must not take a round trip per write.
+test("relay coalesces small writes into few large stdin writes", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
+  standIn.roundTripMs = 5;
+  const received = new Promise<Buffer>((resolve) => {
+    standIn.agent = (remote) => {
+      const chunks: Buffer[] = [];
+      remote.on("data", (d: Buffer) => chunks.push(d));
+      remote.once("end", () => {
+        resolve(Buffer.concat(chunks));
+        remote.end();
+      });
+    };
+  });
+  const stream = await provider.relay!(environment.id, context);
+  stream.resume();
+  const payload = randomBytes(4 * MiB);
+  for (let at = 0; at < payload.length; at += 16 * 1024)
+    if (!stream.write(payload.subarray(at, at + 16 * 1024)))
+      await new Promise((resolve) => stream.once("drain", resolve));
+  stream.end();
+  assert.ok((await received).equals(payload));
+  const { writes } = standIn.processes.at(-1)!;
+  assert.ok(Math.max(...writes) <= STDIN_CHUNK, "no write over the cap");
+  // 256 small writes go as a few round trips per 256 KiB, not one each.
+  assert.ok(writes.length <= 48, `${writes.length} stdin writes`);
 });
 
 // Destroy terminates and is idempotent; the sandbox then reads as gone by

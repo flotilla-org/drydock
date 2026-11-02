@@ -42,16 +42,25 @@ type Row = {
   exit: number | null;
 };
 
-/** One exec. It runs until its stdin ends, as Modal's do: there is no kill. */
+/**
+ * One exec. It runs until its stdin ends, as Modal's do: there is no kill.
+ * Each stdin write is one unary RPC, serialised, as the SDK's are.
+ */
 export class StandInProcess implements Process {
   running = true;
+  /** The size of each stdin write, in order. */
+  writes: number[] = [];
   stdin: WritableStream<Uint8Array>;
   stdout: ReadableStream<Uint8Array>;
   readonly command: string[];
   private exited: Promise<number>;
   private input = new PassThrough();
 
-  constructor(command: string[], serve: (remote: Duplex) => number | void) {
+  constructor(
+    command: string[],
+    serve: (remote: Duplex) => number | void,
+    roundTripMs = 0,
+  ) {
     this.command = command;
     // Stdin and stdout are separate channels: reading less of stdout never
     // ends stdin, and only stdin's end ends the process.
@@ -67,10 +76,13 @@ export class StandInProcess implements Process {
     );
     code = serve(remote) ?? 0;
     this.stdin = new WritableStream({
-      write: (chunk) =>
-        new Promise<void>((resolve) =>
+      write: async (chunk) => {
+        this.writes.push(chunk.length);
+        await new Promise((resolve) => setTimeout(resolve, roundTripMs));
+        await new Promise<void>((resolve) =>
           this.input.write(chunk, () => resolve()),
-        ),
+        );
+      },
       close: () => {
         this.input.end();
       },
@@ -116,6 +128,8 @@ export class StandIn implements Vendor {
   /** Probe output and exit for any other exec. */
   execStdout = "";
   execExit = 0;
+  /** The time each stdin write takes. */
+  roundTripMs = 0;
   private next = 0;
 
   /** Each bridge is answered by `agent`, standing in for the agent's socket. */
@@ -263,15 +277,19 @@ export class StandIn implements Vendor {
         const row = standIn.row(id);
         if (row.exit !== null) throw new ClientError(9, "sandbox has finished");
         standIn.calls.push(`exec ${command.join(" ")}`);
-        const process = new StandInProcess(command, (remote) => {
-          if (command.includes("--bridge")) return standIn.agent(remote);
-          const agentStart = command.join(" ").includes("--supervise");
-          remote.once("end", () =>
-            remote.end(agentStart ? "" : standIn.execStdout),
-          );
-          remote.resume();
-          return agentStart ? standIn.agentStart : standIn.execExit;
-        });
+        const process = new StandInProcess(
+          command,
+          (remote) => {
+            if (command.includes("--bridge")) return standIn.agent(remote);
+            const agentStart = command.join(" ").includes("--supervise");
+            remote.once("end", () =>
+              remote.end(agentStart ? "" : standIn.execStdout),
+            );
+            remote.resume();
+            return agentStart ? standIn.agentStart : standIn.execExit;
+          },
+          standIn.roundTripMs,
+        );
         (process as any).sandbox = id;
         standIn.processes.push(process);
         return process;

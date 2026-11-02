@@ -166,13 +166,16 @@ exec sleep infinity'`. The supervisor detaches; `sleep` keeps the sandbox
   sandbox stays listed: `destroy` it). The SDK takes no abort signal, so a
   cancelled call stops between SDK calls, never during one.
 - Reach is this host's relay route; the relay is an exec of
-  `drydock-agent --bridge`, binary both ways. Modal never kills an exec, so
-  closing the relay ends the bridge's stdin, which ends it. A relay to a
-  terminated sandbox is refused, not retried.
+  `drydock-agent --bridge`, binary both ways. Each stdin write is one
+  serialised SDK round trip, so the relay sends what queued during one as the
+  next, up to 256 KiB a write. Modal never kills an exec, so closing the relay
+  ends the bridge's stdin, which ends it. A relay to a terminated sandbox is
+  refused, not retried.
 - Egress: open sets nothing; deny all is `blockNetwork`; IPv4 CIDRs and
   literals become the CIDR allowlist and names the domain allowlist; ports and
-  IPv6 are refused. TCP is enforced outside the guest, against root, so the
-  declaration is enforced; DNS resolution is never filtered, and an
+  IPv6 are refused. Destinations are enforced outside the guest, against root,
+  by a transparent proxy (a connect succeeds; an unlisted destination is reset
+  at TLS or HTTP), so the declaration is enforced; DNS resolution is never filtered, and an
   `egress_probe` that counts it reports that vessel advisory.
 - There is no suspend: snapshots restore under a new id. A sandbox that
   reached its timeout reads as gone at its lifetime cap; one terminated

@@ -168,6 +168,40 @@ export function networkFields(
 }
 
 /** A tag-sized identity of a policy, and whether it denies everything. */
+/** The most one stdin write carries, as the SDK's streaming writes do. */
+export const STDIN_CHUNK = 256 * 1024;
+
+/**
+ * An exec's stdin as a Node stream. Each SDK write is one unary round trip,
+ * serialised, so passing drydockd's small writes through one by one caps the
+ * relay near a write per round trip. Instead, what queues while one write is
+ * in flight goes as the next, up to `STDIN_CHUNK` bytes a write.
+ */
+export function stdinWritable(stdin: WritableStream<Uint8Array>): Writable {
+  const writer = stdin.getWriter();
+  return new Writable({
+    // Room for a full write to queue behind the one in flight.
+    highWaterMark: 2 * STDIN_CHUNK,
+    async writev(chunks, callback) {
+      try {
+        const data = Buffer.concat(chunks.map(({ chunk }) => chunk));
+        for (let at = 0; at < data.length; at += STDIN_CHUNK)
+          await writer.write(data.subarray(at, at + STDIN_CHUNK));
+        callback();
+      } catch (error) {
+        callback(error as Error);
+      }
+    },
+    final(callback) {
+      writer.close().then(() => callback(), callback);
+    },
+    destroy(error, callback) {
+      writer.abort(error).catch(() => {});
+      callback(error);
+    },
+  });
+}
+
 function policyIdentity(fields: ReturnType<typeof networkFields>) {
   if (fields.blockNetwork) return "deny";
   if (!fields.outboundCidrAllowlist && !fields.outboundDomainAllowlist)
@@ -236,8 +270,10 @@ class Modal implements Provider {
     usage: false,
     quota: true,
     agent: true,
-    // TCP destinations are enforced outside the guest, against root. DNS
-    // resolution is never filtered; `egress_probe` measures each vessel.
+    // Destinations are enforced outside the guest, against root, by a
+    // transparent proxy: a connect succeeds, but an unlisted destination is
+    // reset at TLS or HTTP. DNS resolution is never filtered; `egress_probe`
+    // measures each vessel.
     egress: {
       routes: ["none", "explicit_proxy", "open"],
       enforcement: "enforced",
@@ -704,7 +740,7 @@ class Modal implements Provider {
       const bridge = await call(() =>
         box!.exec([AGENT, "--bridge", "--socket", SOCKET]),
       );
-      const writable = Writable.fromWeb(bridge.stdin as web.WritableStream);
+      const writable = stdinWritable(bridge.stdin);
       // Finishing it closed stdin, which sent the EOF.
       let ended = false;
       writable.once("finish", () => (ended = true));
