@@ -133,7 +133,7 @@ settings, as drydock's other registry clients do, and trust the built-in CA
 roots. A registry that refuses the
 copy is the `staging_refused` image refusal, naming it and quoting the
 registry's own error message (cut short, and left out if it repeats the push
-secret). drydockd logs each
+secret, its Basic encoding or a bearer token). drydockd logs each
 staging and its duration. Staged images are not yet garbage-collected
 (drydock#61); `scripts/live-staging-registry.py` checks staging against a real
 private GHCR package.

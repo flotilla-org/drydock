@@ -348,6 +348,22 @@ impl Registry {
         value.set_sensitive(true);
         Some(value)
     }
+    /// The secret, its Basic encoding, and every bearer token held: whatever
+    /// a registry could echo back of its credentials.
+    fn sent_secrets(&self) -> Vec<String> {
+        let mut sent: Vec<String> = self
+            .basic()
+            .into_iter()
+            .chain(self.authorizations.lock().unwrap().values().cloned())
+            .filter_map(|value| {
+                let value = value.to_str().ok()?;
+                Some(value.split_once(' ').map_or(value, |(_, token)| token).to_owned())
+            })
+            .collect();
+        sent.extend(self.credential.as_ref().map(|c| c.secret.expose().to_owned()));
+        sent.retain(|secret| !secret.is_empty());
+        sent
+    }
     async fn authenticate(&self, scope: &str, headers: &header::HeaderMap) -> Result<HeaderValue> {
         let rejected = || self.refusal(format!("{} refused access to {scope}", self.described()));
         let challenge = headers.get(header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok()).ok_or_else(rejected)?;
@@ -419,11 +435,11 @@ impl Registry {
     }
     /// Why the registry refused, from the first OCI error's message: one line,
     /// at most [`MESSAGE_CHARS`] characters, and nothing at all when it
-    /// repeats this registry's secret.
+    /// repeats anything this registry was sent to authenticate.
     fn registry_message(&self, body: &[u8]) -> Option<String> {
         let errors: Value = serde_json::from_slice(body).ok()?;
         let message = errors["errors"][0]["message"].as_str()?.trim();
-        if message.is_empty() || self.credential.as_ref().is_some_and(|c| message.contains(c.secret.expose())) {
+        if message.is_empty() || self.sent_secrets().iter().any(|secret| message.contains(secret.as_str())) {
             return None;
         }
         let line: String = message.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();

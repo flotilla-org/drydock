@@ -69,7 +69,7 @@ struct Oci {
     /// The staging registry answers uploads with this status.
     refuse_push: Option<u16>,
     /// The message it refuses with, when not the usual one.
-    refusal_message: Option<&'static str>,
+    refusal_message: Option<String>,
     violations: Vec<String>,
 }
 /// Stands in for the network boundary to every registry: the OCI distribution
@@ -149,7 +149,7 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
         if let Some(status) = s.refuse_push {
             let challenge = format!(r#"Bearer realm="https://{host}/token",service="{host}""#);
             let headers = if status == 401 { vec![("www-authenticate", challenge)] } else { vec![] };
-            let message = s.refusal_message.unwrap_or("permission_denied: write_package");
+            let message = s.refusal_message.clone().unwrap_or_else(|| "permission_denied: write_package".into());
             return reply(status, &headers, Bytes::from(json!({"errors":[{"code":"DENIED","message":message}]}).to_string()));
         }
         let location = |id: &str| format!("/v2/{repository}/blobs/uploads/{id}");
@@ -558,8 +558,9 @@ async fn uploads_fit_the_registry_request_limit() {
     }
 }
 
-// A registry message that repeats the push credential's secret is left out of
-// the refusal: the reason travels to callers that must never see it.
+// A registry message that repeats the push credential, raw or Basic-encoded,
+// is left out of the refusal: the reason travels to callers that must never
+// see it.
 #[tokio::test]
 async fn a_refusal_never_repeats_the_push_secret() {
     let dir = tempfile::tempdir().unwrap();
@@ -567,13 +568,20 @@ async fn a_refusal_never_repeats_the_push_secret() {
     {
         let mut s = registries.0.lock().unwrap();
         s.refuse_push = Some(403);
-        s.refusal_message = Some("token push-token may not write here");
     }
     let module = Pulling::default();
     let (image, _) = registries.seed(LAB, "crew/base");
     let daemon = start(dir.path(), &registries, &module).await;
 
-    let error = ProviderApi::prepare(&*daemon, "e2b", &request(&image, Some(credential("lab-user", "lab-secret")))).await.unwrap_err();
-    assert!(matches!(&error, drydock::client::Error::Protocol(ProtocolError::ImageRefused { .. })), "{error:?}");
-    assert!(!format!("{error:?}").contains("push-token"), "{error:?}");
+    // The secret as configured, and as the Basic authorization carrying it.
+    let basic = basic("bot", "push-token");
+    let encoded = basic.trim_start_matches("Basic ");
+    for (echo, secret) in
+        [("token push-token may not write here".to_owned(), "push-token"), (format!("bad credentials {encoded}"), encoded)]
+    {
+        registries.0.lock().unwrap().refusal_message = Some(echo);
+        let error = ProviderApi::prepare(&*daemon, "e2b", &request(&image, Some(credential("lab-user", "lab-secret")))).await.unwrap_err();
+        assert!(matches!(&error, drydock::client::Error::Protocol(ProtocolError::ImageRefused { .. })), "{error:?}");
+        assert!(!format!("{error:?}").contains(secret), "{error:?}");
+    }
 }
