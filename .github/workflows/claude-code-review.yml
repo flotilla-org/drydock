@@ -10,7 +10,10 @@ on:
     #   - "src/**/*.jsx"
 jobs:
   claude-review:
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'in-vessel-review') }}
+    # The tools-image workflow's pin bumps change only a digest; CI checks them.
+    if: >-
+      ${{ !contains(github.event.pull_request.labels.*.name, 'in-vessel-review')
+      && github.event.pull_request.head.ref != 'automation/drydock-tools-pin' }}
     timeout-minutes: 15
     # Optional: Filter by PR author
     # if: |
