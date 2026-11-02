@@ -224,7 +224,7 @@ impl Local {
         unsafe {
             command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
         }
-        let mut child = command.spawn().map_err(|e| unavailable(format!("start agent: {e}")))?;
+        let mut child = spawn_retrying_busy(&mut command).await.map_err(|e| unavailable(format!("start agent: {e}")))?;
         let pid = child.id().ok_or_else(|| unavailable("agent exited at once"))?;
         if let Err(e) = tokio::fs::write(dir.join(PID), pid.to_string()).await {
             // Unrecorded, the agent could never be stopped later.
@@ -271,6 +271,8 @@ impl Local {
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
             }
             // The vessel's own copy: an agent upgrade replaces this file, never the installed build.
+            // Written here while other threads may fork: `start` execs it with
+            // spawn_retrying_busy, which waits out the ETXTBSY that can cause.
             std::fs::copy(&build, dir.join(AGENT))?;
             std::fs::set_permissions(dir.join(AGENT), std::fs::Permissions::from_mode(0o700))?;
             // Whole or absent: a crash mid-write must not leave a record that never parses.
@@ -573,5 +575,48 @@ impl SuspendResume for Local {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(unavailable(format!("clear suspension: {e}"))),
             _ => Ok(()),
         }
+    }
+}
+
+/// Spawns `command`, retrying while its executable is busy. A thread of this
+/// process that forks while another holds a just-copied executable open for
+/// writing passes the descriptor to its child until that child execs, and
+/// exec then fails with ETXTBSY. That lasts milliseconds, so up to eight
+/// retries of doubling delay (about 2.5 s in all) see it through.
+async fn spawn_retrying_busy(command: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+    let mut delay = Duration::from_millis(10);
+    for _ in 0..8 {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            result => return result,
+        }
+    }
+    command.spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // An executable held open for writing cannot be spawned (ETXTBSY);
+    // spawn_retrying_busy retries until the writer closes it, then starts it.
+    #[tokio::test]
+    async fn spawn_waits_out_a_busy_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy");
+        let mut writer = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o755).open(&path).unwrap();
+        std::io::Write::write_all(&mut writer, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut command = tokio::process::Command::new(&path);
+        let busy = command.spawn().map(drop).unwrap_err();
+        assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(writer);
+        });
+        let status = spawn_retrying_busy(&mut command).await.unwrap().wait().await.unwrap();
+        assert!(status.success());
+        release.await.unwrap();
     }
 }
