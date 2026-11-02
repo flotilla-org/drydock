@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+drydock-transport = { path = "../drydock-transport", features = ["websocket"] }
+tar = { version = "0.4", default-features = false }
 drydock-provider = { path = "../drydock-provider" }
 drydock-oci = { path = "../drydock-oci" }
 reqwest = { workspace = true, features = ["json", "query"] }
