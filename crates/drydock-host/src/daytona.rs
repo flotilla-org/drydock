@@ -403,8 +403,9 @@ impl Daytona {
         let tools_config = tools_registry.config(&tools.repository, &tools_manifest).await?;
         let composed = oci::compose(&base_manifest, &base_config, &tools_manifest, &tools_config, platform)?;
         fits_snapshot(composed.bytes(), self.settings.max_image_gib)?;
-        let mut url = self.path(&self.settings.api_url, &["docker-registry", "registry-push-access"])?;
-        url.query_pairs_mut().append_pair("regionId", &self.settings.region);
+        // Daytona resolves `regionId` here only among the organisation's own regions and
+        // answers 404 "Region not found" for the shared ones (eu, us), so none is sent.
+        let url = self.path(&self.settings.api_url, &["docker-registry", "registry-push-access"])?;
         let access = self.call(Method::GET, url, None, c).await?;
         let expires_at = text(&access, "expiresAt")?.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response())?;
         let host = text(&access, "registryUrl")?;
