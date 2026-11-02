@@ -167,7 +167,6 @@ export function networkFields(
   };
 }
 
-/** A tag-sized identity of a policy, and whether it denies everything. */
 /** The most one stdin write carries, as the SDK's streaming writes do. */
 export const STDIN_CHUNK = 256 * 1024;
 
@@ -202,6 +201,7 @@ export function stdinWritable(stdin: WritableStream<Uint8Array>): Writable {
   });
 }
 
+/** A tag-sized identity of a policy, and whether it denies everything. */
 function policyIdentity(fields: ReturnType<typeof networkFields>) {
   if (fields.blockNetwork) return "deny";
   if (!fields.outboundCidrAllowlist && !fields.outboundDomainAllowlist)
