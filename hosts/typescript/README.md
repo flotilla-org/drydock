@@ -162,7 +162,8 @@ exec sleep infinity'`. The supervisor detaches; `sleep` keeps the sandbox
   it is this instance's, with the same size and policy, and refuses it
   otherwise. Either way the module runs `--supervise` again by exec
   (idempotent) and waits for the agent's socket; a sandbox it just created
-  and cannot hand over is terminated. The SDK takes no abort signal, so a
+  and cannot hand over is terminated (if that terminate fails too, the
+  sandbox stays listed: `destroy` it). The SDK takes no abort signal, so a
   cancelled call stops between SDK calls, never during one.
 - Reach is this host's relay route; the relay is an exec of
   `drydock-agent --bridge`, binary both ways. Modal never kills an exec, so
