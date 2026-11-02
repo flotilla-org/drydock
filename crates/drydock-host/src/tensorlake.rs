@@ -433,7 +433,9 @@ impl Tensorlake {
     /// Starts the agent as root, supervised, listening on the guest's
     /// loopback for the tunnel, with a token only root can read. A token file
     /// already there is kept when it holds a token (one that doesn't would
-    /// stop every agent start, so it is replaced), so a running agent (after resume, or another
+    /// stop every agent start, so it is replaced). The write is exclusive
+    /// (`set -C`), so of two concurrent bootstraps one token wins and both
+    /// read it back, so a running agent (after resume, or another
     /// host's bootstrap) keeps answering to it; whichever token the file
     /// holds is read back. The supervisor's lock makes this idempotent.
     /// `--supervise` returns at once: it spawns the supervisor in its own
@@ -445,8 +447,8 @@ impl Tensorlake {
         let port = self.settings.tunnel_port;
         let script = format!(
             "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
-             if ! grep -Eqx '[A-Za-z0-9_-]{{43,}}={{0,2}}' {TOKEN_FILE} 2>/dev/null; then \
-             rm -f {TOKEN_FILE} && (umask 077; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}); fi && \
+             if [ -e {TOKEN_FILE} ] && ! grep -Eqx '[A-Za-z0-9_-]{{43,}}={{0,2}}' {TOKEN_FILE}; then rm -f {TOKEN_FILE}; fi && \
+             {{ (umask 077; set -C; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}) 2>/dev/null || true; }} && \
              echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
              exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
              --tcp 127.0.0.1:{port} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
@@ -919,11 +921,13 @@ impl Provider for Tensorlake {
             });
         }
         let base = ImageRef::parse(&r.image_digest)?;
-        if private_registry(&base.registry) {
-            return Err(refused(format!(
-                "Tensorlake's builders cannot reach the private registry {}; stage the image in a registry they can reach",
-                base.registry
-            )));
+        // The build pulls both stages, so neither may sit on a private host.
+        for registry in [&base.registry, &ImageRef::parse(&r.tools_digest)?.registry] {
+            if private_registry(registry) {
+                return Err(refused(format!(
+                    "Tensorlake's builders cannot reach the private registry {registry}; stage the image in a registry they can reach"
+                )));
+            }
         }
         self.resources(&r.size)?;
         let name = image_name(&r.image_digest, &r.tools_digest, &platform);

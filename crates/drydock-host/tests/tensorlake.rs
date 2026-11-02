@@ -883,8 +883,8 @@ async fn a_failed_build_is_refused_with_its_error() {
     }
 }
 
-// A base image on a private address is refused before any request: no
-// Tensorlake builder can reach it.
+// A base or tools image on a private address is refused before any
+// request: no Tensorlake builder can reach it.
 #[tokio::test]
 async fn a_private_base_is_refused_up_front() {
     let w = unprepared().await;
@@ -900,6 +900,10 @@ async fn a_private_base_is_refused_up_front() {
         let mut request = prepare_request(None);
         request.image_digest = format!("{base}@sha256:{}", "3".repeat(64));
         assert!(matches!(w.provider.prepare(request, &w.credentials).await, Err(ProtocolError::Refused { .. })), "{base}");
+        // The build pulls the tools stage too.
+        let mut request = prepare_request(None);
+        request.tools_digest = format!("{base}@sha256:{}", "3".repeat(64));
+        assert!(matches!(w.provider.prepare(request, &w.credentials).await, Err(ProtocolError::Refused { .. })), "tools {base}");
     }
     assert!(w.stand_in.state().requests.is_empty());
 }
