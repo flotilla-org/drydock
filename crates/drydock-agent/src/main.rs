@@ -69,7 +69,7 @@ async fn main() -> io::Result<()> {
     }
     // Read before anything is bound, so a bad token file refuses startup.
     let tcp = match (tcp, token_file) {
-        (Some(address), Some(path)) => Some((address, drydock_agent::tcp::Token::read(&path)?)),
+        (Some(address), Some(path)) => Some((address, drydock_agent::tcp::read_token(&path)?)),
         (None, None) => None,
         (Some(_), None) => return Err(io::Error::other("--tcp requires --tcp-token-file")),
         (None, Some(_)) => return Err(io::Error::other("--tcp-token-file requires --tcp")),

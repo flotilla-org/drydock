@@ -13,6 +13,9 @@ use tokio::{
 
 pub mod http;
 pub mod ssh;
+pub mod tcp;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 
 pub trait RawStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> RawStream for T {}

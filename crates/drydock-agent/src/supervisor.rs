@@ -52,7 +52,7 @@ fn check_tcp(args: &[OsString]) -> io::Result<()> {
             if !path.is_absolute() {
                 return Err(io::Error::other("--supervise requires an absolute --tcp-token-file"));
             }
-            drydock_agent::tcp::Token::read(path).map(drop)
+            drydock_agent::tcp::read_token(path).map(drop)
         }
         (None, None) => Ok(()),
         (Some(_), None) => Err(io::Error::other("--tcp requires --tcp-token-file")),

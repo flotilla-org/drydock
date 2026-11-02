@@ -5,7 +5,7 @@
 # ///
 """Live check of drydock-agent's TCP listener through a Tensorlake tunnel.
 
-    scripts/live-tcp-listener.py KEY_FILE [--agent PATH] [--image IMAGE]
+    scripts/live-tcp-listener.py KEY_FILE [--agent PATH] [--image IMAGE] [--tunnel-check PATH]
 
 KEY_FILE holds a Tensorlake API key. PATH is a drydock-agent executable for
 linux/amd64, built from this branch (default: target/release/drydock-agent,
@@ -21,12 +21,20 @@ Inside the guest, a process running as the image's non-root user connects to
 127.0.0.1:7811 without the token and with a guessed one, and gets 401 both
 times; it cannot read the token file either. The sandbox is deleted at the
 end, whatever happened. Exit status 0 means every check passed.
+
+With --tunnel-check, PATH is drydock-agent's tunnel_check example (from
+`cargo build --release -p drydock-agent --example tunnel_check`), which
+repeats the tunnel checks through drydock-transport's Rust WebSocket dialer
+and tunnel stream, and moves 4 MiB each way in 64 KiB frames. The token
+reaches it in a 0600 file on this machine, never on an argv.
 """
 import argparse
 import json
 import os
 import secrets
 import signal
+import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -123,10 +131,12 @@ class Sandbox:
         status, raw = request("GET", f"{self.url}/api/v1/processes/{pid}/output", self.key)
         return json.loads(raw).get("lines", []) if status == 200 else [f"HTTP {status}"]
 
+    def tunnel_url(self):
+        return self.url.replace("https://", "wss://", 1) + f"/api/v1/tunnels/tcp?port={PORT}"
+
     def tunnel(self):
-        url = self.url.replace("https://", "wss://", 1) + f"/api/v1/tunnels/tcp?port={PORT}"
         return websockets.sync.client.connect(
-            url, additional_headers={"Authorization": f"Bearer {self.key}"}, open_timeout=30
+            self.tunnel_url(), additional_headers={"Authorization": f"Bearer {self.key}"}, open_timeout=30
         )
 
 
@@ -168,6 +178,18 @@ def handshake(token):
         "GET /v1/connect HTTP/1.1\r\nHost: sandbox\r\nConnection: Upgrade\r\n"
         f"Upgrade: drydock-agent\r\n{authorization}\r\n"
     ).encode()
+
+
+def rust_tunnel_checks(program, url, key_file, token):
+    """The tunnel checks again, through drydock-transport's dialer and stream."""
+    with tempfile.TemporaryDirectory() as directory:
+        token_file = os.path.join(directory, "tcp.token")
+        with open(os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as file:
+            file.write(token)
+        result = subprocess.run([program, url, key_file, token_file], capture_output=True, text=True, timeout=300)
+    for line in result.stdout.splitlines():
+        print(f"  tunnel_check: {line}", flush=True)
+    check(result.returncode == 0, f"tunnel_check passed (exit {result.returncode}){': ' + result.stderr[-500:] if result.stderr else ''}")
 
 
 def tunnel_checks(open_tunnel, token):
@@ -212,6 +234,7 @@ def main():
     parser.add_argument("key_file")
     parser.add_argument("--agent", default="target/release/drydock-agent")
     parser.add_argument("--image", default="tensorlake/ubuntu-minimal")
+    parser.add_argument("--tunnel-check", metavar="PATH", help="drydock-agent's tunnel_check example, built for this machine")
     options = parser.parse_args()
     key = open(options.key_file).read().strip()
     agent = open(options.agent, "rb").read()
@@ -242,6 +265,8 @@ def main():
         check(code == 0 and token not in " ".join(lines), f"the token is not on the agent's argv: {lines}")
 
         tunnel_checks(sandbox.tunnel, token)
+        if options.tunnel_check:
+            rust_tunnel_checks(options.tunnel_check, sandbox.tunnel_url(), options.key_file, token)
 
         code, lines = sandbox.run(GUEST_PROBE, user="tl-user", env={"GUESS": secrets.token_urlsafe(32)})
         print(f"guest probe as non-root (exit {code}): {lines}", flush=True)
