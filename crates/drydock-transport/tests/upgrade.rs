@@ -99,6 +99,11 @@ async fn an_agent_behind_an_edge_is_reached_at_its_url() {
         assert!(error.to_string().contains("invalid connect token") && !error.to_string().contains("stolen"), "{error}");
         while requests.try_recv().is_ok() {}
     }
+    // Userinfo would go out in Host: it is refused, and not shown.
+    let userinfo = format!("http://user:hunter2@{authority}{CONNECT_PATH}");
+    let error = tcp::connect_at(tls.connect(&url(EDGE_KEY)).await.unwrap(), &userinfo, &token).await.err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert!(!error.to_string().contains("hunter2"), "{error}");
     // Cleartext beyond loopback is refused before any connection, without the query.
     let error = tls.connect("http://192.0.2.1/v1/connect?_edge=secret").await.err().unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

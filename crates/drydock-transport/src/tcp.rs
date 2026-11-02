@@ -119,9 +119,13 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
 pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Result<ByteStream> {
     let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("agent url {reason}"));
     let uri: hyper::Uri = url.parse().map_err(|_| invalid("is not a URL"))?;
-    let authority = uri.authority().ok_or_else(|| invalid("has no host"))?.as_str();
+    let authority = uri.authority().ok_or_else(|| invalid("has no host"))?;
+    // Credentials belong in the query; userinfo would go out in `Host`.
+    if authority.as_str().contains('@') {
+        return Err(invalid("must not carry userinfo"));
+    }
     let target = uri.path_and_query().map_or(CONNECT_PATH, |p| p.as_str());
-    match handshake(stream, target, authority, token).await? {
+    match handshake(stream, target, authority.as_str(), token).await? {
         Ok(stream) => Ok(stream),
         Err((status, body)) => {
             let kind = match status {
@@ -134,7 +138,9 @@ pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Res
     }
 }
 
-/// The most of a refusal's answer kept, as text.
+/// The most of a refusal's answer kept, as text. It is the far end's (the
+/// agent's or a provider's edge), so untrusted: callers mask it as they do
+/// any provider text before logging it.
 const REFUSAL_CHARS: usize = 200;
 
 /// Sends the handshake request for `target` with `host`; the switched stream,

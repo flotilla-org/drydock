@@ -153,6 +153,41 @@ async fn connects_through_a_dial_reach_and_reports_it() {
     agent.abort();
 }
 
+// An edge may echo its credential when refusing it, here percent-decoded:
+// drydock's error masks each query value, raw and decoded.
+#[tokio::test]
+async fn a_dial_reach_masks_an_echoed_edge_credential() {
+    let edge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = edge.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = edge.accept().await {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let body = "bad connect token: s3cr+t value";
+            let answer = format!("HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(answer.as_bytes()).await;
+        }
+    });
+    let token = drydock_transport::tcp::Token::generate().unwrap();
+    let url = format!("http://{address}/v1/connect?_edge=s3cr%2Bt+value#fragment");
+    let dial = Reach::Dial { url, token: Secret::new(token.secret()), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let (api, environment) = provider(true, dial).await;
+    let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+    let identity = directory.path().join("id_ed25519");
+    let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+    let error = AgentReach::new().with_dialer(gateway).with_timeout(Duration::from_secs(2)).connect(&api, &vessel).await.err().unwrap();
+    let error = error.to_string();
+    assert!(error.contains("401"), "{error}");
+    assert!(!error.contains("s3cr") && !error.contains("fragment"), "{error}");
+}
+
 // A gateway started for a platform stands in for a guest of that platform on
 // any test host: a vessel prepared for it connects, and the agent reports it.
 #[tokio::test]

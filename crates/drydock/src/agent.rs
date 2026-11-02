@@ -38,6 +38,8 @@ impl StreamDialer for Tls {
         let dialer = match self.0.get() {
             Some(dialer) => dialer,
             None => {
+                // Two first uses at once may both build one; the loser is
+                // dropped (`get_or_try_init` is unstable).
                 let dialer = drydock_transport::websocket::TlsDialer::new()?;
                 self.0.get_or_init(|| dialer)
             }
@@ -178,9 +180,19 @@ impl AgentReach {
                 // The agent's TCP listener behind the provider's edge, which
                 // takes its own credential from the URL's query.
                 Reach::Dial { url, token, .. } => {
-                    let shown = url.split_once('?').map_or(url.as_str(), |(base, _)| base).to_owned();
+                    let base = url.split(['?', '#']).next().unwrap_or_default();
+                    let shown = base.to_owned();
+                    // The edge's credential is a query value; an edge may echo
+                    // it, raw or decoded, alone or with its name.
                     if let Some((_, query)) = url.split_once('?') {
-                        masker.lock().unwrap().remember(query);
+                        let query = query.split('#').next().unwrap_or_default();
+                        let mut masker = masker.lock().unwrap();
+                        masker.remember(query);
+                        for value in query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value)) {
+                            masker.remember(value);
+                            let decoded = percent_encoding::percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned();
+                            masker.remember(&decoded);
+                        }
                     }
                     let token = drydock_transport::tcp::Token::parse(token.expose())
                         .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, format!("dial reach token: {e}")))?;
