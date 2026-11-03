@@ -178,7 +178,7 @@ impl StandIn {
         if let Some((status, message)) = s.outage.as_ref().filter(|(status, _)| !(read && *status == 409)) {
             return response(*status, json!({"statusCode":status,"message":message,"error":"Bad Request"}));
         }
-        if let Some(status) = s.failure.filter(|status| !(read && *status == 409)).and_then(|_| s.failure.take()) {
+        if let Some(status) = s.failure.take_if(|status| !(read && *status == 409)) {
             let message = s.failure_message.take().unwrap_or_else(|| "key-a must never be echoed".into());
             return response(status, json!({"statusCode":status,"message":message,"error":"Too Many Requests"}));
         }
@@ -2279,7 +2279,7 @@ async fn foreign_and_untagged_sandboxes_are_not_ours() {
         assert_eq!(ids, vec![mine.id.clone()], "{id}");
         let e = p.provision(request(prep.clone(), label), &c).await.unwrap_err();
         assert_eq!(e.class(), "refused", "{id}");
-        assert!(e.to_string().contains("drydock.provider=daytona"), "{e}");
+        assert!(e.to_string().contains("drydock.provider=daytona and flotilla.label"), "{e}");
         assert_eq!(p.destroy(id, &c).await.unwrap_err().class(), "refused", "{id}");
         assert!(http.0.lock().unwrap().rows.contains_key(id));
     }

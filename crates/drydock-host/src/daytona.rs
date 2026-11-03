@@ -335,13 +335,15 @@ impl Daytona {
         }
         Ok(Some(v))
     }
-    /// Refuses a sandbox this instance did not tag as its own (drydock#168).
+    /// Refuses a sandbox this instance did not tag as its own (drydock#168). Applied to
+    /// list, adoption and destroy; by-id operations on an id the caller already holds
+    /// (inspect, suspend, resume, reach) are deliberately not guarded.
     fn check_ours(&self, v: &Sandbox) -> Result<()> {
         if kit::ours(&v.labels, &self.name).is_some() {
             return Ok(());
         }
         Err(refused(format!(
-            "Daytona sandbox {} is not tagged {PROVIDER_TAG}={} with {LABEL_TAG}; it belongs to another instance or tool",
+            "Daytona sandbox {} must carry both {PROVIDER_TAG}={} and {LABEL_TAG} to be ours; it belongs to another instance or tool",
             &*v.id, self.name
         )))
     }
