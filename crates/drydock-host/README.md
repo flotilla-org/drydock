@@ -275,28 +275,11 @@ and mixed domain/CIDR requests are refused. Label retries compare normalized
 requested policies, not the results of a new DNS lookup.
 
 The provider capability remains Advisory, including on low tiers where vendor
-organization restrictions may take precedence. Individual running sandboxes
-become Enforced only after an operator-configured `egress_probe` executes as root
-and proves blocked unlisted canary and raw DNS, plus successful listed access
-when the policy has listed destinations:
-
-```json
-{"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}
-```
-
-For deny-all the command receives `DRYDOCK_PROBE_DENY_ALL=1`; `listed_direct`
-is unnecessary. `tools/egress-probe.py` supports that mode. The probe must test
-real externally verified reachable services; never print constants as evidence.
-Provision, server resume completion and explicit inspect measure the claim. Cheap
-list/poll calls do not exec. Every Daytona observation carries an opaque effective
-policy fingerprint; the server retains measured evidence while running with the
-same fingerprint, and invalidates it on policy change, stopped/gone/unknown state
-or disappearance. A changed-back policy requires another measurement. Providers
-without policy fingerprints retain the conservative 60-second fallback TTL.
-A negative proof is Advisory. Probe command/transport/malformed-proof failures
-leave successful provision/resume Advisory and emit a tracing diagnostic with the
-typed error class; explicit inspect still returns the typed error. Open/nonrunning
-rows are Advisory. Transport outages return Unavailable, not adaptor-bug Internal.
+organization restrictions may take precedence. Every row is the vendor's claim
+alone: Advisory, unmeasured, carrying an opaque effective-policy fingerprint.
+This module runs no guest probe; measuring whether the vendor's enforcement
+holds is drydockd's, not the module's. Transport outages return Unavailable,
+not adaptor-bug Internal.
 
 Observation polls every 30 seconds, with complete cursor pagination, provider
 `updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The main server
