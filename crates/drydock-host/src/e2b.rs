@@ -369,8 +369,7 @@ impl E2b {
         Ok(detail)
     }
     fn ours(&self, row: &Value) -> bool {
-        row.pointer(&format!("/metadata/{}", PROVIDER_TAG.replace('~', "~0").replace('/', "~1"))).and_then(Value::as_str)
-            == Some(&self.name)
+        row["metadata"][PROVIDER_TAG].as_str() == Some(&self.name)
     }
     fn label(&self, row: &Value) -> Option<String> {
         self.ours(row).then(|| row.get("metadata")?.get(LABEL_TAG)?.as_str().map(str::to_owned)).flatten()
