@@ -4,7 +4,10 @@
     scripts/live-e2b.py KEY_FILE --team-id ID [--bin-dir DIR] [--agent PATH] [--image IMAGE]
 
 KEY_FILE holds an E2B team API key (`e2b_…`); ID is that team's id (the
-dashboard's Team → General, or the `teamID` of any sandbox event). DIR holds
+dashboard's Team → General, or the `teamID` of any sandbox event). E2B keys
+have no scopes, so use a team kept for drydock: the key can kill any sandbox
+and delete any template in its team. The script itself kills only
+sandboxes tagged as drydock's. DIR holds
 drydock, drydockd and drydock-host built from this branch (default
 target/release, from `cargo build --release -p drydock -p drydock-host`).
 
