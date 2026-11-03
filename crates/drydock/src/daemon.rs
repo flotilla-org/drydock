@@ -970,5 +970,6 @@ fn conservative_capabilities() -> Capabilities {
         usage: false,
         quota: false,
         host_filesystem: false,
+        agent_tcp_port: None,
     }
 }
