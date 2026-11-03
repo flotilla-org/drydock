@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 drydock-provider = { path = "../drydock-provider" }
 drydock-oci = { path = "../drydock-oci" }
+drydock-transport = { path = "../drydock-transport", features = ["websocket"] }
 reqwest = { workspace = true, features = ["json", "query"] }
 sha2.workspace = true
 libc = "0.2"

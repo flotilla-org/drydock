@@ -10,6 +10,7 @@ async fn main() -> std::io::Result<()> {
     let mut registry = reference::registry();
     registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
     registry.insert("local".into(), std::sync::Arc::new(drydock_host::local::LocalModule));
+    registry.insert("runtime".into(), std::sync::Arc::new(drydock_host::runtime::RuntimeModule::new()?));
     let host = Host::new(registry);
     // Register SIGTERM before binding so managed shutdown always drains streams.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
