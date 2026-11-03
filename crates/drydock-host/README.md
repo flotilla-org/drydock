@@ -130,7 +130,8 @@ no build reports `missing_tool`.
   reason, because the host's network cannot be restricted per vessel.
 - **Capabilities** declare `host_filesystem`: a guest path is a host path, so a
   client lays each vessel out below paths it can write, never at fixed guest
-  locations such as `/opt`. They declare no usage, quota or export; conformance
+  locations such as `/opt`. They declare `exclusive_label`, since the id comes
+  from the label and creation is serialized. They declare no usage, quota or export; conformance
   reports the checks that follow from that as not applicable.
 
 Each agent's output is appended to `agent.log` in its directory, unrotated.
