@@ -64,6 +64,9 @@ struct ReferenceSettings {
     /// Every file put fails with this error.
     #[serde(default)]
     upload_fault: Option<ProtocolError>,
+    /// Guest steps that fail: `mv` (moving an upload into place), `start`.
+    #[serde(default)]
+    guest_faults: Vec<String>,
 }
 fn default_workspace_root() -> String {
     "/workspace".into()
@@ -388,44 +391,66 @@ impl Reference {
     /// files: whether the agent is there, moving an upload into place, and
     /// starting the supervisor, which needs an executable agent.
     fn guest_command(&self, id: &str, argv: &[String]) -> Result<Option<String>> {
+        const SUCCEEDED: &str = "drydock-step-succeeded";
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match argv.as_slice() {
+            // `sh -c '"$@" && echo SUCCEEDED' sh ARGV…`: the model's exec
+            // reports no exit status, so a failure shows only as its output.
+            ["sh", "-c", script, "sh", inner @ ..] if *script == format!("\"$@\" && echo {SUCCEEDED}") => {
+                Ok(Some(match self.guest_step(id, inner) {
+                    Ok(output) => format!("{output}{SUCCEEDED}\n"),
+                    Err(ProtocolError::CommandFailed { output, .. }) => output.expose().to_owned(),
+                    Err(error) => return Err(error),
+                }))
+            }
+            ["sh", "-c", script] if script.starts_with("if test -x ") => {
+                let path = script.trim_start_matches("if test -x ").split(';').next().unwrap_or_default();
+                let mut state = self.state.recover();
+                let present = state.files.get(id).and_then(|files| files.get(path)).is_some_and(|(_, mode)| mode & 0o111 != 0);
+                state.guest.entry(id.into()).or_default().push(format!("probe {path}"));
+                Ok(Some(if present { "present\n".into() } else { String::new() }))
+            }
+            ["rm", "-f", path] => {
+                let mut state = self.state.recover();
+                state.files.entry(id.into()).or_default().remove(*path);
+                state.guest.entry(id.into()).or_default().push(format!("rm {path}"));
+                Ok(Some(String::new()))
+            }
+            _ => Ok(None),
+        }
+    }
+    /// Moving an upload into place, and starting the supervisor, which needs
+    /// an executable agent; either fails when `guest_faults` names it.
+    fn guest_step(&self, id: &str, argv: &[&str]) -> Result<String> {
         const AGENT: &str = "/opt/drydock/drydock-agent";
         let mut state = self.state.recover();
         let state = &mut *state;
         let files = state.files.entry(id.into()).or_default();
         let log = state.guest.entry(id.into()).or_default();
-        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let failed = |exit_code: i32, output: &str| ProtocolError::CommandFailed {
             reason: "reference guest command failed".into(),
             exit_code,
             output: Secret::new(output),
         };
-        match argv.as_slice() {
-            ["sh", "-c", script] if script.starts_with("if test -x ") => {
-                let path = script.trim_start_matches("if test -x ").split(';').next().unwrap_or_default();
-                let present = files.get(path).is_some_and(|(_, mode)| mode & 0o111 != 0);
-                log.push(format!("probe {path}"));
-                Ok(Some(if present {
-                    "present
-"
-                    .into()
-                } else {
-                    String::new()
-                }))
-            }
+        let faulted = |step: &str| self.settings.guest_faults.iter().any(|fault| fault == step);
+        match argv {
             ["mv", "-f", from, to] => {
+                if faulted("mv") {
+                    return Err(failed(1, "mv: cannot move: No space left on device"));
+                }
                 let file = files.remove(*from).ok_or_else(|| failed(1, "mv: cannot stat: No such file or directory"))?;
                 files.insert((*to).into(), file);
                 log.push(format!("mv {from} {to}"));
-                Ok(Some(String::new()))
+                Ok(String::new())
             }
             [AGENT, "--supervise", ..] => {
-                if !files.get(AGENT).is_some_and(|(_, mode)| mode & 0o111 != 0) {
-                    return Err(failed(127, "sh: /opt/drydock/drydock-agent: not found"));
+                if faulted("start") || !files.get(AGENT).is_some_and(|(_, mode)| mode & 0o111 != 0) {
+                    return Err(failed(127, "sh: /opt/drydock/drydock-agent: cannot execute"));
                 }
                 log.push(format!("start {}", argv.join(" ")));
-                Ok(Some(String::new()))
+                Ok(String::new())
             }
-            _ => Ok(None),
+            _ => Err(refused("reference guest models no such command")),
         }
     }
 }

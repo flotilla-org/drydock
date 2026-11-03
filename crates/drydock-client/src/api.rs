@@ -615,7 +615,7 @@ pub const GUEST_FILE_LIMIT: usize = 64 << 20;
 #[utoipa::path(put, tag = "host", path = "/v1/providers/{provider}/environments/{id}/files",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),
 ("path" = String, Query, description = "Absolute guest path; parents are made and an existing file replaced"),
-("mode" = u32, Query, description = "Permission bits, at most 0o7777 (4095)")),
+("mode" = u32, Query, description = "Read, write and execute bits, at most 0o777 (511)")),
 request_body(content = FileBytes, content_type = "application/octet-stream", description = "The file's bytes"),
 responses((status = 204, description = "The file is in place"), ErrorResponses)
 )]

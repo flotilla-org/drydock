@@ -173,7 +173,8 @@ pub trait Exec: Send + Sync {
 #[async_trait]
 pub trait GuestFiles: Send + Sync {
     /// Write `bytes` at `file.path` with `file.mode`, making its parents and
-    /// replacing what is there. The file is complete when this returns.
+    /// replacing what is there. The file is complete, and has its mode, only
+    /// when this returns: callers rely on neither before.
     async fn put(&self, id: &str, file: GuestFile, bytes: bytes::Bytes, c: &Credentials) -> Result<()>;
 }
 #[async_trait]

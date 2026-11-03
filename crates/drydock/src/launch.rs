@@ -211,7 +211,10 @@ pub fn supervise() -> Vec<String> {
 
 /// Upload bootstrap, through the provider's files and exec ports: unless the
 /// vessel already holds an agent, put `build` there, then start the agent.
-/// The caller's hello is the proof it runs. A failure names the step.
+/// The caller's hello is the proof it runs. A failure names the step. The
+/// presence check is deliberately weak (any executable file there): drydock
+/// only ever moves a whole agent into place, and the hello replaces one that
+/// is not this build.
 pub(crate) async fn upload_agent(api: &dyn ProviderApi, provider: &str, id: &str, build: bytes::Bytes) -> Result<(), Error> {
     let step = |doing: &'static str| {
         move |error: Error| match error {
@@ -231,12 +234,36 @@ pub(crate) async fn upload_agent(api: &dyn ProviderApi, provider: &str, id: &str
         // this bootstrap's own: two at once each move a whole agent.
         let upload = format!("{AGENT_EXECUTABLE}.upload-{}", uuid::Uuid::new_v4().simple());
         let file = GuestFile { path: upload.clone(), mode: 0o755 };
-        api.put_file(provider, id, &file, build).await.map_err(step("upload the vessel agent"))?;
-        run(api, provider, id, &["mv", "-f", &upload, AGENT_EXECUTABLE]).await.map_err(step("install the uploaded vessel agent"))?;
+        let installed = match api.put_file(provider, id, &file, build).await.map_err(step("upload the vessel agent")) {
+            Ok(()) => succeeds(api, provider, id, &["mv", "-f", &upload, AGENT_EXECUTABLE])
+                .await
+                .map_err(step("install the uploaded vessel agent")),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = installed {
+            // A failed attempt leaves no copy behind to fill a guest's disk.
+            let _ = run(api, provider, id, &["rm", "-f", &upload]).await;
+            return Err(error);
+        }
     }
     let argv = supervise();
-    run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;
-    Ok(())
+    succeeds(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))
+}
+/// What a guest command run by [`succeeds`] prints once it has succeeded.
+pub const SUCCEEDED: &str = "drydock-step-succeeded";
+/// Runs `argv` so that its success shows in its output, which is all an exec
+/// port need report: a command that fails, or prints no [`SUCCEEDED`] line, fails.
+async fn succeeds(api: &dyn ProviderApi, provider: &str, id: &str, argv: &[&str]) -> Result<(), Error> {
+    let script = format!("\"$@\" && echo {SUCCEEDED}");
+    let output = run(api, provider, id, &[&["sh", "-c", &script, "sh"][..], argv].concat()).await?;
+    if output.lines().any(|line| line == SUCCEEDED) {
+        return Ok(());
+    }
+    Err(Error::Protocol(ProtocolError::CommandFailed {
+        reason: "guest command did not succeed".into(),
+        exit_code: -1,
+        output: Secret::new(output),
+    }))
 }
 /// A guest command's output, up to 64 KiB, once it has ended.
 async fn run(api: &dyn ProviderApi, provider: &str, id: &str, argv: &[&str]) -> Result<String, Error> {

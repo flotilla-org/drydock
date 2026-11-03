@@ -914,14 +914,15 @@ pub struct ExecRequest {
     #[schema(min_items = 1)]
     pub command: Vec<String>,
 }
-/// Where the files port puts one file in a guest: an absolute path (parents
-/// are made, an existing file is replaced) and its permission bits.
+/// Where the files port puts one file in a guest: an absolute, normal path
+/// (parents are made, an existing file is replaced) and its read, write and
+/// execute bits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(try_from = "validation::UncheckedGuestFile")]
 pub struct GuestFile {
     #[schema(pattern = "^/")]
     pub path: String,
-    #[schema(maximum = 4095)]
+    #[schema(maximum = 511)]
     pub mode: u32,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

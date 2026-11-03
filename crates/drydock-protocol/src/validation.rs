@@ -190,11 +190,15 @@ pub struct UncheckedGuestFile {
 impl TryFrom<UncheckedGuestFile> for crate::GuestFile {
     type Error = &'static str;
     fn try_from(file: UncheckedGuestFile) -> Result<Self, Self::Error> {
-        if !file.path.starts_with('/') || file.path.ends_with('/') || file.path.contains('\0') {
-            return Err("a guest file path is absolute, names a file and holds no NUL");
+        let segments = file.path.split('/').skip(1);
+        if !file.path.starts_with('/')
+            || file.path.contains('\0')
+            || segments.clone().any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return Err("a guest file path is absolute and normal (no empty, `.` or `..` segment), names a file and holds no NUL");
         }
-        if file.mode > 0o7777 {
-            return Err("a guest file mode is permission bits, at most 0o7777");
+        if file.mode > 0o777 {
+            return Err("a guest file mode is read, write and execute bits, at most 0o777");
         }
         Ok(Self { path: file.path, mode: file.mode })
     }

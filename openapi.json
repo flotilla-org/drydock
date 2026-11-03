@@ -1627,7 +1627,7 @@
           {
             "name": "mode",
             "in": "query",
-            "description": "Permission bits, at most 0o7777 (4095)",
+            "description": "Read, write and execute bits, at most 0o777 (511)",
             "required": true,
             "schema": {
               "type": "integer",

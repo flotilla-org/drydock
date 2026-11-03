@@ -151,8 +151,36 @@ async fn a_failed_upload_names_its_cause() {
     let Error::Protocol(ProtocolError::Refused { reason }) = &error else { panic!("{error:?}") };
     assert_eq!(reason, "upload the vessel agent: provider vessels operation files: guest disk is full");
     let environment = h.environment().await;
-    assert_eq!(h.guest(&environment.id).await["log"], json!([format!("probe {AGENT}")]));
+    let log: Vec<String> = serde_json::from_value(h.guest(&environment.id).await["log"].clone()).unwrap();
+    assert_eq!(log[0], format!("probe {AGENT}"));
+    assert!(log[1].starts_with(&format!("rm {AGENT}.upload-")) && log.len() == 2, "{log:?}");
     assert_eq!(h.gateway.dials(), 0, "no hello is attempted without an agent");
+}
+
+// The exec port need not report an exit status: a step that fails silently
+// (here, starting the supervisor) is caught by drydockd, which names it,
+// rather than waiting out the hello.
+#[tokio::test]
+async fn a_start_that_fails_silently_names_the_step() {
+    let h = Harness::start(", guest_faults=['start']").await;
+    let error = h.daemon.launch(PROVIDER, &Default::default()).await.unwrap_err();
+    let Error::Protocol(ProtocolError::CommandFailed { reason, output, .. }) = &error else { panic!("{error:?}") };
+    assert_eq!(reason, "start the vessel agent: guest command did not succeed");
+    assert!(output.expose().contains("cannot execute"), "{}", output.expose());
+    assert_eq!(h.gateway.dials(), 0);
+}
+
+// A move into place that fails is named, and leaves no upload behind to fill
+// the guest's disk on the next attempt.
+#[tokio::test]
+async fn a_failed_install_leaves_no_upload_behind() {
+    let h = Harness::start(", guest_faults=['mv']").await;
+    let error = h.daemon.launch(PROVIDER, &Default::default()).await.unwrap_err();
+    let Error::Protocol(ProtocolError::CommandFailed { reason, .. }) = &error else { panic!("{error:?}") };
+    assert_eq!(reason, "install the uploaded vessel agent: guest command did not succeed");
+    let guest = h.guest(&h.environment().await.id).await;
+    assert_eq!(guest["files"], json!({}));
+    assert!(guest["log"].as_array().unwrap().last().unwrap().as_str().unwrap().starts_with(&format!("rm {AGENT}.upload-")));
 }
 
 // An agent that is put in place and started but never says hello fails the
