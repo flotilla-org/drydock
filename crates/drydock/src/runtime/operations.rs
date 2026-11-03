@@ -182,4 +182,12 @@ impl ProviderApi for Runtime {
             })
             .await?)
     }
+    async fn push_access(&self, p: &str) -> ApiResult<PushAccess> {
+        let instance = self.instance(p).await?;
+        Ok(instance
+            .call(Gate::PushAccess, self.credential.clone(), |p, c| async move {
+                operation_port(p.operations().push_access)?.push_access(&c).await
+            })
+            .await?)
+    }
 }

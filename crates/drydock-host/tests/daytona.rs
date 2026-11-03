@@ -51,33 +51,24 @@ struct State {
     files: BTreeMap<(String, String), (Bytes, Option<String>)>,
     oci: Registries,
 }
-/// In-memory OCI registries behind the distribution protocol: a private lab
-/// registry Daytona cannot reach, a public tools registry nothing may read,
-/// and Daytona's transient push registry (Harbor). (The stand-in's client follows redirects
-/// itself, so blob redirects are covered in the oci module's tests.)
+/// What Daytona's registry (Harbor) holds: drydockd puts images there, and
+/// a snapshot can name only one it already serves. The module itself never
+/// reads a registry.
 #[derive(Default)]
 struct Registries {
-    /// Blobs by (registry host, digest); repositories share storage.
+    /// Blobs by (registry host, digest).
     blobs: BTreeMap<(String, String), Bytes>,
-    /// Manifests by (host, repository, tag or digest): media type and content.
+    /// Manifests by (host, repository, digest): media type and content.
     manifests: BTreeMap<(String, String, String), (String, Bytes)>,
-    uploads: BTreeMap<String, (String, Vec<u8>)>,
-    /// Harbor serves a pushed manifest only after this many further reads.
+    /// Harbor serves a new manifest only after a delay; these are not yet served.
     pending_reads: BTreeMap<String, usize>,
     /// Lifetime of minted push access; Daytona documents 3600 s.
     push_lifetime: Option<chrono::TimeDelta>,
-    /// Robot accounts and bearer tokens with their expiry.
-    robots: BTreeMap<String, (String, chrono::DateTime<chrono::Utc>)>,
-    tokens: BTreeMap<String, (String, chrono::DateTime<chrono::Utc>)>,
     mints: usize,
-    patch_sizes: Vec<usize>,
-    /// Source registries answer ranged reads with the whole blob.
-    ignore_range: bool,
 }
 const LAB: &str = "lab.invalid";
 const TOOLS: &str = "registry.invalid";
 const HARBOR: &str = "harbor.invalid";
-const VISIBILITY_DELAY_READS: usize = 2;
 #[derive(Default)]
 struct StandIn(Arc<Mutex<State>>, tokio::sync::OnceCell<rigging_replay_testkit::http_contract::StandIn>);
 impl StandIn {
@@ -130,7 +121,9 @@ impl StandIn {
         let mut s = state.lock().unwrap();
         s.requests += 1;
         if request.url().host_str().is_some_and(|host| [LAB, TOOLS, HARBOR].contains(&host)) {
-            return registry_response(&mut s, &request);
+            // drydockd stages images; the module only names them.
+            s.violations.push(format!("the module read the registry {}", request.url().host_str().unwrap()));
+            return http::Response::builder().status(400).body(Bytes::new()).unwrap();
         }
         // Daytona requires bearer auth for both API and toolbox requests.
         let authorized = matches!(
@@ -262,7 +255,6 @@ impl StandIn {
                 let username = format!("robot$push-{}", s.oci.mints);
                 let secret = format!("push-secret-{}", s.oci.mints);
                 let expires = chrono::Utc::now() + s.oci.push_lifetime.unwrap_or(chrono::TimeDelta::seconds(3600));
-                s.oci.robots.insert(username.clone(), (secret.clone(), expires));
                 response(200, json!({"username":username,"secret":secret,"registryUrl":HARBOR,"registryId":"registry-1","project":"daytona-transient","expiresAt":expires.to_rfc3339()}))
             }
             ("POST", "/api/snapshots") => {
@@ -517,163 +509,6 @@ fn snapshot_image_ready(oci: &Registries, image: &str) -> std::result::Result<()
     }
     Ok(())
 }
-/// The OCI distribution protocol with bearer-token challenges. Lab pulls need
-/// lab credentials; Harbor accepts only unexpired robots; the public registry
-/// must never see a credential; Range reads and chunked uploads are honoured.
-fn registry_response(s: &mut State, request: &reqwest::Request) -> http::Response<Bytes> {
-    let host = request.url().host_str().unwrap().to_owned();
-    if host == TOOLS {
-        // Upload bootstrap: no image Daytona runs carries the tools.
-        s.violations.push("the tools registry was read".into());
-    }
-    let now = chrono::Utc::now();
-    let reply = |status: u16, headers: &[(&str, String)], body: Bytes| {
-        let mut response = http::Response::builder().status(status);
-        for (name, value) in headers {
-            response = response.header(*name, value);
-        }
-        response.body(body).unwrap()
-    };
-    let authorization = request.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let basic = |user: &str, secret: &str| {
-        use base64::Engine;
-        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{secret}")))
-    };
-    let path = request.url().path().to_owned();
-    let ignore_range = s.oci.ignore_range && host != HARBOR;
-    let range = |bytes: &Bytes| -> http::Response<Bytes> {
-        match request.headers().get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes=")).filter(|_| !ignore_range)
-        {
-            None => reply(200, &[], bytes.clone()),
-            Some(r) => {
-                let (start, end) = r.split_once('-').unwrap();
-                let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse().unwrap());
-                let end = end.min(bytes.len() - 1);
-                reply(206, &[("content-range", format!("bytes {start}-{end}/{}", bytes.len()))], bytes.slice(start..=end))
-            }
-        }
-    };
-    if path == "/token" || path == "/service/token" {
-        let permitted = match host.as_str() {
-            LAB => authorization.as_deref() == Some(&basic("lab-user", "lab-secret")),
-            HARBOR => s
-                .oci
-                .robots
-                .iter()
-                .any(|(user, (secret, expires))| authorization.as_deref() == Some(&basic(user, secret)) && now < *expires),
-            _ => {
-                if authorization.is_some() {
-                    s.violations.push(format!("credential sent to the public registry {host}"));
-                }
-                true
-            }
-        };
-        if !permitted {
-            return reply(401, &[], Bytes::new());
-        }
-        let expires = match host.as_str() {
-            HARBOR => s.oci.robots.values().map(|(_, e)| *e).max().unwrap(),
-            _ => now + chrono::TimeDelta::seconds(300),
-        };
-        let token = format!("token-{}", s.oci.tokens.len() + 1);
-        s.oci.tokens.insert(token.clone(), (host.clone(), expires));
-        return reply(200, &[], Bytes::from(json!({"token": token}).to_string()));
-    }
-    let authorized = authorization
-        .as_deref()
-        .and_then(|a| a.strip_prefix("Bearer "))
-        .and_then(|t| s.oci.tokens.get(t))
-        .is_some_and(|(h, expires)| *h == host && now < *expires);
-    if !authorized {
-        let realm = if host == HARBOR { "service/token" } else { "token" };
-        return reply(401, &[("www-authenticate", format!(r#"Bearer realm="https://{host}/{realm}",service="{host}""#))], Bytes::new());
-    }
-    let rest = path.strip_prefix("/v2/").unwrap_or_default();
-    let method = request.method().as_str();
-    let body = request.body().and_then(|b| b.as_bytes()).map(Bytes::copy_from_slice).unwrap_or_default();
-    if let Some((repository, reference)) = rest.rsplit_once("/manifests/") {
-        let key = (host.clone(), repository.to_owned(), reference.to_owned());
-        if method == "PUT" {
-            let digest = drydock_host::oci::sha256(&body);
-            let manifest: Value = serde_json::from_slice(&body).unwrap();
-            let referenced = std::iter::once(&manifest["config"]).chain(manifest["layers"].as_array().unwrap());
-            if host != HARBOR
-                || referenced.into_iter().any(|d| !s.oci.blobs.contains_key(&(host.clone(), d["digest"].as_str().unwrap().into())))
-            {
-                s.violations.push("manifest pushed before its blobs".into());
-                return reply(400, &[], Bytes::new());
-            }
-            let media_type = request.headers().get("content-type").unwrap().to_str().unwrap().to_owned();
-            for reference in [reference.to_owned(), digest.clone()] {
-                s.oci.manifests.insert((host.clone(), repository.into(), reference), (media_type.clone(), body.clone()));
-            }
-            s.oci.pending_reads.insert(digest.clone(), VISIBILITY_DELAY_READS);
-            return reply(201, &[("docker-content-digest", digest)], Bytes::new());
-        }
-        if let Some(pending) = s.oci.pending_reads.get_mut(reference) {
-            *pending -= 1;
-            if *pending == 0 {
-                s.oci.pending_reads.remove(reference);
-            }
-            return reply(404, &[], Bytes::new());
-        }
-        return match s.oci.manifests.get(&key) {
-            Some((media_type, bytes)) => {
-                let digest = drydock_host::oci::sha256(bytes);
-                reply(
-                    200,
-                    &[("content-type", media_type.clone()), ("docker-content-digest", digest)],
-                    if method == "HEAD" { Bytes::new() } else { bytes.clone() },
-                )
-            }
-            None => reply(404, &[], Bytes::new()),
-        };
-    }
-    if let Some((_, tail)) = rest.split_once("/blobs/uploads/") {
-        if host != HARBOR {
-            s.violations.push(format!("upload attempted at {host}"));
-            return reply(405, &[], Bytes::new());
-        }
-        let location = |id: &str| format!("/v2/{}/blobs/uploads/{id}", rest.split_once("/blobs/uploads/").unwrap().0);
-        if method == "POST" {
-            let id = format!("upload-{}", s.oci.uploads.len() + 1);
-            s.oci.uploads.insert(id.clone(), (host.clone(), vec![]));
-            return reply(202, &[("location", location(&id))], Bytes::new());
-        }
-        let Some((_, data)) = s.oci.uploads.get_mut(tail) else { return reply(404, &[], Bytes::new()) };
-        if method == "PATCH" {
-            let expected = format!("{}-{}", data.len(), data.len() + body.len() - 1);
-            if request.headers().get("content-range").and_then(|v| v.to_str().ok()) != Some(&expected) {
-                s.violations.push(format!("chunk out of order; expected {expected}"));
-                return reply(416, &[], Bytes::new());
-            }
-            data.extend_from_slice(&body);
-            let len = data.len();
-            s.oci.patch_sizes.push(body.len());
-            return reply(202, &[("location", location(tail)), ("range", format!("0-{}", len - 1))], Bytes::new());
-        }
-        data.extend_from_slice(&body);
-        let data = Bytes::from(data.clone());
-        let digest = request.url().query_pairs().find(|(k, _)| k == "digest").map(|(_, v)| v.into_owned()).unwrap_or_default();
-        if drydock_host::oci::sha256(&data) != digest {
-            s.violations.push("upload committed under the wrong digest".into());
-            return reply(400, &[], Bytes::new());
-        }
-        s.oci.uploads.remove(tail);
-        s.oci.blobs.insert((host.clone(), digest.clone()), data);
-        return reply(201, &[("docker-content-digest", digest)], Bytes::new());
-    }
-    if let Some((_, digest)) = rest.rsplit_once("/blobs/") {
-        let Some(bytes) = s.oci.blobs.get(&(host.clone(), digest.to_owned())).cloned() else { return reply(404, &[], Bytes::new()) };
-        return match (method, host.as_str()) {
-            ("HEAD", _) => reply(200, &[("content-length", bytes.len().to_string())], Bytes::new()),
-            ("GET", _) => range(&bytes),
-            _ => reply(405, &[], Bytes::new()),
-        };
-    }
-    s.violations.push(format!("unexpected registry request {method} {path}"));
-    reply(400, &[], Bytes::new())
-}
 /// Layers of `size` bytes, with distinct content per (image, platform, index).
 struct Seed<'a> {
     host: &'a str,
@@ -735,9 +570,6 @@ fn lab_base(platforms: &'static [&'static str]) -> Seed<'static> {
         layers: 3,
         declared_layer_size: None,
     }
-}
-fn lab_pull() -> Option<RegistryCredential> {
-    Some(RegistryCredential { username: "lab-user".into(), secret: Secret::new("lab-secret") })
 }
 #[async_trait]
 impl HttpClient for StandIn {
@@ -2060,160 +1892,97 @@ fn push_request(image_digest: String, tools_digest: String) -> PrepareRequest {
     PrepareRequest {
         platform: Some(Platform::new("linux", "amd64")),
         route: Some(ImageRouteKind::ProviderPush),
-        image_pull: lab_pull(),
+        image_pull: None,
         size: daytona_size(),
         image_digest,
         tools_digest,
     }
 }
 
-// Push route (#103): the module copies the base alone, for Daytona's one
-// platform, from a private registry Daytona cannot reach into Daytona's own,
-// in bounded chunks with minted push access, waits out the registry's
-// visibility delay, and creates the snapshot by digest. The tools image is
-// never read: another host with a bumped tools pin converges on the same
-// snapshot without pushing again, and it launches.
-#[tokio::test]
-async fn pushed_image_becomes_snapshot_by_digest() {
-    let http = Arc::new(StandIn::default());
-    let (base, base_manifests) = seed(&mut http.0.lock().unwrap(), lab_base(&["arm64", "amd64"]));
-    let chunk = 7;
-    let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": chunk})).await;
-    let c = credentials();
-    let prep = p.prepare(push_request(base.clone(), tools_image('a')), &c).await.unwrap();
-
-    {
-        let s = http.0.lock().unwrap();
-        let image = s.snapshot_requests[0]["imageName"].as_str().unwrap().to_owned();
-        let (name, digest) = image.split_once('@').unwrap();
-        let repository = name.strip_prefix("harbor.invalid/").unwrap();
-        let (_, pushed) = &s.oci.manifests[&(HARBOR.to_owned(), repository.to_owned(), digest.to_owned())];
-        // The base's amd64 manifest, byte for byte, so its digest is kept.
-        assert_eq!(serde_json::from_slice::<Value>(pushed).unwrap(), base_manifests["amd64"]);
-        assert_eq!(digest, drydock_host::oci::sha256(pushed));
-        assert!(s.oci.patch_sizes.len() > s.oci.blobs.len() / 4 && s.oci.patch_sizes.iter().all(|n| *n <= chunk));
-        assert_eq!(s.oci.mints, 1);
-    }
-
-    let other_host = provider(http.clone()).await;
-    assert_eq!(other_host.prepare(push_request(base, tools_image('b')), &c).await.unwrap().id, prep.id);
-    assert_eq!(http.0.lock().unwrap().oci.mints, 1);
-    assert_eq!(http.0.lock().unwrap().snapshot_requests.len(), 1);
-    assert!(matches!(other_host.provision(request(prep, "pushed"), &c).await.unwrap(), Provisioned::Created(_)));
+/// Seeds an image in Daytona's registry, as drydockd's staging puts it there,
+/// and returns its index reference and its amd64 manifest's reference.
+fn in_harbor(s: &mut State, repository: &'static str) -> (String, String) {
+    let (index, manifests) = seed(s, Seed { host: HARBOR, repository, ..lab_base(&["amd64", "arm64"]) });
+    let amd64 = drydock_host::oci::sha256(manifests["amd64"].to_string().as_bytes());
+    (index, format!("{HARBOR}/{repository}@{amd64}"))
 }
 
-// Contract item 4: a platform Daytona cannot run, an image over the snapshot
-// limit, and push access that expires before the upload completes are each
-// the typed image refusal, and none of them creates a snapshot.
+// The push-access port mints a robot for Daytona's registry (no regionId:
+// Daytona finds only the organisation's own regions there) and names the
+// repository drydockd copies into; the route declares the snapshot limit and
+// chunk size drydockd stages within.
 #[tokio::test]
-async fn push_route_refusals_are_typed() {
+async fn push_access_names_daytonas_registry() {
     let http = Arc::new(StandIn::default());
-    let (arm_only, huge, base, tools) = {
-        let mut s = http.0.lock().unwrap();
-        let arm_only = seed(&mut s, Seed { repository: "crew/arm", ..lab_base(&["arm64"]) }).0;
-        let huge = seed(&mut s, Seed { repository: "crew/huge", declared_layer_size: Some(7 << 30), ..lab_base(&["amd64"]) }).0;
-        (arm_only, huge, seed(&mut s, lab_base(&["amd64"])).0, tools_image('a'))
-    };
+    let p = provider_with_settings(http.clone(), json!({"max_image_gib": 30, "push_chunk_bytes": 7})).await;
+    let c = credentials();
+    assert!(Ports::from(p.operations()).push_access);
+    let access = p.operations().push_access.unwrap().push_access(&c).await.unwrap();
+    assert_eq!(access.repository, "harbor.invalid/daytona-transient/drydock-vessel");
+    assert_eq!((access.credential.username.as_str(), access.credential.secret.expose()), ("robot$push-1", "push-secret-1"));
+    let lifetime = access.expires_at.unwrap().instant() - chrono::Utc::now();
+    assert!(lifetime > chrono::TimeDelta::seconds(3590) && lifetime <= chrono::TimeDelta::seconds(3600), "{lifetime}");
+    let push = p.capabilities().image_routes.into_iter().find(|r| r.kind() == ImageRouteKind::ProviderPush).unwrap();
+    let ImageRoute::ProviderPush { max_image_bytes, chunk_bytes, credential_lifetime_seconds, .. } = push else { unreachable!() };
+    assert_eq!((max_image_bytes, chunk_bytes, credential_lifetime_seconds), (Some(30 << 30), Some(7), Some(3600)));
+}
+
+// Push route: drydockd has put the image in Daytona's registry, and the
+// snapshot names it by digest. Another host with a bumped tools pin converges
+// on the same snapshot, and it launches. A platform Daytona cannot run is the
+// typed refusal before any vendor call, and an image the registry does not
+// serve yet is no snapshot.
+#[tokio::test]
+async fn pushed_images_become_snapshots_by_digest() {
+    let http = Arc::new(StandIn::default());
+    let (_, image) = in_harbor(&mut http.0.lock().unwrap(), "daytona-transient/drydock-vessel");
     let p = provider(http.clone()).await;
     let c = credentials();
-    let refusal = |result: Result<Prepared>| match result {
-        Err(ProtocolError::ImageRefused { refusal, .. }) => refusal,
-        other => panic!("{other:?}"),
-    };
+    let prep = p.prepare(push_request(image.clone(), tools_image('a')), &c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().snapshot_requests[0]["imageName"], image.as_str());
+    let other_host = provider(http.clone()).await;
+    assert_eq!(other_host.prepare(push_request(image.clone(), tools_image('b')), &c).await.unwrap().id, prep.id);
+    assert_eq!(http.0.lock().unwrap().snapshot_requests.len(), 1);
+    assert!(matches!(other_host.provision(request(prep, "pushed"), &c).await.unwrap(), Provisioned::Created(_)));
+
     let arm = Platform::new("linux", "arm64");
-    assert_eq!(
-        refusal(p.prepare(PrepareRequest { platform: Some(arm.clone()), ..push_request(base.clone(), tools.clone()) }, &c).await),
-        ImageRefusal::UnsupportedPlatform { platform: arm }
+    let before = http.0.lock().unwrap().requests;
+    let refused = p.prepare(PrepareRequest { platform: Some(arm.clone()), ..push_request(image, tools_image('a')) }, &c).await;
+    assert!(
+        matches!(refused, Err(ProtocolError::ImageRefused { refusal: ImageRefusal::UnsupportedPlatform { platform }, .. }) if platform == arm)
     );
-    assert_eq!(
-        refusal(p.prepare(push_request(arm_only, tools.clone()), &c).await),
-        ImageRefusal::UnsupportedPlatform { platform: Platform::new("linux", "amd64") }
-    );
-    // Three declared 7 GiB layers exceed Daytona's default 20 GiB snapshot maximum.
-    assert!(matches!(
-        refusal(p.prepare(push_request(huge, tools.clone()), &c).await),
-        ImageRefusal::TooLarge { bytes, limit_bytes } if bytes > 21 << 30 && limit_bytes == 20 << 30
-    ));
-    assert_eq!(http.0.lock().unwrap().oci.mints, 0, "refused before minting push access");
-    http.0.lock().unwrap().oci.push_lifetime = Some(chrono::TimeDelta::seconds(10));
-    assert_eq!(refusal(p.prepare(push_request(base, tools), &c).await), ImageRefusal::PushCredentialExpired);
-    assert!(http.0.lock().unwrap().snapshot_requests.is_empty());
+    assert_eq!(http.0.lock().unwrap().requests, before);
+
+    let (_, pending) = in_harbor(&mut http.0.lock().unwrap(), "daytona-transient/pending");
+    let digest = pending.split_once('@').unwrap().1.to_owned();
+    http.0.lock().unwrap().oci.pending_reads.insert(digest, 1);
+    let mut r = push_request(pending, tools_image('a'));
+    r.size.cpus = 1.0;
+    assert!(p.prepare(r, &c).await.is_err());
+    assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
+    http.0.lock().unwrap().violations.clear();
 }
 
-// A source blob is copied only when it can be verified inside bounded
-// requests: a registry that ignores Range for a blob larger than one chunk,
-// and a blob whose bytes do not match its digest, are each refused before the
-// upload commits, so Daytona's registry never holds the layer and no snapshot
-// is created.
+// The stand-in enforces what Daytona documents for pushed images: a snapshot
+// names one by digest only, and only once the registry serves it; an image
+// in a registry Daytona cannot reach is refused.
 #[tokio::test]
-async fn unverifiable_source_blobs_are_refused() {
-    let http = Arc::new(StandIn::default());
-    let (base, base_manifests, tools) = {
-        let mut s = http.0.lock().unwrap();
-        let (base, base_manifests) = seed(&mut s, lab_base(&["amd64"]));
-        (base, base_manifests, tools_image('a'))
-    };
-    let layer = base_manifests["amd64"]["layers"][0]["digest"].as_str().unwrap().to_owned();
-    let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": 7})).await;
-    let c = credentials();
-    let refused_unstored = |result: Result<Prepared>| {
-        assert!(matches!(result, Err(ProtocolError::Internal { .. })), "{result:?}");
-        assert!(!http.0.lock().unwrap().oci.blobs.contains_key(&(HARBOR.to_owned(), layer.clone())));
-    };
-    http.0.lock().unwrap().oci.ignore_range = true;
-    refused_unstored(p.prepare(push_request(base.clone(), tools.clone()), &c).await);
-    {
-        let mut s = http.0.lock().unwrap();
-        s.oci.ignore_range = false;
-        let stored = s.oci.blobs.get_mut(&(LAB.to_owned(), layer.clone())).unwrap();
-        let mut corrupt = stored.to_vec();
-        corrupt[0] ^= 1;
-        *stored = Bytes::from(corrupt);
-    }
-    refused_unstored(p.prepare(push_request(base, tools), &c).await);
-    assert!(http.0.lock().unwrap().snapshot_requests.is_empty());
-}
-
-// The stand-in itself enforces what Daytona documents for pushed images: a
-// snapshot names an image by digest only, and only once the registry serves
-// it; push robots stop authenticating when they expire.
-#[tokio::test]
-async fn standin_enforces_push_contract() {
+async fn standin_enforces_snapshot_image_rules() {
     let http = StandIn::default();
     let client = reqwest::Client::new();
-    let send = |request: reqwest::Request| http.execute(request, &ChannelLabel::Default);
-    let access = send(client.get("https://app.daytona.io/api/docker-registry/registry-push-access").bearer_auth("key-a").build().unwrap())
-        .await
-        .unwrap();
-    let access: Value = serde_json::from_slice(access.body()).unwrap();
-    let robot =
-        |user: &str, secret: &str| client.get("https://harbor.invalid/service/token").basic_auth(user, Some(secret)).build().unwrap();
-    let user = access["username"].as_str().unwrap();
-    assert_eq!(send(robot(user, access["secret"].as_str().unwrap())).await.unwrap().status(), 200);
-    http.0.lock().unwrap().oci.robots.get_mut(user).unwrap().1 = chrono::Utc::now();
-    assert_eq!(send(robot(user, access["secret"].as_str().unwrap())).await.unwrap().status(), 401);
-
-    let (image, _) =
-        seed(&mut http.0.lock().unwrap(), Seed { host: HARBOR, repository: "daytona-transient/drydock-vessel", ..lab_base(&["amd64"]) });
-    let manifest_digest = {
-        let s = http.0.lock().unwrap();
-        let (_, index) = &s.oci.manifests
-            [&(HARBOR.to_owned(), "daytona-transient/drydock-vessel".to_owned(), image.split_once('@').unwrap().1.to_owned())];
-        let index: Value = serde_json::from_slice(index).unwrap();
-        index["manifests"][0]["digest"].as_str().unwrap().to_owned()
-    };
-    let name = "harbor.invalid/daytona-transient/drydock-vessel";
+    let (_, image) = in_harbor(&mut http.0.lock().unwrap(), "daytona-transient/drydock-vessel");
+    let (name, digest) = image.split_once('@').unwrap();
     let snapshot = |image: String| {
         let body = json!({"name":"pushed","imageName":image,"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
         client.post("https://app.daytona.io/api/snapshots").bearer_auth("key-a").json(&body).build().unwrap()
     };
-    http.0.lock().unwrap().oci.pending_reads.insert(manifest_digest.clone(), 1);
-    for refused in [name.to_owned(), format!("{name}:latest"), format!("{name}:v1@{manifest_digest}"), format!("{name}@{manifest_digest}")]
-    {
-        assert_eq!(send(snapshot(refused.clone())).await.unwrap().status(), 400, "{refused}");
+    http.0.lock().unwrap().oci.pending_reads.insert(digest.to_owned(), 1);
+    let lab = format!("{LAB}/crew/base@{digest}");
+    for refused in [name.to_owned(), format!("{name}:latest"), format!("{name}:v1@{digest}"), image.clone(), lab] {
+        assert_eq!(http.execute(snapshot(refused.clone()), &ChannelLabel::Default).await.unwrap().status(), 400, "{refused}");
     }
     http.0.lock().unwrap().oci.pending_reads.clear();
-    assert_eq!(send(snapshot(format!("{name}@{manifest_digest}"))).await.unwrap().status(), 201);
+    assert_eq!(http.execute(snapshot(image), &ChannelLabel::Default).await.unwrap().status(), 201);
     http.0.lock().unwrap().violations.clear();
     http.0.lock().unwrap().snapshot_requests.clear();
 }

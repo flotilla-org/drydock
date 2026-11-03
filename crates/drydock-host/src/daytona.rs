@@ -9,7 +9,7 @@ use crate::{
         image::{check_prepare, check_prepared, content_name, platform_dockerfile},
     },
     module::*,
-    oci::{self, ImageRef, Registry},
+    oci,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -151,7 +151,7 @@ struct SshAccess {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PushAccess {
+struct RegistryPushAccess {
     expires_at: DateTime<Utc>,
     registry_url: Text,
     username: Text,
@@ -238,8 +238,8 @@ struct Settings {
     /// maximum is 20. Organizations with a raised limit configure it.
     #[serde(default = "max_image_gib")]
     max_image_gib: u64,
-    /// Bytes per blob request on the push route. Each request must finish
-    /// inside the host's HTTP deadline, so slow links want smaller chunks.
+    /// Bytes per blob request drydockd sends on the push route. Each request
+    /// must finish inside drydockd's HTTP deadline, so slow links want smaller chunks.
     #[serde(default = "push_chunk_bytes")]
     push_chunk_bytes: u64,
 }
@@ -426,38 +426,6 @@ impl Daytona {
         .await?
         .ok_or_else(|| ProtocolError::unavailable("Daytona sandbox has not started", Some(5)))
     }
-    /// Push route: copy the base image, for the platform, into Daytona's
-    /// registry with minted push access, and wait until a pull by digest
-    /// succeeds. Returns the digest reference.
-    async fn push(&self, r: &PrepareRequest, platform: &Platform, tag: &str, c: &Credentials) -> Result<String> {
-        let http = self.api.http();
-        let base = ImageRef::parse(&r.image_digest)?;
-        // The pull credential belongs to the base's registry and goes nowhere else.
-        let source = Registry::new(http.clone(), &base.registry, r.image_pull.clone(), None)?;
-        let manifest = source.platform_manifest(&base, platform).await?;
-        fits_snapshot(manifest.image_bytes()?, self.settings.max_image_gib)?;
-        // Daytona resolves `regionId` here only among the organisation's own regions and
-        // answers 404 "Region not found" for the shared ones (eu, us), so none is sent.
-        let access: PushAccess = self.api.get(self.api.url(&["docker-registry", "registry-push-access"])?, c).await?;
-        let bad = || DAYTONA.bad_response();
-        let host = access.registry_url.strip_prefix("https://").unwrap_or(&access.registry_url).trim_end_matches('/');
-        if !oci::registry_host_valid(host) {
-            return Err(bad());
-        }
-        let credential = RegistryCredential { username: access.username.into(), secret: Secret::new(String::from(access.secret)) };
-        let target = Registry::new(http.clone(), host, Some(credential), Some(access.expires_at)).map_err(|_| bad())?;
-        let repository = format!("{}/drydock-vessel", access.project);
-        oci::copy_image(&source, &base.repository, &manifest, &target, &repository, self.settings.push_chunk_bytes).await?;
-        // Tagged so the registry retains it; Daytona itself is given the digest.
-        target.put_manifest(&repository, tag, &manifest.media_type, manifest.bytes.clone()).await?;
-        // Daytona's registry serves a new manifest only after a delay, and its
-        // builder pulls once at snapshot creation (cf. `daytona snapshot push`).
-        kit::poll(60, Duration::from_secs(1), async || {
-            Ok(target.manifest_visible(&repository, &manifest.digest).await?.then(|| format!("{host}/{repository}@{}", manifest.digest)))
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("pushed image is not yet visible in Daytona's registry", Some(5)))
-    }
     fn analytics_url(&self, segments: &[&str], from: &str, to: &str) -> Result<Url> {
         let mut url = self.analytics.url(&[&["organization", self.settings.organization_id.as_str()], segments].concat())?;
         url.query_pairs_mut().append_pair("from", from).append_pair("to", to);
@@ -494,17 +462,6 @@ fn error_state(reason: &str) -> Observation {
         reason if reason.contains("unreachable") => Observation::Unknown { reason: UnknownReason::HostUnreachable },
         _ => Observation::Unknown { reason: UnknownReason::ProviderApiError },
     }
-}
-/// An image fills a snapshot exactly at the limit; one byte more is refused.
-fn fits_snapshot(bytes: u64, max_gib: u64) -> Result<()> {
-    let limit_bytes = max_gib.saturating_mul(GIB);
-    if bytes <= limit_bytes {
-        return Ok(());
-    }
-    Err(ProtocolError::ImageRefused {
-        reason: format!("image needs at least {bytes} bytes; Daytona snapshots hold {limit_bytes}"),
-        refusal: ImageRefusal::TooLarge { bytes, limit_bytes },
-    })
 }
 fn name(prefix: &str, input: &str) -> String {
     // Keep vendor names below 63 bytes, with 160 bits of digest identity.
@@ -614,11 +571,14 @@ impl Provider for Daytona {
             agent: true,
             platforms: vec![platform()],
             image_routes: vec![
-                // Default: our own images live in registries Daytona cannot reach.
+                // Default: our own images live in registries Daytona cannot
+                // reach, so drydockd copies them into Daytona's own.
                 ImageRoute::ProviderPush {
                     protocol: PushProtocol::OciDistribution,
                     credential_lifetime_seconds: Some(3600),
                     tools_layer: ToolsLayer::Upload,
+                    max_image_bytes: Some(self.settings.max_image_gib.saturating_mul(GIB)),
+                    chunk_bytes: Some(self.settings.push_chunk_bytes),
                 },
                 // Daytona pulls the base itself, from a registry the
                 // organization registered via POST /docker-registry.
@@ -641,6 +601,7 @@ impl Provider for Daytona {
         Operations {
             exec: Some(self),
             files: Some(self),
+            push_access: Some(self),
             suspend_resume: Some(self),
             quota: Some(self),
             usage: Some(self),
@@ -691,7 +652,8 @@ impl Provider for Daytona {
                     build_info: None,
                 };
                 match route {
-                    ImageRouteKind::ProviderPush => body.image_name = Some(self.push(&r, &platform, &snapshot_name, c).await?),
+                    // drydockd has put the amd64 image in Daytona's registry.
+                    ImageRouteKind::ProviderPush => body.image_name = Some(r.image_digest.clone()),
                     ImageRouteKind::RegistryPull => {
                         // Daytona's snapshot API takes no platform; pin the
                         // multi-arch base in the build so the snapshot
@@ -886,6 +848,24 @@ impl Exec for Daytona {
         Guest::exec(self, id, r, c).await
     }
 }
+/// Daytona's registry, with push access minted for it. Daytona resolves
+/// `regionId` here only among the organisation's own regions and answers 404
+/// "Region not found" for the shared ones (eu, us), so none is sent.
+#[async_trait]
+impl PushAccessOperation for Daytona {
+    async fn push_access(&self, c: &Credentials) -> Result<PushAccess> {
+        let access: RegistryPushAccess = self.api.get(self.api.url(&["docker-registry", "registry-push-access"])?, c).await?;
+        let host = access.registry_url.strip_prefix("https://").unwrap_or(&access.registry_url).trim_end_matches('/');
+        if !oci::registry_host_valid(host) {
+            return Err(DAYTONA.bad_response());
+        }
+        Ok(PushAccess {
+            repository: format!("{host}/{}/drydock-vessel", access.project),
+            credential: RegistryCredential { username: access.username.into(), secret: Secret::new(String::from(access.secret)) },
+            expires_at: Some(access.expires_at.into()),
+        })
+    }
+}
 /// The toolbox writes the file whole (making its parents), then sets its
 /// mode: an upload carries none.
 #[async_trait]
@@ -1074,15 +1054,6 @@ fn platform() -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The snapshot limit is inclusive: an image of exactly max_image_gib fits.
-    #[test]
-    fn snapshot_limit_boundary() {
-        assert!(fits_snapshot(20 * GIB, 20).is_ok());
-        assert!(matches!(
-            fits_snapshot(20 * GIB + 1, 20),
-            Err(ProtocolError::ImageRefused { refusal: ImageRefusal::TooLarge { bytes, limit_bytes }, .. }) if bytes == 20 * GIB + 1 && limit_bytes == 20 * GIB
-        ));
-    }
     // Vendor decimal lexemes retain all digits, beyond binary64's exact range.
     #[test]
     fn exact_vendor_money_and_complete_errors() {
