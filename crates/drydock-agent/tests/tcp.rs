@@ -68,7 +68,11 @@ async fn the_token_switches_to_the_agents_wire() {
     }
     let head = String::from_utf8(head).unwrap().to_lowercase();
     assert!(head.starts_with("http/1.1 101 "), "{head}");
-    assert!(head.contains("upgrade: websocket"), "{head}");
+    // Exactly these headers: a proxy may refuse a 101 whose Connection also
+    // says close (E2B's does), so nothing may be appended to them.
+    let mut headers: Vec<&str> = head.trim_end().lines().skip(1).filter(|line| !line.starts_with("date:")).collect();
+    headers.sort_unstable();
+    assert_eq!(headers, ["connection: upgrade", "upgrade: websocket"], "{head}");
     assert_eq!(hello_over_h2(Box::new(stream)).await.fingerprint, "test-build");
 }
 

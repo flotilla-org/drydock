@@ -35,7 +35,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 drydock-client = { version = "0.1.0", path = "../drydock-client" }
 
 [dev-dependencies]
-base64 = "0.22"
 drydock = { path = "../drydock" }
 tokio = { version = "1", features = ["process", "test-util"] }
 rigging-tls.workspace = true

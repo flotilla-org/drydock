@@ -161,8 +161,11 @@ async fn handshake(stream: tokio::net::TcpStream, peer: SocketAddr, token: &Toke
         };
         std::future::ready(Ok::<_, std::convert::Infallible>(response))
     });
+    // Keep-alive stays on: without it hyper appends `close` to the 101's
+    // `Connection: upgrade`, and E2B's proxy will not splice a 101 that says
+    // close. Refusals still close, as they set `Connection: close` themselves.
     hyper::server::conn::http1::Builder::new()
-        .keep_alive(false)
+        .keep_alive(true)
         .serve_connection(TokioIo::new(stream), service)
         .with_upgrades()
         .await
