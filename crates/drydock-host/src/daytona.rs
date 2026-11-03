@@ -2,7 +2,7 @@
 //! API contract: https://www.daytona.io/docs/openapi.json (2026-10-20).
 use crate::{
     kit::{
-        self, GIB, LABEL_TAG, SizeLimits, StateTable, Vendor,
+        self, GIB, LABEL_TAG, PROVIDER_TAG, SizeLimits, StateTable, Vendor,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found, https_base, join},
         egress::normal_cidr,
         guest::{Guest, GuestOutput, SUPERVISE},
@@ -329,10 +329,21 @@ impl Daytona {
     async fn by_label_name(&self, label: &str, c: &Credentials) -> Result<Option<Sandbox>> {
         // Anything but a 404 fails provision; the caller retries it.
         let Some(v) = self.api.find::<Sandbox>(self.sandbox_url(&name("environment", label), None)?, c).await? else { return Ok(None) };
+        self.check_ours(&v)?;
         if v.labels.get(LABEL_TAG).map(String::as_str) != Some(label) {
             return Err(refused("Daytona sandbox name belongs to a different label"));
         }
         Ok(Some(v))
+    }
+    /// Refuses a sandbox this instance did not tag as its own (drydock#168).
+    fn check_ours(&self, v: &Sandbox) -> Result<()> {
+        if kit::ours(&v.labels, &self.name).is_some() {
+            return Ok(());
+        }
+        Err(refused(format!(
+            "Daytona sandbox {} is not tagged {PROVIDER_TAG}={} with {LABEL_TAG}; it belongs to another instance or tool",
+            &*v.id, self.name
+        )))
     }
     fn environment(&self, v: &Sandbox) -> Result<Environment> {
         let state = match &*v.state {
@@ -756,7 +767,7 @@ impl Provider for Daytona {
         let body = CreateSandbox {
             name: name("environment", &r.label),
             snapshot: &r.prepared.id,
-            labels: BTreeMap::from([(LABEL_TAG, r.label.as_str())]),
+            labels: BTreeMap::from([(LABEL_TAG, r.label.as_str()), (PROVIDER_TAG, self.name.as_str())]),
             target: &self.settings.region,
             auto_stop_interval: 0,
             auto_pause_interval: 0,
@@ -796,6 +807,9 @@ impl Provider for Daytona {
         let mut url = self.api.url(&["sandbox"])?;
         url.query_pairs_mut().append_pair("limit", "200");
         for v in self.api.paged::<Sandbox>(url, &PAGED, c).await? {
+            if kit::ours(&v.labels, &self.name).is_none() {
+                continue;
+            }
             let row = self.environment(&v)?;
             if !matches!(
                 row.state,
@@ -813,6 +827,9 @@ impl Provider for Daytona {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         // Daytona answers 409 while a state change is in progress; wait it out briefly,
         // then surface the retryable `unavailable` error.
+        if let Some(v) = self.api.find::<Sandbox>(self.sandbox_url(id, None)?, c).await? {
+            self.check_ours(&v)?;
+        }
         for attempt in 1..=DESTROY_ATTEMPTS {
             let url = self.sandbox_url(id, None)?;
             match absent_on_not_found(self.unless_conflict::<IgnoredAny>(Method::DELETE, url, Body::None, c).await) {

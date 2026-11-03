@@ -173,10 +173,12 @@ impl StandIn {
         if !authorized {
             return response(401, json!({"statusCode":401,"message":"Unauthorized","error":"Unauthorized"}));
         }
-        if let Some((status, message)) = &s.outage {
+        // 409 is a state-change conflict: only mutations meet it, reads do not.
+        let read = request.method() == "GET" && request.url().path().starts_with("/api/sandbox/");
+        if let Some((status, message)) = s.outage.as_ref().filter(|(status, _)| !(read && *status == 409)) {
             return response(*status, json!({"statusCode":status,"message":message,"error":"Bad Request"}));
         }
-        if let Some(status) = s.failure.take() {
+        if let Some(status) = s.failure.filter(|status| !(read && *status == 409)).and_then(|_| s.failure.take()) {
             let message = s.failure_message.take().unwrap_or_else(|| "key-a must never be echoed".into());
             return response(status, json!({"statusCode":status,"message":message,"error":"Too Many Requests"}));
         }
@@ -733,6 +735,10 @@ fn schema_row(mut row: Value) -> Value {
 
 fn credentials() -> Credentials {
     Credentials::new(Some(Secret::new("key-a")))
+}
+/// Labels of a sandbox the `daytona` instance created.
+fn ours() -> Value {
+    json!({"flotilla.label":"l","drydock.provider":"daytona"})
 }
 async fn provider(http: Arc<dyn HttpClient>) -> Arc<dyn Provider> {
     let config: ProviderConfiguration =
@@ -2172,6 +2178,7 @@ async fn destroy_waits_out_state_change() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials();
+    http.0.lock().unwrap().rows.insert("sbx-1".into(), json!({"id":"sbx-1","labels":ours(),"state":"started","cpu":1,"memory":1,"disk":3}));
     http.0.lock().unwrap().failure = Some(409);
     p.destroy("sbx-1", &c).await.unwrap();
     assert!(http.0.lock().unwrap().failure.is_none());
@@ -2179,7 +2186,7 @@ async fn destroy_waits_out_state_change() {
     let before = http.0.lock().unwrap().requests;
     let e = p.destroy("sbx-1", &c).await.unwrap_err();
     assert_eq!(e.class(), "unavailable");
-    assert_eq!(http.0.lock().unwrap().requests, before + 5);
+    assert_eq!(http.0.lock().unwrap().requests, before + 6);
 }
 
 // Daytona keeps a deleted sandbox listed as destroying for a while; once destroy has
@@ -2190,12 +2197,12 @@ async fn list_omits_sandbox_being_destroyed() {
     let p = provider(http.clone()).await;
     let c = credentials();
     for (id, state) in [("live", "started"), ("going", "destroying"), ("gone", "destroyed")] {
-        http.0.lock().unwrap().rows.insert(id.into(), json!({"id":id,"state":state,"cpu":1,"memory":1,"disk":3}));
+        http.0.lock().unwrap().rows.insert(id.into(), json!({"id":id,"labels":ours(),"state":state,"cpu":1,"memory":1,"disk":3}));
     }
     // A spot-evicted sandbox is a distinct Gone cause and stays listed.
     http.0.lock().unwrap().rows.insert(
         "evicted".into(),
-        json!({"id":"evicted","state":"destroyed","spotEvictedAt":"2026-10-29T00:00:00Z","cpu":1,"memory":1,"disk":3}),
+        json!({"id":"evicted","labels":ours(),"state":"destroyed","spotEvictedAt":"2026-10-29T00:00:00Z","cpu":1,"memory":1,"disk":3}),
     );
     let ids: Vec<_> = p.list(&c).await.unwrap().into_iter().map(|e| e.id).collect();
     assert_eq!(ids, vec!["evicted".to_string(), "live".to_string()]);
@@ -2248,4 +2255,34 @@ async fn adoption_by_name_returns_a_destroyed_sandbox_as_observed() {
     assert!(matches!(adopted, Provisioned::Existing(ref e) if matches!(e.state, Observation::Gone { .. })));
     // Still the one initial create: re-adoption did not create again.
     assert_eq!(http.0.lock().unwrap().creates, 1);
+}
+
+// Only sandboxes tagged with this instance's name are listed, adopted or destroyed.
+#[tokio::test]
+async fn foreign_and_untagged_sandboxes_are_not_ours() {
+    let http = Arc::new(StandIn::default());
+    let p = provider(http.clone()).await;
+    let c = credentials();
+    let prep = prepared(p.as_ref(), &c).await;
+    let mine = row(p.provision(request(prep.clone(), "mine"), &c).await.unwrap());
+    assert_eq!(http.0.lock().unwrap().rows[&mine.id]["labels"]["drydock.provider"], "daytona");
+    let derived = |l: &str| format!("drydock-environment-{}", &format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(l.as_bytes()))[..40]);
+    for (id, label, labels) in
+        [("other", "o", json!({"flotilla.label":"o","drydock.provider":"someone-else"})), ("bare", "b", json!({"flotilla.label":"b"}))]
+    {
+        http.0
+            .lock()
+            .unwrap()
+            .rows
+            .insert(id.into(), json!({"id":id,"name":derived(label),"labels":labels,"state":"started","cpu":1,"memory":1,"disk":3}));
+        let ids: Vec<_> = p.list(&c).await.unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![mine.id.clone()], "{id}");
+        let e = p.provision(request(prep.clone(), label), &c).await.unwrap_err();
+        assert_eq!(e.class(), "refused", "{id}");
+        assert!(e.to_string().contains("drydock.provider=daytona"), "{e}");
+        assert_eq!(p.destroy(id, &c).await.unwrap_err().class(), "refused", "{id}");
+        assert!(http.0.lock().unwrap().rows.contains_key(id));
+    }
+    assert_eq!(http.0.lock().unwrap().creates, 1);
+    p.destroy(&mine.id, &c).await.unwrap();
 }
