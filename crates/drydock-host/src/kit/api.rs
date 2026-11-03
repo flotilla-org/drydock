@@ -309,7 +309,10 @@ impl Api {
                 serde_json::from_value(page_rows.unwrap_or_default()).map_err(|_| self.vendor.incomplete(&operation))?;
             rows.extend(page_rows);
             let next = match &paging.next {
-                Next::Body(keys) => keys.iter().find_map(|key| page.get(*key).and_then(Value::as_str)).map(str::to_owned),
+                Next::Body(keys) => match keys.iter().find_map(|key| page.get(*key).filter(|v| !v.is_null())) {
+                    Some(value) => Some(value.as_str().ok_or_else(|| self.vendor.bad_response())?.to_owned()),
+                    None => None,
+                },
                 Next::Header(name) => match response.headers().get(*name) {
                     Some(value) => Some(value.to_str().map_err(|_| self.vendor.bad_response())?.to_owned()),
                     None => None,
@@ -466,17 +469,20 @@ mod tests {
                 (200, vec![], r#"{"items":[1],"next":"c1"}"#),
                 (200, vec![], r#"{"items":[2],"next":""}"#),
                 (200, vec![], r#"{"next":"c2"}"#),
+                (200, vec![], r#"{"items":[1],"next":7}"#),
                 (200, vec![], "null"),
             ],
         );
         let url = api.url(&["rows"]).unwrap();
         assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap(), [1, 2]);
         assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").incomplete("GET /v1/rows"));
+        // A cursor that is not text is never read as the last page.
+        assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
         let forged = [(AUTHORIZATION, HeaderValue::from_static("Bearer forged"))];
         api.call_with::<Value>(Method::GET, url, Body::None, &key(), &forged).await.unwrap();
         let asked = script.asked.lock().unwrap();
         assert_eq!(asked[1].url().query(), Some("cursor=c1"));
-        assert_eq!(asked[3].headers()[AUTHORIZATION], "Bearer k");
+        assert_eq!(asked[4].headers()[AUTHORIZATION], "Bearer k");
     }
 
     #[derive(Debug, PartialEq, Deserialize)]

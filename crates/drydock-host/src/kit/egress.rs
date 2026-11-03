@@ -76,8 +76,7 @@ impl PrivateHost {
 /// `host` (a registry's, perhaps with a port) is plainly private: a private
 /// address literal or a name that cannot be public. Names are not resolved.
 pub fn private_host(host: &str) -> Option<PrivateHost> {
-    let host = host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = without_port(host);
     if let Ok(ip) = host.parse::<IpAddr>() {
         return private(ip).then_some(PrivateHost::Address(ip));
     }
@@ -92,8 +91,8 @@ pub async fn private_registry(registry: &str, resolver: &dyn Resolver) -> Option
     if let Some(private) = private_host(registry) {
         return Some(private);
     }
-    let host = registry.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(registry, |(h, _)| h);
-    if host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok() {
+    let host = without_port(registry);
+    if host.parse::<IpAddr>().is_ok() {
         return None;
     }
     match resolver.resolve(host).await {
@@ -103,6 +102,16 @@ pub async fn private_registry(registry: &str, resolver: &dyn Resolver) -> Option
             None
         }
     }
+}
+
+/// `host` without its port or IPv6 brackets. A bare IPv6 literal is whole:
+/// its last group is never a port.
+fn without_port(host: &str) -> &str {
+    if host.parse::<IpAddr>().is_ok() {
+        return host;
+    }
+    let host = host.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
+    host.trim_start_matches('[').trim_end_matches(']')
 }
 
 /// Resolves a host name, so prepare can refuse a registry a vendor's
@@ -158,7 +167,7 @@ mod tests {
         for host in ["192.168.1.31:3000", "localhost:5000", "registry:5000", "forgejo.lab.internal", "[::1]:5000", "x.test"] {
             assert!(private_host(host).is_some(), "{host}");
         }
-        for host in ["ghcr.io", "registry.example.com:443", "203.0.113.5"] {
+        for host in ["ghcr.io", "registry.example.com:443", "203.0.113.5", "2606:4700::1111", "[2606:4700::1111]:443"] {
             assert!(private_host(host).is_none(), "{host}");
         }
         assert_eq!(normal_cidr("10.0.0.12/24").as_deref(), Some("10.0.0.0/24"));

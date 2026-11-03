@@ -3,14 +3,16 @@ use super::{Vendor, digest};
 use crate::module::{Result, prepare_platform, prepare_route, refused};
 use drydock_protocol::*;
 
-/// A reference pinned by sha256 digest, with nothing a Dockerfile line or a
-/// shell word could carry beside it.
+/// A reference pinned by sha256 digest, its name made only of the
+/// characters an image reference uses (letters, digits, `.`, `_`, `-`, `/`
+/// and a port's or tag's `:`), so nothing a Dockerfile line or a shell word
+/// could carry rides beside it.
 pub fn pinned(reference: &str) -> bool {
     reference.split_once("@sha256:").is_some_and(|(image, digest)| {
         !image.is_empty()
+            && image.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-/:".contains(&b))
             && digest.len() == 64
             && digest.bytes().all(|b| b.is_ascii_hexdigit())
-            && !reference.contains(|c: char| c.is_whitespace() || c == '\\')
     })
 }
 
@@ -83,6 +85,10 @@ mod tests {
             "ghcr.io/a/b:latest".into(),
             format!("a b@sha256:{digest}"),
             format!("a@sha256:{}", "z".repeat(64)),
+            format!("a;rm@sha256:{digest}"),
+            format!("a$HOME@sha256:{digest}"),
+            format!("a\\b@sha256:{digest}"),
+            format!("a@sha256:{digest}\n"),
         ] {
             assert!(!pinned(&bad), "{bad}");
         }

@@ -25,6 +25,7 @@ pub struct GuestOutput {
     pub note: Option<String>,
 }
 impl GuestOutput {
+    /// An exit status outside i32 reads as -1, as an unreported one does.
     pub fn from_text(stdout: &str, stderr: &str, exit: Option<i64>) -> Self {
         let chunks = [(false, stdout), (true, stderr)].into_iter().filter(|(_, s)| !s.is_empty()).map(|(e, s)| (e, s.into())).collect();
         Self { chunks, exit: exit.map(|c| i32::try_from(c).unwrap_or(-1)), ..Self::default() }

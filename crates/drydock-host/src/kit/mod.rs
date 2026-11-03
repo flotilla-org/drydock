@@ -67,7 +67,8 @@ pub fn digest(input: &str) -> String {
 
 /// `body` is called up to `attempts` times, `interval` apart, until it
 /// returns a value; Ok(None) when it never did. An error ends the wait at
-/// once: retrying failures is the caller's policy, not this loop's.
+/// once: retrying failures is the caller's policy, not this loop's. Zero
+/// attempts never call `body`.
 pub async fn poll<T, F, Fut>(attempts: u32, interval: Duration, mut body: F) -> Result<Option<T>>
 where
     F: FnMut() -> Fut,
