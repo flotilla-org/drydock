@@ -147,6 +147,7 @@ impl Provider for Reference {
             usage: true,
             quota: true,
             host_filesystem: self.settings.host_filesystem,
+            agent_tcp_port: None,
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

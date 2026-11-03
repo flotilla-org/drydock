@@ -453,6 +453,7 @@ impl Provider for Local {
             quota: false,
             // Vessels are directories on this machine: guest paths are its own.
             host_filesystem: true,
+            agent_tcp_port: None,
         }
     }
     fn observation(&self) -> ObservationMode {

@@ -9,7 +9,9 @@ capture. The agent forwards traffic; the kind and upstream enforce policy.
 A provider starts `drydock-agent [--socket /run/drydock/agent.sock]
 [--vsock-port PORT] [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH]` alongside the image's own processes. It must not be PID 1.
 On upload bootstrap drydockd puts the binary at `/opt/drydock/drydock-agent`
-and starts it with `--supervise --socket /run/drydock/agent.sock`;
+and starts it with `--supervise --socket /run/drydock/agent.sock`, plus
+`--tcp 127.0.0.1:PORT --tcp-token-file /run/drydock/tcp-token --print-token`
+when the provider declares `agent_tcp_port`;
 `--supervise --store DIR --socket PATH` passes the store on to every agent the
 supervisor starts, and `--tcp ADDR:PORT --tcp-token-file PATH` before the
 socket passes on the TCP listener below. The socket comes last: every process of one agent ends its

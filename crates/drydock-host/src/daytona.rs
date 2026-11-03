@@ -632,6 +632,7 @@ impl Provider for Daytona {
             usage: true,
             quota: true,
             host_filesystem: false,
+            agent_tcp_port: None,
         }
     }
     fn observation(&self) -> ObservationMode {
