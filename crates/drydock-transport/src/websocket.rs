@@ -122,15 +122,21 @@ impl TlsDialer {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self { tls: Arc::new(config) })
     }
-    /// The connection beneath a dial of `url`: TCP, with TLS for `wss://`
-    /// and `https://`; `ws://` and `http://` only to a loopback IP address.
-    async fn stream(&self, url: &str) -> io::Result<ByteStream> {
+    /// The connection beneath a dial of `url`, whose scheme (in any case)
+    /// must be one of `schemes`: TCP, with TLS for `wss://` and `https://`;
+    /// `ws://` and `http://` only to a loopback IP address.
+    async fn stream(&self, url: &str, schemes: Schemes) -> io::Result<ByteStream> {
         let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{reason}: {}", shown(url)));
         let uri: Uri = url.parse().map_err(|_| invalid("not a URL"))?;
-        let secure = match uri.scheme_str() {
-            Some("wss" | "https") => true,
-            Some("ws" | "http") => false,
-            _ => return Err(invalid("not a ws, wss, http or https URL")),
+        let scheme = uri.scheme_str().unwrap_or_default().to_ascii_lowercase();
+        let (cleartext, tls, refusal) = match schemes {
+            Schemes::WebSocket => ("ws", "wss", "not a ws or wss URL"),
+            Schemes::Http => ("http", "https", "not an http or https URL"),
+        };
+        let secure = match scheme.as_str() {
+            s if s == tls => true,
+            s if s == cleartext => false,
+            _ => return Err(invalid(refusal)),
         };
         let host = uri.host().ok_or_else(|| invalid("no host"))?;
         let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
@@ -148,12 +154,18 @@ impl TlsDialer {
         })
     }
     async fn open(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
-        if !url.starts_with("ws://") && !url.starts_with("wss://") {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a ws or wss URL: {}", shown(url))).into());
-        }
-        let stream = self.stream(url).await?;
+        let stream = self.stream(url, Schemes::WebSocket).await?;
         handshake(url, headers, stream).await
     }
+}
+
+/// The schemes a [`TlsDialer`] connection may be opened for.
+#[derive(Clone, Copy)]
+enum Schemes {
+    /// `ws://` and `wss://`, for [`WebSocketDialer`].
+    WebSocket,
+    /// `http://` and `https://`, for [`StreamDialer`].
+    Http,
 }
 #[async_trait]
 impl WebSocketDialer for TlsDialer {
@@ -189,10 +201,7 @@ pub trait StreamDialer: Send + Sync {
 #[async_trait]
 impl StreamDialer for TlsDialer {
     async fn connect(&self, url: &str) -> io::Result<ByteStream> {
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not an http or https URL: {}", shown(url))));
-        }
-        match tokio::time::timeout(DIAL_TIMEOUT, self.stream(url)).await {
+        match tokio::time::timeout(DIAL_TIMEOUT, self.stream(url, Schemes::Http)).await {
             Ok(result) => result,
             Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "dial timed out")),
         }

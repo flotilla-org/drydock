@@ -306,6 +306,8 @@ async fn reaches_the_agent_through_an_edge_that_wants_its_own_credential() {
         (header_edge, "?unrelated=q-value".into(), edge_header(EDGE_TOKEN), None),
         (header_edge, "?unrelated=q-value".into(), Default::default(), Some("401")),
         (header_edge, "?unrelated=q-value".into(), edge_header("stolen-value"), Some("403")),
+        // Values too short to be credentials leave the status readable.
+        (header_edge, "?flag=&v=1&w=40".into(), Default::default(), Some("401")),
     ];
     for (edge, query, headers, refused) in cases {
         let base = format!("http://{edge}/v1/connect");
@@ -357,6 +359,11 @@ async fn an_unfollowable_dial_reach_is_refused_at_once() {
         (format!("http://user:hunter2@{edge}/v1/connect"), Default::default(), "must not carry userinfo"),
         (format!("http://{edge}/v1/connect"), header("Authorization"), "must not replace the handshake's own"),
         (format!("http://{edge}/v1/connect"), header("not a name"), "is not a header name"),
+        (
+            format!("http://{edge}/v1/connect"),
+            [("X-Edge".to_owned(), Secret::new("header-secret")), ("x-edge".to_owned(), Secret::new("header-secret"))].into(),
+            "is given twice",
+        ),
         ("http://192.0.2.1/v1/connect?_edge=hunter2".into(), Default::default(), "cleartext only to a loopback"),
     ];
     for (url, headers, refusal) in cases {

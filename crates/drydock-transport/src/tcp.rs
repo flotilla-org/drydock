@@ -229,6 +229,7 @@ async fn handshake(
         Upgrade::WebSocket => {
             let mut key = [0u8; 16];
             getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
+            // Sixteen bytes are 22 unpadded characters and always two `=` of padding.
             let key = encode(&key, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") + "==";
             request.header(header::UPGRADE, "websocket").header(header::SEC_WEBSOCKET_VERSION, "13").header(header::SEC_WEBSOCKET_KEY, key)
         }

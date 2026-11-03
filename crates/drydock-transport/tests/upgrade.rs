@@ -124,6 +124,10 @@ async fn an_agent_behind_an_edge_is_reached_at_its_url() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(!error.to_string().contains("secret"), "{error}");
     assert_eq!(tls.connect("wss://example.invalid/").await.err().unwrap().kind(), io::ErrorKind::InvalidInput);
+    // A scheme is a scheme in any case.
+    let upper = url(EDGE_KEY).replacen("http://", "HTTP://", 1);
+    tcp::connect_at(tls.connect(&upper).await.unwrap(), &upper, &token).await.unwrap();
+    while requests.try_recv().is_ok() {}
     // An edge's own header rides along; one that would replace the
     // handshake's is refused before anything is sent.
     let mut headers = hyper::HeaderMap::new();

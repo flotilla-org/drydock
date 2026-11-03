@@ -215,6 +215,10 @@ impl AgentReach {
     }
 }
 
+/// The shortest query value a dial reach's errors mask on its own; shorter
+/// ones are masked only as `name=value`.
+const MASKED_QUERY_VALUE: usize = 8;
+
 impl AgentReach {
     /// One connection to the agent through a dial reach's edge. Everything
     /// the edge is given is masked first, since it may echo it: each query
@@ -236,14 +240,22 @@ impl AgentReach {
         let base = url.split(['?', '#']).next().unwrap_or_default();
         {
             let mut masker = masker.lock().unwrap();
-            // An edge may echo its credential, raw or decoded, alone or with its name.
+            // An edge may echo its credential, raw or decoded, alone or with
+            // its name. A value too short to be a credential (`v=1`) is
+            // masked only with its name, or it would mask every `1` in a
+            // status such as 401.
             if let Some((_, query)) = url.split_once('?') {
                 let query = query.split('#').next().unwrap_or_default();
                 masker.remember(query);
-                for value in query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value)) {
-                    masker.remember(value);
+                for pair in query.split('&') {
+                    masker.remember(pair);
+                    let Some((_, value)) = pair.split_once('=') else { continue };
                     let decoded = percent_encoding::percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned();
-                    masker.remember(&decoded);
+                    for value in [value, &decoded] {
+                        if value.len() >= MASKED_QUERY_VALUE {
+                            masker.remember(value);
+                        }
+                    }
                 }
             }
             for value in headers.values() {
@@ -261,6 +273,10 @@ impl AgentReach {
         for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| unsupported(format!("dial reach header {name:?} is not a header name")))?;
+            // Names are case-insensitive: two spellings of one would leave one unsent.
+            if sent.contains_key(&name) {
+                return Err(unsupported(format!("dial reach header {name} is given twice")));
+            }
             let mut value = HeaderValue::from_str(value.expose())
                 .map_err(|_| unsupported(format!("dial reach header {name}'s value is not a header value")))?;
             value.set_sensitive(true);
