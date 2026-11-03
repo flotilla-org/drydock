@@ -1,7 +1,8 @@
 use std::{
+    ffi::OsString,
     io,
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
 };
 /// A dedicated run directory belongs to the agent's effective user. Refuse
 /// symlinks and sticky/shared directories rather than changing their protection.
@@ -53,6 +54,33 @@ where
     output.flush().await
 }
 
+/// The supervised socket, which comes last: every process of a vessel's
+/// agent ends its argv with `--socket PATH`, so a host can find them all by
+/// it. Options before it (`--store DIR`, `--tcp ADDR:PORT`,
+/// `--tcp-token-file PATH`) are the agent's, passed on to every agent the
+/// supervisor starts.
+pub fn supervised(args: &[OsString]) -> io::Result<PathBuf> {
+    const OPTIONS: &[&str] = &["--store", "--tcp", "--tcp-token-file"];
+    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH] --socket PATH");
+    let [options @ .., flag, path] = args else { return Err(usage()) };
+    let names: Vec<_> = options.chunks(2).map(|pair| &pair[0]).collect();
+    if flag != "--socket"
+        || options.len() % 2 != 0
+        || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
+        || (1..names.len()).any(|i| names[..i].contains(&names[i]))
+    {
+        return Err(usage());
+    }
+    if let Some(pair) = args.chunks(2).find(|pair| pair[1].as_encoded_bytes().starts_with(b"--")) {
+        return Err(io::Error::other(format!(
+            "{} takes a value, not {:?}; name a path beginning with -- as ./--…",
+            pair[0].display(),
+            pair[1]
+        )));
+    }
+    Ok(path.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +127,22 @@ mod tests {
 
         let missing = bridge(&dir.path().join("missing.sock"), tokio::io::empty(), tokio::io::sink()).await.unwrap_err();
         assert!(missing.to_string().contains("missing.sock"), "{missing}");
+    }
+
+    #[test]
+    fn supervised_takes_the_trailing_socket_and_refuses_malformed_argv() {
+        let argv = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        assert_eq!(supervised(&argv(&["--store", "d", "--socket", "/s"])).unwrap(), PathBuf::from("/s"));
+        assert_eq!(supervised(&argv(&["--socket", "/s"])).unwrap(), PathBuf::from("/s"));
+        for bad in [
+            &["--socket"][..],
+            &["--store", "d"],
+            &["--store", "a", "--store", "b", "--socket", "/s"],
+            &["--bogus", "x", "--socket", "/s"],
+            &["--store", "--x", "--socket", "/s"],
+            &["--socket", "--x"],
+        ] {
+            assert!(supervised(&argv(bad)).is_err(), "{bad:?}");
+        }
     }
 }
