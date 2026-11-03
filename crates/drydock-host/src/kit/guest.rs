@@ -248,13 +248,20 @@ pub fn egress_proof(stdout: &[u8], deny_all: bool) -> Option<bool> {
     })
 }
 /// Measures `row`'s egress claim with the probe, as root in the guest: a
-/// complete proof of confinement is Enforced, anything else Advisory. A
-/// probe that could not run leaves the row as it was (logged by class only:
-/// the error bypasses the host's masking); the result says whether it ran.
+/// complete proof of confinement is Enforced, a complete proof of anything
+/// else Advisory. A probe that could not run, or printed no complete proof,
+/// leaves the row as it was (logged by class only: the error bypasses the
+/// host's masking); the result says whether it measured.
 pub async fn measure_egress(guest: &dyn Guest, row: &mut Environment, probe: &ExecRequest, deny_all: bool, c: &Credentials) -> bool {
-    match guest.run(&row.id, &probe_script(probe, deny_all), BTreeMap::new(), c).await.and_then(|o| o.success(guest.vendor())) {
-        Ok(output) => {
-            let confined = egress_proof(&output.stdout(), deny_all) == Some(true);
+    let output = guest.run(&row.id, &probe_script(probe, deny_all), BTreeMap::new(), c).await.and_then(|o| o.success(guest.vendor()));
+    let proof = output.and_then(|output| {
+        egress_proof(&output.stdout(), deny_all).ok_or_else(|| ProtocolError::Internal {
+            reason: format!("incomplete {} egress proof", guest.vendor()),
+            provider_error: "probe output omitted".into(),
+        })
+    });
+    match proof {
+        Ok(confined) => {
             row.egress = if confined { Enforcement::Enforced } else { Enforcement::Advisory };
             row.egress_measured = true;
             true
