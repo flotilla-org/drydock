@@ -445,6 +445,10 @@ impl Daemon {
                 let limits = crate::staging::Limits { max_image_bytes: *max_image_bytes, chunk_bytes: *chunk_bytes };
                 Ok(self.staging.push(provider, mint, request, &platform, limits).await?)
             }
+            ImageRoute::ProviderPush { .. } => {
+                tracing::warn!(provider, "provider declares the provider-push route without the push-access port; the image is not staged");
+                Ok(request)
+            }
             ImageRoute::RegistryPull { .. } if !pull_from.is_empty() => Ok(self.staging.stage(pull_from, request, &platform).await?),
             _ => Ok(request),
         }
