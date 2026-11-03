@@ -86,7 +86,8 @@ pub enum Body {
     None,
     /// Serialized JSON.
     Json(Bytes),
-    /// Bytes with their content type (none when empty).
+    /// Bytes with their content type; an empty one sets none, leaving any
+    /// the caller's headers carry.
     Bytes(Bytes, &'static str),
 }
 impl Body {
