@@ -12,6 +12,8 @@ mod files;
 mod frames;
 mod process;
 mod query;
+mod reach;
+pub use reach::{Attempt, Attempted, Attempts, DEFAULT_TIMEOUT_MS, Identity, MAX_TIMEOUT_MS, Outcome, Target, attempt};
 mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
@@ -29,7 +31,8 @@ use serde::{Deserialize, Serialize};
 pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
-pub const FEATURES: &[&str] = &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts"];
+pub const FEATURES: &[&str] =
+    &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts", "destinations"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};

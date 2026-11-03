@@ -1,5 +1,6 @@
 //! Provider-only user configuration. Module settings are passed through unchanged.
 use crate::credentials::CredentialReference;
+use drydock_agent::Target;
 use drydock_protocol::{Configuration, CredentialLocation, EgressRequest, ProviderConfiguration, Size};
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,34 @@ pub struct Config {
     /// provider instance that lists them in `pull_from`.
     #[serde(default)]
     pub registries: BTreeMap<String, Registry>,
+    /// The default targets for "try these destinations". Parsed and validated here; drydockd does not consume them yet.
+    #[serde(default)]
+    pub destinations: DefaultDestinations,
+}
+/// The shipped targets for the cases no provider lists, once per installation.
+/// Each list given in `[destinations]` replaces the shipped one whole.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultDestinations {
+    /// Egress to an endpoint nobody listed: stable public hosts on 443.
+    #[serde(default = "unlisted")]
+    pub unlisted: Vec<Target>,
+    /// Raw DNS: a lookup through each public resolver on 53.
+    #[serde(default = "raw_dns")]
+    pub raw_dns: Vec<Target>,
+}
+impl Default for DefaultDestinations {
+    fn default() -> Self {
+        Self { unlisted: unlisted(), raw_dns: raw_dns() }
+    }
+}
+fn unlisted() -> Vec<Target> {
+    ["one.one.one.one", "dns.google"].map(|host| Target::Tcp { host: host.into(), port: 443 }).into()
+}
+fn raw_dns() -> Vec<Target> {
+    ["1.1.1.1:53", "8.8.8.8:53"]
+        .map(|resolver| Target::Dns { name: "example.com".into(), resolver: Some(resolver.parse().expect("literal address")) })
+        .into()
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,6 +309,18 @@ settings = {{
             assert!(Config::parse(&(registry(repository) + &provider("'ghcr'"))).is_err(), "{repository}");
         }
         assert!(Config::parse(&(registry("ghcr.io/org/staging") + "chunk_bytes=0\n" + &provider("'ghcr'"))).is_err());
+    }
+    // The shipped targets apply until drydock.toml names its own, list by list.
+    #[test]
+    fn default_destinations_are_shipped_and_overridable() {
+        let shipped = Config::parse("").unwrap().destinations;
+        assert_eq!(shipped.unlisted.len(), 2);
+        assert!(shipped.unlisted.iter().all(|t| matches!(t, Target::Tcp { port: 443, .. })));
+        assert!(shipped.raw_dns.iter().all(|t| matches!(t, Target::Dns { resolver: Some(r), .. } if r.port() == 53)));
+        let config = Config::parse("[destinations]\nunlisted=[{tcp={host='example.net', port=8443}}]\n").unwrap().destinations;
+        assert_eq!(config.unlisted, [Target::Tcp { host: "example.net".into(), port: 8443 }]);
+        assert_eq!(config.raw_dns, shipped.raw_dns);
+        assert!(Config::parse("[destinations]\nother=[]\n").is_err());
     }
     // Generated quantities cover zero, ordinary values and overflow near u64::MAX.
     #[hegel::test]
