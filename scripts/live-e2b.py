@@ -9,7 +9,10 @@ drydock, drydockd and drydock-host built from this branch (default
 target/release, from `cargo build --release -p drydock -p drydock-host`).
 
 PATH is a linux/amd64 drydock-agent, which launch pushes into the vessel if
-the template's agent is older; by default $DRYDOCK_AGENT_BIN_LINUX_AMD64,
+the template's agent is older. The push goes through the template's agent,
+so that agent (baked in from the pinned tools image; each tools pin has its
+own template) must already pass E2B's proxy: one whose 101 says
+`Connection: close` never answers through it. By default $DRYDOCK_AGENT_BIN_LINUX_AMD64,
 else DIR/drydock-agent-linux-amd64, else DIR/drydock-agent on a Linux x86_64
 host. On a Mac, take the one in the pinned tools image:
 
@@ -414,7 +417,10 @@ def main():
             for row in ours(key):
                 status, body, _ = e2b("DELETE", f"/sandboxes/{row['sandboxID']}", key)
                 print(f"NOTE killed leftover sandbox {row['sandboxID']}: HTTP {status}", flush=True)
-            remaining = [row["sandboxID"] for row in ours(key)]
+            # E2B's list lags a kill by a few seconds, so poll before failing.
+            deadline = time.monotonic() + 30
+            while (remaining := [row["sandboxID"] for row in ours(key)]) and time.monotonic() < deadline:
+                time.sleep(2)
             check(not remaining, f"[cleanup] no drydock sandboxes are left at E2B: {remaining}")
         except Exception as error:  # Cleanup reports, never hides, what it could not do.
             check(False, f"[cleanup] listing or killing sandboxes through E2B's API: {error}")

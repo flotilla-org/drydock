@@ -503,7 +503,10 @@ impl StandIn {
     /// to a running sandbox, with its traffic token when it refuses public
     /// traffic (403 otherwise), to a port the guest listens on at its
     /// interface (502 otherwise). Then the request goes on to the guest as
-    /// it came, `Authorization` included, and bytes are spliced both ways.
+    /// it came, `Authorization` included. The guest's answer comes back, but
+    /// a 101 whose `Connection` lists `close` is not spliced: live E2B answers
+    /// it with the same 502 as a closed port. Otherwise bytes are spliced
+    /// both ways.
     async fn serve_proxy(self, mut listener: drydock_transport::MemoryListener) {
         while let Ok(stream) = listener.accept().await {
             let stand_in = self.clone();
@@ -554,14 +557,14 @@ impl StandIn {
                     }
                     Some((port, sandbox)) => match (&sandbox.guest, &sandbox.agent_bind) {
                         // The proxy enters through the guest's interface: a loopback listener is out of its reach.
-                        (Some(guest), Some(bind)) if *bind == format!("0.0.0.0:{port}") => Ok(guest.address),
+                        (Some(guest), Some(bind)) if *bind == format!("0.0.0.0:{port}") => Ok((guest.address, port)),
                         _ => Err(refuse("502 Bad Gateway", &format!("The sandbox is running but port is not open: {port}"))),
                     },
                 }
             }
         };
-        let address = match target {
-            Ok(address) => address,
+        let (address, port) = match target {
+            Ok(target) => target,
             Err(answer) => {
                 let _ = stream.write_all(answer.as_bytes()).await;
                 return;
@@ -569,6 +572,29 @@ impl StandIn {
         };
         let Ok(mut guest) = tokio::net::TcpStream::connect(address).await else { return };
         if guest.write_all(&head).await.is_err() {
+            return;
+        }
+        let mut answer = Vec::new();
+        while !answer.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            if guest.read(&mut byte).await.unwrap_or(0) == 0 {
+                let _ = stream.write_all(&answer).await;
+                return;
+            }
+            answer.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&answer).into_owned();
+        let switched = text.split_whitespace().nth(1) == Some("101");
+        let closes = text.lines().skip(1).filter_map(|l| l.split_once(':')).any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection") && value.split(',').any(|token| token.trim().eq_ignore_ascii_case("close"))
+        });
+        if switched && closes {
+            let _ = stream
+                .write_all(refuse("502 Bad Gateway", &format!("The sandbox is running but port is not open: {port}")).as_bytes())
+                .await;
+            return;
+        }
+        if stream.write_all(&answer).await.is_err() {
             return;
         }
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut guest).await;
@@ -1026,7 +1052,8 @@ impl World {
 // holding the image and size, the tools layer uploaded to the signed URL
 // (without the key) as the COPY context, the base image's ENV restored, then
 // polled to ready. A second prepare finds it by name and builds nothing; a
-// template of another size reuses the cached tools file without uploading.
+// template of another size or tools pin reuses the cached tools file without
+// uploading.
 #[tokio::test(start_paused = true)]
 async fn prepare_builds_once_then_finds_the_template_by_name() {
     let w = world().await;
@@ -1056,8 +1083,14 @@ async fn prepare_builds_once_then_finds_the_template_by_name() {
     assert_eq!(w.stand_in.state().templates[0].builds.len(), 1, "found by name, not rebuilt");
     let larger = w.prepare(size(4.0, 4096, 10)).await.unwrap();
     assert_ne!(larger.id, first.id);
+    assert_eq!(w.stand_in.state().templates.len(), 2);
+    // A new tools pin is a new template, so a new agent is baked in.
+    let mut request = w.prepare_request(size(2.0, 2048, 10), None);
+    request.tools_digest = request.tools_digest.replace("/drydock-tools@", "/drydock-tools-next@");
+    let tools = w.provider.prepare(request, &w.credentials).await.unwrap();
+    assert!(tools.id != first.id && tools.id != larger.id, "{}", tools.id);
     let s = w.stand_in.state();
-    assert_eq!((s.templates.len(), s.uploads), (2, 1), "the tools file is present at E2B");
+    assert_eq!((s.templates.len(), s.uploads), (3, 1), "the tools file is present at E2B");
 }
 
 // A failed build is a refusal carrying E2B's reason and the log's tail.
@@ -1263,6 +1296,42 @@ async fn relay_recovers_its_tokens_and_the_proxy_gates_traffic() {
     let error = drydock_transport::tcp::connect_at(w.dialer.connect().await.unwrap(), &url, &token).await.err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("403") && error.to_string().contains("traffic access token"), "{error}");
+}
+
+// The proxy will not splice a 101 that says `Connection: close`: an agent
+// that answered so is refused with the closed port's 502, as live.
+#[tokio::test]
+async fn the_proxy_refuses_a_closing_upgrade() {
+    let w = world().await;
+    let id = w.launched("vessel-1").await.id;
+    let closing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = closing.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = closing.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    head.push(stream.read_u8().await.unwrap());
+                }
+                let answer = "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade, close\r\nupgrade: websocket\r\n\r\n";
+                let _ = stream.write_all(answer.as_bytes()).await;
+            });
+        }
+    });
+    let token = {
+        let mut s = w.stand_in.state();
+        let guest = s.sandboxes.get_mut(&id).unwrap().guest.as_mut().unwrap();
+        guest.address = address;
+        guest.token.clone()
+    };
+    let traffic = w.stand_in.state().sandboxes[&id].traffic_token.clone().unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert("e2b-traffic-access-token", traffic.parse().unwrap());
+    let url = format!("https://7811-{id}.{DOMAIN}/v1/connect");
+    let error = drydock_transport::tcp::connect_at_with(w.dialer.connect().await.unwrap(), &url, &token, headers).await.err().unwrap();
+    let refusal = drydock_transport::tcp::Refusal::of(&error).expect("an HTTP refusal");
+    assert_eq!(refusal.status, 502, "{error}");
+    assert!(refusal.body.contains("port is not open: 7811"), "{error}");
 }
 
 // A paused sandbox is refused rather than woken.

@@ -945,12 +945,14 @@ fn normal_cidr(cidr: &str) -> Option<String> {
     Some(format!("{}/{bits}", Ipv4Addr::from(u32::from(ip) & mask)))
 }
 
-/// The prepared template's name. E2B sizes the template, not the sandbox, so
-/// the size is part of it. The tools image is not: the agent baked in is a
-/// cache the host upgrades at the first hello. A content-addressed name never
-/// changes content, so prepare never rebuilds a ready one.
-fn template_name(image: &str, platform: &Platform, size: &Size) -> String {
-    format!("drydock-{}", &digest(&format!("e2b-template\0{image}\0{platform}\0{}\0{}", size.cpus as u64, size.memory_bytes / MIB))[..40])
+/// The prepared template's name: one per base image, tools image, platform
+/// and size. E2B sizes the template, not the sandbox, so the size is part of
+/// it; the tools image is too, so a new agent gets a new template rather than
+/// the one baked into a template already ready. A content-addressed name
+/// never changes content, so prepare never rebuilds a ready one.
+fn template_name(image: &str, tools: &str, platform: &Platform, size: &Size) -> String {
+    let key = format!("e2b-template\0{image}\0{tools}\0{platform}\0{}\0{}", size.cpus as u64, size.memory_bytes / MIB);
+    format!("drydock-{}", &digest(&key)[..40])
 }
 fn shell_command(command: &[String]) -> String {
     command.iter().map(|s| format!("'{}'", s.replace('\'', "'\"'\"'"))).collect::<Vec<_>>().join(" ")
@@ -1031,7 +1033,7 @@ impl Provider for E2b {
                 base.registry
             )));
         }
-        let name = template_name(&r.image_digest, &platform, &r.size);
+        let name = template_name(&r.image_digest, &r.tools_digest, &platform, &r.size);
         let template = self.template(&name, c).await?;
         let ready = template.as_ref().is_some_and(|t| t["builds"].as_array().into_iter().flatten().any(|b| b["status"] == "ready"));
         if !ready {
@@ -1051,7 +1053,7 @@ impl Provider for E2b {
             return Err(refused("prepared template belongs to another provider"));
         }
         self.validate_size(&r.size)?;
-        if r.prepared.id != template_name(&r.prepared.image_digest, &r.prepared.platform, &r.size) {
+        if r.prepared.id != template_name(&r.prepared.image_digest, &r.prepared.tools_digest, &r.prepared.platform, &r.size) {
             return Err(refused("E2B size does not match the prepared template"));
         }
         let policy = Policy::request(&r.egress)?;
@@ -1388,20 +1390,21 @@ mod tests {
         }
     }
 
-    // The template name holds the image, platform, vCPUs and memory, not the
-    // disk or the tools image; it is a valid E2B name.
+    // The template name holds the base and tools images, platform, vCPUs and
+    // memory, not the disk; it is a valid E2B name.
     #[test]
     fn template_names() {
         let size = |cpus: f64, memory: u64, disk: u64| Size { cpus, memory_bytes: memory * MIB, disk_bytes: disk * MIB };
         let amd = platform();
-        let name = template_name("image", &amd, &size(2.0, 2048, 10_240));
+        let name = template_name("image", "tools", &amd, &size(2.0, 2048, 10_240));
         assert!(name.len() <= 128 && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'), "{name}");
-        assert_eq!(name, template_name("image", &amd, &size(2.0, 2048, 1024)));
+        assert_eq!(name, template_name("image", "tools", &amd, &size(2.0, 2048, 1024)));
         for other in [
-            template_name("other", &amd, &size(2.0, 2048, 10_240)),
-            template_name("image", &Platform::new("linux", "arm64"), &size(2.0, 2048, 10_240)),
-            template_name("image", &amd, &size(4.0, 2048, 10_240)),
-            template_name("image", &amd, &size(2.0, 4096, 10_240)),
+            template_name("other", "tools", &amd, &size(2.0, 2048, 10_240)),
+            template_name("image", "tools", &Platform::new("linux", "arm64"), &size(2.0, 2048, 10_240)),
+            template_name("image", "other", &amd, &size(2.0, 2048, 10_240)),
+            template_name("image", "tools", &amd, &size(4.0, 2048, 10_240)),
+            template_name("image", "tools", &amd, &size(2.0, 4096, 10_240)),
         ] {
             assert_ne!(other, name);
         }
