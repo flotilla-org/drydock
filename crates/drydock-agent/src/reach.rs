@@ -192,12 +192,12 @@ fn lookup_failure(error: LookupError) -> Found {
     Found::of(if error.missing { Outcome::NameNotResolved } else { Outcome::Failed }, None, Some(error.detail))
 }
 
+/// Resolve through getaddrinfo itself, so the outcome rests on its error code
+/// and not on the libc's wording of it.
+///
 /// A getaddrinfo that outlives its target's timeout runs on until libc gives
 /// up: a blocking-pool thread cannot be cancelled. That is bounded by the 64
 /// targets a request may carry.
-///
-/// getaddrinfo itself, so the outcome rests on its error code and not on the
-/// libc's wording of it.
 async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
     let host = std::ffi::CString::new(host).map_err(|_| LookupError { missing: false, detail: "host contains NUL".into() })?;
     tokio::task::spawn_blocking(move || {
