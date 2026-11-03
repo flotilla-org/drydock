@@ -139,7 +139,14 @@ pub async fn connect_at_with(stream: ByteStream, url: &str, token: &Token, heade
         return Err(invalid("must not carry userinfo"));
     }
     let target = uri.path_and_query().map_or(CONNECT_PATH, |p| p.as_str());
-    let own = [header::HOST, header::CONNECTION, header::UPGRADE, header::AUTHORIZATION, header::SEC_WEBSOCKET_KEY, header::SEC_WEBSOCKET_VERSION];
+    let own = [
+        header::HOST,
+        header::CONNECTION,
+        header::UPGRADE,
+        header::AUTHORIZATION,
+        header::SEC_WEBSOCKET_KEY,
+        header::SEC_WEBSOCKET_VERSION,
+    ];
     if headers.keys().any(|name| own.contains(name)) {
         return Err(invalid("headers must not replace the handshake's own"));
     }
