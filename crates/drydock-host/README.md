@@ -131,8 +131,9 @@ no build reports `missing_tool`.
 - **Capabilities** declare `host_filesystem`: a guest path is a host path, so a
   client lays each vessel out below paths it can write, never at fixed guest
   locations such as `/opt`. They declare `exclusive_label`, since the id comes
-  from the label and creation is serialized. They declare no usage, quota or export; conformance
-  reports the checks that follow from that as not applicable.
+  from the label and creation is serialized. They declare no usage, quota or
+  export; conformance reports the checks that follow from that as not
+  applicable.
 
 Each agent's output is appended to `agent.log` in its directory, unrotated.
 Process tracking reads procfs, so the module is ready only on Linux (elsewhere
