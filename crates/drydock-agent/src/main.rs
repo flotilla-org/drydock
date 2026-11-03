@@ -24,6 +24,9 @@ async fn main() -> io::Result<()> {
     if args.first().is_some_and(|a| a == "--supervise") {
         return supervisor::start(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--print-token") {
+        return print_token(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--supervisor") {
         return supervisor::run(&args[1..]).await;
     }
@@ -124,6 +127,17 @@ async fn main() -> io::Result<()> {
         return Err(replace_image(&executable, &args));
     }
     Err(error)
+}
+
+/// `--print-token --tcp-token-file PATH`: the token a supervised agent was
+/// started with, read back from its file under the same checks the agent makes.
+fn print_token(args: &[std::ffi::OsString]) -> io::Result<()> {
+    let [flag, path] = args else { return Err(io::Error::other("usage: drydock-agent --print-token --tcp-token-file PATH")) };
+    if flag != "--tcp-token-file" {
+        return Err(io::Error::other("usage: drydock-agent --print-token --tcp-token-file PATH"));
+    }
+    println!("{}", drydock_agent::tcp::token_line(&drydock_agent::tcp::read_token(std::path::Path::new(path))?));
+    Ok(())
 }
 
 /// `--collect --store DIR [--release SOCKET]... [--idle SECONDS]`: one
