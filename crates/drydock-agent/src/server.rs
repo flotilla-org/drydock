@@ -312,6 +312,7 @@ fn router(shared: Arc<Shared>) -> Router {
             get(crate::artifacts::get_artifact).put(crate::artifacts::put_artifact).delete(crate::artifacts::delete_artifact),
         )
         .route("/artifacts/{sha256}/links/{*path}", put(crate::artifacts::put_artifact_link))
+        .route("/destinations/attempts", post(crate::reach::try_destinations))
         .route("/forwards/outward", get(outward_forwards))
         .route("/forwards/outward/{id}", get(outward_forward).put(put_outward).delete(remove_outward))
         .route("/forwards/outward/{id}/connections/{connection}", get(crate::streams::claim).connect(crate::streams::claim))

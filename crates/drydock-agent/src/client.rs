@@ -711,6 +711,11 @@ impl Client {
         self.link.empty("PUT", &uri, json_body(&ArtifactLink { member: member.into() })?).await.map(drop)
     }
 
+    /// Try each target from inside the vessel, as the user the agent runs as.
+    pub async fn try_destinations(&self, attempt: &crate::Attempt) -> io::Result<crate::Attempts> {
+        self.link.json("POST", "/destinations/attempts", json_body(attempt)?).await
+    }
+
     /// Upload then activate. Reconnect afterwards and verify the new hello
     /// fingerprint, then confirm, before using any generation-specific routes.
     pub async fn upgrade(&self, executable: impl Into<Bytes>) -> io::Result<()> {

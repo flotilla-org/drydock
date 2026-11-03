@@ -1,0 +1,255 @@
+//! "Try these destinations": the agent attempts each target as the user it
+//! runs as and reports, per target, what happened. Nothing is configured per
+//! provider and no script is injected; the caller supplies the targets.
+use crate::{AgentError, ErrorKind, server::Shared};
+use axum::{Json, extract::State};
+use hickory_proto::{
+    op::{Message, MessageType, Query, ResponseCode},
+    rr::{Name, RData, RecordType},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
+
+/// The longest a single target may take, whatever the request asks.
+pub const MAX_TIMEOUT_MS: u64 = 60_000;
+/// How long each target gets when the request names no timeout.
+pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const MAX_TARGETS: usize = 64;
+
+/// One thing to try. On the wire: `{"tcp": {"host": "example.com", "port": 443}}`
+/// or `{"dns": {"name": "example.com", "resolver": "1.1.1.1:53"}}`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Target {
+    /// Open a TCP connection to `host:port`, resolving `host` first when it
+    /// is a name.
+    Tcp { host: String, port: u16 },
+    /// Look up `name`'s addresses, through the vessel's own resolver, or
+    /// through `resolver` when given.
+    Dns {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolver: Option<SocketAddr>,
+    },
+}
+
+/// The body of `POST /destinations/attempts`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attempt {
+    pub targets: Vec<Target>,
+    /// How long each target gets, in milliseconds. Absent: 5000. At most 60000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// What happened to one target.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// A TCP connection opened, or a DNS answer carried an address.
+    Reached,
+    /// The peer actively refused the connection (or the resolver's port was closed).
+    Refused,
+    /// Nothing answered within the timeout.
+    TimedOut,
+    /// The name has no address: the resolver said so, or no resolver could be asked.
+    NameNotResolved,
+    /// Any other failure, such as an unreachable network; `detail` says which.
+    Failed,
+}
+
+/// The typed result for one target.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attempted {
+    pub target: Target,
+    pub outcome: Outcome,
+    pub elapsed_ms: u64,
+    /// For TCP, the address connected or last tried; for DNS, the first
+    /// address the lookup returned. Absent when none was reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The reply: which user the agent ran the attempts as, and one result per
+/// target, in request order.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Attempts {
+    pub user: Identity,
+    pub results: Vec<Attempted>,
+}
+
+/// The user the agent runs as (the effective user).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Identity {
+    pub uid: u32,
+    /// Absent when the passwd database has no entry for the uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+fn identity() -> Identity {
+    let uid = rustix::process::geteuid().as_raw();
+    let name = std::fs::read_to_string("/etc/passwd").ok().and_then(|passwd| {
+        passwd.lines().find_map(|line| {
+            let mut fields = line.split(':');
+            let name = fields.next()?;
+            (fields.nth(1)? == uid.to_string()).then(|| name.to_owned())
+        })
+    });
+    Identity { uid, name }
+}
+
+/// Try every target concurrently; results keep request order.
+pub async fn attempt(request: &Attempt) -> Result<Attempts, AgentError> {
+    const OP: &str = "destinations.attempt";
+    if request.targets.len() > MAX_TARGETS {
+        return Err(AgentError::new(OP, "targets", ErrorKind::InvalidInput, format!("at most {MAX_TARGETS} targets")));
+    }
+    let timeout = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+    if timeout == 0 || timeout > MAX_TIMEOUT_MS {
+        return Err(AgentError::new(OP, "timeout_ms", ErrorKind::InvalidInput, format!("timeout_ms must be 1 to {MAX_TIMEOUT_MS}")));
+    }
+    for target in &request.targets {
+        match target {
+            Target::Tcp { host, .. } if host.is_empty() => {
+                return Err(AgentError::new(OP, "host", ErrorKind::InvalidInput, "host must not be empty"));
+            }
+            Target::Dns { name, .. } if name.is_empty() => {
+                return Err(AgentError::new(OP, "name", ErrorKind::InvalidInput, "name must not be empty"));
+            }
+            _ => {}
+        }
+    }
+    let timeout = Duration::from_millis(timeout);
+    let results = futures_util::future::join_all(request.targets.iter().map(|target| try_one(target.clone(), timeout))).await;
+    Ok(Attempts { user: identity(), results })
+}
+
+async fn try_one(target: Target, timeout: Duration) -> Attempted {
+    let started = Instant::now();
+    let work = async {
+        match &target {
+            Target::Tcp { host, port } => connect(host, *port).await,
+            Target::Dns { name, resolver: None } => system_lookup(name).await,
+            Target::Dns { name, resolver: Some(resolver) } => resolver_lookup(name, *resolver).await,
+        }
+    };
+    let found = tokio::time::timeout(timeout, work).await.unwrap_or_else(|_| Found::of(Outcome::TimedOut, None, None));
+    Attempted {
+        target,
+        outcome: found.outcome,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        address: found.address,
+        detail: found.detail,
+    }
+}
+
+struct Found {
+    outcome: Outcome,
+    address: Option<String>,
+    detail: Option<String>,
+}
+impl Found {
+    fn of(outcome: Outcome, address: Option<String>, detail: Option<String>) -> Self {
+        Self { outcome, address, detail }
+    }
+}
+
+fn classify(error: &io::Error) -> Outcome {
+    match error.kind() {
+        io::ErrorKind::ConnectionRefused => Outcome::Refused,
+        io::ErrorKind::TimedOut => Outcome::TimedOut,
+        _ => Outcome::Failed,
+    }
+}
+
+async fn connect(host: &str, port: u16) -> Found {
+    let addresses: Vec<SocketAddr> = match lookup_host((host, port)).await {
+        Ok(addresses) => addresses.collect(),
+        Err(error) => return Found::of(Outcome::NameNotResolved, None, Some(error.to_string())),
+    };
+    let mut last = Found::of(Outcome::NameNotResolved, None, Some("no addresses".into()));
+    for address in addresses {
+        match TcpStream::connect(address).await {
+            Ok(_) => return Found::of(Outcome::Reached, Some(address.to_string()), None),
+            Err(error) => last = Found::of(classify(&error), Some(address.to_string()), Some(error.to_string())),
+        }
+    }
+    last
+}
+
+async fn system_lookup(name: &str) -> Found {
+    match lookup_host((name, 0)).await {
+        Ok(mut addresses) => match addresses.next() {
+            Some(address) => Found::of(Outcome::Reached, Some(address.ip().to_string()), None),
+            None => Found::of(Outcome::NameNotResolved, None, Some("no addresses".into())),
+        },
+        Err(error) => Found::of(Outcome::NameNotResolved, None, Some(error.to_string())),
+    }
+}
+
+/// An A query over UDP straight to `resolver`.
+async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
+    let failed = |error: &dyn std::fmt::Display| Found::of(Outcome::Failed, None, Some(error.to_string()));
+    let Ok(fqdn) = Name::from_ascii(name) else {
+        return Found::of(Outcome::NameNotResolved, None, Some("not a DNS name".into()));
+    };
+    let mut query = Message::new();
+    let id = u16::from_ne_bytes(getrandom::u32().unwrap_or(0x6472).to_ne_bytes()[..2].try_into().unwrap());
+    query.set_id(id).set_recursion_desired(true).add_query(Query::query(fqdn, RecordType::A));
+    let bytes = match query.to_vec() {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(&error),
+    };
+    let bind: SocketAddr = if resolver.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { (std::net::Ipv6Addr::UNSPECIFIED, 0).into() };
+    let socket = match UdpSocket::bind(bind).await {
+        Ok(socket) => socket,
+        Err(error) => return failed(&error),
+    };
+    // A connected socket only hears from the resolver; an ICMP port
+    // unreachable then surfaces as ConnectionRefused on the receive.
+    if let Err(error) = socket.connect(resolver).await {
+        return Found::of(classify(&error), None, Some(error.to_string()));
+    }
+    if let Err(error) = socket.send(&bytes).await {
+        return Found::of(classify(&error), None, Some(error.to_string()));
+    }
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let n = match socket.recv(&mut buffer).await {
+            Ok(n) => n,
+            Err(error) => return Found::of(classify(&error), None, Some(error.to_string())),
+        };
+        let Ok(reply) = Message::from_vec(&buffer[..n]) else { continue };
+        if reply.id() != id || reply.message_type() != MessageType::Response {
+            continue;
+        }
+        let address = reply.answers().iter().find_map(|record| match record.data() {
+            RData::A(a) => Some(IpAddr::V4(a.0)),
+            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
+            _ => None,
+        });
+        return match (reply.response_code(), address) {
+            (ResponseCode::NoError, Some(address)) => Found::of(Outcome::Reached, Some(address.to_string()), None),
+            (ResponseCode::NoError | ResponseCode::NXDomain, _) => {
+                Found::of(Outcome::NameNotResolved, None, Some(format!("{} with no address", reply.response_code())))
+            }
+            (code, _) => Found::of(Outcome::Failed, None, Some(code.to_string())),
+        };
+    }
+}
+
+pub(crate) async fn try_destinations(
+    State(_shared): State<Arc<Shared>>,
+    Json(request): Json<Attempt>,
+) -> Result<Json<Attempts>, AgentError> {
+    attempt(&request).await.map(Json)
+}
