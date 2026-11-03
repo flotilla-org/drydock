@@ -106,7 +106,7 @@ impl Manifest {
     fn config(&self) -> Result<Descriptor> {
         Descriptor::parse(&self.json["config"])
     }
-    fn layers(&self) -> Result<Vec<Descriptor>> {
+    pub fn layers(&self) -> Result<Vec<Descriptor>> {
         self.json["layers"].as_array().ok_or_else(|| malformed("manifest has no layers"))?.iter().map(Descriptor::parse).collect()
     }
 }
@@ -489,6 +489,19 @@ impl Registry {
         self.check(&response, &[200], "config")?;
         if sha256(response.body()) != digest {
             return Err(malformed("config content does not match its digest"));
+        }
+        Ok(response.into_body())
+    }
+    /// A whole blob of at most `limit` bytes (a tools layer), verified
+    /// against its descriptor's digest and size.
+    pub async fn blob(&self, repository: &str, blob: &Descriptor, limit: u64) -> Result<Bytes> {
+        if blob.size > limit {
+            return Err(malformed(&format!("blob {} holds {} bytes, more than {limit}", blob.digest, blob.size)));
+        }
+        let response = self.get(&pull_scope(repository), self.url(repository, &["blobs", &blob.digest]), &[], "blob").await?;
+        self.check(&response, &[200], "blob")?;
+        if response.body().len() as u64 != blob.size || sha256(response.body()) != blob.digest {
+            return Err(malformed("blob content does not match its digest"));
         }
         Ok(response.into_body())
     }
