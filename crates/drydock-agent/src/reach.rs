@@ -32,7 +32,8 @@ pub enum Target {
     /// is a name.
     Tcp { host: String, port: u16 },
     /// Look up `name`'s addresses, through the vessel's own resolver, or
-    /// through `resolver` when given.
+    /// through `resolver` when given. A named resolver is asked for A
+    /// records only, so an IPv6-only name reports as not resolved there.
     Dns {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,24 +215,24 @@ async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
         while !at.is_null() {
             // SAFETY: at walks the list getaddrinfo returned.
             let entry = unsafe { &*at };
-            // SAFETY: ai_addr points at ai_addrlen bytes of the family ai_family names.
-            let ip = unsafe {
+            let length = entry.ai_addrlen as usize;
+            // SAFETY: ai_addr points at ai_addrlen bytes of the family ai_family names,
+            // and each cast is guarded by that length.
+            let address = unsafe {
                 match entry.ai_family {
-                    libc::AF_INET if entry.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in>() => Some(IpAddr::from(
-                        std::net::Ipv4Addr::from(u32::from_be((*(entry.ai_addr as *const libc::sockaddr_in)).sin_addr.s_addr)),
-                    )),
+                    libc::AF_INET if length >= std::mem::size_of::<libc::sockaddr_in>() => {
+                        let v4 = &*(entry.ai_addr as *const libc::sockaddr_in);
+                        Some(SocketAddr::new(std::net::Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr)).into(), port))
+                    }
+                    libc::AF_INET6 if length >= std::mem::size_of::<libc::sockaddr_in6>() => {
+                        let v6 = &*(entry.ai_addr as *const libc::sockaddr_in6);
+                        let flow = u32::from_be(v6.sin6_flowinfo);
+                        Some(std::net::SocketAddrV6::new(v6.sin6_addr.s6_addr.into(), port, flow, v6.sin6_scope_id).into())
+                    }
                     _ => None,
                 }
             };
-            addresses.extend(ip.map(|ip| SocketAddr::new(ip, port)));
-            if entry.ai_family == libc::AF_INET6 {
-                debug_assert!(entry.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in6>());
-                // SAFETY: an AF_INET6 entry points at a sockaddr_in6 of at least that length.
-                let v6 = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in6) };
-                addresses.push(
-                    std::net::SocketAddrV6::new(v6.sin6_addr.s6_addr.into(), port, u32::from_be(v6.sin6_flowinfo), v6.sin6_scope_id).into(),
-                );
-            }
+            addresses.extend(address);
             at = entry.ai_next;
         }
         // SAFETY: found came from a successful getaddrinfo and is freed once.
@@ -278,9 +279,14 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
     let Ok(fqdn) = Name::from_ascii(name) else {
         return Found::of(Outcome::Failed, None, Some("not a DNS name".into()));
     };
+    let mut queried = fqdn.clone();
+    queried.set_fqdn(true);
     let mut query = Message::new();
-    let id = getrandom::u32().unwrap_or(0x6472) as u16;
-    query.set_id(id).set_recursion_desired(true).add_query(Query::query(fqdn, RecordType::A));
+    let id = match getrandom::u32() {
+        Ok(random) => random as u16,
+        Err(error) => return failed(&error),
+    };
+    query.set_id(id).set_recursion_desired(true).add_query(Query::query(queried.clone(), RecordType::A));
     let bytes = match query.to_vec() {
         Ok(bytes) => bytes,
         Err(error) => return failed(&error),
@@ -305,9 +311,10 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
             Err(error) => return Found::of(classify(&error), None, Some(error.to_string())),
         };
         let Ok(reply) = Message::from_vec(&buffer[..n]) else { continue };
-        // A reachability probe: the id and response bit are enough to know the
-        // resolver answered us; the question section is not compared.
-        if reply.id() != id || reply.message_type() != MessageType::Response {
+        if reply.id() != id
+            || reply.message_type() != MessageType::Response
+            || reply.queries().first().is_none_or(|q| q.name() != &queried || q.query_type() != RecordType::A)
+        {
             continue;
         }
         let address = reply.answers().iter().find_map(|record| match record.data() {
