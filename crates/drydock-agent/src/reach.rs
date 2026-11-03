@@ -15,7 +15,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
-use tokio::net::{TcpStream, UdpSocket, lookup_host};
+use tokio::net::{TcpStream, UdpSocket};
 
 /// The longest a single target may take, whatever the request asks.
 pub const MAX_TIMEOUT_MS: u64 = 60_000;
@@ -173,24 +173,71 @@ fn classify(error: &io::Error) -> Outcome {
     }
 }
 
-/// Whether a lookup error says the name does not exist, as opposed to the
-/// resolver being unreachable or broken (EAI_AGAIN and the like).
-fn name_missing(error: &io::Error) -> bool {
-    let text = error.to_string();
-    ["Name or service not known", "No address associated", "nodename nor servname", "No such host"].iter().any(|m| text.contains(m))
+/// Why a lookup gave no addresses.
+struct LookupError {
+    /// The name does not exist (EAI_NONAME, EAI_NODATA), as opposed to the
+    /// resolver being unreachable or broken (EAI_AGAIN and the like).
+    missing: bool,
+    detail: String,
 }
-fn lookup_failure(error: &io::Error) -> Found {
-    let outcome = if name_missing(error) { Outcome::NameNotResolved } else { Outcome::Failed };
-    Found::of(outcome, None, Some(error.to_string()))
+impl LookupError {
+    fn of_code(code: libc::c_int) -> Self {
+        // SAFETY: gai_strerror returns a static NUL-terminated string.
+        let detail = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(code)) }.to_string_lossy().into_owned();
+        Self { missing: code == libc::EAI_NONAME || code == libc::EAI_NODATA, detail }
+    }
+}
+fn lookup_failure(error: LookupError) -> Found {
+    Found::of(if error.missing { Outcome::NameNotResolved } else { Outcome::Failed }, None, Some(error.detail))
+}
+
+/// getaddrinfo itself, so the outcome rests on its error code and not on the
+/// libc's wording of it.
+async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
+    let host = std::ffi::CString::new(host).map_err(|_| LookupError { missing: false, detail: "host contains NUL".into() })?;
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: zeroed addrinfo is a valid all-defaults hints value.
+        let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+        hints.ai_socktype = libc::SOCK_STREAM;
+        let mut found: *mut libc::addrinfo = std::ptr::null_mut();
+        // SAFETY: host is NUL-terminated; found is freed below on success.
+        let code = unsafe { libc::getaddrinfo(host.as_ptr(), std::ptr::null(), &hints, &mut found) };
+        if code != 0 {
+            return Err(LookupError::of_code(code));
+        }
+        let mut addresses = Vec::new();
+        let mut at = found;
+        while !at.is_null() {
+            // SAFETY: at walks the list getaddrinfo returned.
+            let entry = unsafe { &*at };
+            // SAFETY: ai_addr points at ai_addrlen bytes of the family ai_family names.
+            let ip = unsafe {
+                match entry.ai_family {
+                    libc::AF_INET => Some(IpAddr::from(std::net::Ipv4Addr::from(u32::from_be(
+                        (*(entry.ai_addr as *const libc::sockaddr_in)).sin_addr.s_addr,
+                    )))),
+                    libc::AF_INET6 => Some(IpAddr::from((*(entry.ai_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr)),
+                    _ => None,
+                }
+            };
+            addresses.extend(ip.map(|ip| SocketAddr::new(ip, port)));
+            at = entry.ai_next;
+        }
+        // SAFETY: found came from a successful getaddrinfo and is freed once.
+        unsafe { libc::freeaddrinfo(found) };
+        Ok(addresses)
+    })
+    .await
+    .unwrap_or_else(|e| Err(LookupError { missing: false, detail: e.to_string() }))
 }
 
 /// Each address gets an equal share of what is left of `budget`, so an
 /// address that black-holes does not starve the ones after it.
 async fn connect(host: &str, port: u16, budget: Duration) -> Found {
     let deadline = Instant::now() + budget;
-    let addresses: Vec<SocketAddr> = match lookup_host((host, port)).await {
-        Ok(addresses) => addresses.collect(),
-        Err(error) => return lookup_failure(&error),
+    let addresses: Vec<SocketAddr> = match lookup(host, port).await {
+        Ok(addresses) => addresses,
+        Err(error) => return lookup_failure(error),
     };
     let mut last = Found::of(Outcome::NameNotResolved, None, Some("no addresses".into()));
     for (index, address) in addresses.iter().enumerate() {
@@ -205,12 +252,12 @@ async fn connect(host: &str, port: u16, budget: Duration) -> Found {
 }
 
 async fn system_lookup(name: &str) -> Found {
-    match lookup_host((name, 0)).await {
-        Ok(mut addresses) => match addresses.next() {
+    match lookup(name, 0).await {
+        Ok(addresses) => match addresses.first() {
             Some(address) => Found::of(Outcome::Reached, Some(address.ip().to_string()), None),
             None => Found::of(Outcome::NameNotResolved, None, Some("no addresses".into())),
         },
-        Err(error) => lookup_failure(&error),
+        Err(error) => lookup_failure(error),
     }
 }
 
@@ -218,7 +265,7 @@ async fn system_lookup(name: &str) -> Found {
 async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
     let failed = |error: &dyn std::fmt::Display| Found::of(Outcome::Failed, None, Some(error.to_string()));
     let Ok(fqdn) = Name::from_ascii(name) else {
-        return Found::of(Outcome::NameNotResolved, None, Some("not a DNS name".into()));
+        return Found::of(Outcome::Failed, None, Some("not a DNS name".into()));
     };
     let mut query = Message::new();
     let id = getrandom::u32().unwrap_or(0x6472) as u16;
@@ -272,4 +319,21 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
 
 pub(crate) async fn try_destinations(Json(request): Json<Attempt>) -> Result<Json<Attempts>, AgentError> {
     attempt(&request).await.map(Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn lookup_codes_decide_missing_versus_broken() {
+        assert!(LookupError::of_code(libc::EAI_NONAME).missing);
+        assert!(LookupError::of_code(libc::EAI_NODATA).missing);
+        assert!(!LookupError::of_code(libc::EAI_AGAIN).missing);
+        assert!(!LookupError::of_code(libc::EAI_FAIL).missing);
+    }
+    #[tokio::test]
+    async fn an_ip_literal_resolves_without_a_resolver() {
+        assert_eq!(lookup("127.0.0.1", 9).await.ok(), Some(vec!["127.0.0.1:9".parse().unwrap()]));
+        assert_eq!(lookup("::1", 9).await.ok(), Some(vec!["[::1]:9".parse().unwrap()]));
+    }
 }
