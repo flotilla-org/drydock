@@ -26,7 +26,7 @@ provider_timestamp, inventory_error = None, False
 size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
 capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clone"],
                 "workspace_root": "/workspace", "suspend_resume": True, "export": True,
-                "egress": {"routes": ["none"], "model": {"shapes": ["none"], "enforced": "none", "mutable_while_running": False}},
+                "egress": {"routes": ["none"], "model": {"shapes": ["open"], "enforced": "none", "mutable_while_running": False}},
                 "fallback_runner": True, "bootstrap": "bake", "usage": True, "quota": True,
                 "platforms": [{"os": "linux", "architecture": "amd64"}]}
 if fault.startswith("egress-"):

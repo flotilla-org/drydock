@@ -568,7 +568,7 @@ fn egress_model() -> EgressModel {
     const LIMITS: &str = "https://www.daytona.io/docs/en/network-limits";
     use EgressShape::*;
     EgressModel {
-        shapes: vec![None, DenyAll, AllowAddresses, AllowDomains],
+        shapes: vec![Open, DenyAll, AllowAddresses, AllowDomains],
         // "Each sandbox runs behind a firewall" and updates change "outbound network
         // policy on the runner": outside the guest. The docs do not say whether guest
         // root can bypass it; drydockd's verdict settles that, not this claim.

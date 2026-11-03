@@ -40,7 +40,7 @@ const capabilities = {
   fallback_runner: false,
   egress: {
     routes: ["none"],
-    model: { shapes: ["none"], enforced: "none", mutable_while_running: false },
+    model: { shapes: ["open"], enforced: "none", mutable_while_running: false },
   },
   bootstrap: "bake",
   agent: false,

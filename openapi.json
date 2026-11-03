@@ -2433,13 +2433,15 @@
         ],
         "properties": {
           "model": {
-            "$ref": "#/components/schemas/EgressModel"
+            "$ref": "#/components/schemas/EgressModel",
+            "description": "The policies the vendor filters that traffic with."
           },
           "routes": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EgressRoute"
-            }
+            },
+            "description": "How a guest's traffic can leave: not at all, through a proxy the client\nconfigures, or directly. Routes say nothing about filtering."
           }
         }
       },
@@ -2534,7 +2536,7 @@
       "EgressShape": {
         "type": "string",
         "enum": [
-          "none",
+          "open",
           "deny_all",
           "allow_addresses",
           "allow_domains",

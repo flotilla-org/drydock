@@ -252,7 +252,7 @@ fn readers_accept_omitted_and_null_optional_fields() {
 fn egress_model_roundtrips(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let shapes =
-        [EgressShape::None, EgressShape::DenyAll, EgressShape::AllowAddresses, EgressShape::AllowDomains, EgressShape::ExplicitProxy];
+        [EgressShape::Open, EgressShape::DenyAll, EgressShape::AllowAddresses, EgressShape::AllowDomains, EgressShape::ExplicitProxy];
     let shape = |tc: &hegel::TestCase| shapes[tc.draw(gs::integers::<usize>().max_value(shapes.len() - 1))];
     let destinations = [
         json!({"kind":"cidr","cidr":"8.8.8.8/32"}),
@@ -292,7 +292,7 @@ fn egress_model_roundtrips(tc: hegel::TestCase) {
 #[test]
 fn egress_model_wire_shapes() {
     fixture::<EgressCapability>(json!({"routes":["none","explicit_proxy"],"model":{
-        "shapes":["none","deny_all","allow_addresses","allow_domains","explicit_proxy"],
+        "shapes":["open","deny_all","allow_addresses","allow_domains","explicit_proxy"],
         "enforced":"outside_guest",
         "side_effects":[{"shapes":["allow_domains"],"opens":[{"kind":"cidr","cidr":"8.8.8.8/32"}],"note":"DNS"},{"shapes":["deny_all","allow_domains"],"note":"unnamed"}],
         "mutable_while_running":true,
@@ -302,4 +302,8 @@ fn egress_model_wire_shapes() {
     }
     assert!(serde_json::from_value::<EgressModel>(json!({"shapes":["future"],"enforced":"none","mutable_while_running":false})).is_err());
     assert!(serde_json::from_value::<EgressCapability>(json!({"routes":[],"enforcement":"advisory"})).is_err());
+    // A side effect's destinations are validated like any other destination.
+    assert!(
+        serde_json::from_value::<EgressSideEffect>(json!({"shapes":[],"opens":[{"kind":"cidr","cidr":"8.8.8.8/33"}],"note":""})).is_err()
+    );
 }

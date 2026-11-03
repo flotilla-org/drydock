@@ -149,7 +149,7 @@ const DOCS = "https://namespace.so/docs";
  * empty list denies all (see `networkPolicy`).
  */
 export const EGRESS_MODEL: Types["EgressModel"] = {
-  shapes: ["none", "deny_all", "allow_domains"],
+  shapes: ["open", "deny_all", "allow_domains"],
   // Namespace's egress filtering runs outside the workload; the docs do not
   // say whether guest root can bypass it.
   enforced: "outside_guest",

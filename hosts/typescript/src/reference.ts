@@ -58,7 +58,7 @@ class Memory implements Provider {
     egress: {
       routes: ["none", "open"],
       model: {
-        shapes: ["none", "deny_all"],
+        shapes: ["open", "deny_all"],
         enforced: "none",
         mutable_while_running: false,
       },

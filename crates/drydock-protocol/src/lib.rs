@@ -343,7 +343,10 @@ pub enum ImageRefusal {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EgressCapability {
+    /// How a guest's traffic can leave: not at all, through a proxy the client
+    /// configures, or directly. Routes say nothing about filtering.
     pub routes: Vec<EgressRoute>,
+    /// The policies the vendor filters that traffic with.
     pub model: EgressModel,
 }
 /// What a module states about its vendor's egress control, from the vendor's
@@ -367,7 +370,7 @@ impl EgressModel {
     /// No policy and nothing enforcing one: egress is the guest's own network.
     pub fn unfiltered() -> Self {
         Self {
-            shapes: vec![EgressShape::None],
+            shapes: vec![EgressShape::Open],
             enforced: EnforcementSite::None,
             side_effects: vec![],
             mutable_while_running: false,
@@ -378,8 +381,8 @@ impl EgressModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressShape {
-    /// No policy: egress is unfiltered.
-    None,
+    /// No policy: egress is unfiltered, as an `open` request asks.
+    Open,
     DenyAll,
     /// Allow listed IP addresses or CIDRs.
     AllowAddresses,

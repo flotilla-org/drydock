@@ -126,7 +126,7 @@ impl Provider for Reference {
             egress: EgressCapability {
                 routes: vec![EgressRoute::None, EgressRoute::Open],
                 model: EgressModel {
-                    shapes: vec![EgressShape::None, EgressShape::DenyAll],
+                    shapes: vec![EgressShape::Open, EgressShape::DenyAll],
                     enforced: EnforcementSite::None,
                     side_effects: vec![],
                     mutable_while_running: false,
