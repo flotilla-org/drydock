@@ -168,11 +168,13 @@ struct Image {
     log: Vec<String>,
     polls_left: u32,
     created: u64,
+    /// When it was built; None leaves `createdAt` out.
+    created_at: Option<String>,
 }
 impl Image {
     fn info(&self) -> Value {
         json!({"id": self.id, "kind": "image", "status": self.state, "state": self.state, "name": self.name, "version": 1,
-            "tags": ["latest"], "error": self.error, "createdAt": format!("2026-11-0{}T00:00:00.000Z", 1 + self.created % 8)})
+            "tags": ["latest"], "error": self.error, "createdAt": self.created_at})
     }
 }
 
@@ -658,8 +660,16 @@ fn build(s: &mut State, body: Value) -> http::Response<Bytes> {
     }
     let id = s.uuid();
     let created = s.next;
-    let mut image =
-        Image { id: id.clone(), name, state: "queued".into(), dockerfile, polls_left: s.build_polls, created, ..Image::default() };
+    let mut image = Image {
+        id: id.clone(),
+        name,
+        state: "queued".into(),
+        dockerfile,
+        polls_left: s.build_polls,
+        created,
+        created_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        ..Image::default()
+    };
     // Runtime's builders refuse private addresses, and blame themselves.
     if let Some(from) = froms
         .iter()
@@ -1256,14 +1266,26 @@ async fn private_registries_are_refused_up_front() {
 }
 
 // At the account's image limit, prepare deletes the oldest drydock image no
-// sandbox started from; when every one is in use it is QuotaExhausted.
+// sandbox started from. One built in the last 30 minutes (a concurrent
+// prepare's, with no sandbox yet) or without a creation time is spared, and
+// when nothing qualifies prepare is QuotaExhausted.
 #[tokio::test(start_paused = true)]
 async fn prepare_frees_an_image_slot_or_refuses() {
     let w = world().await;
     let used = w.launched("vessel-1").await;
     let other = |n: char| format!("ghcr.io/example/other@sha256:{}", n.to_string().repeat(64));
-    w.provider.prepare(prepare_request(&other('5'), None), &w.credentials).await.unwrap();
+    let second = w.provider.prepare(prepare_request(&other('5'), None), &w.credentials).await.unwrap();
     w.stand_in.state().image_limit = 2;
+    let age = |name: &str, created_at: Option<&str>| {
+        let mut s = w.stand_in.state();
+        s.images.values_mut().find(|i| i.name == name).unwrap().created_at = created_at.map(str::to_owned);
+    };
+    let exhausted = |r: Result<Prepared>| matches!(r, Err(ProtocolError::QuotaExhausted { .. }));
+    // Just built, with no sandbox yet: a concurrent prepare's image is not taken.
+    assert!(exhausted(w.provider.prepare(prepare_request(&other('6'), None), &w.credentials).await));
+    age(&second.id, None);
+    assert!(exhausted(w.provider.prepare(prepare_request(&other('6'), None), &w.credentials).await), "no creation time: spared");
+    age(&second.id, Some("2026-01-01T00:00:00.000Z"));
     let third = w.provider.prepare(prepare_request(&other('6'), None), &w.credentials).await.unwrap();
     let names: Vec<String> = w.stand_in.state().images.values().map(|i| i.name.clone()).collect();
     let in_use = w.stand_in.state().sandboxes[&used.id].labels["drydock.image"].as_str().unwrap().to_owned();
@@ -1273,7 +1295,7 @@ async fn prepare_frees_an_image_slot_or_refuses() {
         .provision(
             ProvisionRequest {
                 label: "vessel-2".into(),
-                prepared: third,
+                prepared: third.clone(),
                 size: size(1.0, 1, 4),
                 egress: EgressRequest::Open,
                 ssh_public_key: None,
@@ -1282,10 +1304,8 @@ async fn prepare_frees_an_image_slot_or_refuses() {
         )
         .await
         .unwrap();
-    assert!(matches!(
-        w.provider.prepare(prepare_request(&other('7'), None), &w.credentials).await,
-        Err(ProtocolError::QuotaExhausted { .. })
-    ));
+    age(&third.id, Some("2026-01-01T00:00:00.000Z"));
+    assert!(exhausted(w.provider.prepare(prepare_request(&other('7'), None), &w.credentials).await));
 }
 
 // Provision creates a persistent, never-idle-paused sandbox named for its
@@ -1342,7 +1362,7 @@ async fn provision_readopts_by_name_and_survives_a_stale_replay() {
 }
 
 // Re-adoption refuses a sandbox of that name that is not this instance's for
-// this label, and one of another size or egress policy.
+// this label, and one of another size or egress policy, stopped ones included.
 #[tokio::test]
 async fn readoption_refuses_another_owner_size_or_policy() {
     let w = world().await;
@@ -1350,6 +1370,11 @@ async fn readoption_refuses_another_owner_size_or_policy() {
     let refused = |r: Result<Provisioned>| matches!(r, Err(ProtocolError::Refused { .. }));
     assert!(refused(w.provision("vessel-1", size(2.0, 2, 4), EgressRequest::Open).await));
     assert!(refused(w.provision("vessel-1", size(1.0, 1, 4), EgressRequest::DenyAll { direct: vec![] }).await));
+    // A stopped sandbox's rules are judged by its policy label: it would resume under them.
+    w.stand_in.set_state(&environment.id, "stopped");
+    assert!(refused(w.provision("vessel-1", size(1.0, 1, 4), EgressRequest::DenyAll { direct: vec![] }).await));
+    assert!(matches!(w.provision("vessel-1", size(1.0, 1, 4), EgressRequest::Open).await, Ok(Provisioned::Existing(_))));
+    w.stand_in.set_state(&environment.id, "running");
     w.stand_in.state().sandboxes.get_mut(&environment.id).unwrap().labels["drydock.provider"] = json!("someone-else");
     assert!(refused(w.provision("vessel-1", size(1.0, 1, 4), EgressRequest::Open).await));
 }

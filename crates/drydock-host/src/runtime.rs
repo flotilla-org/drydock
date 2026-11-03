@@ -43,8 +43,10 @@ const VESSEL_LABEL: &str = "flotilla.label";
 const IMAGE_LABEL: &str = "drydock.image";
 /// Label values are at most 256 characters.
 const LABEL_LIMIT: usize = 256;
-/// Answers must come inside the host's 30-second HTTP deadline, so no
-/// server-side wait or guest command may run longer than this.
+/// Each request must be answered inside the host's 30-second HTTP
+/// deadline, so no server-side wait or guest command in one request may
+/// run longer than this. An operation polls across many requests, bounded
+/// by the daemon's own per-operation deadline.
 const WAIT_SECONDS: u64 = 25;
 const STATE_POLL: Duration = Duration::from_secs(1);
 const STATE_POLLS: u32 = 120;
@@ -463,7 +465,7 @@ impl Runtime {
             let row = self.call(Method::GET, url, None, c).await?;
             match text(&row, "state")? {
                 "running" => return Ok(row),
-                "stopped" | "paused" => return Err(refused(format!("Runtime sandbox {id} is {} instead of running", row["state"]))),
+                state @ ("stopped" | "paused") => return Err(refused(format!("Runtime sandbox {id} is {state} instead of running"))),
                 _ => tokio::time::sleep(STATE_POLL).await,
             }
         }
@@ -500,7 +502,14 @@ impl Runtime {
             return Err(refused("an existing Runtime sandbox holds this label with a different size; provision a new label"));
         }
         let id = text(row, "id")?;
-        if text(row, "state")? != "stopped" && &Policy::read(&self.network(id, c).await?)? != policy {
+        // A stopped sandbox's rules can't be read until it runs again, so
+        // its create-time policy label stands in for them.
+        let same = if text(row, "state")? == "stopped" {
+            row["labels"][POLICY_LABEL] == policy.fingerprint().as_str()
+        } else {
+            &Policy::read(&self.network(id, c).await?)? == policy
+        };
+        if !same {
             return Err(refused("an existing Runtime sandbox holds this label with a different egress policy; provision a new label"));
         }
         Ok(())
@@ -576,7 +585,11 @@ impl Runtime {
     }
     /// Makes room for one more image when the account is at its image limit:
     /// deletes the oldest `dd-` image no visible sandbox started from, or
-    /// refuses when every one is in use.
+    /// refuses when every one is in use. Images are keyed by base image, not
+    /// provider instance, so every `dd-` image this key sees qualifies,
+    /// whichever instance built it. One built in the last 30 minutes is
+    /// spared, as is one without a creation time: a concurrent prepare's
+    /// image has no sandbox yet, and its provision would find it gone.
     async fn image_slot(&self, c: &Credentials) -> Result<()> {
         let limits = self.limits(c).await?;
         let Some(row) = limits["account"].as_array().into_iter().flatten().find(|row| row["limit"] == "image.count") else {
@@ -590,6 +603,7 @@ impl Runtime {
         url.query_pairs_mut().append_pair("includeStopped", "true").append_pair("limit", "100");
         let in_use: BTreeSet<String> =
             self.paged(url, c).await?.iter().filter_map(|row| row["labels"][IMAGE_LABEL].as_str().map(str::to_owned)).collect();
+        let spared_since = chrono::Utc::now() - IMAGE_GRACE;
         let mut url = self.api(&["images"])?;
         url.query_pairs_mut().append_pair("limit", "100");
         let mut candidates: Vec<Value> = self
@@ -599,13 +613,14 @@ impl Runtime {
             .filter(|image| {
                 image["name"].as_str().is_some_and(|name| name.starts_with("dd-") && !in_use.contains(name))
                     && matches!(image["state"].as_str(), Some("ready" | "failed"))
+                    && created_at(image).is_some_and(|created| created < spared_since)
             })
             .collect();
-        candidates.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+        candidates.sort_by_key(created_at);
         let Some(oldest) = candidates.first() else {
             return Err(ProtocolError::QuotaExhausted {
                 reason: format!(
-                    "Runtime's account holds its limit of {max} images and every drydock image is in use; destroy a vessel or raise the limit"
+                    "Runtime's account holds its limit of {max} images and every drydock image is in use or new; destroy a vessel or raise the limit"
                 ),
             });
         };
@@ -628,7 +643,7 @@ impl Runtime {
     fn resources(size: &Size) -> Result<(u64, u64, u64)> {
         let limit = |what: &str| refused(format!("Runtime sandbox size: {what}"));
         let cpus = size.cpus;
-        if !cpus.is_finite() || cpus.fract() != 0.0 || !VCPU.contains(&(cpus as u64)) || cpus < 1.0 {
+        if !cpus.is_finite() || cpus.fract() != 0.0 || !VCPU.contains(&(cpus as u64)) {
             return Err(limit("1 to 16 whole vCPUs"));
         }
         if !size.memory_bytes.is_multiple_of(MIB) || !MEMORY_MIB.contains(&(size.memory_bytes / MIB)) {
@@ -690,6 +705,11 @@ fn dockerfile(base: &str, tools: &str) -> String {
         "FROM --platform={platform} {tools} AS drydock_tools\nFROM --platform={platform} {base}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n",
         platform = platform()
     )
+}
+/// How long a freshly built image is spared from slot eviction.
+const IMAGE_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+fn created_at(image: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    image["createdAt"].as_str()?.parse().ok()
 }
 /// The account runs without credit: `/v1/limits` says its credit is empty.
 fn trial(limits: &Value) -> bool {
@@ -966,7 +986,7 @@ impl Provider for Runtime {
         for registry in [&base.registry, &ImageRef::parse(&r.tools_digest)?.registry] {
             if private_registry(registry) {
                 return Err(refused(format!(
-                    "Runtime's builders refuse private addresses and cannot reach the registry {registry}; stage the image in a registry they can reach"
+                    "{registry} looks private (a private, loopback or link-local address, a single-label name or a non-public suffix), and Runtime's builders refuse private addresses; stage the image in a public registry"
                 )));
             }
         }
@@ -1102,9 +1122,17 @@ impl Provider for Runtime {
     /// never resumes. When nothing listens on the agent's port (its sandbox
     /// restarted underneath), the agent is bootstrapped again, once.
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-        let row = self.ours(id, c).await?;
-        if text(&row, "state")? != "running" {
-            return Err(refused(format!("Runtime sandbox {id} is {}, not running; resume it first", row["state"])));
+        let row = match self.ours(id, c).await {
+            Ok(row) => row,
+            Err(error @ ProtocolError::NotFound { .. }) => {
+                self.forget_token(id);
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let state = text(&row, "state")?;
+        if state != "running" {
+            return Err(refused(format!("Runtime sandbox {id} is {state}, not running; resume it first")));
         }
         let mut url = self.sandbox_url(id, None, &["tunnel"])?;
         let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
