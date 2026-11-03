@@ -157,9 +157,32 @@ pub async fn connect_at_with(stream: ByteStream, url: &str, token: &Token, heade
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => io::ErrorKind::PermissionDenied,
                 _ => io::ErrorKind::Other,
             };
-            let text = if body.is_empty() { format!("refused with HTTP {status}") } else { format!("refused with HTTP {status}: {body}") };
-            Err(io::Error::new(kind, text))
+            Err(io::Error::new(kind, Refusal { status: status.as_u16(), body }))
         }
+    }
+}
+
+/// An upgrade answered with something other than 101, as the error
+/// [`connect_at`] and [`connect_at_with`] carry (`io::Error::get_ref`), so a
+/// caller can tell the edge's refusal from the agent's by status rather than
+/// by text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// The start of the answer's body, untrusted (see [`REFUSAL_CHARS`]).
+    pub body: String,
+}
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = StatusCode::from_u16(self.status).map_or_else(|_| self.status.to_string(), |s| s.to_string());
+        if self.body.is_empty() { write!(f, "refused with HTTP {status}") } else { write!(f, "refused with HTTP {status}: {}", self.body) }
+    }
+}
+impl std::error::Error for Refusal {}
+impl Refusal {
+    /// The refusal an upgrade error carries, if it is one.
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
     }
 }
 

@@ -937,6 +937,7 @@ impl Resolver for Names {
         match host {
             "forgejo.lab.example" => Ok(vec!["192.168.1.31".parse().unwrap()]),
             "mixed.example" => Ok(vec!["203.0.113.5".parse().unwrap(), "10.0.0.5".parse().unwrap()]),
+            "mapped.example" => Ok(vec!["::ffff:10.0.0.5".parse().unwrap()]),
             "registry.example.com" | "ghcr.io" => Ok(vec!["203.0.113.10".parse().unwrap()]),
             _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such host")),
         }
@@ -1101,6 +1102,7 @@ async fn a_private_registry_base_is_refused_up_front() {
         "forgejo.lab.internal",
         "forgejo.lab.example",
         "mixed.example",
+        "mapped.example",
     ] {
         let mut request = w.prepare_request(size(1.0, 1024, 10), None);
         request.image_digest = format!("{registry}/lab/image@sha256:{}", "3".repeat(64));

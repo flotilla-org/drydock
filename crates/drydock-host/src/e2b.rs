@@ -277,7 +277,7 @@ impl E2b {
         &self,
         method: Method,
         url: Url,
-        body: Option<(Vec<u8>, &str)>,
+        body: Option<(bytes::Bytes, &str)>,
         c: &Credentials,
         auth: Auth<'_>,
     ) -> Result<http::Response<bytes::Bytes>> {
@@ -337,7 +337,7 @@ impl E2b {
     }
     async fn call(&self, method: Method, url: Url, body: Option<Value>, c: &Credentials) -> Result<Value> {
         let operation = format!("{method} {}", url.path());
-        let body = body.map(|b| (b.to_string().into_bytes(), "application/json"));
+        let body = body.map(|b| (bytes::Bytes::from(b.to_string()), "application/json"));
         let response = self.send(method, url, body, c, Auth::Key).await?;
         Self::answer(&operation, &response)
     }
@@ -459,7 +459,7 @@ impl E2b {
                     self.cached(id).envd
                 }
             };
-            let body = (envelope(0, &message), "application/connect+json");
+            let body = (bytes::Bytes::from(envelope(0, &message)), "application/connect+json");
             let response = self.send(Method::POST, url.clone(), Some(body), c, Auth::Envd(envd.as_deref())).await?;
             if response.status().is_success() {
                 return Run::parse(response.body());
@@ -654,7 +654,7 @@ impl E2b {
                 let headers: BTreeMap<String, String> =
                     serde_json::from_value(upload.get("headers").cloned().unwrap_or(json!({}))).map_err(|_| bad_response())?;
                 let blob = tools_registry.blob(&tools.repository, layer, TOOLS_LAYER_LIMIT).await?;
-                let response = self.send(Method::PUT, url, Some((blob.to_vec(), "")), c, Auth::Signed(&headers)).await?;
+                let response = self.send(Method::PUT, url, Some((blob, "")), c, Auth::Signed(&headers)).await?;
                 Self::answer("PUT tools layer upload", &response)?;
             }
             steps.push(json!({"type": "COPY", "args": ["opt/drydock", "/opt/drydock", "root", ""], "filesHash": hash}));
@@ -698,7 +698,10 @@ impl E2b {
         {
             return Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         }
-        // A name that does not resolve here is left to E2B's builder.
+        // Best effort: E2B resolves the name again when it builds, so DNS that
+        // answers differently there (or rebinds) is not caught. A name that does
+        // not resolve here is left to E2B's builder rather than refused, since
+        // this host's resolver may not see public names a builder does.
         self.resolver.resolve(host).await.ok()?.into_iter().find(|ip| private(*ip))
     }
     fn validate_size(&self, size: &Size) -> Result<()> {
@@ -719,15 +722,31 @@ impl E2b {
     }
 }
 
+/// Addresses no public builder reaches: private, loopback, link-local,
+/// shared (100.64/10), IETF protocol (192.0.0/24) and benchmarking
+/// (198.18/15) IPv4; loopback, unique-local, link- and site-local IPv6; and
+/// IPv4-mapped IPv6 by its IPv4 address.
 fn private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
-            let [a, b, ..] = ip.octets();
-            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || (a == 100 && (64..128).contains(&b))
+            let [a, b, c, _] = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || (a == 100 && (64..128).contains(&b))
+                || (a, b, c) == (192, 0, 0)
+                || (a == 198 && (18..20).contains(&b))
         }
-        IpAddr::V6(ip) => {
-            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80
-        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => private(IpAddr::V4(v4)),
+            None => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || (ip.segments()[0] & 0xfe00) == 0xfc00
+                    || matches!(ip.segments()[0] & 0xffc0, 0xfe80 | 0xfec0)
+            }
+        },
     }
 }
 /// One Connect envelope: a flags byte, the length, the JSON message.
@@ -1125,15 +1144,17 @@ impl Provider for E2b {
         };
         let traffic = if gated { self.traffic_token(id, false, c).await? } else { None };
         let mut result = attempt(traffic.clone(), self.agent_token(id, false, c).await?).await?;
-        if let Err(error) = &result {
-            let text = error.to_string();
-            if text.contains("HTTP 403") && gated {
+        // Which side refused shows in the status: the proxy's 403, the agent's 401.
+        match result.as_ref().err().and_then(tcp::Refusal::of).map(|r| r.status) {
+            Some(403) if gated => {
                 // The proxy refused the traffic token: one held from before a rotation.
                 result = attempt(self.traffic_token(id, true, c).await?, self.agent_token(id, false, c).await?).await?;
-            } else if text.contains("HTTP 401") {
+            }
+            Some(401) => {
                 // The agent refused its token: another bootstrap replaced the file.
                 result = attempt(traffic, self.agent_token(id, true, c).await?).await?;
             }
+            _ => {}
         }
         // drydock-transport's stream, as the provider interface's.
         result.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
@@ -1341,6 +1362,30 @@ mod tests {
         assert_eq!(read.fingerprint(), policy.fingerprint());
         assert_eq!(read.open(), !deny);
         assert_ne!(Policy::read(&json!({})).fingerprint(), policy.fingerprint(), "E2B's default admits public traffic");
+    }
+
+    // Private-address rules, IPv4-mapped IPv6 judged by its IPv4 address.
+    #[test]
+    fn private_addresses() {
+        for ip in [
+            "10.0.0.1",
+            "192.168.1.31",
+            "100.64.0.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "169.254.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "fec0::1",
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(private(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "203.0.113.5", "198.20.0.1", "2606:4700::1111", "::ffff:1.1.1.1"] {
+            assert!(!private(ip.parse().unwrap()), "{ip}");
+        }
     }
 
     // The template name holds the image, platform, vCPUs and memory, not the

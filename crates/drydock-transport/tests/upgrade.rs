@@ -107,6 +107,7 @@ async fn an_agent_behind_an_edge_is_reached_at_its_url() {
         let error = tcp::connect_at(dialer.connect(&url(EDGE_KEY)).await.unwrap(), &url(EDGE_KEY), &wrong).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("401") && error.to_string().contains("wrong tcp token"), "{error}");
+        assert_eq!(tcp::Refusal::of(&error).map(|r| r.status), Some(401));
         let error = tcp::connect_at(dialer.connect(&url("stolen")).await.unwrap(), &url("stolen"), &token).await.err().unwrap();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("invalid connect token") && !error.to_string().contains("stolen"), "{error}");
