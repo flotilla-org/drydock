@@ -6,6 +6,13 @@
 //! service is Connect-RPC with JSON bodies), checked 2026-11-03, and the live
 //! probe of 2026-11-01 (drydock#191).
 use crate::{
+    kit::{
+        self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor,
+        api::{Api, Auth, Body, Failure, Next, Paging, cut, sensitive},
+        egress::{normal_cidr, normal_host, private_registry},
+        guest::{self, Agent, Bootstrap, Guest, GuestOutput},
+        image::{check_prepare, check_prepared, content_name},
+    },
     module::*,
     oci::{ImageRef, Registry},
 };
@@ -16,30 +23,24 @@ use drydock_transport::{
     websocket::{StreamDialer, TlsDialer},
 };
 use futures::{StreamExt, TryStreamExt};
-use reqwest::{Method, Url};
+use reqwest::{Method, Url, header::HeaderName};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
-const MIB: u64 = 1 << 20;
+pub use crate::kit::egress::{Resolver, SystemResolver};
+
+const E2B: Vendor = Vendor("E2B");
 /// envd's port in every sandbox.
 const ENVD_PORT: u16 = 49983;
 /// The guest port the agent's TCP listener binds, published by E2B's proxy.
 const AGENT_PORT: u16 = 7811;
-const TOKEN_FILE: &str = "/run/drydock/tcp.token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 /// The proxy's own gate in front of every published port but envd's.
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
-/// Sandbox metadata naming the drydock instance and the vessel's label. A
-/// sandbox is ours only when it carries both (drydock#168).
-const PROVIDER_TAG: &str = "drydock.provider";
-const LABEL_TAG: &str = "flotilla.label";
 /// Guest commands must finish inside the host's 30-second HTTP deadline;
 /// envd kills a process whose stream outlives its Connect deadline.
 const RUN_TIMEOUT_MS: u64 = 25_000;
@@ -56,31 +57,8 @@ const DETAIL_READS: usize = 8;
 /// and its upload each fit the host's 30-second HTTP deadline, which at 64
 /// MiB needs about 20 Mbit/s; the layer holds one agent binary, far smaller.
 const TOOLS_LAYER_LIMIT: u64 = 64 << 20;
-/// How much of a failed command's or build's output an error carries.
-const OUTPUT_CAUSE_CHARS: usize = 500;
-/// The most of a refusal's text kept in an error.
-const EXPLANATION_CHARS: usize = 500;
 /// Pages of sandbox events read for one usage period.
 const EVENT_PAGES: usize = 100;
-
-/// Resolves a registry's host name, so prepare can refuse one E2B's builders
-/// cannot reach before any build starts.
-#[async_trait]
-pub trait Resolver: Send + Sync {
-    async fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>>;
-}
-/// The system resolver, bounded to five seconds.
-pub struct SystemResolver;
-#[async_trait]
-impl Resolver for SystemResolver {
-    async fn resolve(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
-        let lookup = tokio::net::lookup_host((host, 443));
-        match tokio::time::timeout(Duration::from_secs(5), lookup).await {
-            Ok(addresses) => Ok(addresses?.map(|a| a.ip()).collect()),
-            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "lookup timed out")),
-        }
-    }
-}
 
 /// The module, with the dialer its relays open (TLS in production, an
 /// in-process stand-in in tests) and the resolver prepare checks registry
@@ -147,114 +125,62 @@ impl Module for E2bModule {
         Size { cpus: 1.0, memory_bytes: 512 * MIB, disk_bytes: 1 << 30 }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        let settings: Settings =
-            serde_json::from_value(json!(config.settings)).map_err(|e| refused(format!("invalid E2B settings: {e}")))?;
-        let api = Url::parse(&settings.api_url).ok().filter(|u| {
-            u.scheme() == "https" && u.host_str().is_some() && u.query().is_none() && u.username().is_empty() && u.password().is_none()
-        });
-        if api.is_none()
-            || settings.team_id.is_empty()
+        let settings: Settings = E2B.settings(config)?;
+        if settings.team_id.is_empty()
             || !(1..=86_400).contains(&settings.lifetime_seconds)
             || settings.disk_mb == 0
             || settings.domain.is_empty()
             || !settings.domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         {
-            return Err(refused(
-                "E2B requires team_id, an HTTPS api_url, a domain host name, lifetime_seconds 1..86400 and a positive disk_mb",
-            ));
+            return Err(refused("E2B requires team_id, a domain host name, lifetime_seconds 1..86400 and a positive disk_mb"));
         }
+        let api = Api::new(E2B, &settings.api_url, Auth::Header(HeaderName::from_static("x-api-key")), http)?.classify(classify);
         Ok(Arc::new(E2b {
             name: name.to_owned(),
             settings,
-            http,
+            api,
             dialer: self.dialer.clone(),
             resolver: self.resolver.clone(),
+            agent: Agent::new(Bootstrap { listen: format!("0.0.0.0:{AGENT_PORT}"), precheck: None, unset: &[], workspace: true }),
             access: Mutex::default(),
             suspended: Mutex::default(),
         }))
     }
 }
+/// E2B's statuses: the team's concurrency limit is a quota, not a rate.
+fn classify(f: &Failure) -> ProtocolError {
+    let text = f.message();
+    let reason = f.reason(&text);
+    if f.status == 429 && text.to_ascii_lowercase().contains("concurrent") {
+        return ProtocolError::QuotaExhausted { reason };
+    }
+    f.standard(reason)
+}
 
-/// What reaching one sandbox takes. E2B hands the envd and traffic tokens to
-/// whoever creates or connects to the sandbox; the agent's token is read from
-/// the guest. All are kept in this host's memory only, never in a record or
-/// a log; a missing one is fetched again.
+/// The proxy's tokens for one sandbox. E2B hands the envd and traffic tokens
+/// to whoever creates or connects to the sandbox; they are kept in this
+/// host's memory only, never in a record or a log; a missing one is fetched
+/// again.
 #[derive(Clone, Default)]
 struct Access {
     envd: Option<String>,
     traffic: Option<String>,
-    agent: Option<Token>,
 }
 
 pub struct E2b {
     name: String,
     settings: Settings,
-    http: Arc<dyn HttpClient>,
+    api: Api,
     dialer: Arc<dyn StreamDialer>,
     resolver: Arc<dyn Resolver>,
+    agent: Agent,
     access: Mutex<HashMap<String, Access>>,
     /// Sandboxes this host paused, so their pause reads as requested; E2B
     /// records no cause, and any other pause is its lifetime cap's.
     suspended: Mutex<HashSet<String>>,
 }
-
-trait Recover<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T>;
-}
-impl<T> Recover<T> for Mutex<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-enum Auth<'a> {
-    /// The team API key, for the control plane.
-    Key,
-    /// envd's token and the root user, for the in-guest daemon.
-    Envd(Option<&'a str>),
-    /// A signed upload URL carries its own authorization.
-    Signed(&'a BTreeMap<String, String>),
-}
-
-/// The text of a refusal: E2B's JSON `message`, else the body, cut to its start.
-fn explanation(body: &[u8]) -> String {
-    let text = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned());
-    cut(&text)
-}
-fn cut(text: &str) -> String {
-    match text.char_indices().nth(EXPLANATION_CHARS) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_owned(),
-    }
-}
-/// The status's protocol error, keeping what E2B said.
-fn failure(operation: &str, status: u16, body: &[u8], retry_after: Option<u64>) -> ProtocolError {
-    let text = explanation(body);
-    let reason = format!("E2B {operation} HTTP {status}: {text}");
-    match status {
-        // The team's concurrency limit is a quota, not a request rate.
-        429 if text.to_ascii_lowercase().contains("concurrent") => ProtocolError::QuotaExhausted { reason },
-        400 | 409 | 422 => ProtocolError::Refused { reason },
-        401 => ProtocolError::CredentialRejected { reason },
-        402 => ProtocolError::QuotaExhausted { reason },
-        403 => ProtocolError::Refused { reason: format!("permission denied; {reason}") },
-        404 => ProtocolError::NotFound { reason },
-        429 => ProtocolError::RateLimited { reason, retry_after },
-        408 | 500..=599 => ProtocolError::Unavailable { reason, retry_after, provider_error: None },
-        _ => ProtocolError::Internal { reason: format!("unexpected E2B {operation} HTTP {status}"), provider_error: text },
-    }
-}
-fn bad_response() -> ProtocolError {
-    ProtocolError::Internal { reason: "incomplete E2B response".into(), provider_error: "required field missing or invalid".into() }
-}
-fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
-    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(bad_response)
-}
-fn digest(input: &str) -> String {
-    format!("{:x}", Sha256::digest(input.as_bytes()))
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
@@ -264,93 +190,23 @@ fn platform() -> Platform {
 fn sandbox_id_valid(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
+fn not_a_sandbox() -> ProtocolError {
+    ProtocolError::NotFound { reason: "not an E2B sandbox id".into() }
+}
 
 impl E2b {
-    fn api(&self, segments: &[&str]) -> Result<Url> {
-        let mut url = Url::parse(&self.settings.api_url).map_err(|_| refused("invalid E2B api_url"))?;
-        url.path_segments_mut().map_err(|_| refused("invalid E2B api_url"))?.pop_if_empty().extend(segments);
-        Ok(url)
-    }
     /// A published port of a sandbox: `https://<port>-<id>.<domain>`.
     fn port_url(&self, id: &str, port: u16, path: &str) -> Result<Url> {
         if !sandbox_id_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
+            return Err(not_a_sandbox());
         }
-        Url::parse(&format!("https://{port}-{id}.{}{path}", self.settings.domain)).map_err(|_| bad_response())
-    }
-    async fn send(
-        &self,
-        method: Method,
-        url: Url,
-        body: Option<(bytes::Bytes, &str)>,
-        c: &Credentials,
-        auth: Auth<'_>,
-    ) -> Result<http::Response<bytes::Bytes>> {
-        use reqwest::header::{HeaderName, HeaderValue};
-        let operation = format!("{method} {}", url.path());
-        let mut request = reqwest::Request::new(method, url);
-        let headers = request.headers_mut();
-        let secret = |value: &str| {
-            let mut value = HeaderValue::from_str(value).map_err(|_| refused("invalid E2B credential header"))?;
-            value.set_sensitive(true);
-            Ok::<_, ProtocolError>(value)
-        };
-        match auth {
-            Auth::Key => {
-                let key = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "E2B API key not delivered".into() })?;
-                headers.insert("x-api-key", secret(key.expose())?);
-            }
-            Auth::Envd(token) => {
-                if let Some(token) = token {
-                    headers.insert("x-access-token", secret(token)?);
-                }
-                // envd picks the process's user from Basic `user:`; root has
-                // every capability.
-                headers.insert(reqwest::header::AUTHORIZATION, HeaderValue::from_static("Basic cm9vdDo="));
-                headers.insert("connect-timeout-ms", HeaderValue::from(RUN_TIMEOUT_MS));
-            }
-            Auth::Signed(extra) => {
-                for (name, value) in extra {
-                    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| bad_response())?;
-                    headers.insert(name, HeaderValue::from_str(value).map_err(|_| bad_response())?);
-                }
-            }
-        }
-        if let Some((bytes, content_type)) = body {
-            if !content_type.is_empty() {
-                headers.insert(reqwest::header::CONTENT_TYPE, HeaderValue::from_str(content_type).map_err(|_| bad_response())?);
-            }
-            *request.body_mut() = Some(bytes.into());
-        }
-        rigging_http_client::http_execute!(self.http, request).map_err(|error| ProtocolError::Unavailable {
-            provider_error: Some(error),
-            reason: format!("E2B {operation} transport failed"),
-            retry_after: None,
-        })
-    }
-    /// The JSON of a 2xx answer (Null when empty); any other status as its error.
-    fn answer(operation: &str, response: &http::Response<bytes::Bytes>) -> Result<Value> {
-        let status = response.status().as_u16();
-        if !(200..300).contains(&status) {
-            let retry_after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
-            return Err(failure(operation, status, response.body(), retry_after));
-        }
-        if response.body().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(response.body()).map_err(|_| bad_response())
-    }
-    async fn call(&self, method: Method, url: Url, body: Option<Value>, c: &Credentials) -> Result<Value> {
-        let operation = format!("{method} {}", url.path());
-        let body = body.map(|b| (bytes::Bytes::from(b.to_string()), "application/json"));
-        let response = self.send(method, url, body, c, Auth::Key).await?;
-        Self::answer(&operation, &response)
+        Url::parse(&format!("https://{port}-{id}.{}{path}", self.settings.domain)).map_err(|_| E2B.bad_response())
     }
     fn remember(&self, id: &str, update: impl FnOnce(&mut Access)) {
-        update(self.access.recover().entry(id.to_owned()).or_default());
+        update(lock(&self.access).entry(id.to_owned()).or_default());
     }
     fn cached(&self, id: &str) -> Access {
-        self.access.recover().get(id).cloned().unwrap_or_default()
+        lock(&self.access).get(id).cloned().unwrap_or_default()
     }
     /// Keeps the tokens a create or connect answer carries.
     fn keep_tokens(&self, id: &str, sandbox: &Value) {
@@ -364,9 +220,9 @@ impl E2b {
     /// The sandbox's detail; its envd token is kept.
     async fn detail(&self, id: &str, c: &Credentials) -> Result<Value> {
         if !sandbox_id_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
+            return Err(not_a_sandbox());
         }
-        let detail = self.call(Method::GET, self.api(&["sandboxes", id])?, None, c).await?;
+        let detail = self.api.call(Method::GET, self.api.url(&["sandboxes", id])?, None, c).await?;
         if let Some(envd) = detail.get("envdAccessToken").and_then(Value::as_str) {
             let envd = envd.to_owned();
             self.remember(id, |access| access.envd = Some(envd));
@@ -376,132 +232,39 @@ impl E2b {
     fn ours(&self, row: &Value) -> bool {
         row["metadata"][PROVIDER_TAG].as_str() == Some(&self.name)
     }
-    fn label(&self, row: &Value) -> Option<String> {
-        self.ours(row).then(|| row.get("metadata")?.get(LABEL_TAG)?.as_str().map(str::to_owned)).flatten()
-    }
     fn environment(&self, v: &Value) -> Result<Environment> {
-        let id = text(v, "sandboxID")?.to_owned();
-        let state = match text(v, "state")? {
+        let id = E2B.text(v, "sandboxID")?.to_owned();
+        let state = match E2B.text(v, "state")? {
             "running" => Observation::Running,
-            "paused" if self.suspended.recover().contains(&id) => Observation::Stopped { cause: StopCause::SuspendedByRequest },
+            "paused" if lock(&self.suspended).contains(&id) => Observation::Stopped { cause: StopCause::SuspendedByRequest },
             // The lifetime cap pauses rather than kills (autoPause).
             "paused" => Observation::Stopped { cause: StopCause::PausedByProvider },
             _ => Observation::Unknown { reason: UnknownReason::ProviderStateUnknown },
         };
-        let number = |key| v.get(key).and_then(Value::as_u64).filter(|n| *n > 0);
-        let granted_size = match (number("cpuCount"), number("memoryMB"), number("diskSizeMB")) {
-            (Some(cpus), Some(memory), Some(disk)) => Some(Size { cpus: cpus as f64, memory_bytes: memory * MIB, disk_bytes: disk * MIB }),
-            _ => None,
-        };
-        // A listed row carries no network; the caller reads the detail for it.
-        let egress_policy = v.get("network").map(|network| Policy::read(network).fingerprint());
+        let number = |key| v.get(key).and_then(Value::as_u64);
         Ok(Environment {
-            label: self.label(v),
+            label: kit::ours(&v["metadata"], &self.name),
             id,
             provider: self.name.clone(),
             state,
-            granted_size,
+            granted_size: kit::granted(number("cpuCount"), number("memoryMB"), MIB, number("diskSizeMB"), MIB),
             egress: Enforcement::Enforced,
             platform: Some(platform()),
             egress_measured: false,
-            egress_policy,
+            // A listed row carries no network; the caller reads the detail for it.
+            egress_policy: v.get("network").map(|network| Policy::read(network).fingerprint()),
             timestamp: None,
         })
-    }
-    fn gone(&self, id: &str) -> Environment {
-        Environment {
-            id: id.to_owned(),
-            label: None,
-            provider: self.name.clone(),
-            state: Observation::Gone { cause: GoneCause::DestroyedAtProvider },
-            granted_size: None,
-            egress: Enforcement::Enforced,
-            platform: Some(platform()),
-            egress_measured: false,
-            egress_policy: None,
-            timestamp: None,
-        }
     }
     /// The environment, with its egress claim measured when a probe is
     /// configured and the sandbox runs under a restricted policy.
     async fn observed(&self, v: &Value, c: &Credentials) -> Result<Environment> {
         let mut row = self.environment(v)?;
         let policy = Policy::read(v.get("network").unwrap_or(&Value::Null));
-        let (Some(probe), false, Observation::Running) = (&self.settings.egress_probe, policy.open(), &row.state) else {
-            return Ok(row);
-        };
-        let deny_all = policy.allow_out.is_empty();
-        let script = format!("test \"$(id -u)\" = 0 && DRYDOCK_PROBE_DENY_ALL={} {}", u8::from(deny_all), shell_command(&probe.command));
-        let proof = match self.run(&row.id, &script, BTreeMap::new(), c).await.and_then(Run::success) {
-            Ok(run) => serde_json::from_slice::<Value>(&run.stdout()).unwrap_or(Value::Null),
-            Err(error) => {
-                tracing::warn!(provider = %self.name, environment = %row.id, error_class = error.class(), "egress measurement failed");
-                return Ok(row);
-            }
-        };
-        let confined = proof["uid"] == 0
-            && proof["unlisted_canary"] == false
-            && proof["raw_dns"] == false
-            && (deny_all || proof["listed_direct"] == true);
-        row.egress = if confined { Enforcement::Enforced } else { Enforcement::Advisory };
-        row.egress_measured = true;
+        if let (Some(probe), false, Observation::Running) = (&self.settings.egress_probe, policy.open(), &row.state) {
+            guest::measure_egress(self, &mut row, probe, policy.allow_out.is_empty(), c).await;
+        }
         Ok(row)
-    }
-
-    /// Runs `sh -c script` in the guest as root through envd's process
-    /// service (Connect-RPC, server streaming, JSON envelopes), stdin closed.
-    /// `env` rides in the request, never on argv.
-    async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<Run> {
-        let message = json!({"process": {"cmd": "/bin/sh", "args": ["-c", script], "envs": env}, "stdin": false});
-        let url = self.port_url(id, ENVD_PORT, "/process.Process/Start")?;
-        let operation = format!("POST {}", url.path());
-        for attempt in 0..2 {
-            // A token held from before may be refused: the sandbox's is read again, once.
-            let envd = match self.cached(id).envd {
-                Some(token) if attempt == 0 => Some(token),
-                _ => {
-                    self.detail(id, c).await?;
-                    self.cached(id).envd
-                }
-            };
-            let body = (bytes::Bytes::from(envelope(0, &message)), "application/connect+json");
-            let response = self.send(Method::POST, url.clone(), Some(body), c, Auth::Envd(envd.as_deref())).await?;
-            if response.status().is_success() {
-                return Run::parse(response.body());
-            }
-            if response.status() != 401 || attempt == 1 {
-                return Err(failure(&operation, response.status().as_u16(), response.body(), None));
-            }
-        }
-        unreachable!("the second attempt always returns")
-    }
-    /// Starts the agent as root, supervised, listening on the guest's
-    /// interface for E2B's proxy, with a token only root can read. A token
-    /// file already there is kept when it holds a token, so a running agent
-    /// (after resume, or another host's bootstrap) keeps answering to it;
-    /// whichever token the file holds is read back. The write is exclusive
-    /// (`set -C`): of two concurrent bootstraps one token wins and both read
-    /// it back. `--supervise` returns at once, its supervisor detached with
-    /// output to its log; the supervisor's lock makes a rerun idempotent. Its
-    /// argv ends with `--socket`, as the supervisor requires.
-    async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
-        let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
-        let run = self
-            .run(id, &bootstrap_script(), BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c)
-            .await?
-            .started("bootstrap")?;
-        let token = run.token()?;
-        self.remember(id, |access| access.agent = Some(token.clone()));
-        Ok(token)
-    }
-    async fn agent_token(&self, id: &str, refresh: bool, c: &Credentials) -> Result<Token> {
-        if !refresh && let Some(token) = self.cached(id).agent {
-            return Ok(token);
-        }
-        let run = self.run(id, &format!("echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\""), BTreeMap::new(), c).await?.started("token read")?;
-        let token = run.token()?;
-        self.remember(id, |access| access.agent = Some(token.clone()));
-        Ok(token)
     }
     /// The proxy's traffic token: the one create handed over, or, after a
     /// host restart, a running sandbox's connect answer (which extends its
@@ -517,20 +280,18 @@ impl E2b {
     /// `POST /v2/sandboxes/{id}/connect`: resumes a paused sandbox, extends a
     /// running one's timeout to the configured lifetime, and answers its tokens.
     async fn connect(&self, id: &str, c: &Credentials) -> Result<Value> {
-        let url = self.api(&["v2", "sandboxes", id, "connect"])?;
-        let sandbox = self.call(Method::POST, url, Some(json!({"timeout": self.settings.lifetime_seconds})), c).await?;
+        let url = self.api.url(&["v2", "sandboxes", id, "connect"])?;
+        let sandbox = self.api.call(Method::POST, url, Some(json!({"timeout": self.settings.lifetime_seconds})), c).await?;
         self.keep_tokens(id, &sandbox);
         Ok(sandbox)
     }
     async fn wait_state(&self, id: &str, wanted: &str, c: &Credentials) -> Result<Value> {
-        for _ in 0..STATE_POLLS {
+        kit::poll(STATE_POLLS, STATE_POLL, async || {
             let detail = self.detail(id, c).await?;
-            if text(&detail, "state")? == wanted {
-                return Ok(detail);
-            }
-            tokio::time::sleep(STATE_POLL).await;
-        }
-        Err(ProtocolError::unavailable(format!("E2B sandbox {id} is not {wanted} yet"), Some(5)))
+            Ok((E2B.text(&detail, "state")? == wanted).then_some(detail))
+        })
+        .await?
+        .ok_or_else(|| ProtocolError::unavailable(format!("E2B sandbox {id} is not {wanted} yet"), Some(5)))
     }
     /// Our sandboxes, optionally only the one holding `label`, with their
     /// details (a listed row carries no network policy).
@@ -543,40 +304,18 @@ impl E2b {
             }
             filter.finish()
         };
-        let mut rows = Vec::new();
-        let mut next: Option<String> = None;
-        let mut seen = BTreeSet::new();
-        loop {
-            let mut url = self.api(&["v2", "sandboxes"])?;
-            url.query_pairs_mut().append_pair("metadata", &filter).append_pair("state", "running,paused").append_pair("limit", "100");
-            if let Some(token) = &next {
-                url.query_pairs_mut().append_pair("nextToken", token);
-            }
-            let operation = "GET /v2/sandboxes";
-            let response = self.send(Method::GET, url, None, c, Auth::Key).await?;
-            let page = Self::answer(operation, &response)?;
-            rows.extend(page.as_array().ok_or_else(bad_response)?.iter().cloned());
-            match response.headers().get("x-next-token").and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) {
-                None => break,
-                Some(token) if seen.insert(token.to_owned()) => next = Some(token.to_owned()),
-                Some(_) => return Err(bad_response()),
-            }
-        }
+        let mut url = self.api.url(&["v2", "sandboxes"])?;
+        url.query_pairs_mut().append_pair("metadata", &filter).append_pair("state", "running,paused").append_pair("limit", "100");
+        let paging = Paging { rows: None, cursor: "nextToken", next: Next::Header("x-next-token") };
+        let rows = self.api.paged(url, &paging, c).await?;
         // The server filters by metadata; both tags are checked again here.
         // Each row's detail (for its network policy) is read a few at a time.
         let ids = rows
             .iter()
-            .filter(|row| self.ours(row) && label.is_none_or(|l| self.label(row).as_deref() == Some(l)))
-            .map(|row| text(row, "sandboxID").map(str::to_owned))
+            .filter(|row| kit::ours(&row["metadata"], &self.name).is_some_and(|l| label.is_none_or(|label| l == label)))
+            .map(|row| E2B.text(row, "sandboxID").map(str::to_owned))
             .collect::<Result<Vec<String>>>()?;
-        let reads = ids.into_iter().map(|id| async move {
-            match self.detail(&id, c).await {
-                Ok(detail) => Ok(Some(detail)),
-                // Killed between the list and the read.
-                Err(ProtocolError::NotFound { .. }) => Ok(None),
-                Err(error) => Err(error),
-            }
-        });
+        let reads = ids.into_iter().map(|id| async move { kit::api::absent_on_not_found(self.detail(&id, c).await) });
         let details: Vec<Option<Value>> = futures::stream::iter(reads).buffered(DETAIL_READS).try_collect().await?;
         Ok(details.into_iter().flatten().collect())
     }
@@ -594,13 +333,9 @@ impl E2b {
 
     /// The team's template named `name`: its id and builds, or None.
     async fn template(&self, name: &str, c: &Credentials) -> Result<Option<Value>> {
-        let alias = match self.call(Method::GET, self.api(&["templates", "aliases", name])?, None, c).await {
-            Ok(alias) => alias,
-            Err(ProtocolError::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let id = text(&alias, "templateID")?;
-        self.call(Method::GET, self.api(&["templates", id])?, None, c).await.map(Some)
+        let Some(alias) = self.api.find(self.api.url(&["templates", "aliases", name])?, c).await? else { return Ok(None) };
+        let id = E2B.text(&alias, "templateID")?;
+        self.api.call(Method::GET, self.api.url(&["templates", id])?, None, c).await.map(Some)
     }
     /// Builds `name` from the base image by digest, the tools layer copied
     /// to /opt/drydock and the base's environment restored, then waits for
@@ -609,18 +344,19 @@ impl E2b {
         if let Some(template) = existing {
             let building = template["builds"].as_array().into_iter().flatten().find(|b| b["status"] == "building");
             if let Some(build) = building {
-                return self.await_build(text(template, "templateID")?, text(build, "buildID")?, c).await;
+                return self.await_build(E2B.text(template, "templateID")?, E2B.text(build, "buildID")?, c).await;
             }
         }
         let platform = platform();
         // The pull credential belongs to the base's registry and goes nowhere else.
-        let base_registry = Registry::new(self.http.clone(), &base.registry, r.image_pull.clone(), None)?;
+        let http = self.api.http().clone();
+        let base_registry = Registry::new(http.clone(), &base.registry, r.image_pull.clone(), None)?;
         let base_manifest = base_registry.platform_manifest(base, &platform).await?;
         let config: Value =
-            serde_json::from_slice(&base_registry.config(&base.repository, &base_manifest).await?).map_err(|_| bad_response())?;
+            serde_json::from_slice(&base_registry.config(&base.repository, &base_manifest).await?).map_err(|_| E2B.bad_response())?;
         let tools = ImageRef::parse(&r.tools_digest)?;
         let tools_credential = if tools.registry == base.registry { r.image_pull.clone() } else { None };
-        let tools_registry = Registry::new(self.http.clone(), &tools.registry, tools_credential, None)?;
+        let tools_registry = Registry::new(http, &tools.registry, tools_credential, None)?;
         let tools_manifest = tools_registry.platform_manifest(&tools, &platform).await?;
         // The tools image is one layer holding opt/drydock/ (its Dockerfile
         // copies the agent onto scratch); a layer without it would fail the
@@ -640,8 +376,8 @@ impl E2b {
         }
 
         let size = json!({"name": name, "cpuCount": r.size.cpus as u64, "memoryMB": r.size.memory_bytes / MIB});
-        let created = self.call(Method::POST, self.api(&["v3", "templates"])?, Some(size), c).await?;
-        let (template_id, build_id) = (text(&created, "templateID")?.to_owned(), text(&created, "buildID")?.to_owned());
+        let created = self.api.call(Method::POST, self.api.url(&["v3", "templates"])?, Some(size), c).await?;
+        let (template_id, build_id) = (E2B.text(&created, "templateID")?.to_owned(), E2B.text(&created, "buildID")?.to_owned());
         // E2B drops the image's ENV, so the build sets it again.
         let mut steps = Vec::new();
         let env: Vec<String> = config
@@ -659,116 +395,106 @@ impl E2b {
         // The tools layer is a gzip tar holding opt/drydock/…; it is the COPY
         // context as is, cached by E2B under its own digest, so a later
         // prepare finds it present and uploads nothing.
-        {
-            let hash = layer.digest.strip_prefix("sha256:").ok_or_else(bad_response)?;
-            let upload = self.call(Method::GET, self.api(&["templates", &template_id, "files", hash])?, None, c).await?;
-            if upload["present"] != true {
-                let url =
-                    upload["url"].as_str().and_then(|u| Url::parse(u).ok()).filter(|u| u.scheme() == "https").ok_or_else(bad_response)?;
-                let headers: BTreeMap<String, String> =
-                    serde_json::from_value(upload.get("headers").cloned().unwrap_or(json!({}))).map_err(|_| bad_response())?;
-                let blob = tools_registry.blob(&tools.repository, layer, TOOLS_LAYER_LIMIT).await?;
-                let response = self.send(Method::PUT, url, Some((blob, "")), c, Auth::Signed(&headers)).await?;
-                Self::answer("PUT tools layer upload", &response)?;
-            }
-            steps.push(json!({"type": "COPY", "args": ["opt/drydock", "/opt/drydock", "root", ""], "filesHash": hash}));
+        let hash = layer.digest.strip_prefix("sha256:").ok_or_else(|| E2B.bad_response())?;
+        let upload = self.api.call(Method::GET, self.api.url(&["templates", &template_id, "files", hash])?, None, c).await?;
+        if upload["present"] != true {
+            let url = upload["url"]
+                .as_str()
+                .and_then(|u| Url::parse(u).ok())
+                .filter(|u| u.scheme() == "https")
+                .ok_or_else(|| E2B.bad_response())?;
+            let signed: BTreeMap<String, String> =
+                serde_json::from_value(upload.get("headers").cloned().unwrap_or(json!({}))).map_err(|_| E2B.bad_response())?;
+            let headers = signed
+                .iter()
+                .map(|(name, value)| Some((HeaderName::from_bytes(name.as_bytes()).ok()?, value.parse().ok()?)))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| E2B.bad_response())?;
+            let blob = tools_registry.blob(&tools.repository, layer, TOOLS_LAYER_LIMIT).await?;
+            // A signed upload URL carries its own authorization: never the key.
+            let response = self.api.send(Method::PUT, url, Body::Bytes(blob, ""), c, false, &headers).await?;
+            self.api.answer("PUT tools layer upload", &response)?;
         }
+        steps.push(json!({"type": "COPY", "args": ["opt/drydock", "/opt/drydock", "root", ""], "filesHash": hash}));
         let mut start = json!({"fromImage": r.image_digest, "steps": steps});
         if let Some(pull) = &r.image_pull {
             start["fromImageRegistry"] = json!({"type": "registry", "username": pull.username, "password": pull.secret.expose()});
         }
-        self.call(Method::POST, self.api(&["v2", "templates", &template_id, "builds", &build_id])?, Some(start), c).await?;
+        self.api.call(Method::POST, self.api.url(&["v2", "templates", &template_id, "builds", &build_id])?, Some(start), c).await?;
         self.await_build(&template_id, &build_id, c).await
     }
     async fn await_build(&self, template: &str, build: &str, c: &Credentials) -> Result<()> {
-        for _ in 0..BUILD_POLLS {
-            let status = self.call(Method::GET, self.api(&["templates", template, "builds", build, "status"])?, None, c).await?;
-            match text(&status, "status")? {
-                "ready" => return Ok(()),
+        let url = self.api.url(&["templates", template, "builds", build, "status"])?;
+        kit::poll(BUILD_POLLS, BUILD_POLL, async || {
+            let status = self.api.call(Method::GET, url.clone(), None, c).await?;
+            match E2B.text(&status, "status")? {
+                "ready" => Ok(Some(())),
                 "error" => {
                     let reason = status.pointer("/reason/message").and_then(Value::as_str).unwrap_or("no reason recorded");
                     let logs: Vec<&str> =
                         status["logEntries"].as_array().into_iter().flatten().filter_map(|e| e["message"].as_str()).collect();
                     let tail = logs[logs.len().saturating_sub(5)..].join("\n");
-                    return Err(refused(cut(format!("E2B template build {build} failed: {reason}\n{tail}").trim_end())));
+                    Err(refused(cut(format!("E2B template build {build} failed: {reason}\n{tail}").trim_end(), 500)))
                 }
-                _ => tokio::time::sleep(BUILD_POLL).await,
+                _ => Ok(None),
             }
-        }
-        Err(ProtocolError::unavailable(format!("E2B template build {build} is still running"), Some(30)))
+        })
+        .await?
+        .ok_or_else(|| ProtocolError::unavailable(format!("E2B template build {build} is still running"), Some(30)))
     }
-    /// The private address a registry host is or resolves to, if any. E2B's
-    /// builders pull over the public internet.
-    async fn private_registry(&self, registry: &str) -> Option<IpAddr> {
-        let host = registry.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(registry, |(h, _)| h);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return private(ip).then_some(ip);
+    fn size_limits(&self) -> SizeLimits {
+        SizeLimits {
+            cpus: (1, 64),
+            memory: (512 * MIB, u64::MAX),
+            memory_step: 2 * MIB,
+            disk: (1, self.settings.disk_mb * MIB),
+            disk_step: 1,
         }
-        let lower = host.to_ascii_lowercase();
-        if lower == "localhost"
-            || !lower.contains('.')
-            || [".localhost", ".local", ".internal", ".lan", ".home.arpa"].iter().any(|s| lower.ends_with(s))
-        {
-            return Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        }
-        // Best effort: E2B resolves the name again when it builds, so DNS that
-        // answers differently there (or rebinds) is not caught. A name that does
-        // not resolve here is left to E2B's builder rather than refused, since
-        // this host's resolver may not see public names a builder does.
-        match self.resolver.resolve(host).await {
-            Ok(addresses) => addresses.into_iter().find(|ip| private(*ip)),
-            Err(error) => {
-                tracing::debug!(provider = %self.name, registry = host, %error, "registry name did not resolve; the private-address check is skipped");
-                None
-            }
-        }
-    }
-    fn validate_size(&self, size: &Size) -> Result<()> {
-        if !size.cpus.is_finite()
-            || size.cpus.fract() != 0.0
-            || !(1.0..=64.0).contains(&size.cpus)
-            || !size.memory_bytes.is_multiple_of(2 * MIB)
-            || size.memory_bytes < 512 * MIB
-            || size.disk_bytes == 0
-            || size.disk_bytes > self.settings.disk_mb * MIB
-        {
-            return Err(refused(format!(
-                "E2B sandbox size: whole vCPUs, an even number of MiB of RAM from 512, and at most the plan's {} MiB of disk",
-                self.settings.disk_mb
-            )));
-        }
-        Ok(())
     }
 }
 
-/// Addresses no public builder reaches: private, loopback, link-local,
-/// shared (100.64/10), IETF protocol (192.0.0/24) and benchmarking
-/// (198.18/15) IPv4; loopback, unique-local, link- and site-local IPv6; and
-/// IPv4-mapped IPv6 by its IPv4 address.
-fn private(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            let [a, b, c, _] = ip.octets();
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_unspecified()
-                || (a == 100 && (64..128).contains(&b))
-                || (a, b, c) == (192, 0, 0)
-                || (a == 198 && (18..20).contains(&b))
-        }
-        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-            Some(v4) => private(IpAddr::V4(v4)),
-            None => {
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || (ip.segments()[0] & 0xfe00) == 0xfc00
-                    || matches!(ip.segments()[0] & 0xffc0, 0xfe80 | 0xfec0)
+#[async_trait]
+impl Guest for E2b {
+    fn vendor(&self) -> Vendor {
+        E2B
+    }
+    /// Runs `sh -c script` in the guest as root through envd's process
+    /// service (Connect-RPC, server streaming, JSON envelopes), stdin closed.
+    /// `env` rides in the request, never on argv. envd picks the process's
+    /// user from Basic `user:`; root has every capability.
+    async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        let message = json!({"process": {"cmd": "/bin/sh", "args": ["-c", script], "envs": env}, "stdin": false});
+        let url = self.port_url(id, ENVD_PORT, "/process.Process/Start")?;
+        let operation = format!("POST {}", url.path());
+        for attempt in 0..2 {
+            // A token held from before may be refused: the sandbox's is read again, once.
+            let envd = match self.cached(id).envd {
+                Some(token) if attempt == 0 => Some(token),
+                _ => {
+                    self.detail(id, c).await?;
+                    self.cached(id).envd
+                }
+            };
+            let mut headers = vec![
+                (reqwest::header::AUTHORIZATION, reqwest::header::HeaderValue::from_static("Basic cm9vdDo=")),
+                (HeaderName::from_static("connect-timeout-ms"), RUN_TIMEOUT_MS.into()),
+            ];
+            if let Some(envd) = envd {
+                headers.push((HeaderName::from_static("x-access-token"), sensitive(&envd).map_err(|_| E2B.bad_response())?));
             }
-        },
+            let body = Body::Bytes(envelope(0, &message).into(), "application/connect+json");
+            let response = self.api.send(Method::POST, url.clone(), body, c, false, &headers).await?;
+            if response.status().is_success() {
+                return connect_output(response.body());
+            }
+            if response.status() != 401 || attempt == 1 {
+                return Err(self.api.failure(&operation, &response));
+            }
+        }
+        unreachable!("the second attempt always returns")
     }
 }
+
 /// One Connect envelope: a flags byte, the length, the JSON message.
 fn envelope(flags: u8, message: &Value) -> Vec<u8> {
     let bytes = message.to_string().into_bytes();
@@ -778,111 +504,50 @@ fn envelope(flags: u8, message: &Value) -> Vec<u8> {
     framed.extend_from_slice(&bytes);
     framed
 }
-
-/// Output of one guest command: (stderr, bytes) in order, and its end.
-#[derive(Default)]
-struct Run {
-    output: Vec<(bool, Vec<u8>)>,
-    exit: Option<i32>,
-    /// envd's or Connect's own error, when the process didn't run to its end.
-    error: Option<String>,
-}
-impl Run {
-    /// A Connect server stream: messages `{"event": {start|data|end|keepalive}}`
-    /// and a closing end-stream envelope (flag 2) that may carry an error.
-    /// Protobuf JSON omits zero values, so an end without `exitCode` exited 0.
-    fn parse(mut body: &[u8]) -> Result<Self> {
-        use base64::Engine;
-        let mut run = Run::default();
-        let mut ended = false;
-        while !body.is_empty() {
-            let [flags, a, b, c, d, rest @ ..] = body else { return Err(bad_response()) };
-            let length = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
-            if rest.len() < length || flags & 1 != 0 {
-                return Err(bad_response());
+/// A Connect server stream: messages `{"event": {start|data|end|keepalive}}`
+/// and a closing end-stream envelope (flag 2) that may carry an error.
+/// Protobuf JSON omits zero values, so an end without `exitCode` exited 0.
+fn connect_output(mut body: &[u8]) -> Result<GuestOutput> {
+    use base64::Engine;
+    let mut run = GuestOutput::default();
+    let mut ended = false;
+    let mut error = None;
+    while !body.is_empty() {
+        let [flags, a, b, c, d, rest @ ..] = body else { return Err(E2B.bad_response()) };
+        let length = u32::from_be_bytes([*a, *b, *c, *d]) as usize;
+        if rest.len() < length || flags & 1 != 0 {
+            return Err(E2B.bad_response());
+        }
+        let message: Value = serde_json::from_slice(&rest[..length]).map_err(|_| E2B.bad_response())?;
+        body = &rest[length..];
+        if flags & 2 != 0 {
+            ended = true;
+            if let Some(e) = message.get("error") {
+                error = Some(format!("{}: {}", e["code"].as_str().unwrap_or("unknown"), e["message"].as_str().unwrap_or("")));
             }
-            let message: Value = serde_json::from_slice(&rest[..length]).map_err(|_| bad_response())?;
-            body = &rest[length..];
-            if flags & 2 != 0 {
-                ended = true;
-                if let Some(error) = message.get("error") {
-                    let code = error["code"].as_str().unwrap_or("unknown");
-                    run.error = Some(format!("{code}: {}", error["message"].as_str().unwrap_or("")));
-                }
-                continue;
-            }
-            let event = &message["event"];
-            if let Some(data) = event.get("data") {
-                for (stderr, key) in [(false, "stdout"), (true, "stderr"), (false, "pty")] {
-                    if let Some(chunk) = data.get(key).and_then(Value::as_str) {
-                        let bytes = base64::engine::general_purpose::STANDARD.decode(chunk).map_err(|_| bad_response())?;
-                        run.output.push((stderr, bytes));
-                    }
-                }
-            }
-            if let Some(end) = event.get("end") {
-                run.exit = Some(end.get("exitCode").and_then(Value::as_i64).and_then(|c| i32::try_from(c).ok()).unwrap_or(0));
-                if let Some(error) = end.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
-                    run.error.get_or_insert_with(|| error.to_owned());
+            continue;
+        }
+        let event = &message["event"];
+        if let Some(data) = event.get("data") {
+            for (stderr, key) in [(false, "stdout"), (true, "stderr"), (false, "pty")] {
+                if let Some(chunk) = data.get(key).and_then(Value::as_str) {
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(chunk).map_err(|_| E2B.bad_response())?;
+                    run.chunks.push((stderr, bytes));
                 }
             }
         }
-        if !ended && run.exit.is_none() {
-            return Err(ProtocolError::unavailable("E2B process stream ended early", None));
+        if let Some(end) = event.get("end") {
+            run.exit = Some(end.get("exitCode").and_then(Value::as_i64).and_then(|c| i32::try_from(c).ok()).unwrap_or(0));
+            if let Some(e) = end.get("error").and_then(Value::as_str).filter(|e| !e.is_empty()) {
+                error.get_or_insert_with(|| e.to_owned());
+            }
         }
-        Ok(run)
     }
-    fn bytes(&self, stderr: Option<bool>) -> Vec<u8> {
-        self.output.iter().filter(|(e, _)| stderr.is_none_or(|s| s == *e)).flat_map(|(_, b)| b.iter().copied()).collect()
+    if !ended && run.exit.is_none() {
+        return Err(ProtocolError::unavailable("E2B process stream ended early", None));
     }
-    fn stdout(&self) -> Vec<u8> {
-        self.bytes(Some(false))
-    }
-    /// -1 when the stream ended without an exit, as at a Connect deadline.
-    fn exit_code(&self) -> i32 {
-        self.exit.unwrap_or(-1)
-    }
-    /// Exit 0, or CommandFailed with the merged output.
-    fn success(self) -> Result<Self> {
-        if self.exit_code() == 0 {
-            return Ok(self);
-        }
-        let mut output = String::from_utf8_lossy(&self.bytes(None)).into_owned();
-        if let Some(error) = &self.error {
-            output.push_str(&format!("\n[envd: {error}]"));
-        }
-        Err(ProtocolError::CommandFailed {
-            reason: "E2B guest command failed".into(),
-            exit_code: self.exit_code(),
-            output: Secret::new(output),
-        })
-    }
-    /// Exit 0, or for the module's own guest commands an Internal error whose
-    /// cause is the output's tail, so drydockd's log shows why. Token lines
-    /// are left out.
-    fn started(self, what: &str) -> Result<Self> {
-        if self.exit_code() == 0 {
-            return Ok(self);
-        }
-        let output = String::from_utf8_lossy(&self.bytes(None)).into_owned();
-        let mut output: Vec<&str> = output.lines().filter(|line| !line.contains(TOKEN_LINE.trim_end())).collect();
-        let error = self.error.as_deref().map(|e| format!("[envd: {e}]"));
-        output.extend(error.as_deref());
-        let output = output.join("\n");
-        let tail: String = output.chars().rev().take(OUTPUT_CAUSE_CHARS).collect::<Vec<_>>().into_iter().rev().collect();
-        Err(ProtocolError::Internal {
-            reason: format!("E2B guest {what} exited {}", self.exit_code()),
-            provider_error: if tail.is_empty() { "no output".into() } else { tail },
-        })
-    }
-    fn token(&self) -> Result<Token> {
-        let stdout = String::from_utf8_lossy(&self.stdout()).into_owned();
-        let line = stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE));
-        line.and_then(|line| Token::parse(line).ok()).ok_or_else(|| ProtocolError::Internal {
-            reason: "the agent's TCP token was not read back".into(),
-            provider_error: String::new(),
-        })
-    }
+    run.note = error.map(|e| format!("[envd: {e}]"));
+    Ok(run)
 }
 
 /// E2B's egress configuration, as drydock asks for it and reads it back:
@@ -903,20 +568,14 @@ impl Policy {
         let EgressRequest::DenyAll { direct } = request else { return Ok(policy) };
         policy.deny_out.insert("0.0.0.0/0".into());
         for destination in direct {
-            match destination {
+            let entry = match destination {
                 Destination::HostPort { .. } => return Err(refused("E2B egress rules cannot restrict ports")),
-                Destination::Cidr { cidr } => {
-                    policy.allow_out.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?);
-                }
-                Destination::Host { host } => {
-                    let host = host.as_str().trim_end_matches('.').to_ascii_lowercase();
-                    if host.contains(':') {
-                        return Err(refused("E2B egress takes no IPv6 destinations"));
-                    }
-                    // A name is a domain entry, which E2B resolves itself.
-                    policy.allow_out.insert(normal_cidr(&host).unwrap_or(host));
-                }
-            }
+                Destination::Cidr { cidr } => normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?,
+                Destination::Host { host } if host.as_str().contains(':') => return Err(refused("E2B egress takes no IPv6 destinations")),
+                // A name is a domain entry, which E2B resolves itself.
+                Destination::Host { host } => normal_cidr(host.as_str()).unwrap_or_else(|| normal_host(host.as_str())),
+            };
+            policy.allow_out.insert(entry);
         }
         Ok(policy)
     }
@@ -934,16 +593,8 @@ impl Policy {
     /// `allowPublicTraffic` is E2B's default, which admits public traffic.
     fn read(network: &Value) -> Self {
         let list = |key: &str| -> BTreeSet<String> {
-            network[key]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(|entry| {
-                    let entry = entry.trim_end_matches('.').to_ascii_lowercase();
-                    normal_cidr(&entry).unwrap_or(entry)
-                })
-                .collect()
+            let entries = network[key].as_array().into_iter().flatten().filter_map(Value::as_str);
+            entries.map(|entry| normal_cidr(entry).unwrap_or_else(|| normal_host(entry))).collect()
         };
         Self {
             deny_out: list("denyOut"),
@@ -955,55 +606,17 @@ impl Policy {
         self.deny_out.is_empty()
     }
     fn fingerprint(&self) -> String {
-        digest(&json!([self.deny_out, self.allow_out, self.public_traffic]).to_string())
+        kit::digest(&json!([self.deny_out, self.allow_out, self.public_traffic]).to_string())
     }
-}
-fn normal_cidr(cidr: &str) -> Option<String> {
-    let (ip, bits) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    let (ip, bits) = (ip.parse::<Ipv4Addr>().ok()?, bits.parse::<u32>().ok().filter(|b| *b <= 32)?);
-    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
-    Some(format!("{}/{bits}", Ipv4Addr::from(u32::from(ip) & mask)))
 }
 
 /// The prepared template's name: one per base image, tools image, platform
 /// and size. E2B sizes the template, not the sandbox, so the size is part of
 /// it; the tools image is too, so a new agent gets a new template rather than
-/// the one baked into a template already ready. A content-addressed name
-/// never changes content, so prepare never rebuilds a ready one.
+/// the one baked into a template already ready.
 fn template_name(image: &str, tools: &str, platform: &Platform, size: &Size) -> String {
-    let key = format!("e2b-template\0{image}\0{tools}\0{platform}\0{}\0{}", size.cpus as u64, size.memory_bytes / MIB);
-    format!("drydock-{}", &digest(&key)[..40])
-}
-/// The bootstrap's shell code (see `bootstrap`). The exclusive write fails
-/// quietly when the file exists, as expected; whatever the reason, the file
-/// must then hold a token, or the bootstrap stops saying so.
-fn bootstrap_script() -> String {
-    let token = "'[A-Za-z0-9_-]{43,}={0,2}'";
-    format!(
-        "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
-         if [ -e {TOKEN_FILE} ] && ! grep -Eqx {token} {TOKEN_FILE}; then rm -f {TOKEN_FILE}; fi && \
-         {{ (umask 077; set -C; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}) 2>/dev/null || true; }} && \
-         {{ grep -Eqx {token} {TOKEN_FILE} || {{ echo 'drydock: {TOKEN_FILE} holds no token after writing it' >&2; exit 1; }}; }} && \
-         echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
-         exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
-         --tcp 0.0.0.0:{AGENT_PORT} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
-    )
-}
-fn shell_command(command: &[String]) -> String {
-    command.iter().map(|s| format!("'{}'", s.replace('\'', "'\"'\"'"))).collect::<Vec<_>>().join(" ")
-}
-fn pinned(reference: &str) -> bool {
-    reference.split_once("@sha256:").is_some_and(|(image, digest)| {
-        !image.is_empty()
-            && digest.len() == 64
-            && digest.bytes().all(|b| b.is_ascii_hexdigit())
-            && !reference.contains(|c: char| c.is_whitespace() || c == '\\')
-    })
-}
-/// A deterministic continuation marker binding instance and sandbox; not a
-/// credential, since every resume still needs the key.
-fn resume_marker(instance: &str, id: &str) -> String {
-    format!("e2b-resume-{}", &digest(&format!("{instance}\0{id}"))[..40])
+    let (platform, cpus, memory) = (platform.to_string(), (size.cpus as u64).to_string(), (size.memory_bytes / MIB).to_string());
+    content_name("drydock-", 40, &["e2b-template", image, tools, &platform, &cpus, &memory])
 }
 
 #[async_trait]
@@ -1045,27 +658,14 @@ impl Provider for E2b {
         self.settings.rate_limits.clone().unwrap_or_default()
     }
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-        if prepare_route(&r)? != ImageRouteKind::RegistryPull {
-            return Err(refused("E2B prepares by registry pull only"));
-        }
-        if !pinned(&r.image_digest) || !pinned(&r.tools_digest) {
-            return Err(refused("E2B requires base and tools images pinned by sha256 digest"));
-        }
-        let platform = prepare_platform(&r)?;
-        let supported = self::platform();
-        if platform != supported {
-            return Err(ProtocolError::ImageRefused {
-                reason: format!("E2B runs only {supported} sandboxes"),
-                refusal: ImageRefusal::UnsupportedPlatform { platform },
-            });
-        }
-        self.validate_size(&r.size)?;
+        let (_, platform) = check_prepare(E2B, &r, &[ImageRouteKind::RegistryPull], &platform())?;
+        self.size_limits().check(E2B, &r.size)?;
         let base = ImageRef::parse(&r.image_digest)?;
-        if let Some(address) = self.private_registry(&base.registry).await {
-            let address = if address.is_unspecified() { String::new() } else { format!(" ({address})") };
+        if let Some(private) = private_registry(&base.registry, &*self.resolver).await {
             return Err(refused(format!(
-                "E2B pulls images over the public internet and cannot reach the private registry {}{address}; stage the image in a registry it can reach",
-                base.registry
+                "E2B pulls images over the public internet and cannot reach the private registry {}{}; stage the image in a registry it can reach",
+                base.registry,
+                private.detail()
             )));
         }
         let name = template_name(&r.image_digest, &r.tools_digest, &platform, &r.size);
@@ -1074,7 +674,7 @@ impl Provider for E2b {
         if !ready {
             self.build(&r, &base, &name, template.as_ref(), c).await?;
         }
-        let template = self.template(&name, c).await?.ok_or_else(bad_response)?;
+        let template = self.template(&name, c).await?.ok_or_else(|| E2B.bad_response())?;
         if template["cpuCount"].as_u64() != Some(r.size.cpus as u64) || template["memoryMB"].as_u64() != Some(r.size.memory_bytes / MIB) {
             return Err(refused(format!("E2B template {name} has another size than its name holds")));
         }
@@ -1084,20 +684,16 @@ impl Provider for E2b {
         Ok(Prepared { provider: self.name.clone(), id: name, platform, image_digest: r.image_digest, tools_digest: r.tools_digest })
     }
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        if r.prepared.provider != self.name {
-            return Err(refused("prepared template belongs to another provider"));
-        }
-        self.validate_size(&r.size)?;
-        if r.prepared.id != template_name(&r.prepared.image_digest, &r.prepared.tools_digest, &r.prepared.platform, &r.size) {
-            return Err(refused("E2B size does not match the prepared template"));
-        }
+        self.size_limits().check(E2B, &r.size)?;
+        let p = &r.prepared;
+        check_prepared(E2B, &self.name, p, &template_name(&p.image_digest, &p.tools_digest, &p.platform, &r.size))?;
         let policy = Policy::request(&r.egress)?;
         if let Some(row) = self.ours_listed(Some(&r.label), c).await?.into_iter().next() {
             self.check_existing(&row, &r.size, &policy)?;
-            let id = text(&row, "sandboxID")?.to_owned();
+            let id = E2B.text(&row, "sandboxID")?.to_owned();
             // A paused sandbox stays so: provision never resumes one.
-            if text(&row, "state")? == "running" {
-                self.bootstrap(&id, c).await?;
+            if E2B.text(&row, "state")? == "running" {
+                self.agent.start(self, &id, c).await?;
                 return Ok(Provisioned::Existing(self.inspect(&id, c).await?));
             }
             return Ok(Provisioned::Existing(self.environment(&row)?));
@@ -1110,10 +706,10 @@ impl Provider for E2b {
             "metadata": {PROVIDER_TAG: self.name, LABEL_TAG: r.label},
             "network": policy.body(),
         });
-        let created = self.call(Method::POST, self.api(&["v2", "sandboxes"])?, Some(body), c).await?;
-        let id = text(&created, "sandboxID")?.to_owned();
+        let created = self.api.call(Method::POST, self.api.url(&["v2", "sandboxes"])?, Some(body), c).await?;
+        let id = E2B.text(&created, "sandboxID")?.to_owned();
         self.keep_tokens(&id, &created);
-        self.bootstrap(&id, c).await?;
+        self.agent.start(self, &id, c).await?;
         Ok(Provisioned::Created(self.inspect(&id, c).await?))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
@@ -1122,29 +718,25 @@ impl Provider for E2b {
     /// Killed sandboxes leave E2B's records at once, so an id it does not
     /// know reads as gone.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        match self.detail(id, c).await {
-            Ok(row) => self.observed(&row, c).await,
-            Err(ProtocolError::NotFound { .. }) => Ok(self.gone(id)),
-            Err(error) => Err(error),
+        match kit::api::absent_on_not_found(self.detail(id, c).await)? {
+            Some(row) => self.observed(&row, c).await,
+            None => Ok(kit::gone(&self.name, id, Enforcement::Enforced, platform())),
         }
     }
     /// Kills our sandbox; one already gone is destroyed. Templates stay: they
     /// are retired only by a retention decision (drydock#61).
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        let result = match self.detail(id, c).await {
-            Ok(row) if !self.ours(&row) => return Err(refused(format!("E2B sandbox {id} is not this provider's"))),
-            Ok(_) => match self.call(Method::DELETE, self.api(&["sandboxes", id])?, None, c).await {
-                Ok(_) | Err(ProtocolError::NotFound { .. }) => Ok(()),
-                Err(error) => Err(error),
-            },
-            Err(ProtocolError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error),
-        };
-        if result.is_ok() {
-            self.access.recover().remove(id);
-            self.suspended.recover().remove(id);
+        match kit::api::absent_on_not_found(self.detail(id, c).await)? {
+            Some(row) if !self.ours(&row) => return Err(refused(format!("E2B sandbox {id} is not this provider's"))),
+            Some(_) => {
+                kit::api::absent_on_not_found(self.api.call(Method::DELETE, self.api.url(&["sandboxes", id])?, None, c).await)?;
+            }
+            None => {}
         }
-        result
+        lock(&self.access).remove(id);
+        lock(&self.suspended).remove(id);
+        self.agent.forget(id);
+        Ok(())
     }
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
         Ok(Reach::relay(&self.name, id))
@@ -1157,48 +749,36 @@ impl Provider for E2b {
     /// fetched again, once.
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
         let row = self.detail(id, c).await?;
-        if text(&row, "state")? != "running" {
+        if E2B.text(&row, "state")? != "running" {
             return Err(refused(format!("E2B sandbox {id} is not running; resume it first")));
         }
         let gated = !Policy::read(row.get("network").unwrap_or(&Value::Null)).public_traffic;
         let url = self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string();
-        let attempt = |traffic: Option<String>, agent: Token| {
-            let url = url.clone();
-            async move {
-                let mut headers = http::HeaderMap::new();
-                if let Some(traffic) = traffic {
-                    let mut value = http::HeaderValue::from_str(&traffic).map_err(|_| bad_response())?;
-                    value.set_sensitive(true);
-                    headers.insert(TRAFFIC_HEADER, value);
-                }
-                let stream = self.dialer.connect(&url).await.map_err(|error| ProtocolError::Unavailable {
-                    reason: "E2B proxy connection failed".into(),
-                    retry_after: None,
-                    provider_error: Some(error.to_string()),
-                })?;
-                Ok::<_, ProtocolError>(tcp::connect_at_with(stream, &url, &agent, headers).await)
+        let attempt = async |traffic: Option<String>, agent: Token| {
+            let mut headers = http::HeaderMap::new();
+            if let Some(traffic) = traffic {
+                headers.insert(TRAFFIC_HEADER, sensitive(&traffic).map_err(|_| E2B.bad_response())?);
             }
+            let stream = self.dialer.connect(&url).await.map_err(|error| ProtocolError::Unavailable {
+                reason: "E2B proxy connection failed".into(),
+                retry_after: None,
+                provider_error: Some(error.to_string()),
+            })?;
+            Ok::<_, ProtocolError>(tcp::connect_at_with(stream, &url, &agent, headers).await)
         };
         let traffic = if gated { self.traffic_token(id, false, c).await? } else { None };
-        let mut result = attempt(traffic.clone(), self.agent_token(id, false, c).await?).await?;
+        let mut result = attempt(traffic.clone(), self.agent.token(self, id, false, c).await?).await?;
         // Which side refused shows in the status: the proxy's 403, the agent's 401.
         match result.as_ref().err().and_then(tcp::Refusal::of).map(|r| r.status) {
+            // The proxy refused the traffic token: one held from before a rotation.
             Some(403) if gated => {
-                // The proxy refused the traffic token: one held from before a rotation.
-                result = attempt(self.traffic_token(id, true, c).await?, self.agent_token(id, false, c).await?).await?;
+                result = attempt(self.traffic_token(id, true, c).await?, self.agent.token(self, id, false, c).await?).await?;
             }
-            Some(401) => {
-                // The agent refused its token: another bootstrap replaced the file.
-                result = attempt(traffic, self.agent_token(id, true, c).await?).await?;
-            }
+            // The agent refused its token: another bootstrap replaced the file.
+            Some(401) => result = attempt(traffic, self.agent.token(self, id, true, c).await?).await?,
             _ => {}
         }
-        // drydock-transport's stream, as the provider interface's.
-        result.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
-            reason: "the agent's TCP listener did not accept the connection through E2B's proxy".into(),
-            retry_after: None,
-            provider_error: Some(error.to_string()),
-        })
+        result.map(|stream| Box::new(stream) as ByteStream).map_err(|error| guest::unaccepted(E2B, "proxy", error))
     }
 }
 
@@ -1207,27 +787,25 @@ impl SuspendResume for E2b {
     /// Pauses with memory: processes, the agent among them, survive. Open
     /// relays end, and reconnect after resume.
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        if text(&self.detail(id, c).await?, "state")? == "running" {
-            match self.call(Method::POST, self.api(&["sandboxes", id, "pause"])?, None, c).await {
+        if E2B.text(&self.detail(id, c).await?, "state")? == "running" {
+            match self.api.call(Method::POST, self.api.url(&["sandboxes", id, "pause"])?, None, c).await {
                 // 409: a pause already under way.
                 Ok(_) | Err(ProtocolError::Refused { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
         self.wait_state(id, "paused", c).await?;
-        self.suspended.recover().insert(id.to_owned());
-        Ok(ResumeToken { token: Secret::new(resume_marker(&self.name, id)) })
+        lock(&self.suspended).insert(id.to_owned());
+        Ok(E2B.resume_marker("e2b-resume-", &self.name, id))
     }
     /// Connect resumes the sandbox and restarts its lifetime; the agent is
     /// bootstrapped again, which its supervisor's lock makes a no-op.
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        if token.token.expose() != resume_marker(&self.name, id) {
-            return Err(refused("resume token belongs to another environment"));
-        }
+        E2B.check_resume("e2b-resume-", &self.name, id, &token)?;
         self.connect(id, c).await?;
         self.wait_state(id, "running", c).await?;
-        self.suspended.recover().remove(id);
-        self.bootstrap(id, c).await?;
+        lock(&self.suspended).remove(id);
+        self.agent.start(self, id, c).await?;
         Ok(())
     }
 }
@@ -1236,8 +814,7 @@ impl SuspendResume for E2b {
 impl Exec for E2b {
     /// stdout and stderr merged in arrival order, bytes intact.
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
-        let output = self.run(id, &shell_command(&r.command), BTreeMap::new(), c).await?.success()?.bytes(None);
-        Ok(Box::new(std::io::Cursor::new(output)))
+        Guest::exec(self, id, r, c).await
     }
 }
 
@@ -1246,10 +823,11 @@ impl QuotaOperation for E2b {
     /// Concurrency in use from the team's latest metric. The limit comes from
     /// settings: an API key cannot read the team's limits.
     async fn quota(&self, c: &Credentials) -> Result<Quota> {
-        let metrics = self.call(Method::GET, self.api(&["teams", &self.settings.team_id, "metrics"])?, None, c).await?;
-        let latest = metrics.as_array().ok_or_else(bad_response)?.iter().max_by_key(|m| m["timestampUnix"].as_i64().unwrap_or(i64::MIN));
+        let metrics = self.api.call(Method::GET, self.api.url(&["teams", &self.settings.team_id, "metrics"])?, None, c).await?;
+        let metrics = metrics.as_array().ok_or_else(|| E2B.bad_response())?;
+        let latest = metrics.iter().max_by_key(|m| m["timestampUnix"].as_i64().unwrap_or(i64::MIN));
         let in_use = match latest {
-            Some(metric) => metric["concurrentSandboxes"].as_u64().ok_or_else(bad_response)?,
+            Some(metric) => metric["concurrentSandboxes"].as_u64().ok_or_else(|| E2B.bad_response())?,
             None => 0,
         };
         Ok(Quota {
@@ -1269,29 +847,30 @@ impl UsageOperation for E2b {
     /// memory. Executions still running are counted once they end. Disk is
     /// the plan's; E2B gives an API key no spend.
     async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
-        let parse = |t: &str| t.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad_response());
+        let bad = || E2B.bad_response();
+        let parse = |t: &str| t.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| bad());
         let (from, to) = (period.start().instant(), period.end().instant());
         let mut sizes: BTreeMap<(u64, u64), f64> = BTreeMap::new();
         let (mut cpu_seconds, mut memory_byte_seconds) = (0.0, 0.0);
         let mut sandboxes = BTreeSet::new();
         let mut seen = BTreeSet::new();
         'pages: for page in 0..EVENT_PAGES {
-            let mut url = self.api(&["events", "sandboxes"])?;
+            let mut url = self.api.url(&["events", "sandboxes"])?;
             url.query_pairs_mut()
                 .append_pair("offset", &(page * 100).to_string())
                 .append_pair("limit", "100")
                 .append_pair("orderAsc", "false")
                 .append_pair("types", "sandbox.lifecycle.paused")
                 .append_pair("types", "sandbox.lifecycle.killed");
-            let events = self.call(Method::GET, url, None, c).await?;
-            let events = events.as_array().ok_or_else(bad_response)?;
+            let events = self.api.call(Method::GET, url, None, c).await?;
+            let events = events.as_array().ok_or_else(bad)?;
             for event in events {
-                let ended = parse(text(event, "timestamp")?)?;
+                let ended = parse(E2B.text(event, "timestamp")?)?;
                 if ended < from {
                     // Newest first: every later event ended earlier still.
                     break 'pages;
                 }
-                if !seen.insert(text(event, "id")?.to_owned()) {
+                if !seen.insert(E2B.text(event, "id")?.to_owned()) {
                     continue;
                 }
                 let data = &event["eventData"];
@@ -1300,18 +879,17 @@ impl UsageOperation for E2b {
                 }
                 let execution = &data["execution"];
                 let Some(started) = execution["started_at"].as_str() else { continue };
-                let started = parse(started)?;
-                let (start, end) = (started.max(from), ended.min(to));
+                let (start, end) = (parse(started)?.max(from), ended.min(to));
                 if end <= start {
                     continue;
                 }
                 let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
-                let cpus = execution["vcpu_count"].as_u64().ok_or_else(bad_response)?;
-                let memory = execution["memory_mb"].as_u64().ok_or_else(bad_response)?;
+                let cpus = execution["vcpu_count"].as_u64().ok_or_else(bad)?;
+                let memory = execution["memory_mb"].as_u64().ok_or_else(bad)?;
                 *sizes.entry((cpus, memory)).or_default() += seconds / 3600.0;
                 cpu_seconds += cpus as f64 * seconds;
                 memory_byte_seconds += (memory * MIB) as f64 * seconds;
-                sandboxes.insert(text(event, "sandboxId")?.to_owned());
+                sandboxes.insert(E2B.text(event, "sandboxId")?.to_owned());
             }
             if events.len() < 100 {
                 break;
@@ -1358,16 +936,16 @@ mod tests {
         body.extend(event(json!({"data": {"stdout": "bG8="}})));
         body.extend(event(json!({"end": {"exited": true, "status": "exit status 0"}})));
         body.extend(envelope(2, &json!({})));
-        let run = Run::parse(&body).unwrap();
+        let run = connect_output(&body).unwrap();
         assert_eq!((run.exit_code(), run.stdout(), run.bytes(None)), (0, b"hello".to_vec(), b"hel\xfflo".to_vec()));
         let mut failed = event(json!({"end": {"exitCode": 3, "exited": true}}));
         failed.extend(envelope(2, &json!({"error": {"code": "deadline_exceeded", "message": "timed out"}})));
-        let run = Run::parse(&failed).unwrap();
+        let run = connect_output(&failed).unwrap();
         assert_eq!(run.exit_code(), 3);
-        assert_eq!(run.error.as_deref(), Some("deadline_exceeded: timed out"));
-        assert!(Run::parse(&envelope(2, &json!({"error": {"code": "unavailable", "message": "x"}}))).unwrap().exit_code() == -1);
-        assert!(matches!(Run::parse(&event(json!({"start": {"pid": 7}}))), Err(ProtocolError::Unavailable { .. })));
-        assert!(Run::parse(&body[..body.len() - 1]).is_err());
+        assert_eq!(run.note.as_deref(), Some("[envd: deadline_exceeded: timed out]"));
+        assert!(connect_output(&envelope(2, &json!({"error": {"code": "unavailable", "message": "x"}}))).unwrap().exit_code() == -1);
+        assert!(matches!(connect_output(&event(json!({"start": {"pid": 7}}))), Err(ProtocolError::Unavailable { .. })));
+        assert!(connect_output(&body[..body.len() - 1]).is_err());
     }
 
     // Every request policy reads back from E2B's echo of it, in any order and
@@ -1399,60 +977,6 @@ mod tests {
         assert_eq!(read.fingerprint(), policy.fingerprint());
         assert_eq!(read.open(), !deny);
         assert_ne!(Policy::read(&json!({})).fingerprint(), policy.fingerprint(), "E2B's default admits public traffic");
-    }
-
-    // Private-address rules, IPv4-mapped IPv6 judged by its IPv4 address.
-    #[test]
-    fn private_addresses() {
-        for ip in [
-            "10.0.0.1",
-            "192.168.1.31",
-            "100.64.0.1",
-            "192.0.0.8",
-            "198.18.0.1",
-            "169.254.1.1",
-            "::1",
-            "fd00::1",
-            "fe80::1",
-            "fec0::1",
-            "::ffff:10.0.0.1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(private(ip.parse().unwrap()), "{ip}");
-        }
-        for ip in ["1.1.1.1", "203.0.113.5", "198.20.0.1", "2606:4700::1111", "::ffff:1.1.1.1"] {
-            assert!(!private(ip.parse().unwrap()), "{ip}");
-        }
-    }
-
-    // The bootstrap's shell code, run for real over a temporary directory: it
-    // writes a fresh token only root can read, keeps a token already there,
-    // and stops with a clear message when the write leaves no token.
-    #[test]
-    fn bootstrap_writes_keeps_or_refuses_the_token() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let run = dir.path().join("run");
-        let script = bootstrap_script();
-        let (prefix, _) = script.split_once(" && exec ").unwrap();
-        let prefix = prefix.replace("/run/drydock", run.to_str().unwrap()).replace("/workspace", dir.path().join("w").to_str().unwrap());
-        let bootstrap =
-            |token: &str| std::process::Command::new("sh").args(["-c", &prefix]).env("DRYDOCK_TCP_TOKEN", token).output().unwrap();
-        let file = run.join("tcp.token");
-
-        let missing = bootstrap("");
-        assert!(!missing.status.success());
-        assert!(String::from_utf8_lossy(&missing.stderr).contains("tcp.token holds no token after writing it"), "{missing:?}");
-
-        let (first, second) = (Token::generate().unwrap(), Token::generate().unwrap());
-        let _ = std::fs::remove_file(&file);
-        let written = bootstrap(first.secret());
-        assert!(written.status.success(), "{written:?}");
-        assert_eq!(String::from_utf8_lossy(&written.stdout), format!("{TOKEN_LINE}{}\n", first.secret()));
-        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-        let kept = bootstrap(second.secret());
-        assert!(kept.status.success(), "{kept:?}");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), first.secret());
     }
 
     // The template name holds the base and tools images, platform, vCPUs and
