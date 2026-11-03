@@ -113,6 +113,7 @@ impl Provider for RemoteProvider {
             export: ports.export.then_some(self),
             usage: ports.usage.then_some(self),
             quota: ports.quota.then_some(self),
+            files: ports.files.then_some(self),
         }
     }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {
@@ -141,6 +142,12 @@ impl Provider for RemoteProvider {
 impl Exec for RemoteProvider {
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream> {
         self.host(c).exec(self.name(), id, &request).await.map_err(mutation)
+    }
+}
+#[async_trait]
+impl GuestFiles for RemoteProvider {
+    async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, c: &Credentials) -> Result<()> {
+        self.host(c).put_file(self.name(), id, &file, bytes).await.map_err(mutation)
     }
 }
 #[async_trait]

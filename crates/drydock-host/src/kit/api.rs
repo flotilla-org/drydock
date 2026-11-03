@@ -215,8 +215,24 @@ impl Api {
         authenticated: bool,
         headers: &[(HeaderName, HeaderValue)],
     ) -> Result<http::Response<Bytes>> {
+        self.send_within(method, url, body, c, authenticated, headers, None).await
+    }
+    /// [`Self::send`], ending at `deadline` instead of the client's own
+    /// (30 s), for a request whose body takes longer to send.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_within(
+        &self,
+        method: Method,
+        url: Url,
+        body: impl Into<Body>,
+        c: &Credentials,
+        authenticated: bool,
+        headers: &[(HeaderName, HeaderValue)],
+        deadline: Option<std::time::Duration>,
+    ) -> Result<http::Response<Bytes>> {
         let operation = operation(&method, &url);
         let mut request = reqwest::Request::new(method, url);
+        *request.timeout_mut() = deadline;
         for (name, value) in headers {
             request.headers_mut().insert(name.clone(), value.clone());
         }
@@ -277,6 +293,20 @@ impl Api {
     ) -> Result<T> {
         let operation = operation(&method, &url);
         let response = self.send(method, url, body, c, true, headers).await?;
+        self.answer(&operation, &response)
+    }
+    /// An authenticated call whose request may take until `deadline`, as a
+    /// large upload does; its answer decoded as `T`.
+    pub async fn call_within<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Body,
+        c: &Credentials,
+        deadline: std::time::Duration,
+    ) -> Result<T> {
+        let operation = operation(&method, &url);
+        let response = self.send_within(method, url, body, c, true, &[], Some(deadline)).await?;
         self.answer(&operation, &response)
     }
     /// An authenticated GET.

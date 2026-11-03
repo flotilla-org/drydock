@@ -82,6 +82,7 @@ pub(super) enum Gate {
     Resume,
     Export,
     Exec,
+    Files,
     Usage,
     Quota,
 }
@@ -99,6 +100,7 @@ impl Gate {
             Self::Resume => "resume",
             Self::Export => "export",
             Self::Exec => "exec",
+            Self::Files => "files",
             Self::Usage => "usage",
             Self::Quota => "quota",
         }
@@ -106,13 +108,18 @@ impl Gate {
     /// Long mutations keep the deadline the Daemon gave its POST routes.
     fn deadline(self, ordinary: std::time::Duration) -> std::time::Duration {
         match self {
-            Self::Prepare | Self::Provision | Self::Reach | Self::Suspend | Self::Resume | Self::Export => LONG_CALL.max(ordinary),
+            Self::Prepare | Self::Provision | Self::Reach | Self::Suspend | Self::Resume | Self::Export | Self::Files => {
+                LONG_CALL.max(ordinary)
+            }
             _ => ordinary,
         }
     }
     /// Calls whose interruption can leave vendor side effects.
     fn mutates(self) -> bool {
-        matches!(self, Self::Prepare | Self::Provision | Self::Destroy | Self::Suspend | Self::Resume | Self::Export | Self::Exec)
+        matches!(
+            self,
+            Self::Prepare | Self::Provision | Self::Destroy | Self::Suspend | Self::Resume | Self::Export | Self::Exec | Self::Files
+        )
     }
     fn supported(self, c: &Capabilities) -> bool {
         match self {
@@ -120,6 +127,8 @@ impl Gate {
             Self::Suspend | Self::Resume => c.suspend_resume,
             Self::Export => c.export,
             Self::Exec => c.fallback_runner,
+            // The port itself is the declaration.
+            Self::Files => true,
             Self::Usage => c.usage,
             Self::Quota => c.quota,
         }

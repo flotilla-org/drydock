@@ -181,3 +181,25 @@ pub(crate) fn command<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Stri
         Err(serde::de::Error::custom("command must start with a nonempty executable"))
     }
 }
+
+#[derive(Deserialize)]
+pub struct UncheckedGuestFile {
+    path: String,
+    mode: u32,
+}
+impl TryFrom<UncheckedGuestFile> for crate::GuestFile {
+    type Error = &'static str;
+    fn try_from(file: UncheckedGuestFile) -> Result<Self, Self::Error> {
+        let segments = file.path.split('/').skip(1);
+        if !file.path.starts_with('/')
+            || file.path.contains('\0')
+            || segments.clone().any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return Err("a guest file path is absolute and normal (no empty, `.` or `..` segment), names a file and holds no NUL");
+        }
+        if file.mode > 0o777 {
+            return Err("a guest file mode is read, write and execute bits, at most 0o777");
+        }
+        Ok(Self { path: file.path, mode: file.mode })
+    }
+}
