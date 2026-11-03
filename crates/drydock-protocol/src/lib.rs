@@ -130,6 +130,10 @@ pub struct Ports {
     /// [`BootstrapRoute::Upload`].
     #[serde(default)]
     pub files: bool,
+    /// Mints push access to the provider's own registry, for the
+    /// [`ImageRoute::ProviderPush`] route.
+    #[serde(default)]
+    pub push_access: bool,
 }
 /// How the server observes a provider: it polls the environment list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -227,13 +231,24 @@ pub enum BootstrapRoute {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "route", rename_all = "snake_case")]
 pub enum ImageRoute {
-    /// The host uploads the prepared image into the provider's own registry.
+    /// The image goes into the provider's own registry first. With the
+    /// push-access port drydockd copies it there (composing the tools in on
+    /// `ToolsLayer::Host`) with access the provider mints, and the module is
+    /// handed that copy by digest.
     ProviderPush {
         protocol: PushProtocol,
         /// How long one minted push credential stays valid, when it expires.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential_lifetime_seconds: Option<u64>,
         tools_layer: ToolsLayer,
+        /// The largest image the provider takes (compressed bytes, a lower
+        /// bound on its size); a larger one is refused before any upload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_image_bytes: Option<u64>,
+        /// The most bytes one upload request carries, when the registry or
+        /// the link calls for other than drydockd's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_bytes: Option<u64>,
     },
     /// The provider pulls the base image from a registry it can reach.
     RegistryPull {
@@ -326,7 +341,8 @@ pub enum ToolsLayer {
     /// The host appends it to the base image's manifest before handing it over.
     Host,
     /// None joins the image: it is the base alone, and drydock uploads the
-    /// agent at launch ([`BootstrapRoute::Upload`]).
+    /// agent at launch ([`BootstrapRoute::Upload`]). An image staged for it is
+    /// copied as it is; one for `Host` is composed with the tools once.
     Upload,
 }
 /// Pull access to one registry. Hosts send it only to the registry that the
@@ -336,6 +352,16 @@ pub struct RegistryCredential {
     pub username: String,
     #[schema(value_type = String, format = Password)]
     pub secret: Secret,
+}
+/// Push access to a provider's own registry, minted for one prepare.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PushAccess {
+    /// `host/path`: images go under it, by digest.
+    pub repository: String,
+    pub credential: RegistryCredential,
+    /// When the credential stops working, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<Timestamp>,
 }
 /// Why a provider cannot take an image. Stable codes for client policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -349,8 +375,9 @@ pub enum ImageRefusal {
     /// mints a new one and resumes from the blobs already uploaded.
     PushCredentialExpired,
     /// The staging registry drydock copies the image into, so this provider
-    /// can pull it, refused the copy. `registry` is its configured name; the
-    /// reason says why (authentication, permission, quota).
+    /// can pull it, refused the copy. `registry` is its configured name, or
+    /// the provider's for its own registry; the reason says why
+    /// (authentication, permission, quota).
     StagingRefused { registry: String },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

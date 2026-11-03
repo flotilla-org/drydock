@@ -2099,6 +2099,76 @@
         }
       }
     },
+    "/v1/providers/{provider}/push-access": {
+      "post": {
+        "tags": [
+          "host"
+        ],
+        "operationId": "push_access",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Push access to the provider's own registry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PushAccess"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
     "/v1/providers/{provider}/quota": {
       "get": {
         "tags": [
@@ -3256,7 +3326,7 @@
           },
           {
             "type": "object",
-            "description": "The staging registry drydock copies the image into, so this provider\ncan pull it, refused the copy. `registry` is its configured name; the\nreason says why (authentication, permission, quota).",
+            "description": "The staging registry drydock copies the image into, so this provider\ncan pull it, refused the copy. `registry` is its configured name, or\nthe provider's for its own registry; the reason says why\n(authentication, permission, quota).",
             "required": [
               "registry",
               "cause"
@@ -3280,13 +3350,22 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "The host uploads the prepared image into the provider's own registry.",
+            "description": "The image goes into the provider's own registry first. With the\npush-access port drydockd copies it there (composing the tools in on\n`ToolsLayer::Host`) with access the provider mints, and the module is\nhanded that copy by digest.",
             "required": [
               "protocol",
               "tools_layer",
               "route"
             ],
             "properties": {
+              "chunk_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "The most bytes one upload request carries, when the registry or\nthe link calls for other than drydockd's default.",
+                "minimum": 0
+              },
               "credential_lifetime_seconds": {
                 "type": [
                   "integer",
@@ -3294,6 +3373,15 @@
                 ],
                 "format": "int64",
                 "description": "How long one minted push credential stays valid, when it expires.",
+                "minimum": 0
+              },
+              "max_image_bytes": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "The largest image the provider takes (compressed bytes, a lower\nbound on its size); a larger one is refused before any upload.",
                 "minimum": 0
               },
               "protocol": {
@@ -3837,6 +3925,10 @@
             "type": "boolean",
             "description": "Writes a file into a guest: how drydock puts the agent in a vessel on\n[`BootstrapRoute::Upload`]."
           },
+          "push_access": {
+            "type": "boolean",
+            "description": "Mints push access to the provider's own registry, for the\n[`ImageRoute::ProviderPush`] route."
+          },
           "quota": {
             "type": "boolean"
           },
@@ -4260,6 +4352,34 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "PushAccess": {
+        "type": "object",
+        "description": "Push access to a provider's own registry, minted for one prepare.",
+        "required": [
+          "repository",
+          "credential"
+        ],
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/RegistryCredential"
+          },
+          "expires_at": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When the credential stops working, if it does."
+              }
+            ]
+          },
+          "repository": {
+            "type": "string",
+            "description": "`host/path`: images go under it, by digest."
           }
         }
       },

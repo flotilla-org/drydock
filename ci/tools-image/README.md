@@ -123,7 +123,9 @@ older than the host, which upgrades it to its own build after hello as
 described above, rather than refusing the vessel for a fingerprint mismatch. Resolve the index
 for the guest architecture. The prepared form is the selected base plus the
 tools layer, added where the image route the module declares says: built at
-the provider, or appended to the base manifest by the host. Record the prepared form at the provider. Leave the base's entrypoint,
+the provider, or appended to the base manifest by drydockd, which stages the
+composed image where the provider pulls from and hands the module that one
+digest (`ToolsLayer::Host`). Record the prepared form at the provider. Leave the base's entrypoint,
 command and init unchanged. On `BootstrapRoute::Upload` nothing is baked: the
 prepared form is the base alone, and a module with the files port (`GuestFiles`)
 has drydockd put its own agent build at `/opt/drydock/drydock-agent` (written

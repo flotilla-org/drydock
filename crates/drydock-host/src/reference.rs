@@ -134,6 +134,7 @@ impl Provider for Reference {
             usage: Some(self),
             quota: Some(self),
             files: self.settings.upload.then_some(self as &dyn GuestFiles),
+            push_access: None,
         }
     }
     fn capabilities(&self) -> Capabilities {

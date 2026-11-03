@@ -421,22 +421,39 @@ impl Daemon {
         let prepared = host.handle.client.credentialed(self.credential.clone()).prepare(provider, &request).await?;
         Ok((prepared, request.size))
     }
-    /// The prepare request with its image staged, when this instance pulls
-    /// from declared registries and prepares by the registry-pull route. A
-    /// route or platform the provider does not declare is the host's to refuse.
+    /// The prepare request with its image staged where the provider takes it
+    /// from: into its own registry on the provider-push route, when it mints
+    /// push access; into a declared registry on the registry-pull route, when
+    /// this instance pulls from some. On `ToolsLayer::Host` the image staged
+    /// is the base with the tools composed in. A route or platform the
+    /// provider does not declare is the host's to refuse.
     async fn staged(&self, provider: &str, request: PrepareRequest) -> Result<PrepareRequest, Error> {
         let pull_from = self.config.providers.get(provider).map(|p| p.pull_from.as_slice()).unwrap_or_default();
-        if pull_from.is_empty() {
-            return Ok(request);
-        }
         let status = self.ready_host(provider)?.handle.status.borrow().clone();
         let Some(declaration) = status.providers.iter().find(|d| d.provider == provider) else { return Ok(request) };
         let capabilities = &declaration.capabilities;
         let route = crate::runtime::module::resolve_route(request.route, &capabilities.image_routes);
         let platform = crate::runtime::module::resolve_platform(request.platform.clone(), &capabilities.platforms);
-        let (Ok(ImageRouteKind::RegistryPull), Ok(platform)) = (route, platform) else { return Ok(request) };
-        let request = PrepareRequest { route: Some(ImageRouteKind::RegistryPull), ..request };
-        Ok(self.staging.stage(pull_from, request, &platform).await?)
+        let (Ok(kind), Ok(platform)) = (route, platform) else { return Ok(request) };
+        let Some(route) = capabilities.image_routes.iter().find(|r| r.kind() == kind) else { return Ok(request) };
+        let compose = route.tools_layer() == ToolsLayer::Host;
+        let request = PrepareRequest { route: Some(kind), ..request };
+        match route {
+            ImageRoute::ProviderPush { max_image_bytes, chunk_bytes, .. } if declaration.ports.push_access => {
+                let runtime = self.runtime(provider)?;
+                let mint = async {
+                    runtime.push_access(provider).await.map_err(|error| match error {
+                        Error::Protocol(error) => error,
+                        other => ProtocolError::unavailable(format!("mint push access: {other}"), None),
+                    })
+                };
+                Ok(self.staging.push(provider, mint, request, &platform, compose, (*max_image_bytes, *chunk_bytes)).await?)
+            }
+            ImageRoute::RegistryPull { .. } if !pull_from.is_empty() => {
+                Ok(self.staging.stage(pull_from, request, &platform, compose).await?)
+            }
+            _ => Ok(request),
+        }
     }
     pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
         let (prepared, size) = self.prepare(provider, options).await?;
@@ -731,6 +748,9 @@ impl ProviderApi for Daemon {
     }
     async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
         self.runtime(p)?.put_file(p, id, file, bytes).await
+    }
+    async fn push_access(&self, p: &str) -> Result<PushAccess, Error> {
+        self.runtime(p)?.push_access(p).await
     }
     async fn put_inward(&self, p: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let (existed, exposure) = self.exposures.put_inward(self, p, id, name, request).await?;
