@@ -64,7 +64,9 @@ lock file beside it and renamed into place at mode 0600, with the token in
 writes `drydock-tcp-token <token>`, the file's token, to stdout before the
 supervisor detaches. The variable is not passed on to the supervisor or agent.
 `drydock-agent --print-token --tcp-token-file PATH` reads the token back later
-under the agent's own checks, replacing nothing. The agent reads the file once at startup (and
+under the agent's own checks, replacing nothing; that standalone form takes
+exactly those arguments in that order, unlike `--supervise`, where the flags
+may come in any order before `--socket`. The agent reads the file once at startup (and
 again on each re-exec); a new token takes effect when the agent restarts.
 Under `--supervise` the path must be absolute. Keep the file in a private directory such
 as `/run/drydock`: the agent checks the file, not its parent, so in a directory

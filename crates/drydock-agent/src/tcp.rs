@@ -85,6 +85,8 @@ pub fn provision_token(path: &Path, supplied: Option<Token>) -> io::Result<Token
             Some(token) => token,
             None => Token::generate()?,
         };
+        // A pid can repeat across container restarts; under the lock, a leftover
+        // of that name is stale, so it is removed rather than trusted.
         let staging = beside(&format!(".{}", std::process::id()));
         let _ = std::fs::remove_file(&staging);
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staging)?;
