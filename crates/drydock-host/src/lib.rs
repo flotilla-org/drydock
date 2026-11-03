@@ -5,6 +5,7 @@ pub mod local;
 pub use drydock_oci as oci;
 pub mod reference;
 pub mod tensorlake;
+pub mod runtime;
 use axum::{
     Router,
     extract::Request,
