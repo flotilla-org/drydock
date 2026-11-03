@@ -140,6 +140,7 @@ mod tests {
             &["--store", "a", "--store", "b", "--socket", "/s"],
             &["--bogus", "x", "--socket", "/s"],
             &["--store", "--x", "--socket", "/s"],
+            &["--socket", "--x"],
         ] {
             assert!(supervised(&argv(bad)).is_err(), "{bad:?}");
         }
