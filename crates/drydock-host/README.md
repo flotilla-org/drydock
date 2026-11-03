@@ -171,15 +171,24 @@ The key needs sandbox creation/modification/deletion, snapshot creation and bill
 read access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
 
-Daytona declares two image routes. The default is `provider_push` with the
-tools layer added by the host, for images in registries Daytona cannot reach.
-The host reads the base and tools manifests for `linux/amd64` (with
-`PrepareRequest.image_pull`, sent only to the base's registry, for a private
-base), appends the tools image's layer to the base manifest (a manifest and
-blob operation: no container build, no local Docker), mints push access with
-`GET /docker-registry/registry-push-access`, copies the blobs into Daytona's
-registry in `push_chunk_bytes` requests (default 16 MiB), pushes the manifest,
-waits until a pull by digest succeeds, and creates the snapshot from
+Daytona takes upload bootstrap (`BootstrapRoute::Upload`): a snapshot is the
+base image alone, and drydockd puts its own agent build in each sandbox through
+the files port. The port writes a file whole with the toolbox's
+`POST /files/upload-v2?path=` (a raw `application/octet-stream` body; parents
+are made) and then sets its mode with `POST /files/permissions`. The upload is
+one request inside the host's 30-second HTTP deadline, so a 12 MB agent needs
+about 4 Mbit/s up to Daytona. `scripts/live-daytona-upload.py` checks the
+whole path live: prepare, launch, the uploaded agent's hello, a bumped tools
+pin making no new snapshot, and cleanup.
+
+Daytona declares two image routes, both `tools_layer: upload`. The default is
+`provider_push`, for images in registries Daytona cannot reach. The host reads
+the base's `linux/amd64` manifest (with `PrepareRequest.image_pull`, sent only
+to the base's registry, for a private base), mints push access with
+`GET /docker-registry/registry-push-access`, copies the config and layers into
+Daytona's registry in `push_chunk_bytes` requests (default 16 MiB), puts the
+manifest verbatim (so its digest is the base's), waits until a pull by digest
+succeeds, and creates the snapshot from
 `imageName: <registry>/<project>/drydock-vessel@sha256:…` with no `buildInfo`.
 Images above `max_image_gib` (default 20, Daytona's default snapshot maximum;
 compressed size is the lower bound checked), platforms other than amd64 and
@@ -192,42 +201,46 @@ are authenticated host clients and are trusted to name registries. A pull
 credential goes only to its registry's origin, or to Docker Hub's
 `auth.docker.io` token service for `docker.io`.
 
-The fallback, `registry_pull` with the tools layer added by the provider, builds
-the snapshot with `buildInfo.dockerfileContent`: the pinned base plus
-`COPY --from` the pinned tools image's `/opt/drydock/`. Daytona's builder pulls
-both references itself, so a private registry must first be registered for the
-organisation through `POST /docker-registry` (`name`, `url`, `username`,
-`password`; needs `write:registries`). Request it with `--image-route
-registry_pull` or `route` on the prepare request.
+The fallback, `registry_pull`, creates the snapshot from `imageName` set to the
+base reference itself; Daytona pulls it, so a private registry must first be
+registered for the organisation through `POST /docker-registry` (`name`, `url`,
+`username`, `password`; needs `write:registries`). Request it with
+`--image-route registry_pull` or `route` on the prepare request.
 
-Neither route sets entrypoint, command or init. The build selects the tools
-reference through `crates/drydock/tools-image.txt` (or `DRYDOCK_TOOLS_IMAGE` at
-build time); the `unpublished` pin refuses preparation until the first publish.
-Both references must be immutable SHA-256 image references.
+Neither route sets entrypoint, command or init, and neither reads the tools
+image: the prepare request must still name one pinned by digest, but it is not
+part of the snapshot or its name. The base must be an immutable SHA-256 image
+reference.
 
-The snapshot name includes the digest pair, platform and size, not the route:
-both routes produce the same filesystem. Prepare reuses it and waits
-for `active`, for up to four minutes per call. Provision inherits the snapshot's
-resources and refuses a size that differs from the prepared key. Requests must
-use whole vCPU and GiB within the default 4 vCPU, 8 GiB RAM and 10 GiB disk cap.
+The snapshot name includes the image digest, platform and size, not the route
+(both make the same filesystem) and not the tools pin, so a pin bump makes no
+new snapshot. Snapshots made before upload bootstrap that carry a baked agent
+keep their names and are reused: drydockd finds the agent there and starts it.
+Prepare reuses a snapshot and waits for `active`, for up to four minutes per
+call. Provision inherits the snapshot's resources and refuses a size that
+differs from the prepared key. Requests must use whole vCPU and GiB within the
+default 4 vCPU, 8 GiB RAM and 10 GiB disk cap.
 
 Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
-disables auto-stop/auto-pause and auto-delete, waits for started, then executes
-`/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`.
-The baked binary detaches a supervisor, uses an OS file lock to make concurrent
-bootstraps converge, and restarts the fixed agent after a crash. It requires
-neither Python nor util-linux `flock`. PID 1 remains Daytona's daemon.
+disables auto-stop/auto-pause and auto-delete, and waits for started; it runs no
+guest command. drydockd then looks for `/opt/drydock/drydock-agent`, uploads
+its build for the prepared platform when it is missing (to
+`drydock-agent.upload` beside it, then moved into place), and runs
+`/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`. The
+agent detaches a supervisor, uses an OS file lock to make concurrent bootstraps
+converge, and restarts the agent after a crash. It requires neither Python nor
+util-linux `flock`. PID 1 remains Daytona's daemon. Resume starts the sandbox,
+and drydockd starts the agent again the same way.
 
-Toolbox bootstrap has a 25-second execution budget; ordinary exec/probes get
-20 seconds. Bootstrap starts supervision; it does not claim agent readiness.
-`drydockd` waits up to 60 seconds for the agent's `Client::connect_current`
-handshake over the SSH gateway before returning launch success. It upgrades an
-older tools agent to the build for the platform recorded in the prepared form,
-then verifies the current hello. Daytona declares only `linux/amd64`: its
-sandboxes run on x86_64, and its snapshot API takes no platform, so the push
-route composes the amd64 manifests, both `FROM` lines of the fallback's
-Dockerfile carry `--platform=linux/amd64`, and the snapshot name includes the
-platform. Lookup order for platform `<os>/<arch>`:
+Toolbox commands get a 20-second budget. Starting supervision does not claim
+agent readiness: `drydockd` waits up to 60 seconds for the agent's
+`Client::connect_current` handshake over the SSH gateway before returning
+launch success. An agent found in an older snapshot is upgraded to the build
+for the platform recorded in the prepared form, then the current hello is
+verified. Daytona declares only `linux/amd64`: its sandboxes run on x86_64,
+and its snapshot API takes no platform, so the push route copies the amd64
+manifest and the snapshot name includes the platform. Lookup order for
+platform `<os>/<arch>`:
 
 1. `DRYDOCK_AGENT_BIN_<OS>_<ARCH>` (for example `DRYDOCK_AGENT_BIN_LINUX_ARM64`);
 2. `DRYDOCK_AGENT_BIN`, only when the guest's platform is the host's own;

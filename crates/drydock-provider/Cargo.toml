@@ -6,6 +6,7 @@ license.workspace = true
 [dependencies]
 drydock-protocol = { path = "../drydock-protocol" }
 async-trait = "0.1"
+bytes = "1"
 rigging-http-client.workspace = true
 rigging-stream.workspace = true
 serde.workspace = true

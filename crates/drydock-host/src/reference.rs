@@ -56,6 +56,14 @@ struct ReferenceSettings {
     /// stand-in vessel is the test host.
     #[serde(default)]
     host_filesystem: bool,
+    /// Declare upload bootstrap with the files port: drydock puts and starts
+    /// the agent. Guest files and the commands drydock runs are modelled in
+    /// memory, readable through the `guest` fixture action.
+    #[serde(default)]
+    upload: bool,
+    /// Every file put fails with this error.
+    #[serde(default)]
+    upload_fault: Option<ProtocolError>,
 }
 fn default_workspace_root() -> String {
     "/workspace".into()
@@ -84,6 +92,10 @@ struct Memory {
     inventory_error: bool,
     running_since: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     usage: Vec<(Size, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    /// Per environment: guest files by path, as (bytes, mode).
+    files: BTreeMap<String, BTreeMap<String, (bytes::Bytes, u32)>>,
+    /// Per environment: the files and agent commands drydock ran, in order.
+    guest: BTreeMap<String, Vec<String>>,
 }
 
 impl Memory {
@@ -112,7 +124,14 @@ impl Provider for Reference {
         ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
     }
     fn operations(&self) -> Operations<'_> {
-        Operations { exec: Some(self), suspend_resume: Some(self), export: Some(self), usage: Some(self), quota: Some(self) }
+        Operations {
+            exec: Some(self),
+            suspend_resume: Some(self),
+            export: Some(self),
+            usage: Some(self),
+            quota: Some(self),
+            files: self.settings.upload.then_some(self as &dyn GuestFiles),
+        }
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -134,7 +153,7 @@ impl Provider for Reference {
                 },
             },
             fallback_runner: true,
-            bootstrap: BootstrapRoute::Bake,
+            bootstrap: if self.settings.upload { BootstrapRoute::Upload } else { BootstrapRoute::Bake },
             agent: self.settings.agent,
             platforms: self.settings.platforms.clone(),
             // Modelled as a runtime that pulls public images and bakes the tools itself.
@@ -220,6 +239,8 @@ impl Provider for Reference {
         let mut state = self.state.recover();
         state.stop_billing(id);
         state.environments.remove(id);
+        state.files.remove(id);
+        state.guest.remove(id);
         state.tokens.remove(id);
         state.tools_generation.remove(id);
         Ok(())
@@ -294,6 +315,12 @@ impl Exec for Reference {
                         "challenge": r.command.get(3).ok_or_else(|| refused("missing tools probe challenge"))?
                     })
                 }
+                "guest" => serde_json::json!({
+                    "log": state.guest.get(id).cloned().unwrap_or_default(),
+                    "files": state.files.get(id).map(|files| files.iter().map(|(path, (bytes, mode))| {
+                        (path.clone(), serde_json::json!({"bytes": String::from_utf8_lossy(bytes), "mode": mode}))
+                    }).collect::<serde_json::Map<_, _>>()).unwrap_or_default(),
+                }),
                 "forget" => {
                     state.stop_billing(target);
                     state.environments.remove(target);
@@ -338,6 +365,11 @@ impl Exec for Reference {
         }
         self.check()?;
         self.find(id)?;
+        if self.settings.upload
+            && let Some(output) = self.guest_command(id, &r.command)?
+        {
+            return Ok(Box::new(std::io::Cursor::new(output.into_bytes())));
+        }
         if r.command.first().map(String::as_str) != Some("echo") {
             return Err(refused("reference exec supports cat and echo"));
         }
@@ -348,6 +380,67 @@ impl Exec for Reference {
             let _ = server.shutdown().await;
         });
         Ok(Box::new(client))
+    }
+}
+
+impl Reference {
+    /// The guest commands upload bootstrap runs, modelled on the in-memory
+    /// files: whether the agent is there, moving an upload into place, and
+    /// starting the supervisor, which needs an executable agent.
+    fn guest_command(&self, id: &str, argv: &[String]) -> Result<Option<String>> {
+        const AGENT: &str = "/opt/drydock/drydock-agent";
+        let mut state = self.state.recover();
+        let state = &mut *state;
+        let files = state.files.entry(id.into()).or_default();
+        let log = state.guest.entry(id.into()).or_default();
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let failed = |exit_code: i32, output: &str| ProtocolError::CommandFailed {
+            reason: "reference guest command failed".into(),
+            exit_code,
+            output: Secret::new(output),
+        };
+        match argv.as_slice() {
+            ["sh", "-c", script] if script.starts_with("if test -x ") => {
+                let path = script.trim_start_matches("if test -x ").split(';').next().unwrap_or_default();
+                let present = files.get(path).is_some_and(|(_, mode)| mode & 0o111 != 0);
+                log.push(format!("probe {path}"));
+                Ok(Some(if present {
+                    "present
+"
+                    .into()
+                } else {
+                    String::new()
+                }))
+            }
+            ["mv", "-f", from, to] => {
+                let file = files.remove(*from).ok_or_else(|| failed(1, "mv: cannot stat: No such file or directory"))?;
+                files.insert((*to).into(), file);
+                log.push(format!("mv {from} {to}"));
+                Ok(Some(String::new()))
+            }
+            [AGENT, "--supervise", ..] => {
+                if !files.get(AGENT).is_some_and(|(_, mode)| mode & 0o111 != 0) {
+                    return Err(failed(127, "sh: /opt/drydock/drydock-agent: not found"));
+                }
+                log.push(format!("start {}", argv.join(" ")));
+                Ok(Some(String::new()))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl GuestFiles for Reference {
+    async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, _: &Credentials) -> Result<()> {
+        self.check()?;
+        self.find(id)?;
+        if let Some(error) = &self.settings.upload_fault {
+            return Err(error.clone());
+        }
+        let mut state = self.state.recover();
+        state.guest.entry(id.into()).or_default().push(format!("put {} {:o}", file.path, file.mode));
+        state.files.entry(id.into()).or_default().insert(file.path, (bytes, file.mode));
+        Ok(())
     }
 }
 

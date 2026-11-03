@@ -5,8 +5,8 @@ use crate::{
         self, GIB, LABEL_TAG, SizeLimits, StateTable, Vendor,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found, https_base, join},
         egress::normal_cidr,
-        guest::{Guest, GuestOutput, SUPERVISE},
-        image::{check_prepare, check_prepared, content_name, tools_dockerfile},
+        guest::{Guest, GuestOutput},
+        image::{check_prepare, check_prepared, content_name},
     },
     module::*,
     oci::{self, ImageRef, Registry},
@@ -118,15 +118,9 @@ struct CreateSnapshot<'a> {
     cpu: u64,
     memory: u64,
     disk: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    build_info: Option<BuildInfo>,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildInfo {
-    dockerfile_content: String,
+    /// The base image, by digest: in Daytona's registry (push route) or one
+    /// the organization registered (pull route).
+    image_name: &'a str,
 }
 #[derive(Serialize)]
 struct Execute<'a> {
@@ -364,7 +358,8 @@ impl Daytona {
         }
         Ok(())
     }
-    async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<GuestOutput> {
+    /// A route on the sandbox's toolbox.
+    async fn toolbox(&self, id: &str, segments: &[&str], c: &Credentials) -> Result<Url> {
         let base = match &self.settings.toolbox_url {
             Some(base) => base.clone(),
             None => {
@@ -378,15 +373,12 @@ impl Daytona {
             }
         };
         let base = https_base(DAYTONA, &base).map_err(|_| DAYTONA.bad_response())?;
-        let url = join(&base, &[id, "process", "execute"]).map_err(|_| DAYTONA.bad_response())?;
+        join(&base, &[&[id], segments].concat()).map_err(|_| DAYTONA.bad_response())
+    }
+    async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<GuestOutput> {
+        let url = self.toolbox(id, &["process", "execute"], c).await?;
         let v: Executed = self.api.call(Method::POST, url, Body::json(&Execute { command, timeout })?, c).await?;
         Ok(GuestOutput::from_text(&v.result, "", Some(v.exit_code.into())))
-    }
-    /// The baked executable owns detachment, singleton locking and crash
-    /// recovery. Guest packages and a socket inode are not readiness proof;
-    /// the daemon waits for the agent client's normal hello handshake.
-    async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<()> {
-        self.execute(id, SUPERVISE, 25, c).await?.success(DAYTONA).map(drop)
     }
     // Lifecycle state checks deliberately avoid explicit inspect's root probe.
     async fn lifecycle_state(&self, id: &str, c: &Credentials) -> Result<Observation> {
@@ -410,23 +402,16 @@ impl Daytona {
         .await?
         .ok_or_else(|| ProtocolError::unavailable("Daytona sandbox has not started", Some(5)))
     }
-    /// Push route: append the tools layer to the base image's manifest here,
-    /// upload the result into Daytona's registry with minted push access, and
-    /// wait until a pull by digest succeeds. Returns the digest reference.
+    /// Push route: copy the base image, for the platform, into Daytona's
+    /// registry with minted push access, and wait until a pull by digest
+    /// succeeds. Returns the digest reference.
     async fn push(&self, r: &PrepareRequest, platform: &Platform, tag: &str, c: &Credentials) -> Result<String> {
         let http = self.api.http();
         let base = ImageRef::parse(&r.image_digest)?;
-        let tools = ImageRef::parse(&r.tools_digest)?;
         // The pull credential belongs to the base's registry and goes nowhere else.
-        let base_registry = Registry::new(http.clone(), &base.registry, r.image_pull.clone(), None)?;
-        let tools_credential = if tools.registry == base.registry { r.image_pull.clone() } else { None };
-        let tools_registry = Registry::new(http.clone(), &tools.registry, tools_credential, None)?;
-        let base_manifest = base_registry.platform_manifest(&base, platform).await?;
-        let base_config = base_registry.config(&base.repository, &base_manifest).await?;
-        let tools_manifest = tools_registry.platform_manifest(&tools, platform).await?;
-        let tools_config = tools_registry.config(&tools.repository, &tools_manifest).await?;
-        let composed = oci::compose(&base_manifest, &base_config, &tools_manifest, &tools_config, platform)?;
-        fits_snapshot(composed.bytes(), self.settings.max_image_gib)?;
+        let source = Registry::new(http.clone(), &base.registry, r.image_pull.clone(), None)?;
+        let manifest = source.platform_manifest(&base, platform).await?;
+        fits_snapshot(manifest.image_bytes()?, self.settings.max_image_gib)?;
         // Daytona resolves `regionId` here only among the organisation's own regions and
         // answers 404 "Region not found" for the shared ones (eu, us), so none is sent.
         let access: PushAccess = self.api.get(self.api.url(&["docker-registry", "registry-push-access"])?, c).await?;
@@ -438,20 +423,13 @@ impl Daytona {
         let credential = RegistryCredential { username: access.username.into(), secret: Secret::new(String::from(access.secret)) };
         let target = Registry::new(http.clone(), host, Some(credential), Some(access.expires_at)).map_err(|_| bad())?;
         let repository = format!("{}/drydock-vessel", access.project);
-        for (source, layer) in &composed.layers {
-            let (registry, from) = match source {
-                oci::Source::Base => (&base_registry, &base.repository),
-                oci::Source::Tools => (&tools_registry, &tools.repository),
-            };
-            oci::copy_blob(registry, from, &target, &repository, layer, self.settings.push_chunk_bytes).await?;
-        }
-        target.put_blob(&repository, &composed.config_digest, composed.config.clone().into()).await?;
+        oci::copy_image(&source, &base.repository, &manifest, &target, &repository, self.settings.push_chunk_bytes).await?;
         // Tagged so the registry retains it; Daytona itself is given the digest.
-        target.put_manifest(&repository, tag, &composed.media_type, composed.manifest.clone().into()).await?;
+        target.put_manifest(&repository, tag, &manifest.media_type, manifest.bytes.clone()).await?;
         // Daytona's registry serves a new manifest only after a delay, and its
         // builder pulls once at snapshot creation (cf. `daytona snapshot push`).
         kit::poll(60, Duration::from_secs(1), async || {
-            Ok(target.manifest_visible(&repository, &composed.digest).await?.then(|| format!("{host}/{repository}@{}", composed.digest)))
+            Ok(target.manifest_visible(&repository, &manifest.digest).await?.then(|| format!("{host}/{repository}@{}", manifest.digest)))
         })
         .await?
         .ok_or_else(|| ProtocolError::unavailable("pushed image is not yet visible in Daytona's registry", Some(5)))
@@ -607,7 +585,8 @@ impl Provider for Daytona {
                 model: egress_model(),
             },
             fallback_runner: true,
-            bootstrap: BootstrapRoute::Bake,
+            // The toolbox writes files, so drydock puts the agent in each sandbox.
+            bootstrap: BootstrapRoute::Upload,
             agent: true,
             platforms: vec![platform()],
             image_routes: vec![
@@ -615,15 +594,15 @@ impl Provider for Daytona {
                 ImageRoute::ProviderPush {
                     protocol: PushProtocol::OciDistribution,
                     credential_lifetime_seconds: Some(3600),
-                    tools_layer: ToolsLayer::Host,
+                    tools_layer: ToolsLayer::Upload,
                 },
-                // Daytona's builder pulls the base and tools itself, from a
-                // registry the organization registered via POST /docker-registry.
+                // Daytona pulls the base itself, from a registry the
+                // organization registered via POST /docker-registry.
                 ImageRoute::RegistryPull {
                     auth: RegistryAuthKind::Basic,
                     registration: CredentialRegistration::ProviderApi,
                     digest_references: true,
-                    tools_layer: ToolsLayer::Provider,
+                    tools_layer: ToolsLayer::Upload,
                 },
             ],
             usage: true,
@@ -635,7 +614,14 @@ impl Provider for Daytona {
         ObservationMode::Poll { interval_ms: 30_000 }
     }
     fn operations(&self) -> Operations<'_> {
-        Operations { exec: Some(self), suspend_resume: Some(self), quota: Some(self), usage: Some(self), ..Operations::default() }
+        Operations {
+            exec: Some(self),
+            files: Some(self),
+            suspend_resume: Some(self),
+            quota: Some(self),
+            usage: Some(self),
+            ..Operations::default()
+        }
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         if let Some(limits) = &self.settings.rate_limits {
@@ -655,7 +641,6 @@ impl Provider for Daytona {
         ]
     }
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-        // The references become Dockerfile instructions: pinned, no extra tokens.
         let routes = [ImageRouteKind::ProviderPush, ImageRouteKind::RegistryPull];
         let (route, platform) = check_prepare(DAYTONA, &r, &routes, &platform())?;
         SIZES.check(DAYTONA, &r.size)?;
@@ -664,33 +649,29 @@ impl Provider for Daytona {
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
         // Keep binary units consistent with sandbox readback; decimal conversion
         // would also produce fractions rejected by CreateSnapshot's integer fields.
-        // Both routes produce the same filesystem, so the route is not part of
-        // the key; nor is the tools image, whose agent is only a cache that
-        // the host upgrades to its own build at the first hello.
+        // Both routes produce the same filesystem, the base's, so the route
+        // is not part of the key; nor is the tools image, which no snapshot
+        // holds: drydock uploads the agent to each sandbox.
         let snapshot_name = snapshot_name(&r.image_digest, &platform, &r.size);
         let snapshot = match self.api.find::<Snapshot>(self.api.url(&["snapshots", &snapshot_name])?, c).await? {
             Some(v) => v,
             None => {
-                let mut body = CreateSnapshot {
+                let image_name = match route {
+                    ImageRouteKind::ProviderPush => self.push(&r, &platform, &snapshot_name, c).await?,
+                    // Daytona's snapshot API takes no platform; its amd64
+                    // runners pull that platform's image from the index.
+                    ImageRouteKind::RegistryPull => r.image_digest.clone(),
+                    ImageRouteKind::RemoteBuild => unreachable!("check_prepare admits declared routes only"),
+                };
+                let body = CreateSnapshot {
                     name: &snapshot_name,
                     region_id: &self.settings.region,
                     sandbox_class: "container",
                     cpu: r.size.cpus as u64,
                     memory: r.size.memory_bytes / GIB,
                     disk: r.size.disk_bytes / GIB,
-                    image_name: None,
-                    build_info: None,
+                    image_name: &image_name,
                 };
-                match route {
-                    ImageRouteKind::ProviderPush => body.image_name = Some(self.push(&r, &platform, &snapshot_name, c).await?),
-                    ImageRouteKind::RegistryPull => {
-                        // Daytona's snapshot API takes no platform; pin both multi-arch
-                        // references in the build so the snapshot matches the prepared form.
-                        let dockerfile_content = tools_dockerfile(&r.image_digest, &r.tools_digest, &platform);
-                        body.build_info = Some(BuildInfo { dockerfile_content });
-                    }
-                    ImageRouteKind::RemoteBuild => unreachable!("check_prepare admits declared routes only"),
-                }
                 match self.unless_conflict(Method::POST, self.api.url(&["snapshots"])?, Body::json(&body)?, c).await? {
                     Some(snapshot) => snapshot,
                     None => self.api.get(self.api.url(&["snapshots", &snapshot_name])?, c).await?,
@@ -744,12 +725,9 @@ impl Provider for Daytona {
             // provision does not implicitly resume an existing label. A sandbox still
             // starting is likewise returned as observed (unlike the create-conflict
             // path below, which waits): the caller polls it.
-            let mut row = self.environment(&v)?;
+            let row = self.environment(&v)?;
             if matches!(row.state, Observation::Running) {
-                // Every Running re-adoption bootstraps; the guest supervisor's
-                // lock makes this idempotent even across concurrent hosts.
-                self.bootstrap(&row.id, c).await?;
-                row = self.inspect(&row.id, c).await?;
+                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
             }
             return Ok(Provisioned::Existing(row));
         }
@@ -778,13 +756,11 @@ impl Provider for Daytona {
                 }
 
                 let row = self.wait_started(&v.id, c).await?;
-                self.bootstrap(&row.id, c).await?;
                 return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
             }
             Some(v) => v,
         };
         let row = self.wait_started(&v.id, c).await?;
-        self.bootstrap(&row.id, c).await?;
         Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
@@ -860,13 +836,12 @@ impl SuspendResume for Daytona {
         DAYTONA.check_resume("drydock-resume-", &self.name, id, &token)?;
         let state = self.lifecycle_state(id, c).await?;
         if matches!(state, Observation::Running) {
-            return self.bootstrap(id, c).await;
+            return Ok(());
         }
         if !matches!(state, Observation::Transitioning { phase: TransitionPhase::Starting }) {
             self.post(self.sandbox_url(id, Some("start"))?, c).await?;
         }
         self.wait_started(id, c).await?;
-        self.bootstrap(id, c).await?;
         Ok(())
     }
 }
@@ -874,6 +849,19 @@ impl SuspendResume for Daytona {
 impl Exec for Daytona {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
         Guest::exec(self, id, r, c).await
+    }
+}
+/// The toolbox writes the file whole (making its parents), then sets its
+/// mode: an upload carries none.
+#[async_trait]
+impl GuestFiles for Daytona {
+    async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, c: &Credentials) -> Result<()> {
+        let mut url = self.toolbox(id, &["files", "upload-v2"], c).await?;
+        url.query_pairs_mut().append_pair("path", &file.path);
+        self.api.call::<IgnoredAny>(Method::POST, url, Body::Bytes(bytes, "application/octet-stream"), c).await?;
+        let mut url = self.toolbox(id, &["files", "permissions"], c).await?;
+        url.query_pairs_mut().append_pair("path", &file.path).append_pair("mode", &format!("{:04o}", file.mode));
+        self.post(url, c).await
     }
 }
 #[async_trait]
@@ -1037,7 +1025,9 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 // Call only after validate_size: whole positive CPUs make the integer cast lossless.
 /// The prepared form's key. "frozen-agent" sets apart snapshots made since
 /// the agent's upgrade path was frozen: those made before carry an agent
-/// that predates it, so they are prepared again, once.
+/// that predates it, so they are prepared again, once. Snapshots made since
+/// then that still carry a baked agent are reused: drydock finds the agent
+/// there, starts it and upgrades it at the first hello.
 fn snapshot_name(image: &str, platform: &Platform, size: &Size) -> String {
     name("snapshot", &format!("frozen-agent\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
 }

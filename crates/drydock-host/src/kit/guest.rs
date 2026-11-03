@@ -8,10 +8,6 @@ use async_trait::async_trait;
 use drydock_protocol::*;
 use std::collections::BTreeMap;
 
-/// The agent's supervisor without a TCP listener (reach by SSH). The baked
-/// executable owns detachment, singleton locking and crash recovery.
-pub const SUPERVISE: &str = "/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock";
-
 /// What one guest command printed and how it ended.
 #[derive(Default, Debug)]
 pub struct GuestOutput {

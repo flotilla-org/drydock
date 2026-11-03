@@ -124,11 +124,13 @@ described above, rather than refusing the vessel for a fingerprint mismatch. Res
 for the guest architecture. The prepared form is the selected base plus the
 tools layer, added where the image route the module declares says: built at
 the provider, or appended to the base manifest by the host. Record the prepared form at the provider. Leave the base's entrypoint,
-command and init unchanged. On `BootstrapRoute::Upload`, deliver the identical
-files under `/opt/drydock` instead of baking them. A vessel whose image has no
-agent gets one placed by its module before the first hello, through the
-provider's own route: a files API, a copy or upload, or at worst exec with the
-binary piped to a file that is then made executable, which every module can do.
+command and init unchanged. On `BootstrapRoute::Upload` nothing is baked: the
+prepared form is the base alone, and a module with the files port (`GuestFiles`)
+has drydockd put its own agent build at `/opt/drydock/drydock-agent` (written
+beside it, then moved into place) and start it with `--supervise --socket
+/run/drydock/agent.sock` through exec, after provision and after resume,
+unless an agent is already there. A module on Upload without the files port
+places and starts its own (`local` does).
 
 Each module decides its key from the image digest, the platform and any
 provider prepare-time constraints; Daytona adds size (#44). The tools digest is

@@ -79,6 +79,8 @@ pub trait ProviderApi: Send + Sync {
     async fn usage(&self, provider: &str, period: &Period) -> Result<Usage, Error>;
     async fn relay(&self, provider: &str, id: &str) -> Result<ByteStream, Error>;
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error>;
+    /// Write one file into a guest, through the provider's files port.
+    async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
     /// The same API, using `credential` instead of any held one for each call.
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi>;
     /// Server only: replace the held credential.
@@ -206,6 +208,15 @@ impl ProviderApi for Client {
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error> {
         self.upgrade(provider, id, "exec", "drydock-stream", Some(command)).await
     }
+    async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
+        let request = self
+            .request(Method::PUT, &["v1", "providers", provider, "environments", id, "files"])?
+            .query(file)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes);
+        self.execute_response::<()>(request).await?;
+        Ok(())
+    }
     async fn put_inward(&self, provider: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let request =
             self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "inward", name])?.json(request);
@@ -306,6 +317,7 @@ fn routes() -> OpenApiRouter<Surface> {
         .routes(routes!(reach))
         .routes(routes!(relay))
         .routes(routes!(exec))
+        .routes(routes!(put_file))
         .routes(routes!(suspend))
         .routes(routes!(resume))
         .routes(routes!(export))
@@ -591,6 +603,32 @@ async fn exec(
     let ApiJson(command) = ApiJson::<ExecRequest>::from_request(request, &()).await.map_err(|refusal| refusal.0)?;
     let stream = api.exec(&p, &id, &command).await?;
     Ok(switch(on, "drydock-stream", stream, s.stopping))
+}
+/// A file's raw bytes, as the files route takes them.
+#[derive(utoipa::ToSchema)]
+#[schema(value_type = String, format = Binary)]
+#[allow(dead_code)]
+struct FileBytes(Vec<u8>);
+/// The largest file the files route takes: an agent build with room to grow.
+pub const GUEST_FILE_LIMIT: usize = 256 << 20;
+#[utoipa::path(put, tag = "host", path = "/v1/providers/{provider}/environments/{id}/files",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),
+("path" = String, Query, description = "Absolute guest path; parents are made and an existing file replaced"),
+("mode" = u32, Query, description = "Permission bits, at most 0o7777 (4095)")),
+request_body(content = FileBytes, content_type = "application/octet-stream", description = "The file's bytes"),
+responses((status = 204, description = "The file is in place"), ErrorResponses)
+)]
+async fn put_file(
+    Api(api): Api,
+    ApiPath((p, id)): ApiPath<(String, String)>,
+    ApiQuery(file): ApiQuery<GuestFile>,
+    body: Body,
+) -> ApiResult<StatusCode> {
+    let bytes = axum::body::to_bytes(body, GUEST_FILE_LIMIT)
+        .await
+        .map_err(|_| Error::InvalidRequest(format!("file body unreadable or over {GUEST_FILE_LIMIT} bytes")))?;
+    api.put_file(&p, &id, &file, bytes).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

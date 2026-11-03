@@ -98,6 +98,7 @@ pub struct Inner {
     resolver: Arc<dyn ImageResolver>,
     dialer: Arc<dyn crate::agent::SshDialer>,
     builds: Arc<dyn AgentBuilds>,
+    hello_timeout: Duration,
     exposures: crate::exposures::Exposures,
     staging: crate::staging::Staging,
     /// One lock per label, so two first provisions of a label share one key
@@ -118,6 +119,8 @@ pub struct Seams {
     pub timing: crate::exposures::Timing,
     /// Registries, as staging reaches them.
     pub registries: crate::staging::Transfer,
+    /// How long a launch waits for a new vessel's agent to say hello.
+    pub hello_timeout: Duration,
 }
 impl Seams {
     pub fn new(resolver: Arc<dyn ImageResolver>) -> Self {
@@ -128,6 +131,7 @@ impl Seams {
             guest: Default::default(),
             timing: Default::default(),
             registries: Default::default(),
+            hello_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -172,7 +176,7 @@ impl Daemon {
         options: Vec<HostOption>,
         seams: Seams,
     ) -> Result<Arc<Self>, String> {
-        let Seams { resolver, dialer, builds, guest, timing, registries } = seams;
+        let Seams { resolver, dialer, builds, guest, timing, registries, hello_timeout } = seams;
         crate::local::private_dir(run)?;
         let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
         let mut discovered = Vec::new();
@@ -272,6 +276,7 @@ impl Daemon {
             resolver,
             dialer,
             builds,
+            hello_timeout,
             keying: Default::default(),
             stopping: tokio::sync::watch::channel(false).0,
         });
@@ -461,14 +466,42 @@ impl Daemon {
         let client = host.handle.client.credentialed(self.credential.clone());
         let environment = self.invalidating(provider, client.provision(provider, &request).await).await?.into_inner();
         if let Some(build) = agent_build {
+            if self.uploads(provider) {
+                launch::upload_agent(&client, provider, &environment.id, &build).await?;
+            }
             self.agent_ready(provider, &environment, &platform, &build).await?;
         }
         Ok(environment)
     }
+    /// Whether drydock puts and starts this provider's vessel agents itself:
+    /// its vessels run one, on the upload route, through its files and exec ports.
+    fn uploads(&self, provider: &str) -> bool {
+        let Ok(host) = self.host(provider) else { return false };
+        let status = host.handle.status.borrow();
+        status.providers.iter().any(|d| {
+            d.provider == provider
+                && d.capabilities.agent
+                && d.capabilities.bootstrap == BootstrapRoute::Upload
+                && d.ports.files
+                && d.ports.exec
+        })
+    }
+    /// Upload bootstrap for a running vessel of a provider that takes it: its
+    /// agent put in place, for `platform`, when absent, and started.
+    async fn bootstrap(&self, provider: &str, environment: &Environment, platform: Option<&Platform>) -> Result<(), Error> {
+        if !self.uploads(provider) || !matches!(environment.state, Observation::Running) {
+            return Ok(());
+        }
+        let platform = platform.or(environment.platform.as_ref()).ok_or_else(|| {
+            Error::Protocol(ProtocolError::Refused { reason: "the vessel's platform is unknown, so no agent build can be chosen".into() })
+        })?;
+        let build = self.agent_build(platform).await?;
+        launch::upload_agent(&self.runtime(provider)?, provider, &environment.id, &build).await
+    }
     /// Wait for the vessel agent's current hello, pushing `build` (the agent for
     /// the prepared `platform`) to an older one.
     async fn agent_ready(&self, provider: &str, environment: &Environment, platform: &Platform, build: &[u8]) -> Result<(), Error> {
-        self.agent(provider, environment, platform, build, Duration::from_secs(60)).await.map(drop)
+        self.agent(provider, environment, platform, build, self.hello_timeout).await.map(drop)
     }
     async fn agent(
         &self,
@@ -636,7 +669,12 @@ impl ProviderApi for Daemon {
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
         let keyed = self.keyed(p, request).await?;
-        self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await
+        let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
+        let environment = match &provisioned {
+            crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment) => environment,
+        };
+        self.bootstrap(p, environment, Some(&request.prepared.platform)).await?;
+        Ok(provisioned)
     }
     async fn list(&self, p: &str) -> Result<Vec<Environment>, Error> {
         if self.credential.is_some() {
@@ -664,7 +702,14 @@ impl ProviderApi for Daemon {
         result
     }
     async fn resume(&self, p: &str, id: &str, token: &ResumeToken) -> Result<(), Error> {
-        let result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
+        let mut result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
+        // The supervisor died with the vessel's processes; start it again.
+        if result.is_ok() && self.uploads(p) {
+            result = match self.runtime(p)?.inspect(p, id).await {
+                Ok(environment) => self.bootstrap(p, &environment, None).await,
+                Err(error) => Err(error),
+            };
+        }
         self.exposures.poke(p, id);
         result
     }
@@ -682,6 +727,9 @@ impl ProviderApi for Daemon {
     }
     async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
         self.runtime(p)?.exec(p, id, command).await
+    }
+    async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
+        self.runtime(p)?.put_file(p, id, file, bytes).await
     }
     async fn put_inward(&self, p: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let (existed, exposure) = self.exposures.put_inward(self, p, id, name, request).await?;
