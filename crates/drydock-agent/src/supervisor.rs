@@ -3,37 +3,9 @@ use std::{
     ffi::OsString,
     io,
     os::unix::{fs::OpenOptionsExt, process::CommandExt},
-    path::PathBuf,
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-
-/// The supervised socket, which comes last: every process of a vessel's
-/// agent ends its argv with `--socket PATH`, so a host can find them all by
-/// it. Options before it (`--store DIR`, `--tcp ADDR:PORT`,
-/// `--tcp-token-file PATH`) are the agent's, passed on to every agent the
-/// supervisor starts.
-fn socket(args: &[OsString]) -> io::Result<PathBuf> {
-    const OPTIONS: &[&str] = &["--store", "--tcp", "--tcp-token-file"];
-    let usage = || io::Error::other("usage: drydock-agent --supervise [--store DIR] [--tcp ADDR:PORT --tcp-token-file PATH] --socket PATH");
-    let [options @ .., flag, path] = args else { return Err(usage()) };
-    let names: Vec<_> = options.chunks(2).map(|pair| &pair[0]).collect();
-    if flag != "--socket"
-        || options.len() % 2 != 0
-        || !names.iter().all(|name| OPTIONS.iter().any(|option| name == option))
-        || (1..names.len()).any(|i| names[..i].contains(&names[i]))
-    {
-        return Err(usage());
-    }
-    if let Some(pair) = args.chunks(2).find(|pair| pair[1].as_encoded_bytes().starts_with(b"--")) {
-        return Err(io::Error::other(format!(
-            "{} takes a value, not {:?}; name a path beginning with -- as ./--…",
-            pair[0].display(),
-            pair[1]
-        )));
-    }
-    Ok(path.into())
-}
 
 /// Refuses a TCP listener the agent would refuse, before detaching, so the
 /// provider's bootstrap hears of it rather than a supervisor that restarts
@@ -112,7 +84,7 @@ fn provision(args: &[OsString], variable: Option<&str>, print: bool) -> io::Resu
 pub fn start(args: &[OsString]) -> io::Result<()> {
     let (args, variable, print) = bootstrap(args)?;
     let args = &args[..];
-    let path = socket(args)?;
+    let path = drydock_agent::socket::supervised(args)?;
     check_tcp(args)?;
     provision(args, variable.as_deref(), print)?;
     let parent = path.parent().ok_or_else(|| io::Error::other("socket needs a directory"))?;
@@ -137,7 +109,7 @@ pub fn start(args: &[OsString]) -> io::Result<()> {
 }
 
 pub async fn run(args: &[OsString]) -> io::Result<()> {
-    let socket = socket(args)?;
+    let socket = drydock_agent::socket::supervised(args)?;
     let parent = socket.parent().ok_or_else(|| io::Error::other("socket needs a directory"))?;
     drydock_agent::socket::private_directory(parent)?;
     // Keep this inode forever: unlinking a locked file would allow two owners.
