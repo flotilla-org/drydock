@@ -12,9 +12,13 @@
 TOKEN_FILE holds a Modal token pair as JSON, {"token_id": …, "token_secret": …}.
 DIR holds `drydock`, `drydockd`, `drydock-host` and `examples/tunnel_check`
 from this branch (default target/release, from `cargo build --release -p
-drydock -p drydock-host -p drydock-agent --example tunnel_check`). PATH is the
-TypeScript host's `dist/main.js` (default hosts/typescript/dist/main.js, from
-`corepack pnpm build` there). `--agent` names the linux/amd64 agent drydockd
+drydock -p drydock-host -p drydock-agent --bins --example tunnel_check`; without
+`--bins` only the example is built). PATH is the TypeScript host's
+`dist/main.js` (default hosts/typescript/dist/main.js, from `corepack pnpm
+build` there; where Corepack cannot run the pinned pnpm, `npx --yes
+pnpm@12.15.0 install --frozen-lockfile`, then `node scripts/generate.mjs &&
+rm -rf dist && ./node_modules/.bin/tsc && node scripts/executable.mjs`, which
+is what `build` runs). `--agent` names the linux/amd64 agent drydockd
 pushes to the vessel at hello (default DIR/drydock-agent); it must run on
 IMAGE's glibc, so a laptop with a newer glibc than the image passes the
 tools-image release's `drydock-agent-linux-amd64`.
