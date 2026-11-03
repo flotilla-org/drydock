@@ -478,6 +478,7 @@ test("a failed destroy claims nothing", async () => {
 // Inventory is this instance's running sandboxes, by app and tag; another
 // instance's are not listed or inspectable. A sandbox ended by its timeout is
 // gone at its lifetime cap; one terminated elsewhere is destroyed at Modal.
+// An ended sandbox's agent token is forgotten once inspect sees the end.
 test("list and inspect observe this instance's sandboxes", async () => {
   const { standIn, provider, context, provision, advance } = await setup();
   const ids: string[] = [];
@@ -511,6 +512,8 @@ test("list and inspect observe this instance's sandboxes", async () => {
     cause: { kind: "lifetime_cap_reached" },
   });
   await assert.rejects(provider.inspect(foreign, context), kind("not_found"));
+  const tokens: Map<string, string> = (provider as any).tokens;
+  assert.deepEqual([...tokens.keys()], [ids[0]]);
 });
 
 // Quota is the count of live sandboxes against the configured limit.

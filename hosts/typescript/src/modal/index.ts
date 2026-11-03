@@ -630,11 +630,13 @@ class Modal implements Provider {
     });
   }
 
-  async inspect(id: string, { credential, signal }: Context) {
+  async inspect(id: string, { credential }: Context) {
     return this.using(credential, async (vendor) => {
       const { box, tags } = await this.owned(vendor, id);
       try {
         const code = await call(() => box.poll());
+        // An ended sandbox's agent token is never needed again.
+        if (code !== null) this.tokens.delete(id);
         return this.row(box.sandboxId, tags, code);
       } finally {
         box.detach();
