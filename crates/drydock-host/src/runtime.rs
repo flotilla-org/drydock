@@ -589,7 +589,12 @@ impl Runtime {
     /// provider instance, so every `dd-` image this key sees qualifies,
     /// whichever instance built it. One built in the last 30 minutes is
     /// spared, as is one without a creation time: a concurrent prepare's
-    /// image has no sandbox yet, and its provision would find it gone.
+    /// image has no sandbox yet, and its provision would find it gone. The
+    /// grace runs from `createdAt`, so a build slower than it could still be
+    /// taken once ready, before its provision; that is accepted as unlikely.
+    /// Eviction is best-effort: two prepares can both see room and both
+    /// build, and Runtime refuses the one past the limit (409
+    /// `quota_exceeded`, QuotaExhausted).
     async fn image_slot(&self, c: &Credentials) -> Result<()> {
         let limits = self.limits(c).await?;
         let Some(row) = limits["account"].as_array().into_iter().flatten().find(|row| row["limit"] == "image.count") else {
