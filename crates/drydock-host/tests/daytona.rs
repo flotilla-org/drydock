@@ -49,6 +49,8 @@ struct State {
     /// Guest files the toolbox wrote, by (sandbox, path): bytes and mode,
     /// which an upload leaves unset until permissions are set.
     files: BTreeMap<(String, String), (Bytes, Option<String>)>,
+    /// The next permissions call fails with this status.
+    permissions_failure: Option<u16>,
     oci: Registries,
 }
 /// In-memory OCI registries behind the distribution protocol: a private lab
@@ -414,6 +416,9 @@ impl StandIn {
                 let (Some(path), Some(mode)) = (query.get("path"), query.get("mode")) else { reject!("permissions need a path and mode") };
                 if u32::from_str_radix(mode, 8).is_err() {
                     reject!("mode is octal");
+                }
+                if let Some(status) = s.permissions_failure.take() {
+                    return response(status, json!({"statusCode":status,"message":"toolbox unavailable"}));
                 }
                 let Some(file) = s.files.get_mut(&(id, path.clone())) else {
                     return response(404, json!({"statusCode":404,"message":"file not found"}));
@@ -1340,6 +1345,13 @@ async fn files_port_uploads_then_sets_the_mode() {
     let stored = http.0.lock().unwrap().files[&(id.clone(), "/opt/drydock/drydock-agent.upload".into())].clone();
     assert_eq!(stored, (Bytes::from_static(b"agent build"), Some("0755".into())));
     assert!(matches!(files.put("absent", file("/a"), Bytes::new(), &c).await, Err(ProtocolError::NotFound { .. })));
+    // A mode that fails to set fails the put; putting the file again recovers.
+    http.0.lock().unwrap().permissions_failure = Some(502);
+    let path = "/opt/drydock/again";
+    assert_eq!(files.put(&id, file(path), Bytes::from_static(b"one"), &c).await.unwrap_err().class(), "unavailable");
+    assert_eq!(http.0.lock().unwrap().files[&(id.clone(), path.into())].1, None);
+    files.put(&id, file(path), Bytes::from_static(b"two"), &c).await.unwrap();
+    assert_eq!(http.0.lock().unwrap().files[&(id.clone(), path.into())], (Bytes::from_static(b"two"), Some("0755".into())));
     http.0.lock().unwrap().failure = Some(503);
     assert_eq!(files.put(&id, file("/b"), Bytes::new(), &c).await.unwrap_err().class(), "unavailable");
 }

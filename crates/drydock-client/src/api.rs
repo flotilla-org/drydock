@@ -609,8 +609,9 @@ async fn exec(
 #[schema(value_type = String, format = Binary)]
 #[allow(dead_code)]
 struct FileBytes(Vec<u8>);
-/// The largest file the files route takes: an agent build with room to grow.
-pub const GUEST_FILE_LIMIT: usize = 256 << 20;
+/// The largest file the files route takes, held whole while it is passed
+/// on: an agent build (about 12 MB) with room to grow, and no more.
+pub const GUEST_FILE_LIMIT: usize = 64 << 20;
 #[utoipa::path(put, tag = "host", path = "/v1/providers/{provider}/environments/{id}/files",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),
 ("path" = String, Query, description = "Absolute guest path; parents are made and an existing file replaced"),

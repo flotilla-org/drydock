@@ -2262,7 +2262,7 @@
     "schemas": {
       "BootstrapRoute": {
         "type": "string",
-        "description": "How a vessel's agent gets into it. On Upload a provider with the files and\nexec ports has drydock put the agent in each vessel and start it; one\nwithout places and starts its own.",
+        "description": "How a vessel's agent gets into it. On Upload a provider with the files and\nexec ports has drydockd put the agent in each vessel and start it, after\nprovision and resume: its module starts none, so a caller that bypasses\ndrydockd gets a vessel without one. One without those ports places and\nstarts its own.",
         "enum": [
           "bake",
           "upload"

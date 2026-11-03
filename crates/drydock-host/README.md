@@ -176,8 +176,10 @@ base image alone, and drydockd puts its own agent build in each sandbox through
 the files port. The port writes a file whole with the toolbox's
 `POST /files/upload-v2?path=` (a raw `application/octet-stream` body; parents
 are made) and then sets its mode with `POST /files/permissions`. The upload is
-one request inside the host's 30-second HTTP deadline, so a 12 MB agent needs
-about 4 Mbit/s up to Daytona. `scripts/live-daytona-upload.py` checks the
+one request with a five-minute deadline (others keep the host's 30 seconds),
+so a 12 MB agent needs about 330 kbit/s up to Daytona. Daytona's module starts
+no agent itself: a caller that provisions or resumes without drydockd gets a
+sandbox without one. `scripts/live-daytona-upload.py` checks the
 whole path live: prepare, launch, the uploaded agent's hello, a bumped tools
 pin making no new snapshot, and cleanup.
 
@@ -214,8 +216,9 @@ reference.
 
 The snapshot name includes the image digest, platform and size, not the route
 (both make the same filesystem) and not the tools pin, so a pin bump makes no
-new snapshot. Snapshots made before upload bootstrap that carry a baked agent
-keep their names and are reused: drydockd finds the agent there and starts it.
+new snapshot. It is marked `base-only`, apart from the snapshots made before
+upload bootstrap with a baked agent: each image is prepared again, once, and a
+build that still bakes never finds a snapshot without its agent.
 Prepare reuses a snapshot and waits for `active`, for up to four minutes per
 call. Provision inherits the snapshot's resources and refuses a size that
 differs from the prepared key. Requests must use whole vCPU and GiB within the
@@ -225,7 +228,7 @@ Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
 disables auto-stop/auto-pause and auto-delete, and waits for started; it runs no
 guest command. drydockd then looks for `/opt/drydock/drydock-agent`, uploads
 its build for the prepared platform when it is missing (to
-`drydock-agent.upload` beside it, then moved into place), and runs
+`drydock-agent.upload-<random>` beside it, then moved into place), and runs
 `/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`. The
 agent detaches a supervisor, uses an OS file lock to make concurrent bootstraps
 converge, and restarts the agent after a crash. It requires neither Python nor

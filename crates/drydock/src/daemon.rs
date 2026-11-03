@@ -467,7 +467,7 @@ impl Daemon {
         let environment = self.invalidating(provider, client.provision(provider, &request).await).await?.into_inner();
         if let Some(build) = agent_build {
             if self.uploads(provider) {
-                launch::upload_agent(&client, provider, &environment.id, &build).await?;
+                launch::upload_agent(&client, provider, &environment.id, build.clone()).await?;
             }
             self.agent_ready(provider, &environment, &platform, &build).await?;
         }
@@ -496,7 +496,7 @@ impl Daemon {
             Error::Protocol(ProtocolError::Refused { reason: "the vessel's platform is unknown, so no agent build can be chosen".into() })
         })?;
         let build = self.agent_build(platform).await?;
-        launch::upload_agent(&self.runtime(provider)?, provider, &environment.id, &build).await
+        launch::upload_agent(&self.runtime(provider)?, provider, &environment.id, build).await
     }
     /// Wait for the vessel agent's current hello, pushing `build` (the agent for
     /// the prepared `platform`) to an older one.
@@ -530,10 +530,11 @@ impl Daemon {
         let build = self.agent_build(&platform).await?;
         self.agent(provider, &environment, &platform, &build, timeout).await
     }
-    async fn agent_build(&self, platform: &Platform) -> Result<Vec<u8>, Error> {
+    async fn agent_build(&self, platform: &Platform) -> Result<bytes::Bytes, Error> {
         self.builds
             .build(platform)
             .await
+            .map(bytes::Bytes::from)
             .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason: format!("no vessel agent build for {platform}: {reason}") }))
     }
 

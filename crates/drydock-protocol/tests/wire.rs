@@ -163,6 +163,7 @@ fn image_route_wire_shapes() {
         json!({"route":"registry_pull","auth":"anonymous","registration":"not_required","digest_references":false,"tools_layer":"provider"}),
         json!({"route":"registry_pull","auth":"basic","registration":"per_request","digest_references":true,"tools_layer":"host"}),
         json!({"route":"remote_build","input":"dockerfile","multi_stage":false,"tools_layer":"provider"}),
+        json!({"route":"registry_pull","auth":"basic","registration":"provider_api","digest_references":true,"tools_layer":"upload"}),
     ] {
         fixture::<ImageRoute>(value);
     }
@@ -306,4 +307,17 @@ fn egress_model_wire_shapes() {
     assert!(
         serde_json::from_value::<EgressSideEffect>(json!({"shapes":[],"opens":[{"kind":"cidr","cidr":"8.8.8.8/33"}],"note":""})).is_err()
     );
+
+// A guest file is an absolute path naming a file, without NUL, and plain
+// permission bits; anything else is refused at decoding.
+#[test]
+fn guest_file_paths_and_modes() {
+    let file = |path: &str, mode: u32| serde_json::from_value::<GuestFile>(json!({"path": path, "mode": mode}));
+    assert_eq!(file("/opt/drydock/drydock-agent", 0o755).unwrap(), GuestFile { path: "/opt/drydock/drydock-agent".into(), mode: 0o755 });
+    assert!(file("/x", 0o7777).is_ok());
+    for (path, mode) in
+        [("opt/drydock/agent", 0o755), ("/opt/drydock/", 0o755), ("/", 0o755), ("/a\0b", 0o755), ("", 0o755), ("/x", 0o10000)]
+    {
+        assert!(file(path, mode).is_err(), "{path:?} {mode:o}");
+    }
 }

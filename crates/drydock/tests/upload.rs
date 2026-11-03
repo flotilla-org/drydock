@@ -16,7 +16,6 @@ use tokio::io::AsyncReadExt;
 const BUILD: &[u8] = b"upload test agent";
 const PROVIDER: &str = "vessels";
 const AGENT: &str = "/opt/drydock/drydock-agent";
-const UPLOAD: &str = "/opt/drydock/drydock-agent.upload";
 const START: &str = "start /opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock";
 
 struct Digests;
@@ -107,7 +106,10 @@ async fn launch_uploads_then_starts_the_agent() {
     let h = Harness::start("").await;
     let launched = h.daemon.launch(PROVIDER, &Default::default()).await.unwrap();
     let guest = h.guest(&launched.id).await;
-    assert_eq!(guest["log"], json!([format!("probe {AGENT}"), format!("put {UPLOAD} 755"), format!("mv {UPLOAD} {AGENT}"), START]));
+    let log: Vec<String> = serde_json::from_value(guest["log"].clone()).unwrap();
+    let upload = log[1].strip_prefix("put ").and_then(|put| put.strip_suffix(" 755")).unwrap();
+    assert!(upload.starts_with(&format!("{AGENT}.upload-")), "{upload}");
+    assert_eq!(log, [format!("probe {AGENT}"), format!("put {upload} 755"), format!("mv {upload} {AGENT}"), START.into()]);
     assert_eq!(guest["files"], json!({AGENT: {"bytes": String::from_utf8_lossy(BUILD), "mode": 0o755}}));
     assert!(h.gateway.dials() > 0, "the launch waited for the agent's hello");
 
@@ -167,4 +169,37 @@ async fn an_agent_that_does_not_hello_fails_the_launch() {
     let log = h.guest(&environment.id).await["log"].clone();
     assert_eq!(log.as_array().unwrap().last().unwrap(), START);
     assert!(h.gateway.dials() > 0);
+}
+
+// Two bootstraps of one vessel at once (a client's provision retried while
+// the first is under way) both find no agent and both upload, each under its
+// own name, so both succeed and the vessel holds one whole agent.
+#[tokio::test]
+async fn concurrent_bootstraps_each_install_a_whole_agent() {
+    let h = Harness::start("").await;
+    let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 };
+    let prepare = PrepareRequest {
+        size: size.clone(),
+        platform: None,
+        route: None,
+        image_pull: None,
+        image_digest: format!("image@sha256:{}", "a".repeat(64)),
+        tools_digest: format!("tools@sha256:{}", "b".repeat(64)),
+    };
+    let prepared = ProviderApi::prepare(&*h.daemon, PROVIDER, &prepare).await.unwrap();
+    let request = ProvisionRequest {
+        label: "twice".into(),
+        prepared,
+        size,
+        egress: EgressRequest::Open,
+        ssh_public_key: Some("ssh-ed25519 AAAA test".into()),
+    };
+    let (first, second) =
+        tokio::join!(ProviderApi::provision(&*h.daemon, PROVIDER, &request), ProviderApi::provision(&*h.daemon, PROVIDER, &request));
+    first.unwrap();
+    second.unwrap();
+    let guest = h.guest(&h.environment().await.id).await;
+    assert_eq!(guest["files"], json!({AGENT: {"bytes": String::from_utf8_lossy(BUILD), "mode": 0o755}}));
+    let log: Vec<String> = serde_json::from_value(guest["log"].clone()).unwrap();
+    assert_eq!(log.iter().filter(|line| line.as_str() == START).count(), 2);
 }

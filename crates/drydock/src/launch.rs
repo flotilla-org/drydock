@@ -202,9 +202,7 @@ impl ImageReference {
 
 /// Where a vessel's agent lives, as the tools image lays it out.
 pub const AGENT_EXECUTABLE: &str = "/opt/drydock/drydock-agent";
-/// Where an upload lands before it is moved into place whole, so a vessel
-/// never holds a partial agent at [`AGENT_EXECUTABLE`].
-const AGENT_UPLOAD: &str = "/opt/drydock/drydock-agent.upload";
+
 /// The agent's self-bootstrap: a detached singleton supervisor serving the
 /// agent's socket, reached by SSH or a relay. Repeating it is harmless.
 pub fn supervise() -> Vec<String> {
@@ -214,20 +212,27 @@ pub fn supervise() -> Vec<String> {
 /// Upload bootstrap, through the provider's files and exec ports: unless the
 /// vessel already holds an agent, put `build` there, then start the agent.
 /// The caller's hello is the proof it runs. A failure names the step.
-pub(crate) async fn upload_agent(api: &dyn ProviderApi, provider: &str, id: &str, build: &[u8]) -> Result<(), Error> {
+pub(crate) async fn upload_agent(api: &dyn ProviderApi, provider: &str, id: &str, build: bytes::Bytes) -> Result<(), Error> {
     let step = |doing: &'static str| {
         move |error: Error| match error {
             Error::Protocol(error) => Error::Protocol(error.context(doing)),
-            other => Error::Transport(format!("{doing}: {other}")),
+            Error::Transport(reason) => Error::Transport(format!("{doing}: {reason}")),
+            Error::InvalidResponse(reason) => Error::InvalidResponse(format!("{doing}: {reason}")),
+            Error::InvalidRequest(reason) => Error::InvalidRequest(format!("{doing}: {reason}")),
+            other => other,
         }
     };
     let present = run(api, provider, id, &["sh", "-c", &format!("if test -x {AGENT_EXECUTABLE}; then echo present; fi")])
         .await
         .map_err(step("look for the vessel agent"))?;
     if present.trim() != "present" {
-        let file = GuestFile { path: AGENT_UPLOAD.into(), mode: 0o755 };
-        api.put_file(provider, id, &file, bytes::Bytes::copy_from_slice(build)).await.map_err(step("upload the vessel agent"))?;
-        run(api, provider, id, &["mv", "-f", AGENT_UPLOAD, AGENT_EXECUTABLE]).await.map_err(step("install the uploaded vessel agent"))?;
+        // The upload lands beside the agent's path and is moved into place
+        // whole, so a vessel never holds a partial agent there. Its name is
+        // this bootstrap's own: two at once each move a whole agent.
+        let upload = format!("{AGENT_EXECUTABLE}.upload-{}", uuid::Uuid::new_v4().simple());
+        let file = GuestFile { path: upload.clone(), mode: 0o755 };
+        api.put_file(provider, id, &file, build).await.map_err(step("upload the vessel agent"))?;
+        run(api, provider, id, &["mv", "-f", &upload, AGENT_EXECUTABLE]).await.map_err(step("install the uploaded vessel agent"))?;
     }
     let argv = supervise();
     run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;

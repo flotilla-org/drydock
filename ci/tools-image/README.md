@@ -127,7 +127,7 @@ the provider, or appended to the base manifest by the host. Record the prepared 
 command and init unchanged. On `BootstrapRoute::Upload` nothing is baked: the
 prepared form is the base alone, and a module with the files port (`GuestFiles`)
 has drydockd put its own agent build at `/opt/drydock/drydock-agent` (written
-beside it, then moved into place) and start it with `--supervise --socket
+beside it under a name of its own, then moved into place) and start it with `--supervise --socket
 /run/drydock/agent.sock` through exec, after provision and after resume,
 unless an agent is already there. A module on Upload without the files port
 places and starts its own (`local` does).

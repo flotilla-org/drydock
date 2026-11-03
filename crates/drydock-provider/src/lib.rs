@@ -168,7 +168,8 @@ pub trait Exec: Send + Sync {
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream>;
 }
 /// Writes files into a guest through the provider's own file API. On
-/// [`BootstrapRoute::Upload`] drydock puts the agent in each vessel this way.
+/// [`BootstrapRoute::Upload`] drydockd puts the agent in each vessel this way
+/// and starts it through [`Exec`]; such a module starts no agent itself.
 #[async_trait]
 pub trait GuestFiles: Send + Sync {
     /// Write `bytes` at `file.path` with `file.mode`, making its parents and

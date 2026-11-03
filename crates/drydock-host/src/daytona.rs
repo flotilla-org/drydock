@@ -33,6 +33,9 @@ const PAGED: Paging = Paging { rows: Some("items"), cursor: "cursor", next: Next
 /// enough for a just-resumed sandbox to settle without stalling the caller.
 const DESTROY_ATTEMPTS: u32 = 5;
 const DESTROY_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// A file upload is one toolbox request: an agent build (about 12 MB) needs
+/// longer than an ordinary call on a slow link.
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 const STATES: StateTable = &[
     ("started", Observation::Running),
@@ -858,7 +861,7 @@ impl GuestFiles for Daytona {
     async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, c: &Credentials) -> Result<()> {
         let mut url = self.toolbox(id, &["files", "upload-v2"], c).await?;
         url.query_pairs_mut().append_pair("path", &file.path);
-        self.api.call::<IgnoredAny>(Method::POST, url, Body::Bytes(bytes, "application/octet-stream"), c).await?;
+        self.api.call_within::<IgnoredAny>(Method::POST, url, Body::Bytes(bytes, "application/octet-stream"), c, UPLOAD_DEADLINE).await?;
         let mut url = self.toolbox(id, &["files", "permissions"], c).await?;
         url.query_pairs_mut().append_pair("path", &file.path).append_pair("mode", &format!("{:04o}", file.mode));
         self.post(url, c).await
@@ -1023,13 +1026,12 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 // The provider records the prepared form under this deterministic resource key.
 // Call only after validate_size: whole positive CPUs make the integer cast lossless.
-/// The prepared form's key. "frozen-agent" sets apart snapshots made since
-/// the agent's upgrade path was frozen: those made before carry an agent
-/// that predates it, so they are prepared again, once. Snapshots made since
-/// then that still carry a baked agent are reused: drydock finds the agent
-/// there, starts it and upgrades it at the first hello.
+/// The prepared form's key. "base-only" sets apart snapshots of the base
+/// alone, made since upload bootstrap, from those carrying a baked agent
+/// (keyed "frozen-agent"): each image is prepared again, once, and a build
+/// that still bakes never finds a snapshot without its agent.
 fn snapshot_name(image: &str, platform: &Platform, size: &Size) -> String {
-    name("snapshot", &format!("frozen-agent\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+    name("snapshot", &format!("base-only\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
 }
 /// Daytona runs x86_64 sandboxes only: "Daytona expects the local image to be
 /// built for AMD64 architecture" (docs, per the sandbox survey, 2026-10).

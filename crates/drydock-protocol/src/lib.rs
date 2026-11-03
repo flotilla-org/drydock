@@ -211,8 +211,10 @@ pub enum CheckoutStrategy {
     CloneInVessel,
 }
 /// How a vessel's agent gets into it. On Upload a provider with the files and
-/// exec ports has drydock put the agent in each vessel and start it; one
-/// without places and starts its own.
+/// exec ports has drydockd put the agent in each vessel and start it, after
+/// provision and resume: its module starts none, so a caller that bypasses
+/// drydockd gets a vessel without one. One without those ports places and
+/// starts its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapRoute {
