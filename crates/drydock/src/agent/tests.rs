@@ -114,6 +114,84 @@ async fn connects_through_the_providers_relay_and_reports_it() {
     agent.abort();
 }
 
+// Behaviour: a dial reach is followed to the agent's TCP listener at the
+// reach's URL, with its token as the agent's; nothing is dialled over SSH,
+// and drydock reports the URL without its query, where a provider's edge
+// credential rides. A wrong token is the agent's refusal, reported masked.
+#[tokio::test]
+async fn connects_through_a_dial_reach_and_reports_it() {
+    let token = drydock_transport::tcp::Token::generate().unwrap();
+    let listener = drydock_agent::tcp::TokenListener::bind("127.0.0.1:0".parse().unwrap(), token.clone()).await.unwrap();
+    let address = listener.local_addr();
+    let agent = tokio::spawn(drydock_agent::Agent::new(listener, format!("{:x}", Sha256::digest(BUILD)), "/unused".into()).run());
+    let url = format!("http://{address}/v1/connect?_edge=edge-credential");
+    let expires_at: drydock_protocol::Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+    for (presented, refused) in
+        [(token.secret().to_owned(), false), (drydock_transport::tcp::Token::generate().unwrap().secret().into(), true)]
+    {
+        let dial = Reach::Dial { url: url.clone(), token: Secret::new(presented), expires_at: expires_at.clone() };
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let (api, environment) = provider(true, dial).await;
+        let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+        let identity = directory.path().join("id_ed25519");
+        let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+        let timeout = Duration::from_secs(if refused { 2 } else { 10 });
+        let result = AgentReach::new().with_dialer(gateway.clone()).with_timeout(timeout).connect(&api, &vessel).await;
+        assert_eq!(gateway.dials(), 0);
+        if refused {
+            let error = result.err().unwrap().to_string();
+            assert!(error.contains("401") && !error.contains("edge-credential"), "{error}");
+            continue;
+        }
+        let connected = result.unwrap();
+        assert_eq!(connected.report.endpoint, format!("http://{address}/v1/connect"));
+        assert_eq!(
+            connected.report.to_string(),
+            format!("dial http://{address}/v1/connect to reference vessel {environment} (provider a)")
+        );
+    }
+    agent.abort();
+}
+
+// An edge may echo its credential when refusing it, here percent-decoded,
+// and the request's `Authorization`: drydock's error masks each query value,
+// raw and decoded, and the agent's token.
+#[tokio::test]
+async fn a_dial_reach_masks_an_echoed_edge_credential() {
+    let edge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = edge.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = edge.accept().await {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if stream.read(&mut byte).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let sent = head.lines().find_map(|l| l.strip_prefix("authorization: ")).unwrap_or_default();
+            let body = format!("bad connect token: s3cr+t value; you sent {sent}");
+            let answer = format!("HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            let _ = stream.write_all(answer.as_bytes()).await;
+        }
+    });
+    let token = drydock_transport::tcp::Token::generate().unwrap();
+    let url = format!("http://{address}/v1/connect?_edge=s3cr%2Bt+value#fragment");
+    let dial = Reach::Dial { url, token: Secret::new(token.secret()), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let (api, environment) = provider(true, dial).await;
+    let gateway = Gateway::start(directory.path(), BUILD).unwrap();
+    let identity = directory.path().join("id_ed25519");
+    let vessel = Vessel { provider: "a", environment: &environment, identity: &identity, platform: &Platform::current(), build: BUILD };
+    let error = AgentReach::new().with_dialer(gateway).with_timeout(Duration::from_secs(2)).connect(&api, &vessel).await.err().unwrap();
+    let error = error.to_string();
+    assert!(error.contains("401"), "{error}");
+    assert!(!error.contains("s3cr") && !error.contains("fragment"), "{error}");
+    assert!(error.contains("you sent") && !error.contains(token.secret()), "{error}");
+}
+
 // A gateway started for a platform stands in for a guest of that platform on
 // any test host: a vessel prepared for it connects, and the agent reports it.
 #[tokio::test]
@@ -131,14 +209,13 @@ async fn a_gateway_stands_in_for_the_platform_it_was_started_as() {
 }
 
 // What the client cannot follow is refused at once, without dialling: a
-// provider whose declaration has no agent, and a reach that is not SSH.
+// provider whose declaration has no agent, and a dial reach whose token
+// cannot be an agent's.
 #[tokio::test]
 async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
     let dial =
-        Reach::Dial { url: "wss://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
-    for (agent, reach, refusal) in
-        [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "agent hello requires an SSH or relay reach")]
-    {
+        Reach::Dial { url: "https://dial.test".into(), token: Secret::new("minted"), expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+    for (agent, reach, refusal) in [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "dial reach token")] {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(agent, reach).await;
         let gateway = Gateway::start(directory.path(), BUILD).unwrap();

@@ -3,6 +3,7 @@
 //! as `scripts/live-tcp-listener.py --tunnel-check` runs it:
 //!
 //! `tunnel_check URL KEY_FILE TOKEN_FILE`
+//! `tunnel_check --edge URL TOKEN_FILE`
 //!
 //! URL is the tunnel's `wss://` URL, KEY_FILE holds the provider's API key
 //! (sent as a Bearer token) and TOKEN_FILE the agent's TCP token. Through
@@ -11,10 +12,16 @@
 //! into 64 KiB frames), then checks that a wrong token gets the agent's 401
 //! and a wrong key the provider's. Every check prints PASS or FAIL; the exit
 //! status is 0 when all passed.
+//!
+//! With `--edge`, URL is instead an `https://` URL at the agent's
+//! `/v1/connect` behind a provider's edge that splices bytes after the
+//! agent's 101 to a WebSocket upgrade, its credential in the query (as a Modal connect token's
+//! `_modal_connect_token`), as drydockd follows a dial reach. The same checks
+//! run, with no frames, and the wrong key is a wrong query value.
 use drydock_agent::{Client, FileOptions};
 use drydock_transport::{
     tcp::{self, Token},
-    websocket::{self, DialError, TlsDialer, WebSocketDialer, tungstenite::http},
+    websocket::{self, DialError, StreamDialer, TlsDialer, WebSocketDialer, tungstenite::http},
 };
 use std::{io, path::Path, time::Instant};
 
@@ -41,6 +48,57 @@ async fn agent(dialer: &TlsDialer, url: &str, key: &str, token: &Token, fingerpr
     Client::connect(stream, fingerprint).await
 }
 
+async fn edge_agent(dialer: &TlsDialer, url: &str, token: &Token, fingerprint: &str) -> io::Result<Client> {
+    let stream = tcp::connect_at(dialer.connect(url).await?, url, token).await?;
+    Client::connect(stream, fingerprint).await
+}
+
+/// `url` with each query value replaced, so the edge's credential is wrong.
+fn spoiled(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else { return format!("{url}?wrong=wrong") };
+    let pairs: Vec<String> = query.split('&').map(|pair| format!("{}=wrong", pair.split_once('=').map_or(pair, |(k, _)| k))).collect();
+    format!("{base}?{}", pairs.join("&"))
+}
+
+async fn edge(url: &str, token: &Token, checks: &mut Checks) {
+    let dialer = TlsDialer::new().expect("TLS configuration");
+    let shown = url.split_once('?').map_or(url, |(base, _)| base);
+    let started = Instant::now();
+    match edge_agent(&dialer, url, token, "").await {
+        Ok(client) => {
+            let hello = client.hello();
+            checks.check(
+                !hello.fingerprint.is_empty(),
+                format!(
+                    "hello through the edge at {shown} in {:.2}s: fingerprint {:.16}…",
+                    started.elapsed().as_secs_f64(),
+                    hello.fingerprint
+                ),
+            );
+            let client = edge_agent(&dialer, url, token, &hello.fingerprint).await;
+            match async { round_trip(&client?).await }.await {
+                Ok((seconds, same)) => checks.check(same, format!("4 MiB written and read back through the edge in {seconds:.2}s")),
+                Err(error) => checks.check(false, format!("4 MiB round trip: {error}")),
+            }
+        }
+        Err(error) => checks.check(false, format!("hello through the edge at {shown}: {error}")),
+    }
+    let wrong = Token::generate().expect("random token");
+    match edge_agent(&dialer, url, &wrong, "").await {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            checks.check(true, format!("a wrong agent token is refused through the edge: {error}"))
+        }
+        other => checks.check(false, format!("a wrong agent token: {:?}", other.map(drop))),
+    }
+    let bad = spoiled(url);
+    match edge_agent(&dialer, &bad, token, "").await {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied || error.to_string().contains("refused with HTTP") => {
+            checks.check(true, format!("a wrong connect token is refused by the edge: {error}"))
+        }
+        other => checks.check(false, format!("a wrong connect token: {:?}", other.map(drop))),
+    }
+}
+
 async fn round_trip(client: &Client) -> io::Result<(f64, bool)> {
     // Unique per run, so concurrent checks against one sandbox do not collide.
     let probe =
@@ -58,12 +116,21 @@ async fn round_trip(client: &Client) -> io::Result<(f64, bool)> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let read_token =
+        |path: &str| Token::parse(&std::fs::read_to_string(path).expect("read TOKEN_FILE")).expect("TOKEN_FILE holds a tcp token");
+    if let [flag, url, token_file] = &args[..]
+        && flag == "--edge"
+    {
+        let mut checks = Checks(true);
+        edge(url, &read_token(token_file), &mut checks).await;
+        std::process::exit(if checks.0 { 0 } else { 1 });
+    }
     let [url, key_file, token_file] = &args[..] else {
-        eprintln!("usage: tunnel_check URL KEY_FILE TOKEN_FILE");
+        eprintln!("usage: tunnel_check URL KEY_FILE TOKEN_FILE | tunnel_check --edge URL TOKEN_FILE");
         std::process::exit(2);
     };
     let key = std::fs::read_to_string(key_file).expect("read KEY_FILE").trim().to_owned();
-    let token = Token::parse(&std::fs::read_to_string(token_file).expect("read TOKEN_FILE")).expect("TOKEN_FILE holds a tcp token");
+    let token = read_token(token_file);
     let dialer = TlsDialer::new().expect("TLS configuration");
     let mut checks = Checks(true);
 

@@ -1,5 +1,8 @@
-# ssh2 (through @namespacelabs/sdk) has optional native bindings; the companion
-# stays pure JavaScript, so their build scripts never run.
+# ssh2 (through @namespacelabs/sdk) and cbor-x (through modal) have optional
+# native bindings, and protobufjs a post-install notice; the companion stays
+# pure JavaScript, so their build scripts never run.
 allowBuilds:
+  cbor-extract: false
   cpu-features: false
+  protobufjs: false
   ssh2: false

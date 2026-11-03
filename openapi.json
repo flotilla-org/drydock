@@ -4209,6 +4209,7 @@
           },
           {
             "type": "object",
+            "description": "The agent's token-gated TCP listener behind a provider's HTTP edge:\ndrydock opens `url` (`https://`, or `http://` to a loopback address)\nand asks for the agent's handshake at its path and query with `token`\nas the Bearer; the bytes after the agent's 101 are its socket's. A\ncredential the edge wants rides in `url`'s query, which drydock never\nshows.",
             "required": [
               "url",
               "token",
@@ -4217,7 +4218,8 @@
             ],
             "properties": {
               "expires_at": {
-                "$ref": "#/components/schemas/Timestamp"
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When `url`'s credential stops working; drydock asks for a fresh\nreach for each connection."
               },
               "kind": {
                 "type": "string",
@@ -4226,7 +4228,8 @@
                 ]
               },
               "token": {
-                "$ref": "#/components/schemas/Secret"
+                "$ref": "#/components/schemas/Secret",
+                "description": "The agent's TCP token."
               },
               "url": {
                 "type": "string"
