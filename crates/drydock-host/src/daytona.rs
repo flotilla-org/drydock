@@ -229,10 +229,6 @@ struct Settings {
     tier: u8,
     #[serde(default = "analytics_url")]
     analytics_url: String,
-    /// Operator-supplied conformance command, executed as root. No declaration
-    /// alone upgrades the claim: provision/resume/explicit inspect measure it.
-    #[serde(default)]
-    egress_probe: Option<ExecRequest>,
     /// Largest image a snapshot may hold, in GiB: Daytona's default snapshot
     /// maximum is 20. Organizations with a raised limit configure it.
     #[serde(default = "max_image_gib")]
@@ -368,39 +364,6 @@ impl Daytona {
         }
         Ok(())
     }
-    /// The row, its advisory egress claim measured by the probe as root when
-    /// the sandbox runs under a restricted policy. The image probe receives
-    /// the policy mode, so deny-all needs no listed destination to succeed.
-    async fn observed(&self, v: Sandbox, c: &Credentials) -> Result<Environment> {
-        let p = &v.policy;
-        let deny_all = p.network_block_all == Some(true);
-        let restricted = deny_all
-            || p.domain_allow_list.as_deref().is_some_and(|s| !s.is_empty())
-            || p.network_allow_list.as_deref().is_some_and(|s| !s.is_empty() && s != "0.0.0.0/0");
-        let mut row = self.environment(&v)?;
-        if restricted
-            && matches!(row.state, Observation::Running)
-            && let Some(probe) = &self.settings.egress_probe
-        {
-            // Root is checked independently of the probe.
-            let command =
-                format!("test \"$(id -u)\" = 0 && DRYDOCK_PROBE_DENY_ALL={} {}", u8::from(deny_all), kit::shell_command(&probe.command));
-            let output = self.execute(&row.id, &command, 20, c).await.and_then(|o| o.success(DAYTONA));
-            match output.and_then(|o| egress_proof(&o.stdout(), deny_all)) {
-                Ok(confined) => {
-                    if confined {
-                        row.egress = Enforcement::Enforced;
-                    }
-                    row.egress_measured = true;
-                }
-                // This fallback bypasses host error masking: log only its category.
-                Err(error) => {
-                    tracing::warn!(provider = %self.name, environment = %row.id, error_class = error.class(), "egress measurement failed")
-                }
-            }
-        }
-        Ok(row)
-    }
     async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<GuestOutput> {
         let base = match &self.settings.toolbox_url {
             Some(base) => base.clone(),
@@ -519,28 +482,6 @@ impl Guest for Daytona {
     }
 }
 
-/// The egress probe's JSON proof.
-#[derive(Deserialize)]
-struct Proof {
-    uid: u64,
-    unlisted_canary: bool,
-    raw_dns: bool,
-    /// Absent under deny-all, which lists nothing.
-    listed_direct: Option<bool>,
-}
-/// Whether the probe's proof shows the sandbox confined; an error when the
-/// proof is missing or incomplete.
-fn egress_proof(stdout: &[u8], deny_all: bool) -> Result<bool> {
-    let incomplete =
-        || ProtocolError::Internal { reason: "incomplete Daytona egress proof".into(), provider_error: "probe output omitted".into() };
-    let proof: Proof = serde_json::from_slice(stdout).map_err(|_| incomplete())?;
-    let listed = match proof.listed_direct {
-        _ if deny_all => true,
-        Some(listed) => listed,
-        None => return Err(incomplete()),
-    };
-    Ok(proof.uid == 0 && !proof.unlisted_canary && !proof.raw_dns && listed)
-}
 /// An error state's cause, from Daytona's free-text reason.
 fn error_state(reason: &str) -> Observation {
     match reason.to_ascii_lowercase().as_str() {
@@ -836,7 +777,7 @@ impl Provider for Daytona {
         Ok(rows)
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        self.observed(self.sandbox(id, c).await?, c).await
+        self.environment(&self.sandbox(id, c).await?)
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         // Daytona answers 409 while a state change is in progress; wait it out briefly,

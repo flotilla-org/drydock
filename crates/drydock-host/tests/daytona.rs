@@ -31,9 +31,7 @@ struct State {
     outage: Option<(u16, String)>,
     ssh_response: Option<Value>,
     exec_response: Option<Value>,
-    probe_failure_message: Option<String>,
     executed: Vec<String>,
-    probe: Option<Value>,
     violations: Vec<String>,
     fixture_rows: Vec<Value>,
     usage_periods: Option<Value>,
@@ -49,8 +47,6 @@ struct State {
     command_exit: Option<i32>,
     command_output: Option<String>,
     require_bootstrap_budget: bool,
-    probe_exit: Option<i32>,
-    probe_http_failure: Option<u16>,
     exec_timeouts: Vec<u64>,
     oci: Registries,
 }
@@ -397,9 +393,6 @@ impl StandIn {
                 let Some(command) = body["command"].as_str() else { reject!("missing command"); };
                 let Some(timeout) = body["timeout"].as_u64() else { reject!("missing timeout"); };
                 s.exec_timeouts.push(timeout);
-                if command.starts_with("test \"$(id -u)\"") && let Some(status) = s.probe_http_failure {
-                    return response(status, json!({"statusCode":status,"message":s.probe_failure_message.as_deref().unwrap_or("Bad Gateway"),"error":"Bad Gateway"}));
-                }
                 if let Some(value) = &s.exec_response { return response(200, value.clone()); }
                 if s.require_bootstrap_budget && command.contains("--supervise") && timeout < 20 {
                     return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
@@ -409,12 +402,8 @@ impl StandIn {
                     if !command.contains("--socket /run/drydock/agent.sock") { reject!("bootstrap missing socket flag"); }
                 }
                 s.executed.push(command.into());
-                let output = if command.starts_with("test \"$(id -u)\"") {
-                    s.probe.clone().unwrap_or(Value::Null).to_string()
-                } else {
-                    s.command_output.clone().unwrap_or_else(|| "guest output".into())
-                };
-                let code = if command.starts_with("test \"$(id -u)\"") { s.probe_exit.unwrap_or(0) } else { s.command_exit.unwrap_or(0) };
+                let output = s.command_output.clone().unwrap_or_else(|| "guest output".into());
+                let code = s.command_exit.unwrap_or(0);
                 response(200, json!({"exitCode":code,"result":output}))
             }
             ("GET", "/api/organizations/org-1/usage") => response(
@@ -746,16 +735,9 @@ fn credentials() -> Credentials {
     Credentials::new(Some(Secret::new("key-a")))
 }
 async fn provider(http: Arc<dyn HttpClient>) -> Arc<dyn Provider> {
-    provider_with_probe(http, false).await
-}
-async fn provider_with_probe(http: Arc<dyn HttpClient>, probe: bool) -> Arc<dyn Provider> {
     let config: ProviderConfiguration =
         serde_json::from_value(json!({"module":"daytona","settings":{"organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"}}))
             .unwrap();
-    let mut config = config;
-    if probe {
-        config.settings.insert("egress_probe".into(), json!({"command":["/usr/local/bin/check-egress"]}));
-    }
     DaytonaModule.configure("daytona", &config, http).await.unwrap()
 }
 fn tools_image(digit: char) -> String {
@@ -798,7 +780,7 @@ async fn lifecycle_and_credential_rotation() {
     let (a, b) = tokio::join!(p.provision(r.clone(), &c), p.provision(r.clone(), &c));
     let a = a.unwrap();
     let (Provisioned::Created(observation) | Provisioned::Existing(observation)) = &a;
-    assert!(!observation.egress_measured, "no probe means no measured evidence");
+    assert!(!observation.egress_measured, "a backend reports no measurement; drydockd measures");
     let b = b.unwrap();
     assert!(matches!((&a, &b), (Provisioned::Created(_), Provisioned::Existing(_)) | (Provisioned::Existing(_), Provisioned::Created(_))));
     let id = row(a).id;
@@ -980,34 +962,6 @@ fn generated_lifecycle(tc: hegel::TestCase) {
             }
         }
     });
-}
-
-// Enforced is a measured root claim. A declaration, a non-root result, an
-// allowed canary, or successful raw DNS is never sufficient to assert it.
-#[tokio::test]
-async fn root_egress_claim_is_measured_each_time() {
-    let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    let mut r = request(prep, "probe");
-    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
-    let good = json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false});
-    http.0.lock().unwrap().probe = Some(good.clone());
-    let env = row(p.provision(r, &c).await.unwrap());
-    assert_eq!(env.egress, Enforcement::Enforced);
-    let original_policy = p.inspect(&env.id, &c).await.unwrap().egress_policy;
-    assert!(original_policy.is_some());
-    assert_eq!(p.list(&c).await.unwrap()[0].egress_policy, original_policy);
-    http.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["networkAllowList"] = json!("198.51.100.0/24");
-    assert_ne!(p.list(&c).await.unwrap()[0].egress_policy, original_policy);
-    for (key, bad) in [("uid", json!(1000)), ("listed_direct", json!(false)), ("unlisted_canary", json!(true)), ("raw_dns", json!(true))] {
-        let mut result = good.clone();
-        result[key] = bad;
-        http.0.lock().unwrap().probe = Some(result);
-        assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
-        assert_eq!(p.list(&c).await.unwrap()[0].egress, Enforcement::Advisory);
-    }
 }
 
 // Error reasons map to typed loss/unknown causes and granted sizes come from
@@ -1414,25 +1368,6 @@ async fn slow_start_does_not_queue_other_labels() {
     assert!(slow.await.unwrap().is_ok());
 }
 
-// Polling does not execute guest probes, so inventory cost does not grow with
-// probe latency or interfere with observation cadence.
-#[tokio::test]
-async fn list_never_runs_guest_probes() {
-    let vendor = Arc::new(StandIn::default());
-    let http = Arc::new(Latency::new(vendor.clone(), false, true));
-    let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials();
-    for i in 0..7 {
-        vendor.0.lock().unwrap().rows.insert(
-            format!("s-{i}"),
-            json!({"id":format!("s-{i}"),"state":"started","networkAllowList":"192.0.2.1/32","cpu":1,"memory":1,"disk":1}),
-        );
-    }
-    vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
-    assert_eq!(p.list(&c).await.unwrap().len(), 7);
-    assert_eq!(http.peak.load(std::sync::atomic::Ordering::SeqCst), 0);
-}
-
 // Reusing a label cannot silently return a wider network policy or a different
 // size than the request. Exact retries still converge on the same sandbox.
 #[tokio::test]
@@ -1450,31 +1385,6 @@ async fn existing_labels_surface_size_and_egress_mismatches() {
     changed.egress = EgressRequest::Open;
     assert!(matches!(p.provision(changed, &c).await, Err(ProtocolError::Refused { .. })));
     assert!(matches!(p.provision(r, &c).await.unwrap(), Provisioned::Existing(_)));
-}
-
-// Deny-all has no listed destination: a root proof of blocked canary/DNS is
-// enough, but missing facts, non-root execution and probe errors never enforce.
-#[tokio::test]
-async fn deny_all_proof_and_probe_diagnostics() {
-    let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
-    let env = row(p.provision(request(prep, "deny-all"), &c).await.unwrap());
-    assert_eq!(env.egress, Enforcement::Enforced);
-    assert!(http.0.lock().unwrap().executed.iter().any(|s| s.contains("DRYDOCK_PROBE_DENY_ALL=1")));
-    let before = http.0.lock().unwrap().executed.len();
-    p.list(&c).await.unwrap();
-    assert_eq!(http.0.lock().unwrap().executed.len(), before);
-    http.0.lock().unwrap().probe = Some(json!({"uid":1000,"unlisted_canary":false,"raw_dns":false}));
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
-    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":true,"raw_dns":false}));
-    assert_eq!(p.inspect(&env.id, &c).await.unwrap().egress, Enforcement::Advisory);
-    http.0.lock().unwrap().probe_exit = Some(2);
-    let unmeasured = p.inspect(&env.id, &c).await.unwrap();
-    assert!(!unmeasured.egress_measured);
-    assert_eq!(unmeasured.egress, Enforcement::Advisory);
 }
 
 // Native host rules preserve request identity without consulting current DNS.
@@ -1529,25 +1439,23 @@ async fn internal_retains_vendor_body() {
     assert!(provider_error.as_str().contains("key-a must never be echoed"));
 }
 
-// Lifecycle state checks must not invoke isolation probes. Even a failing probe
-// cannot block stop; resume performs only the agent bootstrap exec, with the
-// host responsible for consuming a subsequent explicit measurement.
+// Lifecycle state checks run no guest command: suspend execs nothing, resume
+// performs only the agent bootstrap exec, and the row stays a vendor claim.
 #[tokio::test]
 async fn lifecycle_state_checks_do_not_probe() {
     let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
+    let p = provider(http.clone()).await;
     let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
-    http.0.lock().unwrap().probe = Some(json!({"uid":0,"unlisted_canary":false,"raw_dns":false}));
     let env = row(p.provision(request(prep, "probe-independent-stop"), &c).await.unwrap());
-    http.0.lock().unwrap().probe_exit = Some(1);
     let before = http.0.lock().unwrap().executed.len();
     let sr = p.operations().suspend_resume.unwrap();
     let token = sr.suspend(&env.id, &c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before);
     sr.resume(&env.id, token, &c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before + 1);
-    assert!(!p.inspect(&env.id, &c).await.unwrap().egress_measured);
+    let inspected = p.inspect(&env.id, &c).await.unwrap();
+    assert!((inspected.egress, inspected.egress_measured) == (Enforcement::Advisory, false));
 }
 
 // Retried stop/start observes operations already moving in the requested
@@ -1593,43 +1501,6 @@ async fn transport_outages_are_unavailable() {
     assert!(error.to_string().contains("private transport detail"));
     let ProtocolError::Unavailable { provider_error: Some(detail), .. } = error else { panic!("missing protected transport diagnostic") };
     assert!(detail.as_str().contains("private transport detail"));
-}
-
-// Probe command failure and malformed proof leave creation, re-adoption and
-// inspect successful, Advisory and unmeasured.
-#[tokio::test]
-async fn lifecycle_success_is_independent_of_probe_failure() {
-    for failure in 0..3 {
-        let http = Arc::new(StandIn::default());
-        let p = provider_with_probe(http.clone(), true).await;
-        let c = credentials();
-        let prep = prepared(p.as_ref(), &c).await;
-        if failure == 1 {
-            http.0.lock().unwrap().probe_exit = Some(1);
-        }
-        if failure == 2 {
-            http.0.lock().unwrap().probe_http_failure = Some(502);
-        }
-        let mut request = request(prep, "broken-probe");
-        request.egress = EgressRequest::DenyAll { direct: vec![] };
-        for _ in 0..2 {
-            let result = p.provision(request.clone(), &c).await.unwrap();
-            let (Provisioned::Created(row) | Provisioned::Existing(row)) = result;
-            assert_eq!(row.egress, Enforcement::Advisory);
-            assert!(!row.egress_measured);
-            let port = p.operations().suspend_resume.unwrap();
-            let token = port.suspend(&row.id, &c).await.unwrap();
-            port.resume(&row.id, token, &c).await.unwrap();
-            // Failed enrichment reuses the sandbox GET; it must not list the inventory.
-            let requests = http.0.lock().unwrap().requests;
-            let resumed = p.inspect(&row.id, &c).await.unwrap();
-            // The probe resolves its toolbox URL with a second GET, then executes.
-            assert_eq!(http.0.lock().unwrap().requests - requests, 3);
-            assert!(matches!(resumed.state, Observation::Running));
-            assert_eq!(resumed.egress, Enforcement::Advisory);
-            assert!(!resumed.egress_measured);
-        }
-    }
 }
 
 // Size-hours clip vendor periods to the requested window, ignore boundary-only
@@ -1886,8 +1757,7 @@ impl HostHarness {
                 name: "daytona-test".into(),
                 connection: drydock::HostConnection::ExternalUnix { path: dir.path().join("host.sock") },
                 configuration: serde_json::from_value(json!({"providers":{"daytona":{"module":"daytona","settings":{
-                    "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA",
-                    "egress_probe":{"command":["/usr/local/bin/check-egress"]}
+                    "organization_id":"org-1","ssh_host_key":"ssh-ed25519 AAAA"
                 }}}}))
                 .unwrap(),
                 credentials: Default::default(),
@@ -1904,29 +1774,6 @@ impl HostHarness {
         self.stop.take().unwrap().send(()).unwrap();
         self.task.await.unwrap();
     }
-}
-
-// A stop/start between polls must lose measured enforcement as soon as either
-// preparing or starting is observed, even when the effective policy is unchanged.
-#[tokio::test]
-async fn fast_restart_invalidates_host_egress_evidence() {
-    let vendor = Arc::new(StandIn::default());
-    vendor.0.lock().unwrap().probe = Some(json!({"uid":0,"listed_direct":true,"unlisted_canary":false,"raw_dns":false}));
-    let host = HostHarness::start(vendor.clone()).await;
-    let p = provider(vendor.clone()).await;
-    let prep = prepared(p.as_ref(), &credentials()).await;
-    let mut r = request(prep, "fast-restart");
-    r.egress = EgressRequest::DenyAll { direct: vec![Destination::Cidr { cidr: "192.0.2.1/32".parse().unwrap() }] };
-    let env = host.client.provision("daytona", &r).await.unwrap().into_inner();
-    for phase in ["starting", "creating"] {
-        assert_eq!(host.client.inspect("daytona", &env.id).await.unwrap().egress, Enforcement::Enforced);
-        assert_eq!(host.client.list("daytona").await.unwrap()[0].egress, Enforcement::Enforced);
-        vendor.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["state"] = json!(phase);
-        assert!(matches!(host.client.list("daytona").await.unwrap()[0].state, Observation::Transitioning { .. }));
-        vendor.0.lock().unwrap().rows.get_mut(&env.id).unwrap()["state"] = json!("started");
-        assert_eq!(host.client.list("daytona").await.unwrap()[0].egress, Enforcement::Advisory);
-    }
-    host.finish().await;
 }
 
 // The exact running/stopped sample is queried only after accounting has settled.
@@ -2053,7 +1900,7 @@ async fn vendor_body_masking_precedes_truncation() {
 #[tokio::test]
 async fn malformed_sensitive_responses_do_not_disclose_values() {
     let http = Arc::new(StandIn::default());
-    let p = provider_with_probe(http.clone(), true).await;
+    let p = provider(http.clone()).await;
     let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
     let env = row(p.provision(request(prep, "malformed-sensitive"), &c).await.unwrap());
@@ -2070,43 +1917,6 @@ async fn malformed_sensitive_responses_do_not_disclose_values() {
             assert!(!view.contains("guest-private-output"), "{view}");
         }
     }
-}
-
-// Inspect's probe fallback succeeds, so its module-level log must contain only
-// the category: the host never receives this error to apply credential masking.
-#[test]
-fn lifecycle_fallback_log_does_not_disclose_provider_body() {
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let output = logs.clone();
-    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || Capture(output.clone())).finish();
-    // This must remain the only global-subscriber installer in this integration
-    // binary; another installer would fail. Use the process dispatcher
-    // so HTTP/provider tasks and parallel callsite registration are captured too.
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-        let http = Arc::new(StandIn::default());
-        let p = provider_with_probe(http.clone(), true).await;
-        let c = credentials();
-        let prep = prepared(p.as_ref(), &c).await;
-        http.0.lock().unwrap().probe_http_failure = Some(502);
-        http.0.lock().unwrap().probe_failure_message = Some("validation fallback-secret-xyz".into());
-        let mut r = request(prep, "fallback-log");
-        r.egress = EgressRequest::DenyAll { direct: vec![] };
-        p.provision(r, &c).await.unwrap();
-    });
-    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("egress measurement failed"), "{logs}");
-    assert!(!logs.contains("fallback-secret-xyz"), "{logs}");
 }
 
 // Concurrent provision retries both bootstrap the same started sandbox, without
