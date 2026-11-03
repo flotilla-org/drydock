@@ -191,6 +191,10 @@ fn lookup_failure(error: LookupError) -> Found {
     Found::of(if error.missing { Outcome::NameNotResolved } else { Outcome::Failed }, None, Some(error.detail))
 }
 
+/// A getaddrinfo that outlives its target's timeout runs on until libc gives
+/// up: a blocking-pool thread cannot be cancelled. That is bounded by the 64
+/// targets a request may carry.
+///
 /// getaddrinfo itself, so the outcome rests on its error code and not on the
 /// libc's wording of it.
 async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
@@ -213,14 +217,21 @@ async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
             // SAFETY: ai_addr points at ai_addrlen bytes of the family ai_family names.
             let ip = unsafe {
                 match entry.ai_family {
-                    libc::AF_INET => Some(IpAddr::from(std::net::Ipv4Addr::from(u32::from_be(
-                        (*(entry.ai_addr as *const libc::sockaddr_in)).sin_addr.s_addr,
-                    )))),
-                    libc::AF_INET6 => Some(IpAddr::from((*(entry.ai_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr)),
+                    libc::AF_INET if entry.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in>() => Some(IpAddr::from(
+                        std::net::Ipv4Addr::from(u32::from_be((*(entry.ai_addr as *const libc::sockaddr_in)).sin_addr.s_addr)),
+                    )),
                     _ => None,
                 }
             };
             addresses.extend(ip.map(|ip| SocketAddr::new(ip, port)));
+            if entry.ai_family == libc::AF_INET6 {
+                debug_assert!(entry.ai_addrlen as usize >= std::mem::size_of::<libc::sockaddr_in6>());
+                // SAFETY: an AF_INET6 entry points at a sockaddr_in6 of at least that length.
+                let v6 = unsafe { &*(entry.ai_addr as *const libc::sockaddr_in6) };
+                addresses.push(
+                    std::net::SocketAddrV6::new(v6.sin6_addr.s6_addr.into(), port, u32::from_be(v6.sin6_flowinfo), v6.sin6_scope_id).into(),
+                );
+            }
             at = entry.ai_next;
         }
         // SAFETY: found came from a successful getaddrinfo and is freed once.

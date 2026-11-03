@@ -150,3 +150,22 @@ fn the_wire_shape_is_stable() {
     );
     assert_eq!(serde_json::to_value(Outcome::NameNotResolved).unwrap(), "name_not_resolved");
 }
+
+#[tokio::test]
+async fn an_ipv6_resolver_is_asked_over_ipv6() {
+    let Ok(socket) = UdpSocket::bind("[::1]:0").await else { return }; // no IPv6 loopback here
+    let address = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 512];
+        let (n, from) = socket.recv_from(&mut buffer).await.unwrap();
+        let query = Message::from_vec(&buffer[..n]).unwrap();
+        let mut reply = Message::new();
+        reply.set_id(query.id()).set_message_type(MessageType::Response).add_queries(query.queries().iter().cloned());
+        reply.add_answer(Record::from_rdata(query.queries()[0].name().clone(), 30, RData::A(A(Ipv4Addr::new(192, 0, 2, 9)))));
+        socket.send_to(&reply.to_vec().unwrap(), from).await.unwrap();
+    });
+    let h = harness(false, "test-build").await;
+    let target = Target::Dns { name: "example.com".into(), resolver: Some(address) };
+    let attempts = h.client.try_destinations(&within(2000, vec![target])).await.unwrap();
+    assert_eq!(attempts.results[0].outcome, Outcome::Reached, "{:?}", attempts.results[0]);
+}
