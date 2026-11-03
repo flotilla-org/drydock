@@ -216,7 +216,10 @@ impl AgentReach {
 }
 
 /// The shortest query value a dial reach's errors mask on its own; shorter
-/// ones are masked only as `name=value`.
+/// ones are masked only as `name=value`. The trade-off: an edge that echoes a
+/// shorter credential bare (`abc123` from `?token=abc123`) shows it, which is
+/// accepted because provider credentials are far longer, while masking every
+/// short value would redact digits such as a refusal's status.
 const MASKED_QUERY_VALUE: usize = 8;
 
 impl AgentReach {
