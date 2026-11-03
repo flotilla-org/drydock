@@ -203,8 +203,8 @@ impl Api {
         sensitive(&value).map_err(|_| refused(format!("invalid {} API key header", self.vendor)))
     }
     /// One request, whatever its status. `headers` are added as given (mark
-    /// secrets sensitive); `authenticated` then adds the key, which no
-    /// caller header replaces.
+    /// secrets sensitive); `authenticated` then adds the key, and a body its
+    /// content type, which no caller header replaces.
     pub async fn send(
         &self,
         method: Method,
@@ -286,8 +286,9 @@ impl Api {
     pub async fn find<T: DeserializeOwned>(&self, url: Url, c: &Credentials) -> Result<Option<T>> {
         absent_on_not_found(self.get(url, c).await)
     }
-    /// Every row of a cursor-paged list, following each cursor once (a
-    /// repeated cursor is a bad response, never a loop).
+    /// Every row of a cursor-paged list, following each cursor once: a
+    /// repeated cursor, one that is not text, or more than [`MAX_PAGES`]
+    /// pages is a bad response, never a loop or a silently short list.
     pub async fn paged<T: DeserializeOwned>(&self, url: Url, paging: &Paging, c: &Credentials) -> Result<Vec<T>> {
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
@@ -309,16 +310,22 @@ impl Api {
             rows.extend(page_rows);
             let next = match &paging.next {
                 Next::Body(keys) => keys.iter().find_map(|key| page.get(*key).and_then(Value::as_str)).map(str::to_owned),
-                Next::Header(name) => response.headers().get(*name).and_then(|v| v.to_str().ok()).map(str::to_owned),
+                Next::Header(name) => match response.headers().get(*name) {
+                    Some(value) => Some(value.to_str().map_err(|_| self.vendor.bad_response())?.to_owned()),
+                    None => None,
+                },
             };
             match next.filter(|n| !n.is_empty()) {
                 None => return Ok(rows),
-                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
+                Some(next) if seen.len() + 1 < MAX_PAGES && seen.insert(next.clone()) => cursor = Some(next),
                 Some(_) => return Err(self.vendor.bad_response()),
             }
         }
     }
 }
+
+/// The most pages one list follows.
+pub const MAX_PAGES: usize = 1000;
 
 /// `METHOD /path`, as reasons name an operation.
 pub fn operation(method: &Method, url: &Url) -> String {
@@ -379,12 +386,17 @@ mod tests {
     #[derive(Default)]
     struct Script {
         answers: Mutex<Vec<Answer>>,
+        /// Whole responses, answered before `answers`.
+        raw: Mutex<Vec<http::Response<Bytes>>>,
         asked: Mutex<Vec<reqwest::Request>>,
     }
     #[async_trait]
     impl HttpClient for Script {
         async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
             self.asked.lock().unwrap().push(request);
+            if let Some(answer) = self.raw.lock().unwrap().pop() {
+                return Ok(answer);
+            }
             let (status, headers, body) = self.answers.lock().unwrap().remove(0);
             let mut response = http::Response::builder().status(status);
             for (name, value) in headers {
@@ -423,7 +435,23 @@ mod tests {
         let headers = script.asked.lock().unwrap()[0].headers().clone();
         assert_eq!(headers["x-api-key"], "k");
         assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
+        // A cursor that is not text is never read as the last page.
+        let mut answer = http::Response::new(Bytes::from_static(b"[]"));
+        answer.headers_mut().insert("x-next", HeaderValue::from_bytes(b"\xff").unwrap());
+        script.raw.lock().unwrap().push(answer);
         assert_eq!(api.paged::<u8>(url, &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
+    }
+
+    // A vendor that never stops handing out fresh cursors ends the list
+    // with a bad response at the page limit.
+    #[tokio::test]
+    async fn endless_cursors_stop_at_the_page_limit() {
+        let cursors: Vec<&'static str> = (0..MAX_PAGES).map(|n| &*Box::leak(n.to_string().into_boxed_str())).collect();
+        let (api, script) = api(Auth::Bearer, cursors.iter().map(|c| (200, vec![("x-next", *c)], "[1]")).collect());
+        let paging = Paging { rows: None, cursor: "next", next: Next::Header("x-next") };
+        assert_eq!(api.paged::<u8>(api.url(&["rows"]).unwrap(), &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
+        assert_eq!(script.asked.lock().unwrap().len(), MAX_PAGES);
     }
 
     // A body cursor is followed from the page beside its rows; a page
