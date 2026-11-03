@@ -10,6 +10,7 @@ async fn main() -> std::io::Result<()> {
     let mut registry = reference::registry();
     registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
     registry.insert("local".into(), std::sync::Arc::new(drydock_host::local::LocalModule));
+    registry.insert("runtime".into(), std::sync::Arc::new(drydock_host::runtime::RuntimeModule));
     registry.insert("tensorlake".into(), std::sync::Arc::new(drydock_host::tensorlake::TensorlakeModule::new()?));
     let host = Host::new(registry);
     // Register SIGTERM before binding so managed shutdown always drains streams.

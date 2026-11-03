@@ -53,6 +53,26 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 - Quota has no API; it is the count of live sandboxes in the app.
 - The agent is reached through Modal's connect-token edge, where TLS ends: Modal sees the connect token and the agent's TCP token (`Authorization`) in transit, and every byte to and from the agent. The agent listens on all addresses in the sandbox, since the edge cannot reach loopback, so its token is the only gate on that port. drydockd masks both credentials in its errors and log.
 
+## Runtime (`runtime`, Rust host)
+
+Credential: an API key (`rtcloud_…`), as a plain token file.
+
+Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Runtime keys are full or read-only, and see only what they made (`reach: agent`, the default) or the whole account.
+
+| Setting | Why |
+|---|---|
+| Access: full | images (prepare), sandboxes, exec, files (the agent upload), network rules, and previews (a preview's token is signed only for a key that can run commands) |
+| Reach: agent | drydock sees only the sandboxes and images this key made, which is what `list` should return |
+| Daily limit: set one | caps what a runaway launch loop can spend; `GET /v1/limits` reports it as quota |
+
+- `reach: agent` scopes listing to the key. A sandbox made by another key, or before a key rotation, is invisible: list shows nothing and inspect returns 404, as if it were gone. Destroy drydock's sandboxes before revoking a key, or use `reach: account`.
+- A read-only key fails at prepare with a permission error, but list and quota still work, so the provider looks ready.
+- drydock reaches the agent through a private preview of its port (7811): each reach signs a preview token good for a day, and drydockd sends it in `x-runtime-preview-token` beside the agent's own token. The preview goes with the sandbox at destroy.
+- An environment reports egress `enforced` once Runtime has applied the rules drydock set and they match the request. A later change to them through Runtime's console or API, with the same key, is not detected.
+- Usage takes running time and size from Runtime's sandbox events, which it keeps 14 days, and cost from the settled usage export; a period that starts earlier is refused.
+- Without credit, sandboxes reach ports 80 and 443 only and Runtime refuses host:port rules (`connect`). Persistent sandboxes need credit too, so without it drydock creates ordinary ones, which keep no disk once stopped.
+- The key goes as a Bearer header to `api_url` (default `https://api.withruntime.com/v1`) only. Change that setting only to a host you trust with the key.
+
 ## Tensorlake (`tensorlake`, Rust host)
 
 Credential: a project API key (`tl_apiKey_…`), as a plain token file. Usage also needs `organization_id` in the settings; without it the provider declares no usage.
