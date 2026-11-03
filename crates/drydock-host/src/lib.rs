@@ -1,5 +1,6 @@
 //! Thin Rust module loader serving the public API. Common policy lives in drydock::runtime.
 pub mod daytona;
+pub mod e2b;
 pub mod kit;
 pub use drydock_provider as module;
 pub mod local;
