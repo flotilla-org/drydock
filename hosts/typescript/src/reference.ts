@@ -48,6 +48,7 @@ class Memory implements Provider {
     checkout_strategies: ["host_worktree", "host_clone", "clone_in_vessel"],
     workspace_root: "/workspace",
     suspend_resume: false,
+    exclusive_label: true,
     suspend_preserves_memory: false,
     export: false,
     fallback_runner: false,

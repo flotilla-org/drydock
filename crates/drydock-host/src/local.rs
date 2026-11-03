@@ -453,6 +453,7 @@ impl Provider for Local {
             quota: false,
             // Vessels are directories on this machine: guest paths are its own.
             host_filesystem: true,
+            exclusive_label: true,
             agent_tcp_port: None,
         }
     }

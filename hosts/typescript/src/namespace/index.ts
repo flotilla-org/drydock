@@ -212,6 +212,7 @@ class Namespace implements Provider {
     checkout_strategies: ["clone_in_vessel"],
     workspace_root: "/workspace",
     suspend_resume: true,
+    exclusive_label: true,
     // Devbox stop keeps the filesystem; memory and processes are lost.
     suspend_preserves_memory: false,
     export: false,

@@ -203,6 +203,12 @@ pub struct Capabilities {
     /// below paths it can write, never at fixed guest locations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_filesystem: bool,
+    /// Concurrent provisions of one label return one environment: the provider
+    /// refuses a second sandbox for a label. Without it, a retry after a
+    /// provision has returned still returns that environment, but concurrent
+    /// provisions may each create one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusive_label: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

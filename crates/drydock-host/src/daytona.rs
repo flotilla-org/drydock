@@ -632,6 +632,7 @@ impl Provider for Daytona {
             usage: true,
             quota: true,
             host_filesystem: false,
+            exclusive_label: true,
             agent_tcp_port: None,
         }
     }

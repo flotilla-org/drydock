@@ -305,6 +305,7 @@ class Modal implements Provider {
     checkout_strategies: ["clone_in_vessel"],
     workspace_root: "/workspace",
     suspend_resume: false,
+    exclusive_label: true,
     export: false,
     fallback_runner: false,
     usage: false,
