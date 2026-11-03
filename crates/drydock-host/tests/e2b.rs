@@ -1093,6 +1093,48 @@ async fn prepare_builds_once_then_finds_the_template_by_name() {
     assert_eq!((s.templates.len(), s.uploads), (3, 1), "the tools file is present at E2B");
 }
 
+/// A tools image (an index over one amd64 manifest) whose layers are
+/// `layers`, stored at the tools registry; its pinned reference.
+fn tools_image(w: &World, layers: Value) -> String {
+    let mut s = w.stand_in.state();
+    let mut put = |content_type: &str, bytes: Vec<u8>| {
+        let (digest, size) = (sha256(&bytes), bytes.len());
+        s.registries.insert((TOOLS_REGISTRY.to_owned(), digest.clone()), (content_type.to_owned(), Bytes::from(bytes)));
+        (digest, size)
+    };
+    let (config, config_size) = put("application/octet-stream", br#"{"architecture":"amd64","os":"linux"}"#.to_vec());
+    let manifest = json!({"schemaVersion": 2, "mediaType": OCI_MANIFEST,
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config, "size": config_size}, "layers": layers});
+    let (manifest, manifest_size) = put(OCI_MANIFEST, serde_json::to_vec(&manifest).unwrap());
+    let index = json!({"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [
+        {"mediaType": OCI_MANIFEST, "digest": manifest, "size": manifest_size, "platform": {"os": "linux", "architecture": "amd64"}}]});
+    let (index, _) = put(OCI_INDEX, serde_json::to_vec(&index).unwrap());
+    format!("{TOOLS_REGISTRY}/flotilla-org/drydock-tools@{index}")
+}
+
+// The tools image must be one layer that fits the host's HTTP deadline
+// (64 MiB): two layers, or a larger one, are refused before any template
+// is created or anything uploaded.
+#[tokio::test]
+async fn prepare_refuses_tools_it_cannot_copy() {
+    let w = world().await;
+    let layer = |size: u64| json!({"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": format!("sha256:{}", "c".repeat(64)), "size": size});
+    for (layers, expected) in [
+        (json!([layer(10), layer(10)]), "the tools image has 2 layers"),
+        (json!([]), "the tools image has 0 layers"),
+        (json!([layer((64 << 20) + 1)]), "the tools layer holds 67108865 bytes"),
+    ] {
+        let mut request = w.prepare_request(size(1.0, 1024, 10), None);
+        request.tools_digest = tools_image(&w, layers);
+        match w.provider.prepare(request, &w.credentials).await {
+            Err(ProtocolError::Refused { reason }) => assert!(reason.contains(expected), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let s = w.stand_in.state();
+    assert_eq!((s.templates.len(), s.uploads), (0, 0));
+}
+
 // A failed build is a refusal carrying E2B's reason and the log's tail.
 #[tokio::test(start_paused = true)]
 async fn a_failed_build_is_refused_with_its_reason_and_log() {

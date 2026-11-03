@@ -15,6 +15,7 @@ use drydock_transport::{
     tcp::{self, CONNECT_PATH, Token},
     websocket::{StreamDialer, TlsDialer},
 };
+use futures::{StreamExt, TryStreamExt};
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,8 +50,12 @@ const BUILD_POLL: Duration = Duration::from_secs(3);
 const BUILD_POLLS: u32 = 150;
 const STATE_POLL: Duration = Duration::from_secs(1);
 const STATE_POLLS: u32 = 60;
-/// The largest tools layer uploaded as a build's COPY context.
-const TOOLS_LAYER_LIMIT: u64 = 256 << 20;
+/// How many sandbox details a listing reads at once.
+const DETAIL_READS: usize = 8;
+/// The largest tools layer uploaded as a build's COPY context. Its download
+/// and its upload each fit the host's 30-second HTTP deadline, which at 64
+/// MiB needs about 20 Mbit/s; the layer holds one agent binary, far smaller.
+const TOOLS_LAYER_LIMIT: u64 = 64 << 20;
 /// How much of a failed command's or build's output an error carries.
 const OUTPUT_CAUSE_CHARS: usize = 500;
 /// The most of a refusal's text kept in an error.
@@ -481,16 +486,10 @@ impl E2b {
     /// argv ends with `--socket`, as the supervisor requires.
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
         let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
-        let script = format!(
-            "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
-             if [ -e {TOKEN_FILE} ] && ! grep -Eqx '[A-Za-z0-9_-]{{43,}}={{0,2}}' {TOKEN_FILE}; then rm -f {TOKEN_FILE}; fi && \
-             {{ (umask 077; set -C; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}) 2>/dev/null || true; }} && \
-             echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
-             exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
-             --tcp 0.0.0.0:{AGENT_PORT} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
-        );
-        let run =
-            self.run(id, &script, BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c).await?.started("bootstrap")?;
+        let run = self
+            .run(id, &bootstrap_script(), BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c)
+            .await?
+            .started("bootstrap")?;
         let token = run.token()?;
         self.remember(id, |access| access.agent = Some(token.clone()));
         Ok(token)
@@ -563,20 +562,23 @@ impl E2b {
                 Some(_) => return Err(bad_response()),
             }
         }
-        let mut details = Vec::new();
-        for row in rows {
-            // The server filters by metadata; both tags are checked again here.
-            if !self.ours(&row) || label.is_some_and(|l| self.label(&row).as_deref() != Some(l)) {
-                continue;
-            }
-            match self.detail(text(&row, "sandboxID")?, c).await {
-                Ok(detail) => details.push(detail),
+        // The server filters by metadata; both tags are checked again here.
+        // Each row's detail (for its network policy) is read a few at a time.
+        let ids = rows
+            .iter()
+            .filter(|row| self.ours(row) && label.is_none_or(|l| self.label(row).as_deref() == Some(l)))
+            .map(|row| text(row, "sandboxID").map(str::to_owned))
+            .collect::<Result<Vec<String>>>()?;
+        let reads = ids.into_iter().map(|id| async move {
+            match self.detail(&id, c).await {
+                Ok(detail) => Ok(Some(detail)),
                 // Killed between the list and the read.
-                Err(ProtocolError::NotFound { .. }) => {}
-                Err(error) => return Err(error),
+                Err(ProtocolError::NotFound { .. }) => Ok(None),
+                Err(error) => Err(error),
             }
-        }
-        Ok(details)
+        });
+        let details: Vec<Option<Value>> = futures::stream::iter(reads).buffered(DETAIL_READS).try_collect().await?;
+        Ok(details.into_iter().flatten().collect())
     }
     /// An existing sandbox matches only the size and egress policy asked for.
     fn check_existing(&self, row: &Value, size: &Size, policy: &Policy) -> Result<()> {
@@ -620,9 +622,21 @@ impl E2b {
         let tools_credential = if tools.registry == base.registry { r.image_pull.clone() } else { None };
         let tools_registry = Registry::new(self.http.clone(), &tools.registry, tools_credential, None)?;
         let tools_manifest = tools_registry.platform_manifest(&tools, &platform).await?;
+        // The tools image is one layer holding opt/drydock/ (its Dockerfile
+        // copies the agent onto scratch); a layer without it would fail the
+        // build with an opaque COPY error, so any other shape is refused here.
         let layers = tools_manifest.layers()?;
-        if layers.is_empty() {
-            return Err(refused("the tools image has no layers"));
+        let [layer] = layers.as_slice() else {
+            return Err(refused(format!(
+                "the tools image has {} layers; E2B's prepare copies exactly one, holding opt/drydock/",
+                layers.len()
+            )));
+        };
+        if layer.size > TOOLS_LAYER_LIMIT {
+            return Err(refused(format!(
+                "the tools layer holds {} bytes, more than the {TOOLS_LAYER_LIMIT} that fit the host's HTTP deadline",
+                layer.size
+            )));
         }
 
         let size = json!({"name": name, "cpuCount": r.size.cpus as u64, "memoryMB": r.size.memory_bytes / MIB});
@@ -642,10 +656,10 @@ impl E2b {
         if !env.is_empty() {
             steps.push(json!({"type": "ENV", "args": env}));
         }
-        // Each tools layer is a gzip tar holding opt/drydock/…; it is the
-        // COPY context as is, cached by E2B under its own digest, so a later
+        // The tools layer is a gzip tar holding opt/drydock/…; it is the COPY
+        // context as is, cached by E2B under its own digest, so a later
         // prepare finds it present and uploads nothing.
-        for layer in &layers {
+        {
             let hash = layer.digest.strip_prefix("sha256:").ok_or_else(bad_response)?;
             let upload = self.call(Method::GET, self.api(&["templates", &template_id, "files", hash])?, None, c).await?;
             if upload["present"] != true {
@@ -953,6 +967,21 @@ fn normal_cidr(cidr: &str) -> Option<String> {
 fn template_name(image: &str, tools: &str, platform: &Platform, size: &Size) -> String {
     let key = format!("e2b-template\0{image}\0{tools}\0{platform}\0{}\0{}", size.cpus as u64, size.memory_bytes / MIB);
     format!("drydock-{}", &digest(&key)[..40])
+}
+/// The bootstrap's shell code (see `bootstrap`). The exclusive write fails
+/// quietly when the file exists, as expected; whatever the reason, the file
+/// must then hold a token, or the bootstrap stops saying so.
+fn bootstrap_script() -> String {
+    let token = "'[A-Za-z0-9_-]{43,}={0,2}'";
+    format!(
+        "mkdir -p /run/drydock /workspace && chmod 0700 /run/drydock && \
+         if [ -e {TOKEN_FILE} ] && ! grep -Eqx {token} {TOKEN_FILE}; then rm -f {TOKEN_FILE}; fi && \
+         {{ (umask 077; set -C; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}) 2>/dev/null || true; }} && \
+         {{ grep -Eqx {token} {TOKEN_FILE} || {{ echo 'drydock: {TOKEN_FILE} holds no token after writing it' >&2; exit 1; }}; }} && \
+         echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \
+         exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise \
+         --tcp 0.0.0.0:{AGENT_PORT} --tcp-token-file {TOKEN_FILE} --socket /run/drydock/agent.sock"
+    )
 }
 fn shell_command(command: &[String]) -> String {
     command.iter().map(|s| format!("'{}'", s.replace('\'', "'\"'\"'"))).collect::<Vec<_>>().join(" ")
@@ -1388,6 +1417,36 @@ mod tests {
         for ip in ["1.1.1.1", "203.0.113.5", "198.20.0.1", "2606:4700::1111", "::ffff:1.1.1.1"] {
             assert!(!private(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    // The bootstrap's shell code, run for real over a temporary directory: it
+    // writes a fresh token only root can read, keeps a token already there,
+    // and stops with a clear message when the write leaves no token.
+    #[test]
+    fn bootstrap_writes_keeps_or_refuses_the_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let script = bootstrap_script();
+        let (prefix, _) = script.split_once(" && exec ").unwrap();
+        let prefix = prefix.replace("/run/drydock", run.to_str().unwrap()).replace("/workspace", dir.path().join("w").to_str().unwrap());
+        let bootstrap =
+            |token: &str| std::process::Command::new("sh").args(["-c", &prefix]).env("DRYDOCK_TCP_TOKEN", token).output().unwrap();
+        let file = run.join("tcp.token");
+
+        let missing = bootstrap("");
+        assert!(!missing.status.success());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("tcp.token holds no token after writing it"), "{missing:?}");
+
+        let (first, second) = (Token::generate().unwrap(), Token::generate().unwrap());
+        let _ = std::fs::remove_file(&file);
+        let written = bootstrap(first.secret());
+        assert!(written.status.success(), "{written:?}");
+        assert_eq!(String::from_utf8_lossy(&written.stdout), format!("{TOKEN_LINE}{}\n", first.secret()));
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let kept = bootstrap(second.secret());
+        assert!(kept.status.success(), "{kept:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), first.secret());
     }
 
     // The template name holds the base and tools images, platform, vCPUs and
