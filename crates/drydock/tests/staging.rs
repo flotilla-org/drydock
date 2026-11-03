@@ -83,6 +83,8 @@ struct Oci {
     hidden: BTreeMap<String, usize>,
     /// Source registries answer ranged reads with the whole blob.
     ignore_range: bool,
+    /// The provider's registry refuses the next tag put.
+    refuse_tag_once: bool,
     violations: Vec<String>,
 }
 /// Stands in for the network boundary to every registry: the OCI distribution
@@ -150,6 +152,9 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
             if reference != sha256(&body) && (host != OWN || reference != sha256(&body).replace(':', "-")) {
                 s.violations.push(format!("manifest put under {reference}, not its digest"));
                 return reply(400, &[], Bytes::new());
+            }
+            if host == OWN && reference != sha256(&body) && std::mem::take(&mut s.refuse_tag_once) {
+                return reply(503, &[], Bytes::new());
             }
             if host == OWN && reference == sha256(&body) && s.visibility_delay > 0 {
                 s.hidden.insert(reference.into(), s.visibility_delay);
@@ -822,5 +827,26 @@ async fn composed_once_for_a_provider_that_bakes() {
     assert_eq!(ProviderApi::prepare(&*daemon, "baking", &baking(&tools)).await.unwrap().image_digest, prepared.image_digest);
     assert_eq!(registries.uploads_to(STAGE), uploads);
     assert_ne!(ProviderApi::prepare(&*daemon, "baking", &baking(&other_tools)).await.unwrap().image_digest, prepared.image_digest);
+    assert_eq!(registries.violations(), Vec::<String>::new());
+}
+
+// A copy whose retention tag failed to go in (the manifest put, then the tag
+// refused) gets its tag on the next prepare, which finds the copy already
+// there: the registry never holds it untagged for long.
+#[tokio::test]
+async fn a_lost_retention_tag_is_put_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    registries.0.lock().unwrap().refuse_tag_once = true;
+    let module = Pulling::default();
+    let (image, amd64) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+    let tagged =
+        || registries.0.lock().unwrap().manifests.contains_key(&(OWN.to_owned(), OWN_REPOSITORY.to_owned(), amd64.replace(':', "-")));
+
+    assert!(ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await.is_err());
+    assert!(!tagged());
+    ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await.unwrap();
+    assert!(tagged());
     assert_eq!(registries.violations(), Vec::<String>::new());
 }

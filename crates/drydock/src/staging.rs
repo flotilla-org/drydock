@@ -160,6 +160,8 @@ impl Staging {
         // tools registry its layer comes from.
         let composed = if compose {
             let tools = ImageRef::parse(&request.tools_digest)?;
+            // Pull access is to one registry, as `RegistryCredential` is: the
+            // request's goes to the tools image only when that is the same registry.
             let tools_credential = if tools.registry == source.registry { tools_credential } else { None };
             let tools_from = Registry::new(http, &tools.registry, tools_credential, None)?;
             let base_config = from.config(&source.repository, &manifest).await?;
@@ -174,10 +176,12 @@ impl Staging {
         };
         let target = target.await?;
         let to = &target.registry;
-        let (digest, copied) = match composed {
+        let (digest, media_type, bytes, copied) = match composed {
             Some((composed, tools_from, tools_repository)) => {
                 let lock = self.lock(&format!("{}@{}", target.location(), composed.digest));
                 let _copying = lock.lock().await;
+                // The manifest goes in last, after every blob it names, so a
+                // manifest already there means its blobs are too.
                 let copied = !to.manifest_visible(&target.repository, &composed.digest).await?;
                 if copied {
                     for (origin, layer) in &composed.layers {
@@ -190,23 +194,21 @@ impl Staging {
                     to.put_blob(&target.repository, &composed.config_digest, composed.config.clone().into()).await?;
                     to.put_manifest(&target.repository, &composed.digest, &composed.media_type, composed.manifest.clone().into()).await?;
                 }
-                if copied && target.retain {
-                    to.put_manifest(&target.repository, &retention_tag(&composed.digest), &composed.media_type, composed.manifest.into())
-                        .await?;
-                }
-                (composed.digest, copied)
+                (composed.digest, composed.media_type, bytes::Bytes::from(composed.manifest), copied)
             }
             None => {
                 let lock = self.lock(&format!("{}@{}", target.location(), manifest.digest));
                 let _copying = lock.lock().await;
                 let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, to, &target.repository, target.chunk).await?;
-                if copied && target.retain {
-                    to.put_manifest(&target.repository, &retention_tag(&manifest.digest), &manifest.media_type, manifest.bytes.clone())
-                        .await?;
-                }
-                (manifest.digest, copied)
+                (manifest.digest, manifest.media_type, manifest.bytes, copied)
             }
         };
+        // The tag is put after the manifest, so a copy found already there may
+        // have lost its tag to a failure between the two: one read finds out.
+        let tag = retention_tag(&digest);
+        if target.retain && (copied || !to.manifest_visible(&target.repository, &tag).await?) {
+            to.put_manifest(&target.repository, &tag, &media_type, bytes).await?;
+        }
         // A registry can serve a new manifest only after a delay (Daytona's
         // does), and the provider pulls it once, at its prepare.
         let visible = async || to.manifest_visible(&target.repository, &digest).await;
