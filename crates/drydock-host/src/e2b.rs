@@ -42,6 +42,7 @@ const DETAIL_READS: usize = 8;
 const EVENT_PAGE: usize = 100;
 const EVENT_PAGES: usize = 100;
 const SANDBOX_PAGES: Paging = Paging { rows: None, cursor: "nextToken", next: Next::Header("x-next-token") };
+const BUILD_PAGES: Paging = Paging { rows: Some("builds"), cursor: "nextToken", next: Next::Header("x-next-token") };
 const RESUME_PREFIX: &str = "e2b-resume-";
 
 #[derive(Serialize)]
@@ -82,6 +83,8 @@ struct TemplateBuild {
     #[serde(rename = "buildID")]
     id: Text,
     status: Text,
+    #[serde(rename = "diskSizeMB")]
+    disk_mb: Option<u64>,
 }
 #[derive(Serialize)]
 struct BuildStart<'a> {
@@ -176,6 +179,10 @@ struct Event {
     timestamp: DateTime<Utc>,
     #[serde(rename = "sandboxId")]
     sandbox: Text,
+    #[serde(rename = "sandboxTemplateId")]
+    template: Text,
+    #[serde(rename = "sandboxBuildId")]
+    build: Text,
     #[serde(rename = "eventData")]
     data: EventData,
 }
@@ -190,6 +197,11 @@ struct Execution {
     started_at: DateTime<Utc>,
     vcpu_count: u64,
     memory_mb: u64,
+}
+#[derive(Clone)]
+enum Disk {
+    Granted(u64),
+    Build(String, String),
 }
 #[derive(Deserialize)]
 struct Metric {
@@ -480,6 +492,13 @@ impl E2b {
         let reads = self.listed(label, c).await?.into_iter().map(|v| async move { absent_on_not_found(self.sandbox(&v.id, c).await) });
         let details: Vec<Option<Sandbox>> = futures::stream::iter(reads).buffered(DETAIL_READS).try_collect().await?;
         Ok(details.into_iter().flatten().collect())
+    }
+    async fn builds(&self, template: &str, c: &Credentials) -> Result<BTreeMap<String, u64>> {
+        let mut url = self.api.url(&["templates", template])?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        let builds: Vec<TemplateBuild> = absent_on_not_found(self.api.paged(url, &BUILD_PAGES, c).await)?
+            .ok_or_else(|| refused(format!("E2B template {template} is gone, so its sandboxes' disk is unknown")))?;
+        Ok(builds.into_iter().filter_map(|b| Some((b.id.to_string(), b.disk_mb?))).collect())
     }
     async fn template(&self, name: &str, c: &Credentials) -> Result<Option<Template>> {
         let Some(alias) = absent_on_not_found(self.get::<Alias>(&["templates", "aliases", name], c).await)? else { return Ok(None) };
@@ -927,7 +946,7 @@ impl QuotaOperation for E2b {
 impl UsageOperation for E2b {
     async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
         let (from, to) = (period.start().instant(), period.end().instant());
-        let mut executions: BTreeMap<(String, DateTime<Utc>), (DateTime<Utc>, u64, u64)> = BTreeMap::new();
+        let mut executions: BTreeMap<(String, DateTime<Utc>), (DateTime<Utc>, u64, u64, Disk)> = BTreeMap::new();
         let mut seen = BTreeSet::new();
         let mut complete = false;
         'pages: for page in 0..EVENT_PAGES {
@@ -948,10 +967,10 @@ impl UsageOperation for E2b {
                     continue;
                 }
                 let Some(x) = &event.data.execution else { continue };
-                let entry =
-                    executions.entry((event.sandbox.to_string(), x.started_at)).or_insert((event.timestamp, x.vcpu_count, x.memory_mb));
+                let row = (event.timestamp, x.vcpu_count, x.memory_mb, Disk::Build(event.template.to_string(), event.build.to_string()));
+                let entry = executions.entry((event.sandbox.to_string(), x.started_at)).or_insert_with(|| row.clone());
                 if event.timestamp < entry.0 {
-                    *entry = (event.timestamp, x.vcpu_count, x.memory_mb);
+                    *entry = row;
                 }
             }
             if events.len() < EVENT_PAGE {
@@ -967,31 +986,44 @@ impl UsageOperation for E2b {
         }
         let now = Utc::now();
         for v in self.listed(None, c).await? {
-            if let (Some(started), Some(cpus), Some(memory), "running") = (v.started_at, v.cpus, v.memory_mb, self.state(&v)) {
-                executions.entry((v.id.to_string(), started)).or_insert((now, cpus, memory));
+            if let (Some(started), Some(cpus), Some(memory), Some(disk), "running") =
+                (v.started_at, v.cpus, v.memory_mb, v.disk_mb, self.state(&v))
+            {
+                executions.entry((v.id.to_string(), started)).or_insert((now, cpus, memory, Disk::Granted(disk)));
             }
         }
-        let mut sizes: BTreeMap<(u64, u64), f64> = BTreeMap::new();
+        executions.retain(|(_, started), (ended, ..)| (*ended).min(to) > (*started).max(from));
+        let mut builds = BTreeMap::new();
+        for (_, _, _, disk) in executions.values() {
+            if let Disk::Build(template, _) = disk
+                && !builds.contains_key(template)
+            {
+                builds.insert(template.clone(), self.builds(template, c).await?);
+            }
+        }
+        let mut sizes: BTreeMap<(u64, u64, u64), f64> = BTreeMap::new();
         let (mut cpu_seconds, mut memory_byte_seconds) = (0.0, 0.0);
         let mut sandboxes = BTreeSet::new();
-        for ((sandbox, started), (ended, cpus, memory)) in executions {
+        for ((sandbox, started), (ended, cpus, memory, disk)) in executions {
+            let disk = match disk {
+                Disk::Granted(disk) => disk,
+                Disk::Build(template, build) => builds[&template].get(&build).copied().ok_or_else(|| {
+                    refused(format!("E2B reports no disk for build {build} of template {template}, which sandbox {sandbox} ran"))
+                })?,
+            };
             let (start, end) = (started.max(from), ended.min(to));
-            if end <= start {
-                continue;
-            }
             let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
-            *sizes.entry((cpus, memory)).or_default() += seconds / 3600.0;
+            *sizes.entry((cpus, memory, disk)).or_default() += seconds / 3600.0;
             cpu_seconds += cpus as f64 * seconds;
             memory_byte_seconds += (memory * MIB) as f64 * seconds;
             sandboxes.insert(sandbox);
         }
-        let disk_bytes = self.settings.disk_mb * MIB;
         Ok(Usage {
             period,
             environment_hours: sizes
                 .into_iter()
-                .map(|((cpus, memory), hours)| SizeUsage {
-                    size: Size { cpus: cpus as f64, memory_bytes: memory * MIB, disk_bytes },
+                .map(|((cpus, memory, disk), hours)| SizeUsage {
+                    size: Size { cpus: cpus as f64, memory_bytes: memory * MIB, disk_bytes: disk * MIB },
                     hours,
                 })
                 .collect(),
