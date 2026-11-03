@@ -35,3 +35,25 @@ containerregistry *  containerregistry/repository *  containerregistry/image *
 - Without `ingress access`, every SDK gateway call returns 403.
 - Quota (`UsageService/GetConcurrency`) needs a grant beyond these, not yet identified. Without it quota is refused and the provider stays ready.
 - Image optimize is refused for every grant a revocable token can carry; the module doesn't call it.
+
+## E2B (`e2b`, Rust host)
+
+Credential: a team API key (`e2b_…`), as a plain token file, sent as `X-API-Key`. Configuration also needs `team_id`.
+
+Create it in the E2B dashboard (Team → API Keys). Keys have no scopes: a key can build and delete every template and kill every sandbox in the team. Use a team that holds only drydock's sandboxes; drydock finds its own by their `drydock.provider` and `flotilla.label` metadata, and refuses to adopt or destroy a sandbox without both.
+
+| Call | Used for |
+|---|---|
+| `/templates/aliases/{name}`, `/v3/templates`, `/templates/{id}/files/{hash}`, `/v2/templates/{id}/builds/{build}`, `/templates/{id}/builds/{build}/status` | prepare |
+| `/v2/sandboxes`, `/sandboxes/{id}`, `/sandboxes/{id}/pause`, `/v2/sandboxes/{id}/connect` | provision, list, inspect, suspend, resume, destroy |
+| envd's `process.Process/Start` at `49983-<sandbox>.<domain>` | bootstrap, exec |
+| the proxy at `7811-<sandbox>.<domain>` | reach |
+| `/events/sandboxes` | usage |
+| `/teams/{teamID}/metrics` | quota (in use) |
+
+- Each sandbox returns `envdAccessToken` and `trafficAccessToken` at create and connect. The host holds them in memory; they are never written to a record or a log. After a host restart it reads the envd token back from `GET /sandboxes/{id}` and the traffic token from a running sandbox's connect, which extends its timeout to `lifetime_seconds`.
+- The key can't read the team's limits, credit or spend; set `concurrency_limit` in settings. Usage reports no cost.
+- Private registries are given per prepare, not stored at E2B. E2B pulls over the public internet, so drydock refuses a base whose registry is or resolves to a private address; a staging registry (`pull_from`) is the way to such images.
+- Hobby caps a sandbox at one hour of running: a longer timeout is refused at create and silently clamped on extend. Sandboxes are created with `autoPause`, so the cap pauses rather than kills; drydock reads that pause as `paused_by_provider` and resumes on demand. Set `lifetime_seconds` (default 3600) to 86400 on Pro, and `disk_mb` (default 10240) to the plan's sandbox disk.
+- Templates stay at teardown, one per image and size; the tools layers uploaded to E2B's build cache can't be deleted.
+- E2B's terms ask for written consent before a third-party app interacts with the Services. This module is our own use of our own account; confirm with E2B before offering it to anyone else.
