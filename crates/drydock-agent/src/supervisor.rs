@@ -37,7 +37,7 @@ fn socket(args: &[OsString]) -> io::Result<PathBuf> {
 
 /// Refuses a TCP listener the agent would refuse, before detaching, so the
 /// provider's bootstrap hears of it rather than a supervisor that restarts
-/// a failing agent for ever.
+/// a failing agent for ever. The token file's own state is [`provision`]'s.
 fn check_tcp(args: &[OsString]) -> io::Result<()> {
     let value = |name: &str| args.chunks(2).find(|pair| pair[0] == name).and_then(|pair| pair.get(1));
     match (value("--tcp"), value("--tcp-token-file")) {
@@ -52,7 +52,7 @@ fn check_tcp(args: &[OsString]) -> io::Result<()> {
             if !path.is_absolute() {
                 return Err(io::Error::other("--supervise requires an absolute --tcp-token-file"));
             }
-            drydock_agent::tcp::read_token(path).map(drop)
+            Ok(())
         }
         (None, None) => Ok(()),
         (Some(_), None) => Err(io::Error::other("--tcp requires --tcp-token-file")),
@@ -60,9 +60,57 @@ fn check_tcp(args: &[OsString]) -> io::Result<()> {
     }
 }
 
+/// `--token-from-env VAR` and `--print-token` are bootstrap's, not the
+/// agent's: `args` without them, and what they asked for.
+fn bootstrap(args: &[OsString]) -> io::Result<(Vec<OsString>, Option<String>, bool)> {
+    let (mut rest, mut variable, mut print) = (Vec::new(), None, false);
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--print-token" {
+            print = true;
+        } else if arg == "--token-from-env" {
+            let name = args.next().and_then(|v| v.to_str()).filter(|v| !v.is_empty() && !v.starts_with("--"));
+            variable = Some(name.ok_or_else(|| io::Error::other("--token-from-env requires a variable name"))?.to_owned());
+        } else {
+            // Every other option takes a value, which is kept whole.
+            rest.push(arg.clone());
+            rest.extend(args.next().cloned());
+        }
+    }
+    Ok((rest, variable, print))
+}
+
+/// Writes or keeps the token file `--tcp-token-file` names, then prints the
+/// token if asked, before detaching, so a bootstrap hears of a bad file or
+/// variable rather than a supervisor that restarts a failing agent for ever.
+fn provision(args: &[OsString], variable: Option<&str>, print: bool) -> io::Result<()> {
+    let Some(path) = args.chunks(2).find(|pair| pair[0] == "--tcp-token-file").and_then(|pair| pair.get(1)) else {
+        return match (variable, print) {
+            (None, false) => Ok(()),
+            _ => Err(io::Error::other("--token-from-env and --print-token require --tcp-token-file")),
+        };
+    };
+    let path = std::path::Path::new(path);
+    let supplied = match variable {
+        Some(name) => {
+            let text = std::env::var(name).map_err(|_| io::Error::other(format!("--token-from-env: {name} is not set to text")))?;
+            Some(drydock_agent::tcp::Token::parse(&text).map_err(|e| io::Error::new(e.kind(), format!("--token-from-env {name}: {e}")))?)
+        }
+        None => None,
+    };
+    let token = drydock_agent::tcp::provision_token(path, supplied)?;
+    if print {
+        println!("{}", drydock_agent::tcp::token_line(&token));
+    }
+    Ok(())
+}
+
 pub fn start(args: &[OsString]) -> io::Result<()> {
+    let (args, variable, print) = bootstrap(args)?;
+    let args = &args[..];
     let path = socket(args)?;
     check_tcp(args)?;
+    provision(args, variable.as_deref(), print)?;
     let parent = path.parent().ok_or_else(|| io::Error::other("socket needs a directory"))?;
     drydock_agent::socket::private_directory(parent)?;
     let log = std::fs::OpenOptions::new()
@@ -73,6 +121,10 @@ pub fn start(args: &[OsString]) -> io::Result<()> {
         .open(parent.join("supervisor.log"))?;
     let mut command = Command::new(std::env::current_exe()?);
     command.arg("--supervisor").args(args).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+    // Only the file keeps the token: the agent's environment is readable through /proc.
+    if let Some(name) = &variable {
+        command.env_remove(name);
+    }
     // Its own process group, outside the toolbox exec session's foreground
     // group, without depending on nohup or an image init.
     command.process_group(0);

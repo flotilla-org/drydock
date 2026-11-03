@@ -49,6 +49,58 @@ pub fn read_token(path: &Path) -> io::Result<Token> {
     result.map_err(|e| context("tcp.token", path.display(), e))
 }
 
+/// The token the file at `path` holds, written first if it holds none. A
+/// valid token in an acceptable file (see [`read_token`]) is kept; a missing
+/// file is created with `supplied`, or a fresh token, at mode 0600; anything
+/// else (garbage, a wrong mode or owner, a symlink or FIFO) is replaced. The
+/// file is complete on appearance, and concurrent callers serialize on a lock
+/// file beside it, so all of them return the one token the file ends up with.
+pub fn provision_token(path: &Path, supplied: Option<Token>) -> io::Result<Token> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let result = (|| {
+        let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tcp token file needs a file name"))?;
+        let directory = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let beside = |suffix: &str| {
+            let mut name = name.to_owned();
+            name.push(suffix);
+            directory.join(name)
+        };
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(beside(".lock"))?;
+        lock.lock()?;
+        if let Ok(token) = read_token(path) {
+            return Ok(token);
+        }
+        let token = match supplied {
+            Some(token) => token,
+            None => Token::generate()?,
+        };
+        let staging = beside(&format!(".{}", std::process::id()));
+        let _ = std::fs::remove_file(&staging);
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&staging)?;
+        let written = file.write_all(format!("{}\n", token.secret()).as_bytes()).and_then(|()| file.sync_all());
+        // rename replaces a symlink or special file itself, never what it names.
+        let placed = written.and_then(|()| std::fs::rename(&staging, path));
+        if placed.is_err() {
+            let _ = std::fs::remove_file(&staging);
+        }
+        placed?;
+        read_token(path)
+    })();
+    result.map_err(|e| context("tcp.token", path.display(), e))
+}
+
+/// The line `--print-token` writes, for the host that reads the token back.
+pub fn token_line(token: &Token) -> String {
+    format!("drydock-tcp-token {}", token.secret())
+}
+
 fn admissible(regular: bool, owner: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
     if !regular {
         Err("tcp token file must be a regular file")
@@ -267,6 +319,96 @@ async fn accept(listener: TcpListener, token: Token, admitted: mpsc::Sender<io::
 mod tests {
     use super::*;
     use hegel::generators as gs;
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    // No file: one is created at mode 0600 with the supplied token, or a fresh
+    // one, and read_token accepts it. A valid file is kept whatever is supplied.
+    #[test]
+    fn provisioning_creates_and_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcp.token");
+        let supplied = Token::generate().unwrap();
+        assert_eq!(provision_token(&path, Some(supplied.clone())).unwrap(), supplied);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(read_token(&path).unwrap(), supplied);
+        assert_eq!(provision_token(&path, Some(Token::generate().unwrap())).unwrap(), supplied);
+        assert_eq!(provision_token(&path, None).unwrap(), supplied);
+        let fresh = dir.path().join("fresh.token");
+        let generated = provision_token(&fresh, None).unwrap();
+        assert_eq!(read_token(&fresh).unwrap(), generated);
+        assert_ne!(generated, supplied);
+    }
+
+    // Garbage, a short token, a valid token in a file others could read, a
+    // symlink, and a FIFO are each replaced, never trusted or followed.
+    #[test]
+    fn provisioning_replaces_what_read_token_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcp.token");
+        let old = Token::generate().unwrap();
+        let broken: [&dyn Fn(); 5] = [
+            &|| std::fs::write(&path, "not a token!\n").unwrap(),
+            &|| std::fs::write(&path, "").unwrap(),
+            &|| {
+                std::fs::write(&path, format!("{}\n", old.secret())).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            },
+            &|| {
+                let target = dir.path().join("target");
+                std::fs::write(&target, format!("{}\n", old.secret())).unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            },
+            &|| rustix::fs::mknodat(rustix::fs::CWD, &path, rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap(),
+        ];
+        for (index, break_it) in broken.iter().enumerate() {
+            let _ = std::fs::remove_file(&path);
+            break_it();
+            let token = provision_token(&path, None).unwrap();
+            assert_ne!(token, old, "case {index}");
+            assert_eq!(read_token(&path).unwrap(), token, "case {index}");
+            assert_eq!(mode(&path), 0o600, "case {index}");
+        }
+        // The symlink's target was left alone.
+        assert_eq!(read_token(&dir.path().join("target")).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(dir.path().join("target")).unwrap().trim(), old.secret());
+    }
+
+    // Starts racing over a missing or garbage file all end with the one token
+    // the file holds, and leave only the token file and its lock.
+    #[test]
+    fn concurrent_provisioning_agrees_on_one_token() {
+        for garbage in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tcp.token");
+            if garbage {
+                std::fs::write(&path, "garbage").unwrap();
+            }
+            let tokens: Vec<_> = (0..16)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || provision_token(&path, None).unwrap())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect();
+            assert!(tokens.iter().all(|t| *t == read_token(&path).unwrap()), "garbage: {garbage}");
+            let mut left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+            left.sort();
+            assert_eq!(left, ["tcp.token", "tcp.token.lock"]);
+        }
+    }
+
+    #[test]
+    fn the_printed_line_names_the_token() {
+        let token = Token::generate().unwrap();
+        assert_eq!(token_line(&token), format!("drydock-tcp-token {}", token.secret()));
+    }
 
     // A token file is trusted only as a regular file of the agent's user with
     // mode 0600 exactly: every other mode is refused on a real file, a

@@ -127,8 +127,9 @@ fn free_port() -> SocketAddr {
 }
 
 // Startup refuses `--tcp` without a token file and the reverse, and a token
-// file that is not private (mode 0644), missing, or too short; supervision
-// refuses the same before it detaches anything.
+// file that is not private (mode 0644), missing, or too short. Supervision
+// refuses the structural errors before it detaches anything; it replaces a bad
+// file instead (see `supervise_provisions_and_prints_the_token`).
 #[tokio::test]
 async fn startup_refuses_an_unsafe_tcp_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -142,16 +143,17 @@ async fn startup_refuses_an_unsafe_tcp_configuration() {
     let address = free_port().to_string();
     let (public, short, missing) =
         (public.to_str().unwrap(), short.to_str().unwrap(), dir.path().join("missing").to_string_lossy().into_owned());
-    let cases: [&[&str]; 6] = [
-        &["--tcp", &address],
-        &["--tcp-token-file", public],
-        &["--tcp", &address, "--tcp-token-file", public],
-        &["--tcp", &address, "--tcp-token-file", short],
-        &["--tcp", &address, "--tcp-token-file", &missing],
-        &["--tcp", "localhost", "--tcp-token-file", public],
+    // Whether supervision refuses the case too, or repairs the file.
+    let cases: [(&[&str], bool); 6] = [
+        (&["--tcp", &address], true),
+        (&["--tcp-token-file", public], true),
+        (&["--tcp", &address, "--tcp-token-file", public], false),
+        (&["--tcp", &address, "--tcp-token-file", short], false),
+        (&["--tcp", &address, "--tcp-token-file", &missing], false),
+        (&["--tcp", "localhost", "--tcp-token-file", public], true),
     ];
-    for args in cases {
-        for supervise in [false, true] {
+    for (args, supervision_refuses) in cases {
+        for supervise in [false, true].into_iter().filter(|supervise| !supervise || supervision_refuses) {
             let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock-agent"));
             if supervise {
                 command.arg("--supervise").args(args).arg("--socket").arg(&socket);
