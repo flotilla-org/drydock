@@ -561,6 +561,37 @@ fn allowlist(request: EgressRequest) -> Result<Policy> {
     }
 }
 
+/// Daytona's egress as its documentation states it (2026-11-03). The module
+/// applies one control per request (see `policy`); it never sets
+/// `outboundProxyUrl`, whose `HTTP_PROXY` route works inside the guest.
+fn egress_model() -> EgressModel {
+    const LIMITS: &str = "https://www.daytona.io/docs/en/network-limits";
+    use EgressShape::*;
+    EgressModel {
+        shapes: vec![Open, DenyAll, AllowAddresses, AllowDomains],
+        // "Each sandbox runs behind a firewall" and updates change "outbound network
+        // policy on the runner": outside the guest. The docs do not say whether guest
+        // root can bypass it; drydockd's verdict settles that, not this claim.
+        enforced: EnforcementSite::OutsideGuest,
+        side_effects: vec![EgressSideEffect {
+            shapes: vec![DenyAll, AllowAddresses, AllowDomains],
+            opens: vec![],
+            note: "On Tier 1 and 2, organization-level restrictions take precedence over the sandbox's \
+                   policy and essential services remain reachable."
+                .into(),
+        }],
+        // Tier 3 and 4 only; lower tiers refuse the update. Declared false
+        // because the module cannot see the organization's tier.
+        mutable_while_running: false,
+        sources: vec![
+            LIMITS.into(),
+            format!("{LIMITS}#tier-based-network-restrictions"),
+            format!("{LIMITS}#update-network-settings-while-a-sandbox-is-running"),
+            "https://www.daytona.io/docs/en/isolation#network-isolation".into(),
+        ],
+    }
+}
+
 #[async_trait]
 impl Provider for Daytona {
     fn capabilities(&self) -> Capabilities {
@@ -573,7 +604,7 @@ impl Provider for Daytona {
             export: false,
             egress: EgressCapability {
                 routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                enforcement: Enforcement::Advisory,
+                model: egress_model(),
             },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,

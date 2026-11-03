@@ -898,7 +898,7 @@ fn conservative_capabilities() -> Capabilities {
         suspend_resume: false,
         suspend_preserves_memory: None,
         export: false,
-        egress: EgressCapability { routes: vec![], enforcement: Enforcement::Advisory },
+        egress: EgressCapability { routes: vec![], model: EgressModel { shapes: vec![], ..EgressModel::unfiltered() } },
         fallback_runner: false,
         bootstrap: BootstrapRoute::Upload,
         agent: false,

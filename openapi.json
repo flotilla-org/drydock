@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "10"
+    "version": "11"
   },
   "paths": {
     "/v1/config": {
@@ -2429,17 +2429,59 @@
         "type": "object",
         "required": [
           "routes",
-          "enforcement"
+          "model"
         ],
         "properties": {
-          "enforcement": {
-            "$ref": "#/components/schemas/Enforcement"
+          "model": {
+            "$ref": "#/components/schemas/EgressModel",
+            "description": "The policies the vendor filters that traffic with."
           },
           "routes": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/EgressRoute"
-            }
+            },
+            "description": "How a guest's traffic can leave: not at all, through a proxy the client\nconfigures, or directly. Routes say nothing about filtering."
+          }
+        }
+      },
+      "EgressModel": {
+        "type": "object",
+        "description": "What a module states about its vendor's egress control, from the vendor's\ndocumentation. A claim, never a verification: drydockd owns the verdict.",
+        "required": [
+          "shapes",
+          "enforced",
+          "mutable_while_running"
+        ],
+        "properties": {
+          "enforced": {
+            "$ref": "#/components/schemas/EnforcementSite",
+            "description": "Where the vendor applies a policy."
+          },
+          "mutable_while_running": {
+            "type": "boolean",
+            "description": "Whether the vendor can change the policy of a running sandbox."
+          },
+          "shapes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressShape"
+            },
+            "description": "Policy shapes the module can apply. It refuses requests outside them."
+          },
+          "side_effects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressSideEffect"
+            },
+            "description": "Documented effects of a policy beyond what it requests."
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Vendor documentation the declaration rests on."
           }
         }
       },
@@ -2491,11 +2533,54 @@
           "open"
         ]
       },
+      "EgressShape": {
+        "type": "string",
+        "enum": [
+          "open",
+          "deny_all",
+          "allow_addresses",
+          "allow_domains",
+          "explicit_proxy"
+        ]
+      },
+      "EgressSideEffect": {
+        "type": "object",
+        "description": "A documented effect of applying any of `shapes`. `opens` lists the\ndestinations it also allows, when the vendor names them; `note` says the rest.",
+        "required": [
+          "shapes",
+          "note"
+        ],
+        "properties": {
+          "note": {
+            "type": "string"
+          },
+          "opens": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Destination"
+            }
+          },
+          "shapes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EgressShape"
+            }
+          }
+        }
+      },
       "Enforcement": {
         "type": "string",
         "enum": [
           "enforced",
           "advisory"
+        ]
+      },
+      "EnforcementSite": {
+        "type": "string",
+        "enum": [
+          "none",
+          "outside_guest",
+          "inside_guest"
         ]
       },
       "Environment": {

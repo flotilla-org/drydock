@@ -126,7 +126,7 @@ no build reports `missing_tool`.
 - **Destroy** kills the agent and its session, then removes the directory, read-only
   contents (such as the agent's artifact store) included. Anything
   that started its own session escapes.
-- **Egress** is declared open and advisory. A deny-all request is refused with a
+- **Egress** is declared open and unfiltered. A deny-all request is refused with a
   reason, because the host's network cannot be restricted per vessel.
 - **Capabilities** declare `host_filesystem`: a guest path is a host path, so a
   client lays each vessel out below paths it can write, never at fixed guest
@@ -274,8 +274,10 @@ AAAA rejection of dual-stack names. IPv6 literals/CIDRs, port-specific entries
 and mixed domain/CIDR requests are refused. Label retries compare normalized
 requested policies, not the results of a new DNS lookup.
 
-The provider capability remains Advisory, including on low tiers where vendor
-organization restrictions may take precedence. Every row is the vendor's claim
+The capability declares Daytona's documented egress model (`egress_model`):
+firewall enforcement outside the guest, the tier 1–2 rule that organization
+restrictions take precedence, and no running-sandbox update (tier 3–4 only).
+It claims nothing verified. Every row is the vendor's claim
 alone: Advisory, unmeasured, carrying an opaque effective-policy fingerprint.
 This module runs no guest probe; measuring whether the vendor's enforcement
 holds is drydockd's, not the module's. Transport outages return Unavailable,

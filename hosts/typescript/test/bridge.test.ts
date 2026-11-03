@@ -38,7 +38,10 @@ const capabilities = {
   usage: false,
   quota: false,
   fallback_runner: false,
-  egress: { routes: ["none"], enforcement: "advisory" },
+  egress: {
+    routes: ["none"],
+    model: { shapes: ["open"], enforced: "none", mutable_while_running: false },
+  },
   bootstrap: "bake",
   agent: false,
   platforms: [{ os: "linux", architecture: "amd64" }],
@@ -170,7 +173,7 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     id = encodeURIComponent(environment.id);
   assert.equal((await stat(f.socketPath)).mode & 0o777, 0o600);
   const hello = await request(f.socketPath, "/v1/hello", undefined, "GET");
-  assert.equal(hello.body.protocol_version, "10");
+  assert.equal(hello.body.protocol_version, "11");
   assert.equal(hello.body.loadable_modules[0].name, f.name);
   assert.equal(
     (await request(f.socketPath, "/v1/hello", undefined, "HEAD")).status,

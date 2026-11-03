@@ -122,7 +122,17 @@ impl Provider for Reference {
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
             export: true,
-            egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::Open], enforcement: Enforcement::Advisory },
+            // A fixture with no guest network: it accepts deny-all and open, and enforces neither.
+            egress: EgressCapability {
+                routes: vec![EgressRoute::None, EgressRoute::Open],
+                model: EgressModel {
+                    shapes: vec![EgressShape::Open, EgressShape::DenyAll],
+                    enforced: EnforcementSite::None,
+                    side_effects: vec![],
+                    mutable_while_running: false,
+                    sources: vec![],
+                },
+            },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Bake,
             agent: self.settings.agent,

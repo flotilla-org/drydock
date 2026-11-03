@@ -242,3 +242,68 @@ fn readers_accept_omitted_and_null_optional_fields() {
     let quota: Quota = serde_json::from_value(json!({"credits_remaining": null, "credit_unit": null})).unwrap();
     assert_eq!(quota, serde_json::from_value(json!({})).unwrap());
 }
+
+// A module's declared egress model is data on the wire: every shape, site and
+// side effect survives a round trip. The generator draws any subset of shapes
+// in any order (including none and duplicates), every enforcement site, zero to
+// three side effects over every destination kind, both mutability answers, and
+// empty or present sources, which are omitted from the wire when empty.
+#[hegel::test]
+fn egress_model_roundtrips(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let shapes =
+        [EgressShape::Open, EgressShape::DenyAll, EgressShape::AllowAddresses, EgressShape::AllowDomains, EgressShape::ExplicitProxy];
+    let shape = |tc: &hegel::TestCase| shapes[tc.draw(gs::integers::<usize>().max_value(shapes.len() - 1))];
+    let destinations = [
+        json!({"kind":"cidr","cidr":"8.8.8.8/32"}),
+        json!({"kind":"host","host":"dns.google"}),
+        json!({"kind":"host_port","host":"8.8.4.4","port":53}),
+    ];
+    let side_effects = (0..tc.draw(gs::integers::<usize>().max_value(3)))
+        .map(|_| EgressSideEffect {
+            shapes: (0..tc.draw(gs::integers::<usize>().max_value(3))).map(|_| shape(&tc)).collect(),
+            opens: (0..tc.draw(gs::integers::<usize>().max_value(3)))
+                .map(|_| serde_json::from_value(destinations[tc.draw(gs::integers::<usize>().max_value(2))].clone()).unwrap())
+                .collect(),
+            note: tc.draw(gs::sampled_from(vec![String::new(), "allowing a domain also opens 8.8.8.8".into()])),
+        })
+        .collect();
+    let model = EgressModel {
+        shapes: (0..tc.draw(gs::integers::<usize>().max_value(6))).map(|_| shape(&tc)).collect(),
+        enforced: [EnforcementSite::None, EnforcementSite::OutsideGuest, EnforcementSite::InsideGuest]
+            [tc.draw(gs::integers::<usize>().max_value(2))],
+        side_effects,
+        mutable_while_running: tc.draw(gs::booleans()),
+        sources: (0..tc.draw(gs::integers::<usize>().max_value(2))).map(|i| format!("https://vendor.example/docs/{i}")).collect(),
+    };
+    let capability = EgressCapability { routes: vec![EgressRoute::Open], model };
+    let encoded = serde_json::to_value(&capability).unwrap();
+    assert_eq!(encoded["model"].get("side_effects").is_none(), capability.model.side_effects.is_empty());
+    assert_eq!(encoded["model"].get("sources").is_none(), capability.model.sources.is_empty());
+    for (effect, wire) in capability.model.side_effects.iter().zip(encoded["model"]["side_effects"].as_array().into_iter().flatten()) {
+        assert_eq!(wire.get("opens").is_none(), effect.opens.is_empty());
+    }
+    assert_eq!(serde_json::from_value::<EgressCapability>(encoded).unwrap(), capability);
+}
+
+// Every egress shape and enforcement site has one pinned wire name, and the
+// retired `enforcement` claim is no longer a capability: a reader refuses a
+// capability that carries it in place of a model.
+#[test]
+fn egress_model_wire_shapes() {
+    fixture::<EgressCapability>(json!({"routes":["none","explicit_proxy"],"model":{
+        "shapes":["open","deny_all","allow_addresses","allow_domains","explicit_proxy"],
+        "enforced":"outside_guest",
+        "side_effects":[{"shapes":["allow_domains"],"opens":[{"kind":"cidr","cidr":"8.8.8.8/32"}],"note":"DNS"},{"shapes":["deny_all","allow_domains"],"note":"unnamed"}],
+        "mutable_while_running":true,
+        "sources":["https://vendor.example/docs"]}}));
+    for site in ["none", "outside_guest", "inside_guest"] {
+        fixture::<EgressModel>(json!({"shapes":[],"enforced":site,"mutable_while_running":false}));
+    }
+    assert!(serde_json::from_value::<EgressModel>(json!({"shapes":["future"],"enforced":"none","mutable_while_running":false})).is_err());
+    assert!(serde_json::from_value::<EgressCapability>(json!({"routes":[],"enforcement":"advisory"})).is_err());
+    // A side effect's destinations are validated like any other destination.
+    assert!(
+        serde_json::from_value::<EgressSideEffect>(json!({"shapes":[],"opens":[{"kind":"cidr","cidr":"8.8.8.8/33"}],"note":""})).is_err()
+    );
+}
