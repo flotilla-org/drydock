@@ -122,30 +122,50 @@ impl TlsDialer {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self { tls: Arc::new(config) })
     }
-    async fn open(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
-        let invalid = |reason: &str| DialError::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("{reason}: {}", shown(url))));
+    /// The connection beneath a dial of `url`, whose scheme (in any case)
+    /// must be one of `schemes`: TCP, with TLS for `wss://` and `https://`;
+    /// `ws://` and `http://` only to a loopback IP address.
+    async fn stream(&self, url: &str, schemes: Schemes) -> io::Result<ByteStream> {
+        let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{reason}: {}", shown(url)));
         let uri: Uri = url.parse().map_err(|_| invalid("not a URL"))?;
-        let secure = match uri.scheme_str() {
-            Some("wss") => true,
-            Some("ws") => false,
-            _ => return Err(invalid("not a ws or wss URL")),
+        let scheme = uri.scheme_str().unwrap_or_default().to_ascii_lowercase();
+        let (cleartext, tls, refusal) = match schemes {
+            Schemes::WebSocket => ("ws", "wss", "not a ws or wss URL"),
+            Schemes::Http => ("http", "https", "not an http or https URL"),
+        };
+        let secure = match scheme.as_str() {
+            s if s == tls => true,
+            s if s == cleartext => false,
+            _ => return Err(invalid(refusal)),
         };
         let host = uri.host().ok_or_else(|| invalid("no host"))?;
         let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
         if !secure && !host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
-            return Err(invalid("ws:// only to a loopback IP address"));
+            return Err(invalid("cleartext only to a loopback IP address"));
         }
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
         let tcp = tokio::net::TcpStream::connect((host, port)).await?;
         tcp.set_nodelay(true)?;
-        let stream: ByteStream = if secure {
+        Ok(if secure {
             let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|_| invalid("not a TLS server name"))?;
             Box::new(tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp).await?)
         } else {
             Box::new(tcp)
-        };
+        })
+    }
+    async fn open(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
+        let stream = self.stream(url, Schemes::WebSocket).await?;
         handshake(url, headers, stream).await
     }
+}
+
+/// The schemes a [`TlsDialer`] connection may be opened for.
+#[derive(Clone, Copy)]
+enum Schemes {
+    /// `ws://` and `wss://`, for [`WebSocketDialer`].
+    WebSocket,
+    /// `http://` and `https://`, for [`StreamDialer`].
+    Http,
 }
 #[async_trait]
 impl WebSocketDialer for TlsDialer {
@@ -164,6 +184,34 @@ impl WebSocketDialer for TlsDialer {
 impl WebSocketDialer for MemoryDialer {
     async fn dial(&self, url: &str, headers: HeaderMap) -> Result<WebSocket, DialError> {
         handshake(url, headers, self.connect().await?).await
+    }
+}
+
+/// Opens the plain byte connection an HTTP request to a URL travels on, for a
+/// module whose provider forwards one upgraded request to a guest port and
+/// splices the bytes after its 101 (as [`crate::tcp::connect_at`] asks).
+/// The rules are [`TlsDialer`]'s for WebSockets: `https://` verified against
+/// the platform's trust store, `http://` only to a loopback IP address, no
+/// proxy, 30 seconds for the whole connection. Errors never show `url`'s
+/// query, which may carry a credential.
+#[async_trait]
+pub trait StreamDialer: Send + Sync {
+    async fn connect(&self, url: &str) -> io::Result<ByteStream>;
+}
+#[async_trait]
+impl StreamDialer for TlsDialer {
+    async fn connect(&self, url: &str) -> io::Result<ByteStream> {
+        match tokio::time::timeout(DIAL_TIMEOUT, self.stream(url, Schemes::Http)).await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "dial timed out")),
+        }
+    }
+}
+/// Every URL reaches the one in-process listener.
+#[async_trait]
+impl StreamDialer for MemoryDialer {
+    async fn connect(&self, _url: &str) -> io::Result<ByteStream> {
+        MemoryDialer::connect(self).await
     }
 }
 

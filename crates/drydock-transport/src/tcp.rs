@@ -84,12 +84,16 @@ impl Token {
 }
 
 fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    encode(bytes, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+}
+
+/// Unpadded base64 in `alphabet`.
+fn encode(bytes: &[u8], alphabet: &[u8; 64]) -> String {
     let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..=chunk.len() {
-            text.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            text.push(alphabet[(n >> (18 - 6 * i) & 63) as usize] as char);
         }
     }
     text
@@ -101,6 +105,114 @@ fn base64url(bytes: &[u8]) -> String {
 /// does, so the agent's client takes it. A refused token is
 /// `PermissionDenied`.
 pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream> {
+    match handshake(stream, CONNECT_PATH, PROTOCOL, Upgrade::Agent, token, header::HeaderMap::new()).await? {
+        Ok(stream) => Ok(stream),
+        Err((StatusCode::UNAUTHORIZED, _)) => Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token")),
+        Err((status, _)) => Err(io::Error::other(format!("the agent's tcp listener answered {status}"))),
+    }
+}
+
+/// [`connect`] through an HTTP proxy in front of the listener, such as a
+/// provider's edge that forwards a request to a guest port and splices the
+/// bytes after the agent's 101: the request goes to `url`'s path and query
+/// (the path must be [`CONNECT_PATH`] when it reaches the agent) with its
+/// authority as `Host`. It is a WebSocket upgrade request, since such edges
+/// splice only those (Modal's answers any other upgrade and closes); the
+/// agent accepts it and both ends still carry raw bytes, unframed. A credential the proxy wants rides in the query, since
+/// `Authorization` carries the agent's token. A 401 or 403, the agent's or
+/// the proxy's, is `PermissionDenied`; its text names the status and the
+/// start of the answer, never `url`.
+pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Result<ByteStream> {
+    connect_at_with(stream, url, token, header::HeaderMap::new()).await
+}
+
+/// [`connect_at`] with `headers` added to the request, for an edge that
+/// takes its credential in a header of its own (E2B's
+/// `e2b-traffic-access-token`). They may not replace the handshake's own
+/// headers; mark secret values sensitive.
+pub async fn connect_at_with(stream: ByteStream, url: &str, token: &Token, headers: header::HeaderMap) -> io::Result<ByteStream> {
+    let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("agent url {reason}"));
+    let uri: hyper::Uri = url.parse().map_err(|_| invalid("is not a URL"))?;
+    let authority = uri.authority().ok_or_else(|| invalid("has no host"))?;
+    // Credentials belong in the query; userinfo would go out in `Host`.
+    if authority.as_str().contains('@') {
+        return Err(invalid("must not carry userinfo"));
+    }
+    let target = uri.path_and_query().map_or(CONNECT_PATH, |p| p.as_str());
+    let own = [
+        header::HOST,
+        header::CONNECTION,
+        header::UPGRADE,
+        header::AUTHORIZATION,
+        header::SEC_WEBSOCKET_KEY,
+        header::SEC_WEBSOCKET_VERSION,
+    ];
+    if headers.keys().any(|name| own.contains(name)) {
+        return Err(invalid("headers must not replace the handshake's own"));
+    }
+    match handshake(stream, target, authority.as_str(), Upgrade::WebSocket, token, headers).await? {
+        Ok(stream) => Ok(stream),
+        Err((status, body)) => {
+            let kind = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => io::ErrorKind::PermissionDenied,
+                _ => io::ErrorKind::Other,
+            };
+            Err(io::Error::new(kind, Refusal { status: status.as_u16(), body }))
+        }
+    }
+}
+
+/// An upgrade answered with something other than 101, as the error
+/// [`connect_at`] and [`connect_at_with`] carry (`io::Error::get_ref`), so a
+/// caller can tell the edge's refusal from the agent's by status rather than
+/// by text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// The start of the answer's body, untrusted (see [`REFUSAL_CHARS`]).
+    pub body: String,
+}
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = StatusCode::from_u16(self.status).map_or_else(|_| self.status.to_string(), |s| s.to_string());
+        if self.body.is_empty() { write!(f, "refused with HTTP {status}") } else { write!(f, "refused with HTTP {status}: {}", self.body) }
+    }
+}
+impl std::error::Error for Refusal {}
+impl Refusal {
+    /// The refusal an upgrade error carries, if it is one.
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
+/// The most of a refusal's answer kept, as text. It is the far end's (the
+/// agent's or a provider's edge), so untrusted: callers mask it as they do
+/// any provider text before logging it.
+const REFUSAL_CHARS: usize = 200;
+
+/// The upgrade a handshake asks for.
+enum Upgrade {
+    /// `Upgrade: drydock-agent`, for the agent's listener itself.
+    Agent,
+    /// A WebSocket upgrade request (RFC 6455: version 13 and a fresh random
+    /// key), for proxies that splice only those. The answer's
+    /// `Sec-WebSocket-Accept` is not checked: the agent sends none, and the
+    /// token, not the key, is what proves the far end.
+    WebSocket,
+}
+
+/// Sends the handshake request for `target` with `host`; the switched stream,
+/// or the status and start of the body that refused it.
+async fn handshake(
+    stream: ByteStream,
+    target: &str,
+    host: &str,
+    upgrade: Upgrade,
+    token: &Token,
+    headers: header::HeaderMap,
+) -> io::Result<Result<ByteStream, (StatusCode, String)>> {
+    use http_body_util::BodyExt;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.map_err(io::Error::other)?;
     // The connection task ends by handing its bytes to the upgrade; on any
     // early return it is aborted.
@@ -111,24 +223,40 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
         }
     }
     let _driver = Abort(tokio::spawn(connection.with_upgrades()));
-    let request = Request::get(CONNECT_PATH)
-        .header(header::HOST, PROTOCOL)
-        .header(header::CONNECTION, "upgrade")
-        .header(header::UPGRADE, PROTOCOL)
+    let request = Request::get(target).header(header::HOST, host).header(header::CONNECTION, "upgrade");
+    let request = match upgrade {
+        Upgrade::Agent => request.header(header::UPGRADE, PROTOCOL),
+        Upgrade::WebSocket => {
+            let mut key = [0u8; 16];
+            getrandom::fill(&mut key).map_err(|e| io::Error::other(e.to_string()))?;
+            // Sixteen bytes are 22 unpadded characters and always two `=` of padding.
+            let key = encode(&key, b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") + "==";
+            request.header(header::UPGRADE, "websocket").header(header::SEC_WEBSOCKET_VERSION, "13").header(header::SEC_WEBSOCKET_KEY, key)
+        }
+    };
+    let mut request = request
         .header(header::AUTHORIZATION, format!("Bearer {}", token.secret()))
         .body(Empty::<Bytes>::new())
         .map_err(io::Error::other)?;
+    request.headers_mut().extend(headers);
     let mut response = sender.send_request(request).await.map_err(io::Error::other)?;
-    match response.status() {
-        StatusCode::SWITCHING_PROTOCOLS => {}
-        StatusCode::UNAUTHORIZED => {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the agent refused the tcp token"));
-        }
-        status => {
-            return Err(io::Error::other(format!("the agent's tcp listener answered {status}")));
-        }
+    let status = response.status();
+    if status == StatusCode::SWITCHING_PROTOCOLS {
+        return Ok(Ok(crate::http::upgraded(hyper::upgrade::on(&mut response)).await?));
     }
-    crate::http::upgraded(hyper::upgrade::on(&mut response)).await
+    // The start of the answer, read briefly: a refusal need not end its body.
+    let mut body = Vec::new();
+    let mut incoming = response.into_body();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while body.len() < 4096
+            && let Some(Ok(frame)) = incoming.frame().await
+        {
+            body.extend_from_slice(frame.data_ref().map_or(&[][..], |d| d.as_ref()));
+        }
+    })
+    .await;
+    let text: String = String::from_utf8_lossy(&body).trim().chars().take(REFUSAL_CHARS).collect();
+    Ok(Err((status, text)))
 }
 
 #[cfg(test)]

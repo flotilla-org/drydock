@@ -7,8 +7,9 @@ license.workspace = true
 [dependencies]
 drydock-provider = { path = "../drydock-provider" }
 drydock-agent = { path = "../drydock-agent" }
-drydock-transport = { path = "../drydock-transport" }
+drydock-transport = { path = "../drydock-transport", features = ["websocket"] }
 drydock-oci = { path = "../drydock-oci" }
+percent-encoding = "2"
 rigging-paths.workspace = true
 rigging-http-serve.workspace = true
 rigging-http-client.workspace = true
