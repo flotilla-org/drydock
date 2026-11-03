@@ -1,8 +1,10 @@
 //! "Try these destinations": the agent attempts each target as the user it
 //! runs as and reports, per target, what happened. Nothing is configured per
 //! provider and no script is injected; the caller supplies the targets.
-use crate::{AgentError, ErrorKind, server::Shared};
-use axum::{Json, extract::State};
+//! Callers are trusted: the route is on the agent's control socket, which only
+//! drydockd reaches, and it will probe any host:port and any resolver named.
+use crate::{AgentError, ErrorKind};
+use axum::Json;
 use hickory_proto::{
     op::{Message, MessageType, Query, ResponseCode},
     rr::{Name, RData, RecordType},
@@ -11,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     io,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::net::{TcpStream, UdpSocket, lookup_host};
@@ -130,14 +131,15 @@ pub async fn attempt(request: &Attempt) -> Result<Attempts, AgentError> {
     }
     let timeout = Duration::from_millis(timeout);
     let results = futures_util::future::join_all(request.targets.iter().map(|target| try_one(target.clone(), timeout))).await;
-    Ok(Attempts { user: identity(), results })
+    let user = tokio::task::spawn_blocking(identity).await.map_err(|e| AgentError::new(OP, "user", ErrorKind::Other, e.to_string()))?;
+    Ok(Attempts { user, results })
 }
 
 async fn try_one(target: Target, timeout: Duration) -> Attempted {
     let started = Instant::now();
     let work = async {
         match &target {
-            Target::Tcp { host, port } => connect(host, *port).await,
+            Target::Tcp { host, port } => connect(host, *port, timeout).await,
             Target::Dns { name, resolver: None } => system_lookup(name).await,
             Target::Dns { name, resolver: Some(resolver) } => resolver_lookup(name, *resolver).await,
         }
@@ -171,17 +173,33 @@ fn classify(error: &io::Error) -> Outcome {
     }
 }
 
-async fn connect(host: &str, port: u16) -> Found {
+/// Whether a lookup error says the name does not exist, as opposed to the
+/// resolver being unreachable or broken (EAI_AGAIN and the like).
+fn name_missing(error: &io::Error) -> bool {
+    let text = error.to_string();
+    ["Name or service not known", "No address associated", "nodename nor servname", "No such host"].iter().any(|m| text.contains(m))
+}
+fn lookup_failure(error: &io::Error) -> Found {
+    let outcome = if name_missing(error) { Outcome::NameNotResolved } else { Outcome::Failed };
+    Found::of(outcome, None, Some(error.to_string()))
+}
+
+/// Each address gets an equal share of what is left of `budget`, so an
+/// address that black-holes does not starve the ones after it.
+async fn connect(host: &str, port: u16, budget: Duration) -> Found {
+    let deadline = Instant::now() + budget;
     let addresses: Vec<SocketAddr> = match lookup_host((host, port)).await {
         Ok(addresses) => addresses.collect(),
-        Err(error) => return Found::of(Outcome::NameNotResolved, None, Some(error.to_string())),
+        Err(error) => return lookup_failure(&error),
     };
     let mut last = Found::of(Outcome::NameNotResolved, None, Some("no addresses".into()));
-    for address in addresses {
-        match TcpStream::connect(address).await {
-            Ok(_) => return Found::of(Outcome::Reached, Some(address.to_string()), None),
-            Err(error) => last = Found::of(classify(&error), Some(address.to_string()), Some(error.to_string())),
-        }
+    for (index, address) in addresses.iter().enumerate() {
+        let share = deadline.saturating_duration_since(Instant::now()) / u32::try_from(addresses.len() - index).unwrap_or(u32::MAX);
+        last = match tokio::time::timeout(share, TcpStream::connect(address)).await {
+            Ok(Ok(_)) => return Found::of(Outcome::Reached, Some(address.to_string()), None),
+            Ok(Err(error)) => Found::of(classify(&error), Some(address.to_string()), Some(error.to_string())),
+            Err(_) => Found::of(Outcome::TimedOut, Some(address.to_string()), None),
+        };
     }
     last
 }
@@ -192,7 +210,7 @@ async fn system_lookup(name: &str) -> Found {
             Some(address) => Found::of(Outcome::Reached, Some(address.ip().to_string()), None),
             None => Found::of(Outcome::NameNotResolved, None, Some("no addresses".into())),
         },
-        Err(error) => Found::of(Outcome::NameNotResolved, None, Some(error.to_string())),
+        Err(error) => lookup_failure(&error),
     }
 }
 
@@ -203,7 +221,7 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
         return Found::of(Outcome::NameNotResolved, None, Some("not a DNS name".into()));
     };
     let mut query = Message::new();
-    let id = u16::from_ne_bytes(getrandom::u32().unwrap_or(0x6472).to_ne_bytes()[..2].try_into().unwrap());
+    let id = getrandom::u32().unwrap_or(0x6472) as u16;
     query.set_id(id).set_recursion_desired(true).add_query(Query::query(fqdn, RecordType::A));
     let bytes = match query.to_vec() {
         Ok(bytes) => bytes,
@@ -229,6 +247,8 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
             Err(error) => return Found::of(classify(&error), None, Some(error.to_string())),
         };
         let Ok(reply) = Message::from_vec(&buffer[..n]) else { continue };
+        // A reachability probe: the id and response bit are enough to know the
+        // resolver answered us; the question section is not compared.
         if reply.id() != id || reply.message_type() != MessageType::Response {
             continue;
         }
@@ -237,6 +257,9 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
             RData::AAAA(a) => Some(IpAddr::V6(a.0)),
             _ => None,
         });
+        if reply.truncated() && address.is_none() {
+            return Found::of(Outcome::Failed, None, Some("truncated reply with no address".into()));
+        }
         return match (reply.response_code(), address) {
             (ResponseCode::NoError, Some(address)) => Found::of(Outcome::Reached, Some(address.to_string()), None),
             (ResponseCode::NoError | ResponseCode::NXDomain, _) => {
@@ -247,9 +270,6 @@ async fn resolver_lookup(name: &str, resolver: SocketAddr) -> Found {
     }
 }
 
-pub(crate) async fn try_destinations(
-    State(_shared): State<Arc<Shared>>,
-    Json(request): Json<Attempt>,
-) -> Result<Json<Attempts>, AgentError> {
+pub(crate) async fn try_destinations(Json(request): Json<Attempt>) -> Result<Json<Attempts>, AgentError> {
     attempt(&request).await.map(Json)
 }

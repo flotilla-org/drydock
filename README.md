@@ -138,22 +138,6 @@ staging and its duration. Staged images are not yet garbage-collected
 (drydock#61); `scripts/live-staging-registry.py` checks staging against a real
 private GHCR package.
 
-### Destination checks
-
-The vessel agent can try a list of destinations from inside the vessel
-(`POST /destinations/attempts`, `Client::try_destinations`): each target is a TCP
-`host:port` or a DNS lookup, optionally against a named resolver, and each result
-says reached, refused, timed out, name not resolved or failed, with timing and the
-address used. The reply names the user the agent ran as. The shipped default targets
-(two public hosts on 443; two public resolvers on 53) can be replaced, list by list,
-once per installation:
-
-```toml
-[destinations]
-unlisted = [{ tcp = { host = "example.net", port = 443 } }]
-raw_dns = [{ dns = { name = "example.com", resolver = "9.9.9.9:53" } }]
-```
-
 Rigging resolves XDG paths: `XDG_CONFIG_HOME/drydock/drydock.toml`, falling back
 to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
 (config under `$DRYDOCK_ROOT/config`). The socket intentionally lives at
@@ -212,6 +196,23 @@ conveniences. It reads its configuration file at start: a `PUT` or `PATCH
 trait works against the embedded `Daemon` or a Unix-socket `Client`. `/v1/events`
 merges host streams with an opaque vector cursor; partial snapshots explicitly
 mark other hosts' providers unavailable so they cannot imply deletion.
+
+### Destination checks
+
+The vessel agent can try a list of destinations from inside the vessel
+(`POST /destinations/attempts`, `Client::try_destinations`): each target is a TCP
+`host:port` or a DNS lookup, optionally against a named resolver, and each result
+says reached, refused, timed out, name not resolved or failed, with timing and the
+address used. The reply names the user the agent ran as. The agent API always takes explicit targets. For callers that name none,
+drydock.toml carries the shipped defaults (two public hosts on 443; two public
+resolvers on 53), replaceable list by list once per installation; drydockd does not
+consume them yet (follow-up: https://github.com/flotilla-org/drydock/issues/225):
+
+```toml
+[destinations]
+unlisted = [{ tcp = { host = "example.net", port = 443 } }]
+raw_dns = [{ dns = { name = "example.com", resolver = "9.9.9.9:53" } }]
+```
 
 ### Exposures
 

@@ -20,7 +20,7 @@ pub struct Config {
     /// provider instance that lists them in `pull_from`.
     #[serde(default)]
     pub registries: BTreeMap<String, Registry>,
-    /// Where "try these destinations" looks when the caller names no targets.
+    /// The default targets for "try these destinations". Parsed and validated here; drydockd does not consume them yet.
     #[serde(default)]
     pub destinations: DefaultDestinations,
 }
