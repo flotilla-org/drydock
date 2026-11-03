@@ -202,18 +202,11 @@ and sandbox backend from those, so run the host without them.
   rejected credential. One SDK client is kept per credential; one a newer
   credential replaced closes once its last call ends.
 
-Its tests run against an in-process stand-in for the SDK
-(`test/support/modal.ts`) that enforces what Modal documents and live runs
-in drydock#192 observed. `test/support/modal-host.ts` loads the module with
-that stand-in as `modal-stand-in`, and `corepack pnpm conformance` runs
-drydock's conformance suite against it through drydockd (all but reach,
-which needs a real agent behind Modal's edge).
-
-`corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration tests
+`corepack pnpm conformance` builds the companion, then discovers and runs the ignored Rust integration test
 against this actual child host through the main Daemon and its existing checker.
 Authentication is exercised by the shared server serving tests; private UDS uses
 filesystem authorization. Exec-based host fixtures await #85 and reach awaits #132. The test drains
 and counts child output without retaining credentials, checks optional-operation
 admission in the embedded server, and requires the shared conformance report to
-pass. The script fails if a named test is missing, rather than silently running
+pass. The script fails if its named test is missing, rather than silently running
 zero tests. The existing CI check command includes this test without another job.

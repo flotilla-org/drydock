@@ -1,8 +1,3 @@
-/**
- * Modal SDK clients by credential, with the calls using each. A client a
- * newer credential replaced closes once its last call ends, so rotating the
- * credential never cuts a call short.
- */
 export class Clients<V extends { close(): void }> {
   private clients = new Map<
     string,
@@ -11,7 +6,6 @@ export class Clients<V extends { close(): void }> {
 
   constructor(private connect: (key: string) => V) {}
 
-  /** The client for `key`, held until `release`. */
   acquire(key: string) {
     let client = this.clients.get(key);
     if (!client?.current) {
@@ -42,7 +36,6 @@ export class Clients<V extends { close(): void }> {
     }
   }
 
-  /** Closes replaced clients that nothing uses any more. */
   private retire() {
     for (const [key, client] of this.clients)
       if (!client.current && client.users === 0) {

@@ -1,14 +1,18 @@
-// Modal sandboxes through the JavaScript SDK (owner ruling 2026-11-02: the
-// TypeScript host). One Modal app per provider instance holds every sandbox.
-// Prepare has Modal build the base by digest with the tools image copied in;
-// provision creates a named, tagged sandbox and starts drydock's agent by a
-// root exec, with its token-gated TCP listener; reach is a dial of that
-// listener through Modal's connect-token edge, which drydock makes itself.
-// Exec only runs commands, never agent traffic. Sandboxes cannot be
-// suspended, and live at most a day.
 import { createHash, randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
+import {
+  AlreadyExistsError,
+  ClientClosedError,
+  ConflictError,
+  InvalidError,
+  ModalClient,
+  NotFoundError,
+  ResourceExhaustedError,
+  type App,
+  type Sandbox,
+  type SandboxCreateParams,
+} from "modal";
 import { parseImageRef, type ImageRef } from "../oci.js";
 import {
   ProtocolFailure,
@@ -20,57 +24,25 @@ import {
 } from "../provider.js";
 import { compile } from "../validation.js";
 import { Clients } from "./clients.js";
-import {
-  alreadyExists,
-  call,
-  protocolError,
-  sdkVendor,
-  type App,
-  type Box,
-  type Create,
-  type Token,
-  type Vendor,
-} from "./vendor.js";
 
 const MiB = 1024 * 1024;
-const GiB = 1024 * MiB;
-/** Sandbox tags: the owning provider instance, the client's label, and the facts re-adoption checks. */
-export const TAGS = {
+const TAGS = {
   provider: "drydock.provider",
   label: "flotilla.label",
   egress: "drydock.egress",
   size: "drydock.size",
-  /** Unix seconds when the sandbox reaches its timeout. */
   expires: "drydock.expires",
 } as const;
-export const AGENT = "/opt/drydock/drydock-agent";
-export const SOCKET = "/run/drydock/agent.sock";
-/** The agent's TCP token, root's alone (0600). */
-export const TOKEN_FILE = "/run/drydock/tcp.token";
-/**
- * The agent's TCP listener, which connect tokens route to. It listens on all
- * addresses: Modal's edge cannot reach loopback, and the token gates the port.
- */
-export const PORT = 7811;
-/** Where the agent's listener takes its handshake (drydock-transport's `CONNECT_PATH`). */
-export const CONNECT_PATH = "/v1/connect";
-/** Modal's edge takes its connect token here, leaving `Authorization` to the agent. */
-export const CONNECT_TOKEN_PARAM = "_modal_connect_token";
-/** Modal's longest sandbox lifetime; the default is five minutes. */
-export const LIFETIME_SECONDS = 86_400;
-/**
- * The sandbox command (it replaces the image's, and is not an init). It only
- * keeps the sandbox alive: the agent needs its token, which reaches it by exec.
- */
-export const COMMAND = ["sleep", "infinity"];
-/**
- * Run as root with a fresh token on stdin: keeps the token already in the
- * sandbox, if any (written once, atomically, 0600), starts the agent's
- * supervisor with its TCP listener (its lock makes that idempotent; `--socket`
- * must come last), waits for the socket, and prints the token in use. The
- * token is never on an argv or in the environment.
- */
-export const ENSURE_AGENT = [
+const AGENT = "/opt/drydock/drydock-agent";
+const SOCKET = "/run/drydock/agent.sock";
+const TOKEN_FILE = "/run/drydock/tcp.token";
+const PORT = 7811;
+const LIFETIME_SECONDS = 86_400;
+const DIAL_SECONDS = 300;
+const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
+// Modal's connect-token edge (https://modal.com/docs/guide/sandbox-networking)
+// was seen not to reach loopback, so the agent listens on all addresses.
+const ENSURE_AGENT = [
   "t=$(head -c 256)",
   "umask 077",
   "mkdir -p /run/drydock",
@@ -79,34 +51,28 @@ export const ENSURE_AGENT = [
   `for i in $(seq 100); do [ -S ${SOCKET} ] && exec cat ${TOKEN_FILE}; sleep 0.1; done`,
   "exit 1",
 ].join("\n");
-/** How long a reach's connect token is offered for; drydock dials at once. */
-const DIAL_SECONDS = 300;
-const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
-/** Concurrent tag reads while listing. */
-const READS = 8;
 
-const objectName = "^[A-Za-z0-9._-]{1,63}$";
-const settingsValid = compile({
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    /** The app holding every sandbox of this instance (default `drydock`). */
-    app: { type: "string", pattern: objectName },
-    environment: { type: "string", pattern: objectName },
-    runtime: { enum: ["vm", "gvisor"] },
-    concurrency_limit: { type: "integer", minimum: 1 },
-  },
-});
+type Token = { token_id: string; token_secret: string };
 type Settings = {
   app?: string;
   environment?: string;
   runtime?: "vm" | "gvisor";
   concurrency_limit?: number;
 };
+const objectName = "^[A-Za-z0-9._-]{1,63}$";
+const settingsValid = compile({
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    app: { type: "string", pattern: objectName },
+    environment: { type: "string", pattern: objectName },
+    runtime: { enum: ["vm", "gvisor"] },
+    concurrency_limit: { type: "integer", minimum: 1 },
+  },
+});
 
 const hex = (value: string) => createHash("sha256").update(value).digest("hex");
 
-/** Addresses Modal's builders cannot reach: Modal pulls only from the public internet. */
 const PRIVATE = new BlockList();
 for (const [address, prefix] of [
   ["0.0.0.0", 8],
@@ -125,30 +91,20 @@ for (const [address, prefix] of [
 ] as const)
   PRIVATE.addSubnet(address, prefix, "ipv6");
 
-export function privateAddress(address: string) {
+function privateAddress(address: string) {
   const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
   if (mapped) return PRIVATE.check(mapped, "ipv4");
   return PRIVATE.check(address, isIPv6(address) ? "ipv6" : "ipv4");
 }
 
-/** Every address a registry host resolves to here; a literal is itself. */
-export type Resolve = (host: string) => Promise<string[]>;
-const resolveHost: Resolve = async (host) =>
-  (await lookup(host, { all: true })).map((a) => a.address);
+type Network = Pick<
+  SandboxCreateParams,
+  "outboundCidrAllowlist" | "outboundDomainAllowlist"
+>;
 
-/**
- * Egress as Modal's create fields. An absent request is the protocol's
- * default, deny all: an empty CIDR allowlist, not `blockNetwork`, since Modal
- * refuses a connect token (so the agent's reach) to a sandbox with a blocked
- * network. IPv4 CIDRs and literals become the CIDR allowlist and names the
- * domain allowlist; ports and IPv6 are refused, never widened.
- */
-export function networkFields(
-  egress: Types["EgressRequest"] | undefined,
-): Pick<
-  Create,
-  "blockNetwork" | "outboundCidrAllowlist" | "outboundDomainAllowlist"
-> {
+// Deny all is an empty CIDR allowlist: Modal was seen to refuse a connect token
+// to a sandbox with blockNetwork (https://modal.com/docs/guide/sandbox-networking).
+function networkFields(egress: Types["EgressRequest"] | undefined): Network {
   if (egress?.mode === "open") return {};
   const cidrs = new Set<string>(),
     domains = new Set<string>();
@@ -177,12 +133,8 @@ export function networkFields(
   };
 }
 
-/** What Modal documents (and the SDK states) about its egress control. */
-export const EGRESS_MODEL: Types["EgressModel"] = {
+const EGRESS_MODEL: Types["EgressModel"] = {
   shapes: ["open", "deny_all", "allow_addresses", "allow_domains"],
-  // Destinations are enforced outside the guest, against root, by a
-  // transparent proxy: a connect succeeds, but an unlisted destination is
-  // reset at TLS or HTTP.
   enforced: "outside_guest",
   side_effects: [
     {
@@ -190,26 +142,18 @@ export const EGRESS_MODEL: Types["EgressModel"] = {
       note: "DNS resolution is not filtered (seen in live runs; Modal's docs do not say).",
     },
   ],
-  // `Sandbox.updateNetworkPolicy` replaces a running sandbox's allowlists;
-  // the module does not use it.
   mutable_while_running: true,
-  sources: [
-    "https://modal.com/docs/guide/sandbox-networking",
-    "https://www.npmjs.com/package/modal/v/0.11.1",
-  ],
+  sources: ["https://modal.com/docs/guide/sandbox-networking"],
 };
 
-/** A tag-sized identity of a policy, and whether it denies everything. */
-function policyIdentity(fields: ReturnType<typeof networkFields>) {
+function policyIdentity(network: Network) {
   const { outboundCidrAllowlist: cidrs, outboundDomainAllowlist: domains } =
-    fields;
-  if (fields.blockNetwork || (cidrs?.length === 0 && !domains?.length))
-    return "deny";
+    network;
+  if (cidrs?.length === 0 && !domains?.length) return "deny";
   if (!cidrs && !domains) return "open";
-  return `allow-${hex(JSON.stringify(fields)).slice(0, 24)}`;
+  return `allow-${hex(JSON.stringify(network)).slice(0, 24)}`;
 }
 
-/** Modal's resources for a size: fractional CPUs, whole MiB, no disk. */
 function resources(size: Types["Size"]) {
   if (size.disk_bytes !== 0)
     refused("Modal sandboxes have no disk size; request disk 0");
@@ -230,32 +174,130 @@ function credentialToken(credential: string | undefined): Token {
       kind: "credential_rejected",
       reason: 'Modal credential must be {"token_id": …, "token_secret": …}',
     });
-  return token as Token;
+  return { token_id: token.token_id!, token_secret: token.token_secret! };
 }
 
-export function modalModule(
-  vendor: (token: Token, environment?: string) => Vendor = sdkVendor,
-  resolve: Resolve = resolveHost,
-  now: () => number = Date.now,
-): ProviderModule {
-  return {
-    name: "modal",
-    version: "0.1.0",
-    smallestSize: { cpus: 0.25, memory_bytes: 512 * MiB, disk_bytes: 0 },
-    async configure(name, config) {
-      if (!settingsValid(config.settings ?? {}))
-        refused("invalid modal settings");
-      return new Modal(
-        name,
-        (config.settings ?? {}) as Settings,
-        vendor,
-        resolve,
-        now,
-      );
-    },
-  };
+const GRPC = {
+  INVALID_ARGUMENT: 3,
+  DEADLINE_EXCEEDED: 4,
+  NOT_FOUND: 5,
+  ALREADY_EXISTS: 6,
+  PERMISSION_DENIED: 7,
+  RESOURCE_EXHAUSTED: 8,
+  FAILED_PRECONDITION: 9,
+  ABORTED: 10,
+  UNAVAILABLE: 14,
+  UNAUTHENTICATED: 16,
+} as const;
+
+const brief = (text: string) =>
+  text.length > 400 ? `${text.slice(0, 400)}…` : text;
+
+function protocolError(error: unknown): ProtocolFailure {
+  if (error instanceof ProtocolFailure) return error;
+  const detail = String((error as Error)?.message ?? error);
+  const failure = (detail: Types["ProtocolError"]) =>
+    new ProtocolFailure(detail);
+  if (error instanceof NotFoundError)
+    return failure({ kind: "not_found", reason: `Modal: ${detail}` });
+  if (
+    error instanceof AlreadyExistsError ||
+    error instanceof ConflictError ||
+    error instanceof InvalidError
+  )
+    return failure({
+      kind: "refused",
+      reason: `Modal refused the request: ${brief(detail)}`,
+    });
+  if (error instanceof ResourceExhaustedError)
+    return failure({
+      kind: "unavailable",
+      reason: "Modal has no capacity for the sandbox",
+      provider_error: detail,
+    });
+  if (error instanceof ClientClosedError)
+    return failure({
+      kind: "unavailable",
+      reason: "Modal client closed",
+      provider_error: detail,
+    });
+  if (/^Image build for \S+ (failed|terminated|timed out)/.test(detail))
+    return failure({
+      kind: "refused",
+      reason: `Modal could not build the image: ${brief(detail)}`,
+    });
+  const code = (error as { code?: unknown })?.code;
+  if ((error as Error)?.name === "ClientError" && typeof code === "number") {
+    const message = brief(
+      String((error as { details?: string }).details ?? detail),
+    );
+    switch (code) {
+      case GRPC.UNAUTHENTICATED:
+        return failure({
+          kind: "credential_rejected",
+          reason: `Modal refused the credential: ${message}`,
+        });
+      case GRPC.PERMISSION_DENIED:
+        return failure({
+          kind: "refused",
+          reason: `Modal denied the operation (the token lacks a right): ${message}`,
+        });
+      case GRPC.NOT_FOUND:
+        return failure({ kind: "not_found", reason: `Modal: ${message}` });
+      case GRPC.INVALID_ARGUMENT:
+      case GRPC.FAILED_PRECONDITION:
+      case GRPC.ALREADY_EXISTS:
+        return failure({
+          kind: "refused",
+          reason: `Modal refused the request: ${message}`,
+        });
+      case GRPC.RESOURCE_EXHAUSTED:
+        return failure({ kind: "rate_limited", reason: `Modal: ${message}` });
+      case GRPC.UNAVAILABLE:
+      case GRPC.DEADLINE_EXCEEDED:
+      case GRPC.ABORTED:
+        return failure({
+          kind: "unavailable",
+          reason: "Modal is unavailable",
+          provider_error: detail,
+        });
+    }
+  }
+  return failure({
+    kind: "internal",
+    reason: "Modal call failed",
+    provider_error: detail,
+  });
 }
-export default modalModule();
+
+function alreadyExists(error: unknown) {
+  return (
+    error instanceof AlreadyExistsError ||
+    ((error as Error)?.name === "ClientError" &&
+      (error as { code?: unknown }).code === GRPC.ALREADY_EXISTS)
+  );
+}
+
+async function call<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw protocolError(error);
+  }
+}
+
+const kind = (error: unknown) => protocolError(error).detail.kind;
+
+export default {
+  name: "modal",
+  version: "0.1.0",
+  smallestSize: { cpus: 0.25, memory_bytes: 512 * MiB, disk_bytes: 0 },
+  async configure(name, config) {
+    if (!settingsValid(config.settings ?? {}))
+      refused("invalid modal settings");
+    return new Modal(name, (config.settings ?? {}) as Settings);
+  },
+} satisfies ProviderModule;
 
 class Modal implements Provider {
   capabilities: Types["Capabilities"] = {
@@ -264,8 +306,6 @@ class Modal implements Provider {
     workspace_root: "/workspace",
     suspend_resume: false,
     export: false,
-    // Modal execs could run commands, but this host has no exec port until
-    // drydock#85, and the daemon refuses a declaration without its port.
     fallback_runner: false,
     usage: false,
     quota: true,
@@ -285,50 +325,48 @@ class Modal implements Provider {
   };
   observation: Types["ObservationMode"] = { mode: "poll", interval_ms: 30_000 };
   rateLimits: Types["RateLimit"][] = [];
-  private clients: Clients<Vendor>;
-  /** The app's handle per client; one lookup (or create) each. */
-  private apps = new WeakMap<Vendor, Promise<App>>();
-  /**
-   * Sandboxes this host terminated, so their end reads as requested. It is
-   * process-local: after a host restart such an end reads as destroyed at the
-   * provider. Modal lists no terminated sandboxes, so it stays small.
-   */
+  private clients: Clients<ModalClient>;
+  private apps = new WeakMap<ModalClient, Promise<App>>();
   private destroyed = new Set<string>();
-  /** Each sandbox's agent TCP token, as `ensureAgent` last read it. */
   private tokens = new Map<string, string>();
   private appName: string;
 
   constructor(
     private name: string,
     private settings: Settings,
-    connect: (token: Token, environment?: string) => Vendor,
-    private resolve: Resolve,
-    private now: () => number,
   ) {
     this.appName = settings.app ?? "drydock";
-    this.clients = new Clients((key) =>
-      connect(JSON.parse(key), settings.environment),
-    );
-  }
-
-  private key(credential: string | undefined) {
-    const { token_id, token_secret } = credentialToken(credential);
-    return JSON.stringify({ token_id, token_secret });
+    this.clients = new Clients((key) => {
+      const { token_id, token_secret } = JSON.parse(key) as Token;
+      return new ModalClient({
+        tokenId: token_id,
+        tokenSecret: token_secret,
+        environment: settings.environment,
+      });
+    });
   }
 
   private using<T>(
     credential: string | undefined,
-    work: (vendor: Vendor) => Promise<T>,
+    work: (client: ModalClient) => Promise<T>,
   ): Promise<T> {
-    return this.clients.using(this.key(credential), work);
+    return this.clients.using(
+      JSON.stringify(credentialToken(credential)),
+      work,
+    );
   }
 
-  private app(vendor: Vendor): Promise<App> {
-    let app = this.apps.get(vendor);
+  private app(client: ModalClient): Promise<App> {
+    let app = this.apps.get(client);
     if (!app) {
-      app = call(() => vendor.app(this.appName));
-      app.catch(() => this.apps.delete(vendor));
-      this.apps.set(vendor, app);
+      app = call(() =>
+        client.apps.fromName(this.appName, {
+          environment: this.settings.environment,
+          createIfMissing: true,
+        }),
+      );
+      app.catch(() => this.apps.delete(client));
+      this.apps.set(client, app);
     }
     return app;
   }
@@ -350,18 +388,13 @@ class Modal implements Provider {
     return { status: "ready" };
   }
 
-  /**
-   * Refuses a registry Modal's builders cannot reach, before building. A
-   * best-effort check of what it resolves to here: Modal resolves again, and
-   * a name unknown here goes on to fail (or not) in Modal's build.
-   */
   private async publicRegistry(ref: ImageRef) {
     const host = ref.registry.replace(/:\d+$/, "");
     let addresses = [host];
     try {
-      if (!isIP(host)) addresses = await this.resolve(host);
+      if (!isIP(host))
+        addresses = (await lookup(host, { all: true })).map((a) => a.address);
     } catch {
-      // Modal resolves names itself; one unknown here may still be public.
       return;
     }
     if (addresses.some(privateAddress))
@@ -390,22 +423,26 @@ class Modal implements Provider {
     const reference = (r: ImageRef) =>
       `${r.registry}/${r.repository}@${r.digest}`;
     const pull = request.image_pull ?? undefined;
-    const id = await this.using(credential, async (vendor) => {
-      const app = await this.app(vendor);
-      // The SDK takes no signal: an abort is seen between calls, never
-      // during one, so a build already started runs to its end.
+    const id = await this.using(credential, async (client) => {
+      const app = await this.app(client);
       signal.throwIfAborted();
-      // Modal caches by definition, so the same digests give the same image.
-      return call(() =>
-        vendor.build(app, {
-          base: reference(base),
-          commands: [
+      return call(async () => {
+        const secret = pull
+          ? await client.secrets.fromObject(
+              {
+                REGISTRY_USERNAME: pull.username,
+                REGISTRY_PASSWORD: pull.secret,
+              },
+              { environment: this.settings.environment },
+            )
+          : undefined;
+        const image = client.images
+          .fromRegistry(reference(base), secret)
+          .dockerfileCommands([
             `COPY --from=${reference(tools)} /opt/drydock/ /opt/drydock/`,
-          ],
-          // The pull credential is the base's registry's, and goes nowhere else.
-          pull: pull && { username: pull.username, password: pull.secret },
-        }),
-      );
+          ]);
+        return (await image.build(app)).imageId;
+      });
     });
     return {
       id,
@@ -423,67 +460,68 @@ class Modal implements Provider {
     if (request.prepared.provider !== this.name)
       refused("prepared form belongs to another provider");
     const { cpu, memoryMiB } = resources(request.size);
-    const egress = networkFields(request.egress);
+    const network = networkFields(request.egress);
     const tags = {
       [TAGS.provider]: this.name,
       [TAGS.label]: request.label,
-      [TAGS.egress]: policyIdentity(egress),
+      [TAGS.egress]: policyIdentity(network),
       [TAGS.size]: `${cpu}/${memoryMiB}`,
     };
     const name = `drydock-${hex(request.label).slice(0, 24)}`;
-    return this.using(credential, async (vendor) => {
-      const app = await this.app(vendor);
+    return this.using(credential, async (client) => {
+      const app = await this.app(client);
+      let image;
       try {
-        await call(() => vendor.image(request.prepared.id));
+        image = await client.images.fromId(request.prepared.id);
       } catch (error) {
-        if (protocolError(error).detail.kind === "not_found")
-          refused("unknown prepared form");
-        throw error;
+        if (kind(error) === "not_found") refused("unknown prepared form");
+        throw protocolError(error);
       }
       signal.throwIfAborted();
       let created = true;
-      let box: Box;
+      let sandbox: Sandbox;
       try {
-        box = await vendor.create(app, request.prepared.id, {
+        sandbox = await client.sandboxes.create(app, image, {
           name,
           tags: {
             ...tags,
             [TAGS.expires]: String(
-              Math.floor(this.now() / 1000) + LIFETIME_SECONDS,
+              Math.floor(Date.now() / 1000) + LIFETIME_SECONDS,
             ),
           },
           cpu,
           memoryMiB,
           timeoutMs: LIFETIME_SECONDS * 1000,
           runtime: this.settings.runtime ?? "vm",
-          command: COMMAND,
-          ...egress,
+          command: ["sleep", "infinity"],
+          ...network,
         });
       } catch (error) {
-        // The name is the label's: a running sandbox already holds it.
         if (!alreadyExists(error)) throw protocolError(error);
-        box = await call(() => vendor.fromName(this.appName, name));
+        sandbox = await call(() =>
+          client.sandboxes.fromName(this.appName, name, {
+            environment: this.settings.environment,
+          }),
+        );
         created = false;
       }
       try {
-        const actual = await call(() => box.getTags());
+        const actual = await call(() => sandbox.getTags());
         if (!created) this.adopt(actual, tags);
-        await this.ensureAgent(box);
+        await this.ensureAgent(sandbox);
         return {
           created,
-          environment: this.row(box.sandboxId, actual, null),
+          environment: this.row(sandbox.sandboxId, actual, null),
         };
       } catch (error) {
-        // A sandbox this call made and cannot hand over would run for a day.
-        if (created) await box.terminate().catch(() => {});
+        if (created) await sandbox.terminate().catch(() => {});
         throw error;
       } finally {
-        box.detach();
+        sandbox.detach();
       }
     });
   }
 
-  /** Refuses a sandbox under this name that is not this request's (drydock#168). */
   private adopt(
     actual: Record<string, string>,
     wanted: Record<string, string>,
@@ -505,28 +543,25 @@ class Modal implements Provider {
         );
   }
 
-  /** Runs a command to its end, with `input` as its whole stdin; its exit code and stdout. */
-  private async run(box: Box, argv: string[], input = "") {
-    const process = await call(() => box.exec(argv));
-    // An exec keeps running until its stdin ends.
+  private async ensureAgent(sandbox: Sandbox) {
+    const process = await call(() =>
+      sandbox.exec(["sh", "-c", ENSURE_AGENT], {
+        mode: "binary",
+        stdout: "pipe",
+        stderr: "ignore",
+      }),
+    );
     const stdin = process.stdin.getWriter();
-    if (input) await call(() => stdin.write(new TextEncoder().encode(input)));
+    await call(() =>
+      stdin.write(
+        new TextEncoder().encode(randomBytes(32).toString("base64url")),
+      ),
+    );
     await call(() => stdin.close());
     const [stdout, code] = await Promise.all([
       new Response(process.stdout as ReadableStream).text(),
       call(() => process.wait()),
     ]);
-    return { code, stdout };
-  }
-
-  /** Starts the agent if it is not running; the TCP token it holds. */
-  private async ensureAgent(box: Box) {
-    const fresh = randomBytes(32).toString("base64url");
-    const { code, stdout } = await this.run(
-      box,
-      ["sh", "-c", ENSURE_AGENT],
-      fresh,
-    );
     const token = stdout.trim();
     if (code !== 0 || !/^[A-Za-z0-9_-]{43,}$/.test(token))
       throw new ProtocolFailure({
@@ -534,7 +569,7 @@ class Modal implements Provider {
         reason: "drydock's agent did not start in the Modal sandbox",
         provider_error: `exit ${code}`,
       });
-    this.tokens.set(box.sandboxId, token);
+    this.tokens.set(sandbox.sandboxId, token);
     return token;
   }
 
@@ -554,15 +589,14 @@ class Modal implements Provider {
           ? { cpus, memory_bytes: mib * MiB, disk_bytes: 0 }
           : null,
       platform: PLATFORM,
-      // The module states its vendor's model (`EGRESS_MODEL`) and measures
-      // nothing; drydockd owns the verdict.
       egress: "advisory",
       egress_policy: tags[TAGS.egress] ?? null,
       timestamp: null,
     };
   }
 
-  /** Why a sandbox ended: 124 is Modal's timeout, 137 a termination. */
+  // Terminate exits 137 (https://modal.com/docs/guide/sandbox); a timeout was
+  // seen to exit 124.
   private gone(
     id: string,
     tags: Record<string, string>,
@@ -571,7 +605,7 @@ class Modal implements Provider {
     const expires = Number(tags[TAGS.expires]);
     const capped =
       code === 124 ||
-      (code === 137 && expires > 0 && this.now() / 1000 >= expires);
+      (code === 137 && expires > 0 && Date.now() / 1000 >= expires);
     return {
       state: "gone",
       cause: capped
@@ -580,134 +614,119 @@ class Modal implements Provider {
           ? { kind: "destroyed_by_request" }
           : code === 137
             ? { kind: "destroyed_at_provider" }
-            : // The sandbox command never exits on its own.
-              { kind: "guest_powered_off" },
+            : { kind: "guest_powered_off" },
     };
   }
 
-  /** This provider's sandbox by id, or not found; tags say whose it is. */
-  private async owned(vendor: Vendor, id: string) {
-    const box = await call(() => vendor.fromId(id));
-    const tags = await call(() => box.getTags());
+  private async owned(client: ModalClient, id: string) {
+    const sandbox = await call(() => client.sandboxes.fromId(id));
+    const tags = await call(() => sandbox.getTags());
     if (tags[TAGS.provider] !== this.name)
       throw new ProtocolFailure({
         kind: "not_found",
         reason: "no such sandbox for this provider",
       });
-    return { box, tags };
+    return { sandbox, tags };
   }
 
-  /** Running sandboxes of this instance; Modal lists no terminated ones. */
-  private async listed(vendor: Vendor) {
-    const app = await this.app(vendor);
+  private async listed(client: ModalClient) {
+    const app = await this.app(client);
     return call(async () => {
-      const boxes: Box[] = [];
-      for await (const box of vendor.list(app.appId, {
-        [TAGS.provider]: this.name,
+      const sandboxes: Sandbox[] = [];
+      for await (const sandbox of client.sandboxes.list({
+        appId: app.appId,
+        tags: { [TAGS.provider]: this.name },
       }))
-        boxes.push(box);
-      return boxes;
+        sandboxes.push(sandbox);
+      return sandboxes;
     });
   }
 
   async list({ credential }: Context) {
-    return this.using(credential, async (vendor) => {
-      const queue = await this.listed(vendor);
+    return this.using(credential, async (client) => {
+      const queue = await this.listed(client);
       const rows: Types["Environment"][] = [];
       const worker = async () => {
-        for (let box = queue.shift(); box; box = queue.shift()) {
+        for (let sandbox = queue.shift(); sandbox; sandbox = queue.shift()) {
           try {
-            rows.push(
-              this.row(box.sandboxId, await call(() => box.getTags()), null),
-            );
+            const tags = await call(() => sandbox.getTags());
+            rows.push(this.row(sandbox.sandboxId, tags, null));
           } catch (error) {
-            if (protocolError(error).detail.kind !== "not_found") throw error;
+            if (kind(error) !== "not_found") throw error;
           }
         }
       };
-      await Promise.all(Array.from({ length: READS }, worker));
+      await Promise.all(Array.from({ length: 8 }, worker));
       return rows;
     });
   }
 
   async inspect(id: string, { credential }: Context) {
-    return this.using(credential, async (vendor) => {
-      const { box, tags } = await this.owned(vendor, id);
+    return this.using(credential, async (client) => {
+      const { sandbox, tags } = await this.owned(client, id);
       try {
-        const code = await call(() => box.poll());
-        // An ended sandbox's agent token is never needed again.
+        const code = await call(() => sandbox.poll());
         if (code !== null) this.tokens.delete(id);
-        return this.row(box.sandboxId, tags, code);
+        return this.row(sandbox.sandboxId, tags, code);
       } finally {
-        box.detach();
+        sandbox.detach();
       }
     });
   }
 
   async destroy(id: string, { credential }: Context) {
-    return this.using(credential, async (vendor) => {
-      let box: Box;
+    return this.using(credential, async (client) => {
+      let sandbox: Sandbox;
       try {
-        ({ box } = await this.owned(vendor, id));
+        ({ sandbox } = await this.owned(client, id));
       } catch (error) {
-        // Destroy is idempotent: an absent sandbox is already destroyed.
-        if (protocolError(error).detail.kind === "not_found") return;
+        if (kind(error) === "not_found") return;
         throw error;
       }
       this.destroyed.add(id);
       this.tokens.delete(id);
       try {
-        await call(() => box.terminate());
+        await call(() => sandbox.terminate({ wait: true }));
       } catch (error) {
-        if (protocolError(error).detail.kind !== "not_found") {
-          // Not ours to claim: a later end is someone else's.
+        if (kind(error) !== "not_found") {
           this.destroyed.delete(id);
           throw error;
         }
       } finally {
-        box.detach();
+        sandbox.detach();
       }
     });
   }
 
-  /** A running sandbox of this provider; a terminated one is refused, not retried. */
-  private async running(vendor: Vendor, id: string) {
-    const { box } = await this.owned(vendor, id);
-    if ((await call(() => box.poll())) !== null) {
-      box.detach();
-      refused("Modal sandbox has terminated");
-    }
-    return box;
-  }
-
-  // Reach is the agent's TCP listener behind Modal's connect-token edge:
-  // drydock dials it (Reach::Dial). The edge takes its token from the query
-  // and splices the bytes after the agent's 101; `Authorization` carries the
-  // agent's token. Exec carries no agent traffic.
+  // The edge takes its connect token in the query, leaving Authorization to
+  // the agent: https://modal.com/docs/guide/sandbox-networking
   async reach(id: string, { credential }: Context): Promise<Types["Reach"]> {
-    return this.using(credential, async (vendor) => {
-      const box = await this.running(vendor, id);
+    return this.using(credential, async (client) => {
+      const { sandbox } = await this.owned(client, id);
       try {
-        // After a host restart, the token is read back from the sandbox.
-        const token = this.tokens.get(id) ?? (await this.ensureAgent(box));
-        const connect = await call(() => box.connectToken(PORT));
-        const url = new URL(CONNECT_PATH, connect.url);
-        url.searchParams.set(CONNECT_TOKEN_PARAM, connect.token);
+        if ((await call(() => sandbox.poll())) !== null)
+          refused("Modal sandbox has terminated");
+        const token = this.tokens.get(id) ?? (await this.ensureAgent(sandbox));
+        const connect = await call(() =>
+          sandbox.createConnectToken({ port: PORT }),
+        );
+        const url = new URL("/v1/connect", connect.url);
+        url.searchParams.set("_modal_connect_token", connect.token);
         return {
           kind: "dial",
           url: url.href,
           token,
-          expires_at: new Date(this.now() + DIAL_SECONDS * 1000).toISOString(),
+          expires_at: new Date(Date.now() + DIAL_SECONDS * 1000).toISOString(),
         };
       } finally {
-        box.detach();
+        sandbox.detach();
       }
     });
   }
 
   async quota({ credential }: Context): Promise<Types["Quota"]> {
-    return this.using(credential, async (vendor) => {
-      const count = (await this.listed(vendor)).length;
+    return this.using(credential, async (client) => {
+      const count = (await this.listed(client)).length;
       return {
         resources: [],
         credits_remaining: null,
