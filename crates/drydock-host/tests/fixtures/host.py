@@ -26,11 +26,11 @@ provider_timestamp, inventory_error = None, False
 size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
 capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clone"],
                 "workspace_root": "/workspace", "suspend_resume": True, "export": True,
-                "egress": {"routes": ["none"], "enforcement": "advisory"},
+                "egress": {"routes": ["none"], "model": {"shapes": ["none"], "enforced": "none", "mutable_while_running": False}},
                 "fallback_runner": True, "bootstrap": "bake", "usage": True, "quota": True,
                 "platforms": [{"os": "linux", "architecture": "amd64"}]}
 if fault.startswith("egress-"):
-    capabilities["egress"]["enforcement"] = "enforced"
+    capabilities["egress"]["model"] = {"shapes": ["deny_all", "allow_addresses"], "enforced": "outside_guest", "mutable_while_running": False}
 if fault == "capabilities":
     capabilities["workspace_root"] = "relative"
 auth_path = Path(sys.argv[1] + ".auth.py")
@@ -130,7 +130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "10", "host_version": "fixture",
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "11", "host_version": "fixture",
                 "loadable_modules": [{"name": "reference", "version": "fixture", "smallest_size": size}]})
         if parsed.path == "/v1/providers":
             return self.respond(200, [self.declaration(name) for name in providers])

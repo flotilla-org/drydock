@@ -54,7 +54,15 @@ class Memory implements Provider {
     usage: false,
     quota: false,
     agent: false,
-    egress: { routes: ["none", "open"], enforcement: "advisory" },
+    // A fixture with no guest network: it accepts deny-all and open, and enforces neither.
+    egress: {
+      routes: ["none", "open"],
+      model: {
+        shapes: ["none", "deny_all"],
+        enforced: "none",
+        mutable_while_running: false,
+      },
+    },
     bootstrap: "bake",
     platforms: [{ os: "linux", architecture: "amd64" }],
     image_routes: [

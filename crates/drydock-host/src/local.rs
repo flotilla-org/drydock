@@ -437,7 +437,7 @@ impl Provider for Local {
             suspend_preserves_memory: Some(false),
             export: false,
             // No isolation: nothing is enforced, and deny-all cannot be represented.
-            egress: EgressCapability { routes: vec![EgressRoute::Open], enforcement: Enforcement::Advisory },
+            egress: EgressCapability { routes: vec![EgressRoute::Open], model: EgressModel::unfiltered() },
             fallback_runner: false,
             bootstrap: BootstrapRoute::Upload,
             agent: true,

@@ -399,10 +399,10 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             target.refusal(&mut report, &mut owned_ids).await;
         }
         if options.selected(Scenario::Egress) {
-            if caps.egress.enforcement == Enforcement::Enforced || environment.egress == Enforcement::Enforced {
+            if environment.egress == Enforcement::Enforced {
                 report.record("enforced_egress", egress(client, provider, environment, &options).await);
             } else {
-                report.not_applicable("enforced_egress", "the provider declares egress as advisory and the environment is not enforced");
+                report.not_applicable("enforced_egress", "the environment is not enforced");
             }
         }
         if options.selected(Scenario::HostFixtures) {

@@ -277,7 +277,7 @@ impl Provider for PullingProvider {
             suspend_resume: false,
             suspend_preserves_memory: None,
             export: false,
-            egress: EgressCapability { routes: vec![EgressRoute::Open], enforcement: Enforcement::Advisory },
+            egress: EgressCapability { routes: vec![EgressRoute::Open], model: EgressModel::unfiltered() },
             fallback_runner: false,
             bootstrap: BootstrapRoute::Bake,
             agent: false,

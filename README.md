@@ -153,7 +153,7 @@ Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
 `egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
 such as `2GiB`/`512MiB`. Suffixes are case-sensitive; `"5 GiB"` also works,
 and a numeric string such as `"12"` means bytes. Missing size fields use the module's declared smallest
-size. The standalone default is Open, declared Advisory by today's modules;
+size. The standalone default is Open, reported Advisory by today's modules;
 low-level protocol requests retain deny-all as their default. Image tags are
 resolved through the OCI registry at prepare/launch and recorded as immutable
 SHA-256 references in the prepared form and local launch evidence. A key pair
@@ -336,6 +336,12 @@ Wire conventions chosen for this first protocol version:
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
   unsupported destinations are refused, never widened. The result records
   enforced versus advisory protection.
+- `capabilities.egress.model` is what a module states about its vendor's
+  egress, from the vendor's documentation, never a verification: the policy
+  shapes it applies, where enforcement happens (outside or inside the guest, or
+  nowhere), documented side effects such as destinations a policy also opens,
+  whether the policy can change on a running sandbox, and the documentation it
+  cites. drydockd owns the verdict.
 - `/v1/events` is one host-wide NDJSON stream. Each line is an `ObserveRecord`.
   `since` is an opaque exclusive cursor. A host unable to replay emits a
   list snapshot with a new cursor, marking a metering gap. An optional
@@ -534,7 +540,7 @@ reports. Missing probes fail the stream check rather than silently accepting a
 recipe declaration. The same seam supports every declared recipe as providers
 are added; it does not assume arbitrary agent streams echo input.
 
-An `Enforced` provider must also use `DenyAll` with exactly one direct destination
+Conformance checks egress when the environment reports `Enforced`. It must also use `DenyAll` with exactly one direct destination
 and supply `egress_probe: {"command": [...]}`. Copy
 [`tools/egress-probe.py`](tools/egress-probe.py) into the prepared guest and run it
 through exec as root, with these arguments: listed IP, listed port, unlisted
@@ -552,7 +558,7 @@ process exit code:
 ```
 
 Any other result, missing root evidence, missing probe, refusal of the required
-allowlist, or downgrade to Advisory fails an Enforced claim. Providers without
+allowlist, or downgrade to Advisory fails an Enforced environment. Providers without
 exec can supply the probe through a guest bridge when that tooling is available;
 currently this check requires exec and cannot silently pass without it.
 

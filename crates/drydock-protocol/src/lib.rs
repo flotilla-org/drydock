@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "10";
+pub const PROTOCOL_VERSION: &str = "11";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -344,7 +344,67 @@ pub enum ImageRefusal {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct EgressCapability {
     pub routes: Vec<EgressRoute>,
-    pub enforcement: Enforcement,
+    pub model: EgressModel,
+}
+/// What a module states about its vendor's egress control, from the vendor's
+/// documentation. A claim, never a verification: drydockd owns the verdict.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct EgressModel {
+    /// Policy shapes the module can apply. It refuses requests outside them.
+    pub shapes: Vec<EgressShape>,
+    /// Where the vendor applies a policy.
+    pub enforced: EnforcementSite,
+    /// Documented effects of a policy beyond what it requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub side_effects: Vec<EgressSideEffect>,
+    /// Whether the vendor can change the policy of a running sandbox.
+    pub mutable_while_running: bool,
+    /// Vendor documentation the declaration rests on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<String>,
+}
+impl EgressModel {
+    /// No policy and nothing enforcing one: egress is the guest's own network.
+    pub fn unfiltered() -> Self {
+        Self {
+            shapes: vec![EgressShape::None],
+            enforced: EnforcementSite::None,
+            side_effects: vec![],
+            mutable_while_running: false,
+            sources: vec![],
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressShape {
+    /// No policy: egress is unfiltered.
+    None,
+    DenyAll,
+    /// Allow listed IP addresses or CIDRs.
+    AllowAddresses,
+    /// Allow listed domain names.
+    AllowDomains,
+    ExplicitProxy,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementSite {
+    /// Nothing enforces a policy.
+    None,
+    /// The vendor's network or a proxy, beyond the reach of guest root.
+    OutsideGuest,
+    /// Inside the guest, where guest root can undo it.
+    InsideGuest,
+}
+/// A documented effect of applying any of `shapes`. `opens` lists the
+/// destinations it also allows, when the vendor names them; `note` says the rest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct EgressSideEffect {
+    pub shapes: Vec<EgressShape>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opens: Vec<Destination>,
+    pub note: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

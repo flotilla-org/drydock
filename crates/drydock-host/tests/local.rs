@@ -134,7 +134,7 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     let c = p.capabilities();
     assert!(c.agent);
     assert_eq!(c.platforms, [Platform::current()]);
-    assert_eq!(c.egress, EgressCapability { routes: vec![EgressRoute::Open], enforcement: Enforcement::Advisory });
+    assert_eq!(c.egress, EgressCapability { routes: vec![EgressRoute::Open], model: EgressModel::unfiltered() });
     assert!(c.suspend_resume && c.suspend_preserves_memory == Some(false));
     assert!(!c.usage && !c.quota && !c.export && !c.fallback_runner);
     assert_eq!(c.workspace_root, root.path().to_str().unwrap());

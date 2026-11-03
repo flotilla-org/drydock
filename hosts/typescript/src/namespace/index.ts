@@ -142,6 +142,33 @@ export function networkPolicy(
   return { allowedDomains: [...domains].sort(), advisory: false };
 }
 
+const DOCS = "https://namespace.so/docs";
+/**
+ * Namespace's egress as its documentation states it (2026-11-03). The module
+ * applies devbox `networkPolicy.allowedDomains` with `advisory: false`; an
+ * empty list denies all (see `networkPolicy`).
+ */
+export const EGRESS_MODEL: Types["EgressModel"] = {
+  shapes: ["none", "deny_all", "allow_domains"],
+  // Namespace's egress filtering runs outside the workload; the docs do not
+  // say whether guest root can bypass it.
+  enforced: "outside_guest",
+  side_effects: [
+    {
+      shapes: ["deny_all", "allow_domains"],
+      note: "Namespace infrastructure domains are always allowed.",
+    },
+  ],
+  // `devbox.update()` accepts a network policy, but the docs do not say
+  // whether a running devbox picks it up.
+  mutable_while_running: false,
+  sources: [
+    `${DOCS}/reference/typescript-sdk/devbox/manage`,
+    `${DOCS}/reference/devbox-cli/spec-file#network-policy`,
+    `${DOCS}/security/egress-policy`,
+  ],
+};
+
 /** A label-sized identity of a policy, and whether it denies everything. */
 function policyIdentity(policy: NetworkPolicy | undefined) {
   if (!policy) return "open";
@@ -192,12 +219,9 @@ class Namespace implements Provider {
     usage: false,
     quota: true,
     agent: true,
-    // Untested against a live devbox: enforced only per environment, when
-    // the operator's probe passes as root (see `egress_probe`).
-    egress: {
-      routes: ["none", "explicit_proxy", "open"],
-      enforcement: "advisory",
-    },
+    // Enforced per environment only when the operator's probe passes as
+    // root (see `egress_probe`).
+    egress: { routes: ["none", "explicit_proxy", "open"], model: EGRESS_MODEL },
     bootstrap: "bake",
     platforms: [PLATFORM],
     image_routes: [

@@ -119,7 +119,8 @@ wait`, `ingress access` and `containerregistry *`,
   with state from `refresh` (list itself says `unknown`). Nothing that observes
   runs a command or opens a connection on a stopped devbox, since those start it.
 - Egress maps host names to `networkPolicy.allowedDomains` (non-advisory) and
-  refuses CIDR, port and address entries; an absent request is deny all. Declared enforcement is advisory; an
+  refuses CIDR, port and address entries; an absent request is deny all. The capability declares Namespace's
+  documented egress model (`EGRESS_MODEL`), never a verification; an
   environment reports enforced only when `egress_probe` passes as root.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
   platform class). The grants above do not cover it: without its grant quota
