@@ -100,7 +100,7 @@ impl Staging {
     }
     /// The request for a provider's own registry, on the provider-push route:
     /// the image copied (or composed) there with push access the provider
-    /// mints (`mint`, called once the image is known to fit `limits.0`),
+    /// mints (`mint`, called once the image is known to fit the limits),
     /// tagged so the registry keeps it, and visible by digest. The provider
     /// pulls its own registry, so the request carries no pull access.
     pub(crate) async fn push(
@@ -110,7 +110,7 @@ impl Staging {
         request: PrepareRequest,
         platform: &Platform,
         compose: bool,
-        limits: (Option<u64>, Option<u64>),
+        limits: Limits,
     ) -> Result<PrepareRequest> {
         let target = async {
             let access = mint.await?;
@@ -129,11 +129,11 @@ impl Staging {
                     .staging(provider),
                 name: provider.to_owned(),
                 repository: repository.to_owned(),
-                chunk: limits.1.unwrap_or(self.transfer.chunk_bytes),
+                chunk: limits.chunk_bytes.unwrap_or(self.transfer.chunk_bytes),
                 retain: true,
             })
         };
-        let mut request = self.put(target, limits.0, request, platform, compose).await?;
+        let mut request = self.put(target, limits.max_image_bytes, request, platform, compose).await?;
         request.image_pull = None;
         Ok(request)
     }
@@ -190,7 +190,7 @@ impl Staging {
                     to.put_blob(&target.repository, &composed.config_digest, composed.config.clone().into()).await?;
                     to.put_manifest(&target.repository, &composed.digest, &composed.media_type, composed.manifest.clone().into()).await?;
                 }
-                if target.retain {
+                if copied && target.retain {
                     to.put_manifest(&target.repository, &retention_tag(&composed.digest), &composed.media_type, composed.manifest.into())
                         .await?;
                 }
@@ -200,7 +200,7 @@ impl Staging {
                 let lock = self.lock(&format!("{}@{}", target.location(), manifest.digest));
                 let _copying = lock.lock().await;
                 let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, to, &target.repository, target.chunk).await?;
-                if target.retain {
+                if copied && target.retain {
                     to.put_manifest(&target.repository, &retention_tag(&manifest.digest), &manifest.media_type, manifest.bytes.clone())
                         .await?;
                 }
@@ -233,6 +233,13 @@ impl Staging {
         request.platform = Some(platform.clone());
         Ok(request)
     }
+}
+/// What a provider's own registry takes, as its provider-push route declares.
+pub(crate) struct Limits {
+    /// The largest image, in compressed bytes.
+    pub(crate) max_image_bytes: Option<u64>,
+    /// The most bytes one upload request carries.
+    pub(crate) chunk_bytes: Option<u64>,
 }
 /// How many times staging reads a put manifest back before giving up, a
 /// second apart.

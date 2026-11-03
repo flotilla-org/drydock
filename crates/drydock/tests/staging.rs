@@ -712,8 +712,7 @@ async fn pushed_into_the_providers_own_registry() {
     let mut bumped = lab_request(&image);
     bumped.tools_digest = format!("ghcr.io/flotilla-org/drydock-tools@sha256:{}", "8".repeat(64));
     assert_eq!(ProviderApi::prepare(&*daemon, "daytona", &bumped).await.unwrap().image_digest, copy);
-    // Only the retention tag is put again; no blob moves.
-    assert_eq!(registries.uploads_to(OWN), uploads + 1);
+    assert_eq!(registries.uploads_to(OWN), uploads, "nothing is put again");
     assert_eq!(module.1.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(registries.violations(), Vec::<String>::new());
 }

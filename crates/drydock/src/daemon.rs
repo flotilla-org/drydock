@@ -429,7 +429,9 @@ impl Daemon {
     /// provider does not declare is the host's to refuse.
     async fn staged(&self, provider: &str, request: PrepareRequest) -> Result<PrepareRequest, Error> {
         let pull_from = self.config.providers.get(provider).map(|p| p.pull_from.as_slice()).unwrap_or_default();
-        let status = self.ready_host(provider)?.handle.status.borrow().clone();
+        // An unready host is the prepare call's to report.
+        let Ok(host) = self.ready_host(provider) else { return Ok(request) };
+        let status = host.handle.status.borrow().clone();
         let Some(declaration) = status.providers.iter().find(|d| d.provider == provider) else { return Ok(request) };
         let capabilities = &declaration.capabilities;
         let route = crate::runtime::module::resolve_route(request.route, &capabilities.image_routes);
@@ -444,10 +446,11 @@ impl Daemon {
                 let mint = async {
                     runtime.push_access(provider).await.map_err(|error| match error {
                         Error::Protocol(error) => error,
-                        other => ProtocolError::unavailable(format!("mint push access: {other}"), None),
+                        other => ProtocolError::unavailable(format!("mint push access: {other}"), Some(5)),
                     })
                 };
-                Ok(self.staging.push(provider, mint, request, &platform, compose, (*max_image_bytes, *chunk_bytes)).await?)
+                let limits = crate::staging::Limits { max_image_bytes: *max_image_bytes, chunk_bytes: *chunk_bytes };
+                Ok(self.staging.push(provider, mint, request, &platform, compose, limits).await?)
             }
             ImageRoute::RegistryPull { .. } if !pull_from.is_empty() => {
                 Ok(self.staging.stage(pull_from, request, &platform, compose).await?)
