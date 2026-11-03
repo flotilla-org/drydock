@@ -498,7 +498,11 @@ impl Daemon {
         if !self.uploads(provider) || !matches!(environment.state, Observation::Running) {
             return Ok(None);
         }
-        launch::upload_agent(api, provider, &environment.id, build, fresh).await.map(Some)
+        let tcp_port = self
+            .host(provider)
+            .ok()
+            .and_then(|host| host.handle.status.borrow().providers.iter().find(|d| d.provider == provider)?.capabilities.agent_tcp_port);
+        launch::upload_agent(api, provider, &environment.id, build, fresh, tcp_port).await.map(Some)
     }
     /// The agent build for a vessel's platform: `platform` when the caller
     /// knows it, else the one the provider reports.

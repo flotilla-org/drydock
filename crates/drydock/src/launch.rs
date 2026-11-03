@@ -203,10 +203,24 @@ impl ImageReference {
 /// Where a vessel's agent lives, as the tools image lays it out.
 pub const AGENT_EXECUTABLE: &str = "/opt/drydock/drydock-agent";
 
+/// Where a TCP-reached vessel's agent keeps its token, for a module to read
+/// back with `drydock-agent --print-token --tcp-token-file`.
+pub const AGENT_TCP_TOKEN_FILE: &str = "/run/drydock/tcp-token";
+
 /// The agent's self-bootstrap: a detached singleton supervisor serving the
 /// agent's socket, reached by SSH or a relay. Repeating it is harmless.
-pub fn supervise() -> Vec<String> {
-    [AGENT_EXECUTABLE, "--supervise", "--socket", crate::agent::AGENT_SOCKET].map(String::from).to_vec()
+///
+/// With a `tcp_port` it also serves the agent's token-gated TCP listener on
+/// loopback there, its token file at [`AGENT_TCP_TOKEN_FILE`], and prints the
+/// token; the socket stays last, as the agent's README requires.
+pub fn supervise(tcp_port: Option<u16>) -> Vec<String> {
+    let mut argv = vec![AGENT_EXECUTABLE.to_owned(), "--supervise".into()];
+    if let Some(port) = tcp_port {
+        argv.extend(["--tcp".into(), format!("127.0.0.1:{port}"), "--tcp-token-file".into(), AGENT_TCP_TOKEN_FILE.into()]);
+        argv.push("--print-token".into());
+    }
+    argv.extend(["--socket".into(), crate::agent::AGENT_SOCKET.into()]);
+    argv
 }
 
 /// Upload bootstrap, through the provider's files and exec ports: put `build`
@@ -223,6 +237,7 @@ pub(crate) async fn upload_agent(
     id: &str,
     build: bytes::Bytes,
     fresh: bool,
+    tcp_port: Option<u16>,
 ) -> Result<Secret, Error> {
     let step = |doing: &'static str| {
         move |error: Error| match error {
@@ -243,7 +258,7 @@ pub(crate) async fn upload_agent(
         let file = GuestFile { path: AGENT_EXECUTABLE.into(), mode: 0o755 };
         api.put_file(provider, id, &file, build).await.map_err(step("upload the vessel agent"))?;
     }
-    let argv = supervise();
+    let argv = supervise(tcp_port);
     let output =
         run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;
     Ok(Secret::new(output))
