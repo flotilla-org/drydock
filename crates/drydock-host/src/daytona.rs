@@ -731,9 +731,9 @@ impl Provider for Daytona {
         for _ in 0..120 {
             match &*snapshot.state {
                 "active" => {
-                    if snapshot.cpu.0 != r.size.cpus
-                        || snapshot.mem.0 != (r.size.memory_bytes / GIB) as f64
-                        || snapshot.disk.0 != (r.size.disk_bytes / GIB) as f64
+                    if snapshot.cpu.get() != r.size.cpus
+                        || snapshot.mem.get() != (r.size.memory_bytes / GIB) as f64
+                        || snapshot.disk.get() != (r.size.disk_bytes / GIB) as f64
                     {
                         return Err(refused("Daytona snapshot resources do not match the requested size"));
                     }
@@ -918,8 +918,8 @@ impl QuotaOperation for Daytona {
                 resources.push(ResourceQuota {
                     key: QuotaKey { region: Some(region.region_id.to_string()), class: Some(region.sandbox_class.to_string()), resource },
                     unit: unit.into(),
-                    in_use: in_use.0 * factor,
-                    limit: Some(limit.0 * factor),
+                    in_use: in_use.get() * factor,
+                    limit: Some(limit.get() * factor),
                 });
             }
         }
@@ -930,8 +930,8 @@ impl QuotaOperation for Daytona {
             resources.push(ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: "By".into(),
-                in_use: in_use.0 * GIB as f64,
-                limit: Some(limit.0 * GIB as f64),
+                in_use: in_use.get() * GIB as f64,
+                limit: Some(limit.get() * GIB as f64),
             });
         }
         Ok(Quota { resources, credits_remaining: None, credit_unit: None, concurrency_in_use: None, concurrency_limit: None })
@@ -960,7 +960,7 @@ impl UsageOperation for Daytona {
             (ResourceKind::Environments, "1", v.sandboxes, 1.0),
         ]
         .into_iter()
-        .map(|(resource, unit, amount, factor)| (resource, Quantity { amount: amount.0 * factor, unit: unit.into() }))
+        .map(|(resource, unit, amount, factor)| (resource, Quantity { amount: amount.get() * factor, unit: unit.into() }))
         .collect();
         let price = price(&v.price)?;
         // Analytics prices are denominated in USD; there is no currency field.
@@ -973,7 +973,7 @@ impl UsageOperation for Daytona {
             }
             let periods: Vec<UsagePeriod> = self.analytics(&["sandbox", &sandbox.sandbox_id, "usage"], &from_text, &to_text, c).await?;
             for row in periods {
-                let cpus = row.cpu.0;
+                let cpus = row.cpu.get();
                 // Zero-CPU records contribute no size-hours, even with
                 // their other fields absent.
                 if cpus == 0.0 {

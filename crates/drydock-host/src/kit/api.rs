@@ -128,17 +128,25 @@ impl From<Text> for String {
 /// A number field that must be finite and not negative: sizes, usage, quota.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Deserialize)]
 #[serde(try_from = "f64")]
-pub struct Amount(pub f64);
+pub struct Amount(f64);
+impl Amount {
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
 impl TryFrom<f64> for Amount {
     type Error = &'static str;
     fn try_from(n: f64) -> std::result::Result<Self, Self::Error> {
-        if n.is_finite() && n >= 0.0 { Ok(Self(n)) } else { Err("negative") }
+        if n.is_finite() && n >= 0.0 { Ok(Self(n)) } else { Err("not a finite, non-negative number") }
     }
 }
 
 /// Where a page's rows and the next cursor are.
 pub struct Paging {
-    /// The rows' key in the page, or None when the page is the array.
+    /// The rows' key in the page, or None when the page is the array (whose
+    /// cursor then can only travel in a header). A page missing the key is
+    /// incomplete, never empty: a vendor that omits an empty list needs its
+    /// own read.
     pub rows: Option<&'static str>,
     /// The query parameter the cursor goes back in.
     pub cursor: &'static str,
@@ -194,8 +202,9 @@ impl Api {
         };
         sensitive(&value).map_err(|_| refused(format!("invalid {} API key header", self.vendor)))
     }
-    /// One request, whatever its status. `authenticated` adds the key;
-    /// `headers` are added as given (mark secrets sensitive).
+    /// One request, whatever its status. `headers` are added as given (mark
+    /// secrets sensitive); `authenticated` then adds the key, which no
+    /// caller header replaces.
     pub async fn send(
         &self,
         method: Method,
@@ -207,15 +216,15 @@ impl Api {
     ) -> Result<http::Response<Bytes>> {
         let operation = operation(&method, &url);
         let mut request = reqwest::Request::new(method, url);
+        for (name, value) in headers {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
         if authenticated {
             let name = match &self.auth {
                 Auth::Bearer => AUTHORIZATION,
                 Auth::Header(name) => name.clone(),
             };
             request.headers_mut().insert(name, self.key(c)?);
-        }
-        for (name, value) in headers {
-            request.headers_mut().insert(name.clone(), value.clone());
         }
         match body.into() {
             Body::None => {}
@@ -293,7 +302,7 @@ impl Api {
             let mut page: Value = self.answer(&operation, &response)?;
             let page_rows = match paging.rows {
                 Some(key) => page.get_mut(key).map(Value::take),
-                None => Some(page.clone()),
+                None => Some(page.take()),
             };
             let page_rows: Vec<T> =
                 serde_json::from_value(page_rows.unwrap_or_default()).map_err(|_| self.vendor.incomplete(&operation))?;
@@ -329,7 +338,7 @@ pub fn sensitive(value: &str) -> std::result::Result<HeaderValue, http::header::
     value.set_sensitive(true);
     Ok(value)
 }
-/// `Retry-After` in whole seconds.
+/// `Retry-After` in whole seconds; an HTTP-date form reads as None.
 pub fn retry_after_header(headers: &HeaderMap) -> Option<u64> {
     headers.get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok())
 }
@@ -417,6 +426,31 @@ mod tests {
         assert_eq!(api.paged::<u8>(url, &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
     }
 
+    // A body cursor is followed from the page beside its rows; a page
+    // without its rows key is incomplete; a caller's header never replaces
+    // the key.
+    #[tokio::test]
+    async fn body_cursors_missing_rows_and_the_key_wins() {
+        let paging = Paging { rows: Some("items"), cursor: "cursor", next: Next::Body(&["next"]) };
+        let (api, script) = api(
+            Auth::Bearer,
+            vec![
+                (200, vec![], r#"{"items":[1],"next":"c1"}"#),
+                (200, vec![], r#"{"items":[2],"next":""}"#),
+                (200, vec![], r#"{"next":"c2"}"#),
+                (200, vec![], "null"),
+            ],
+        );
+        let url = api.url(&["rows"]).unwrap();
+        assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap(), [1, 2]);
+        assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").incomplete("GET /v1/rows"));
+        let forged = [(AUTHORIZATION, HeaderValue::from_static("Bearer forged"))];
+        api.call_with::<Value>(Method::GET, url, Body::None, &key(), &forged).await.unwrap();
+        let asked = script.asked.lock().unwrap();
+        assert_eq!(asked[1].url().query(), Some("cursor=c1"));
+        assert_eq!(asked[3].headers()[AUTHORIZATION], "Bearer k");
+    }
+
     #[derive(Debug, PartialEq, Deserialize)]
     struct Row {
         id: Text,
@@ -462,14 +496,19 @@ mod tests {
     #[tokio::test]
     async fn the_standard_table() {
         let long: &'static str = Box::leak(format!("{{\"message\":\"{}\"}}", "x".repeat(EXPLANATION_CHARS + 1)).into_boxed_str());
-        let (api, script) =
-            api(Auth::Bearer, vec![(403, vec![], long), (503, vec![("retry-after", "7")], "down"), (418, vec![], "teapot")]);
+        let (api, script) = api(
+            Auth::Bearer,
+            vec![(403, vec![], long), (503, vec![("retry-after", "7")], "down"), (418, vec![], "teapot"), (302, vec![], "moved")],
+        );
         let url = api.url(&["a"]).unwrap();
         let ProtocolError::Refused { reason } = api.get::<Value>(url.clone(), &key()).await.unwrap_err() else { panic!() };
         assert_eq!(reason, format!("permission denied; Test GET /v1/a HTTP 403: {}…", "x".repeat(EXPLANATION_CHARS)));
         let down = api.get::<Value>(url.clone(), &key()).await.unwrap_err();
         assert!(matches!(down, ProtocolError::Unavailable { retry_after: Some(7), .. }), "{down:?}");
-        assert!(matches!(api.get::<Value>(url, &key()).await.unwrap_err(), ProtocolError::Refused { .. }));
+        assert!(matches!(api.get::<Value>(url.clone(), &key()).await.unwrap_err(), ProtocolError::Refused { .. }));
+        // The whole body: the host masks credential echoes before it limits.
+        let ProtocolError::Internal { reason, provider_error } = api.get::<Value>(url, &key()).await.unwrap_err() else { panic!() };
+        assert_eq!((reason.as_str(), provider_error.as_str()), ("unexpected Test GET /v1/a HTTP 302", "moved"));
         assert!(Api::new(Vendor("Test"), "http://api.test/", Auth::Bearer, script).is_err());
     }
 }
