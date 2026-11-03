@@ -1,7 +1,10 @@
 // The existing checker runs above the actual main server, not inside this host.
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-const test = "typescript_reference_conforms_through_main_server";
+const tests = [
+  "typescript_reference_conforms_through_main_server",
+  "typescript_modal_conforms_through_main_server",
+];
 const args = [
   "test",
   "--locked",
@@ -12,7 +15,7 @@ const args = [
   "--",
   "--ignored",
   "--exact",
-  test,
+  ...tests,
 ];
 // The package script builds first; scripts/executable.mjs makes the
 // shebang entry point executable, so Rust can spawn it directly.
@@ -39,12 +42,13 @@ if (listed.status !== 0) {
   process.stderr.write(listed.stderr);
   process.exit(listed.status ?? 1);
 }
-if (!listed.stdout.split("\n").includes(`${test}: test`)) {
-  console.error(
-    `Expected ignored conformance test was not discovered: ${test}`,
-  );
-  process.exit(1);
-}
+for (const test of tests)
+  if (!listed.stdout.split("\n").includes(`${test}: test`)) {
+    console.error(
+      `Expected ignored conformance test was not discovered: ${test}`,
+    );
+    process.exit(1);
+  }
 const result = spawnSync("cargo", [...args, "--nocapture"], {
   ...options,
   stdio: "inherit",
