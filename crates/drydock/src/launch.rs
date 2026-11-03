@@ -213,7 +213,7 @@ pub const AGENT_TCP_TOKEN_FILE: &str = "/run/drydock/tcp-token";
 /// With a `tcp_port` it also serves the agent's token-gated TCP listener on
 /// loopback there, its token file at [`AGENT_TCP_TOKEN_FILE`], and prints the
 /// token; the socket stays last, as the agent's README requires.
-pub fn supervise(tcp_port: Option<u16>) -> Vec<String> {
+pub fn supervise(tcp_port: Option<std::num::NonZeroU16>) -> Vec<String> {
     let mut argv = vec![AGENT_EXECUTABLE.to_owned(), "--supervise".into()];
     if let Some(port) = tcp_port {
         argv.extend(["--tcp".into(), format!("127.0.0.1:{port}"), "--tcp-token-file".into(), AGENT_TCP_TOKEN_FILE.into()]);
@@ -237,7 +237,7 @@ pub(crate) async fn upload_agent(
     id: &str,
     build: bytes::Bytes,
     fresh: bool,
-    tcp_port: Option<u16>,
+    tcp_port: Option<std::num::NonZeroU16>,
 ) -> Result<Secret, Error> {
     let step = |doing: &'static str| {
         move |error: Error| match error {

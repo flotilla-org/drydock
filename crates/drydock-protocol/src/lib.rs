@@ -180,11 +180,14 @@ pub struct Capabilities {
     /// success only after the agent's current hello over the SSH reach.
     #[serde(default)]
     pub agent: bool,
-    /// The guest TCP port its vessels are reached through, when they are:
-    /// drydock starts the agent listening there, with a token file, on the
-    /// upload route. The provider writes no bootstrap of its own.
+    /// The guest TCP port the provider's vessels are reached through, when
+    /// they are; it needs `agent`. On the upload route drydock starts the
+    /// agent listening on loopback there, with its token file at the fixed
+    /// path `drydock::launch::AGENT_TCP_TOKEN_FILE`. The provider writes no
+    /// bootstrap of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_tcp_port: Option<u16>,
+    #[schema(value_type = Option<u16>, minimum = 1, maximum = 65535)]
+    pub agent_tcp_port: Option<std::num::NonZeroU16>,
     /// Platforms this provider can run, preferred first. A prepare request
     /// that names none gets the first; one naming another is refused.
     #[serde(default)]
