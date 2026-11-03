@@ -25,6 +25,7 @@ serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal", "process", "fs"] }
 chrono = "0.4"
 url = "2"
+base64 = "0.22"
 # Matches drydock-agent's; a build context is one plain tar.
 tar = { version = "0.4", default-features = false }
 bytes = "1"
