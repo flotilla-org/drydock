@@ -121,6 +121,9 @@ impl Network {
     }
 }
 
+/// A failed bootstrap's stdout and exit status.
+type FailedBootstrap = Option<(String, i64)>;
+
 #[derive(Default)]
 struct Sandbox {
     id: String,
@@ -139,6 +142,10 @@ struct Sandbox {
     agent_port: Option<u16>,
     guest: Option<Guest>,
     created: u64,
+    /// Its image has no python3, so Runtime's tunnel helper never starts.
+    no_python3: bool,
+    /// The bootstrap's stdout and exit status, when its shell code failed.
+    failed_bootstrap: FailedBootstrap,
 }
 impl Sandbox {
     fn info(&self, paid: bool) -> Value {
@@ -170,6 +177,7 @@ struct Image {
     created: u64,
     /// When it was built; None leaves `createdAt` out.
     created_at: Option<String>,
+    no_python3: bool,
 }
 impl Image {
     fn info(&self) -> Value {
@@ -230,6 +238,8 @@ struct State {
     build_failure: Option<(String, Vec<String>)>,
     /// The tools layer is missing from the image, so the bootstrap's exec fails.
     agent_missing: bool,
+    /// Bases built from now on lack python3, as buildpack-deps' did live.
+    without_python3: bool,
     exec_output: String,
     exec_exit: i64,
     usage: Vec<Value>,
@@ -571,11 +581,11 @@ fn create(s: &mut State, body: Value) -> http::Response<Bytes> {
         return error(400, "invalid_request", "diskMiB: at least 3072");
     }
     let image = body["image"].as_str().unwrap_or_default();
-    match s.images.values().find(|i| i.name == image) {
+    let no_python3 = match s.images.values().find(|i| i.name == image) {
         None => return error(404, "image_not_found", &format!("no image {image}")),
         Some(i) if i.state != "ready" => return error_after(409, "image_not_ready", "the image is still building", Some(5)),
-        Some(_) => {}
-    }
+        Some(i) => i.no_python3,
+    };
     let persistent = body["persistent"] == true;
     if persistent && s.trial {
         return error(402, "payment_required", "persistent sandboxes are paid only: add credit");
@@ -633,6 +643,7 @@ fn create(s: &mut State, body: Value) -> http::Response<Bytes> {
             lag,
         },
         created,
+        no_python3,
         ..Sandbox::default()
     };
     let info = sandbox.info(s.paid());
@@ -667,6 +678,7 @@ fn build(s: &mut State, body: Value) -> http::Response<Bytes> {
         dockerfile,
         polls_left: s.build_polls,
         created,
+        no_python3: s.without_python3,
         created_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         ..Image::default()
     };
@@ -715,6 +727,8 @@ fn exec(s: &mut State, id: &str, body: Value) -> http::Response<Bytes> {
         }
     } else if script.starts_with("test \"$(id -u)\" = 0") {
         (json!({"uid": 0, "unlisted_canary": false, "raw_dns": false, "listed_direct": true}).to_string(), String::new(), 0)
+    } else if let Some((stdout, code)) = sandbox.failed_bootstrap.clone().filter(|_| script.contains("--supervise")) {
+        (stdout, String::new(), code)
     } else if script.contains("--supervise") {
         let token = format!("drydock-tcp-token {}\n", sandbox.token_file.clone().unwrap_or_default());
         if s.agent_missing {
@@ -744,10 +758,28 @@ fn supervise(script: &str) -> std::result::Result<Vec<String>, String> {
 }
 /// The bootstrap run for real by `sh`, with /run/drydock moved to a
 /// temporary directory, Runtime's identity variables in its environment and
-/// a stub in the agent's place recording the environment it gets. Returns
-/// the token file afterwards and that environment.
-fn run_bootstrap(script: &str, existing: Option<&str>, token: Option<&str>) -> (Option<String>, BTreeMap<String, String>) {
+/// a stub in the agent's place recording the environment it gets, and a
+/// PATH of the tools it uses, with python3 unless the image lacks it.
+/// Returns the token file afterwards, that environment, and the shell's
+/// stdout and exit status when it failed.
+fn run_bootstrap(
+    script: &str,
+    existing: Option<&str>,
+    token: Option<&str>,
+    python3: bool,
+) -> (Option<String>, BTreeMap<String, String>, FailedBootstrap) {
     let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for tool in ["mkdir", "chmod", "grep", "rm", "cat", "env"] {
+        let found = std::env::split_paths(&path).map(|d| d.join(tool)).find(|p| p.is_file()).unwrap();
+        std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
+    }
+    if python3 {
+        std::fs::write(bin.join("python3"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join("python3"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
     let run = dir.path().join("run");
     let stub = dir.path().join("agent");
     let recorded = dir.path().join("env");
@@ -758,21 +790,23 @@ fn run_bootstrap(script: &str, existing: Option<&str>, token: Option<&str>) -> (
         std::fs::create_dir(&run).unwrap();
         std::fs::write(run.join("tcp.token"), existing).unwrap();
     }
-    let status = std::process::Command::new("sh")
+    let output = std::process::Command::new("/bin/sh")
         .args(["-c", &script])
+        .env("PATH", &bin)
         .env("DRYDOCK_TCP_TOKEN", token.unwrap_or_default())
         .env("RUNTIME_ID_TOKEN_REQUEST_TOKEN", "rt-identity-secret")
         .env("RUNTIME_ID_TOKEN_REQUEST_URL", "http://169.254.169.254/token")
-        .stdout(std::process::Stdio::null())
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "bootstrap's shell code failed: {script}");
+    assert!(output.status.success() || !python3, "bootstrap's shell code failed: {script}");
+    let failed = (!output.status.success())
+        .then(|| (String::from_utf8_lossy(&output.stdout).into_owned(), i64::from(output.status.code().unwrap_or(-1))));
     let env = std::fs::read_to_string(&recorded)
         .unwrap_or_default()
         .lines()
         .filter_map(|line| line.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
         .collect();
-    (std::fs::read_to_string(run.join("tcp.token")).ok(), env)
+    (std::fs::read_to_string(run.join("tcp.token")).ok(), env, failed)
 }
 
 impl StandIn {
@@ -805,14 +839,16 @@ impl StandIn {
             let missing = s.agent_missing;
             let Some(sandbox) = s.sandboxes.get(&id).filter(|sb| sb.state == "running") else { return };
             let existing = sandbox.token_file.clone();
+            let python3 = !sandbox.no_python3;
             drop(s);
-            let (token_file, env) = run_bootstrap(&script, existing.as_deref(), token.as_ref().map(Token::secret));
+            let (token_file, env, failed) = run_bootstrap(&script, existing.as_deref(), token.as_ref().map(Token::secret), python3);
             let mut s = self.state();
-            if !missing {
+            if !missing && failed.is_none() {
                 s.agent_envs.push(env);
             }
             let sandbox = s.sandboxes.get_mut(&id).unwrap();
             sandbox.token_file = token_file;
+            sandbox.failed_bootstrap = failed;
             match (&sandbox.guest, sandbox.token_file.as_deref().map(Token::parse), port) {
                 (None, Some(Ok(token)), Some(port)) if !missing => {
                     sandbox.agent_port = Some(port);
@@ -908,6 +944,11 @@ impl StandIn {
         };
         let Ok(mut socket) = accept_hdr_async(stream, check).await else { return };
         let Some((id, resume)) = found.lock().unwrap().take() else { return };
+        if self.state().sandboxes.get(&id).is_some_and(|sandbox| sandbox.no_python3) {
+            // Runtime's helper is a python3 program: without it the tunnel never readies.
+            self.state().violations.push("a tunnel to a sandbox whose image has no python3".into());
+            return;
+        }
         let (helper, replay) = match &resume {
             Some(token) => {
                 let mut s = self.state();
@@ -1390,6 +1431,21 @@ async fn a_failed_bootstrap_reports_the_guests_output() {
     let ProtocolError::Internal { provider_error, .. } = &error else { panic!("{error:?}") };
     assert!(provider_error.contains("drydock-agent': No such file or directory"), "{provider_error}");
     assert!(!format!("{error:?}").contains(&token), "{error:?}");
+}
+
+// Runtime's tunnel helper runs on the guest's python3, so an image without
+// it would leave every tunnel unopened: provision refuses first, naming it,
+// and starts no agent.
+#[tokio::test]
+async fn an_image_without_python3_is_refused_at_provision() {
+    let w = world().await;
+    w.stand_in.state().without_python3 = true;
+    let error = w.provision("vessel-1", size(1.0, 1, 4), EgressRequest::Open).await.unwrap_err();
+    let ProtocolError::Refused { reason } = &error else { panic!("{error:?}") };
+    assert!(reason.contains("no python3"), "{reason}");
+    let s = w.stand_in.state();
+    assert!(s.agent_envs.is_empty(), "no agent starts");
+    assert!(s.sandboxes.values().all(|sandbox| sandbox.token_file.is_none()), "no token is written");
 }
 
 // A restart outside drydock loses every process and /run/drydock: the next

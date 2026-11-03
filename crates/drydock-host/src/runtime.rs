@@ -2,6 +2,9 @@
 //! images Runtime builds from a Dockerfile, reached through Runtime's
 //! sandbox tunnel to the agent's token-gated TCP listener on the guest's
 //! loopback. Egress is enforced by Runtime's host proxy, outside the guest.
+//! The tunnel's guest-side helper is a python3 program (found live; Runtime's
+//! docs don't say), so the base image must carry python3: the bootstrap
+//! checks first and provision refuses without it.
 //! The host owns inventory and retries.
 //! API contract: https://api.withruntime.com/v1/openapi.json (0.2.0) and
 //! https://withruntime.com/docs/api, read 2026-11-03, with what the live
@@ -439,8 +442,13 @@ impl Runtime {
     async fn bootstrap(&self, id: &str, c: &Credentials) -> Result<Token> {
         let fresh = Token::generate().map_err(|e| ProtocolError::Internal { reason: "TCP token".into(), provider_error: e.to_string() })?;
         let script = bootstrap_script(self.settings.tunnel_port);
-        let run =
-            self.run(id, &script, BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c).await?.started("bootstrap")?;
+        let run = self.run(id, &script, BTreeMap::from([("DRYDOCK_TCP_TOKEN", fresh.secret().to_owned())]), c).await?;
+        if run.stdout.lines().any(|line| line == NO_PYTHON3) {
+            return Err(refused(
+                "the image has no python3 on PATH, and Runtime's tunnel runs a python3 helper inside the sandbox (undocumented; without it the tunnel never opens); use a base image with python3",
+            ));
+        }
+        let run = run.started("bootstrap")?;
         let token = run.token()?;
         self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_owned(), token.clone());
         Ok(token)
@@ -687,15 +695,20 @@ impl Runtime {
     }
 }
 
+/// The bootstrap's line for a guest without python3, which Runtime's
+/// tunnel helper needs.
+const NO_PYTHON3: &str = "drydock-no-python3";
+
 /// The policy drydock asked for, as a fingerprint label on the sandbox.
 const POLICY_LABEL: &str = "drydock.egress";
 
 /// The bootstrap's shell script, run as root with the fresh token in
-/// `DRYDOCK_TCP_TOKEN`: everything before `exec` is the token file's
-/// handling, then the agent's supervisor with `--socket` last.
+/// `DRYDOCK_TCP_TOKEN`: the python3 check, the token file's handling, then
+/// the agent's supervisor with `--socket` last.
 fn bootstrap_script(port: u16) -> String {
     format!(
-        "mkdir -p /run/drydock && chmod 0700 /run/drydock && \
+        "if ! command -v python3 >/dev/null 2>&1; then echo {NO_PYTHON3}; exit 1; fi && \
+         mkdir -p /run/drydock && chmod 0700 /run/drydock && \
          if [ -e {TOKEN_FILE} ] && ! grep -Eqx '[A-Za-z0-9_-]{{43,}}={{0,2}}' {TOKEN_FILE}; then rm -f {TOKEN_FILE}; fi && \
          {{ (umask 077; set -C; printf %s \"$DRYDOCK_TCP_TOKEN\" > {TOKEN_FILE}) 2>/dev/null || true; }} && \
          echo \"{TOKEN_LINE}$(cat {TOKEN_FILE})\" && \

@@ -52,6 +52,7 @@ Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Run
 - A read-only key fails at prepare with a permission error, but list and quota still work, so the provider looks ready.
 - Private-registry pulls use logins stored once in the account (`POST /v1/images/registries`), not this key; prepare refuses a private base whose registry has none. Runtime's builders refuse private addresses, so drydock refuses a base on one up front.
 - At its image limit (20 by default), prepare deletes the oldest `dd-` image no sandbox started from, and refuses when every one is in use.
+- The base image must carry `python3`: Runtime's tunnel runs a python3 helper inside the sandbox, which its docs don't say. Provision checks first and refuses an image without it, rather than leaving the tunnel to time out.
 - Without credit, sandboxes reach ports 80 and 443 only and host:port rules (`connect`) are refused; drydock refuses them at provision, naming trial funding. Persistent sandboxes need credit too, so without it drydock creates ordinary ones, which keep no disk once stopped.
 - Every guest process gets `RUNTIME_ID_TOKEN_REQUEST_TOKEN`, a credential for minting Runtime identity tokens; drydock removes it from the agent's environment, so neither the agent nor what it starts can use it.
 - The key goes as a Bearer header to `api_url` (default `https://api.withruntime.com/v1`) and its tunnel. Change that setting only to a host you trust with the key.

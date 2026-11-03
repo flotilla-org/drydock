@@ -21,8 +21,10 @@ or cross-build it with cargo-zigbuild:
     cargo zigbuild --release -p drydock-agent --target x86_64-unknown-linux-gnu
     # then --agent target/x86_64-unknown-linux-gnu/release/drydock-agent
 
-IMAGE is a public linux/amd64 image with a glibc userland, bash and curl,
-pinned by digest (default buildpack-deps:bookworm-curl as of 2026-11-02).
+IMAGE is a public linux/amd64 image with a glibc userland, bash, curl and
+python3, pinned by digest (default python:3.13-bookworm as of 2026-11-03).
+Runtime's tunnel runs a python3 helper inside the sandbox, which its docs
+don't say; without python3 the module refuses at provision.
 Only the Python standard library is needed.
 
 It starts drydockd with a throwaway DRYDOCK_ROOT (a short directory under
@@ -68,8 +70,8 @@ import urllib.request
 API = "https://api.withruntime.com/v1"
 INSTANCE = "runtime"
 FAILED = []
-# buildpack-deps:bookworm-curl on 2026-11-02.
-IMAGE = "docker.io/library/buildpack-deps@sha256:f5c5d07ea24ee91272739fe451c280aa4b7fa5120b9278815db5fcd713d83772"
+# python:3.13-bookworm on 2026-11-03: Runtime's tunnel needs python3 in the guest.
+IMAGE = "docker.io/library/python@sha256:3856e3e7bf4d0ba061501a84ed2eb0d429663307c0f54f191dc4de03c7081c3e"
 
 
 class Stop(Exception):
@@ -245,12 +247,14 @@ for authorization in "" "Authorization: Bearer $GUESS"; do
 done
 """
 # Whether any drydock-agent process holds Runtime's identity-token credential.
+# The pattern is anchored to the agent's argv[0], so this probe's own shell,
+# whose command line names the agent too, is not counted.
 IDENTITY_PROBE = r"""
 found=0
-for pid in $(pgrep -f /opt/drydock/drydock-agent); do
+for pid in $(pgrep -f '^/opt/drydock/drydock-agent( |$)'); do
   if tr '\0' '\n' < /proc/$pid/environ | grep -q '^RUNTIME_ID_TOKEN_REQUEST_TOKEN='; then found=1; fi
 done
-echo "agents $(pgrep -fc /opt/drydock/drydock-agent) identity $found"
+echo "agents $(pgrep -fc '^/opt/drydock/drydock-agent( |$)') identity $found"
 """
 
 
