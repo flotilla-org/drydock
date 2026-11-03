@@ -51,3 +51,4 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 - A token that can't see the app lists nothing rather than failing.
 - DNS resolution is never filtered, whatever the egress policy, so it remains a covert channel.
 - Quota has no API; it is the count of live sandboxes in the app.
+- The agent is reached through Modal's connect-token edge, where TLS ends: Modal sees the connect token and the agent's TCP token (`Authorization`) in transit, and every byte to and from the agent. The agent listens on all addresses in the sandbox, since the edge cannot reach loopback, so its token is the only gate on that port. drydockd masks both credentials in its errors and log.

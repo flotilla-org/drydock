@@ -118,10 +118,12 @@ pub async fn connect(stream: ByteStream, token: &Token) -> io::Result<ByteStream
 /// (the path must be [`CONNECT_PATH`] when it reaches the agent) with its
 /// authority as `Host`. It is a WebSocket upgrade request, since such edges
 /// splice only those (Modal's answers any other upgrade and closes); the
-/// agent accepts it and both ends still carry raw bytes, unframed. A credential the proxy wants rides in the query, since
-/// `Authorization` carries the agent's token. A 401 or 403, the agent's or
-/// the proxy's, is `PermissionDenied`; its text names the status and the
-/// start of the answer, never `url`.
+/// agent accepts it and both ends still carry raw bytes, unframed. A
+/// credential the proxy wants rides in the query, since `Authorization`
+/// carries the agent's token. A 401 or 403, the agent's or the proxy's, is
+/// `PermissionDenied`; its text names the status and the start of the
+/// answer, never `url`, and may echo the request's credentials: callers mask
+/// it, as drydockd masks the query's values and the token.
 pub async fn connect_at(stream: ByteStream, url: &str, token: &Token) -> io::Result<ByteStream> {
     let invalid = |reason: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("agent url {reason}"));
     let uri: hyper::Uri = url.parse().map_err(|_| invalid("is not a URL"))?;

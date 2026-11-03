@@ -174,7 +174,8 @@ and sandbox backend from those, so run the host without them.
   and returns its URL at `/v1/connect` with the token in the
   `_modal_connect_token` query parameter, and the agent's token as the
   reach's. drydock asks for a WebSocket upgrade, the only kind the edge
-  splices, and both ends carry raw bytes after the agent's 101. A host that lost
+  splices, and both ends carry raw bytes after the agent's 101. TLS ends at
+  the edge, so Modal sees both tokens and the agent's traffic in transit. A host that lost
   the token (a restart) reads it back by the same exec. Exec carries no agent
   traffic: each stdin write is one round trip, too slow for agent uploads. A
   reach to a terminated sandbox is refused, not retried.

@@ -153,8 +153,9 @@ async fn connects_through_a_dial_reach_and_reports_it() {
     agent.abort();
 }
 
-// An edge may echo its credential when refusing it, here percent-decoded:
-// drydock's error masks each query value, raw and decoded.
+// An edge may echo its credential when refusing it, here percent-decoded,
+// and the request's `Authorization`: drydock's error masks each query value,
+// raw and decoded, and the agent's token.
 #[tokio::test]
 async fn a_dial_reach_masks_an_echoed_edge_credential() {
     let edge = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -169,7 +170,9 @@ async fn a_dial_reach_masks_an_echoed_edge_credential() {
                 }
                 head.push(byte[0]);
             }
-            let body = "bad connect token: s3cr+t value";
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let sent = head.lines().find_map(|l| l.strip_prefix("authorization: ")).unwrap_or_default();
+            let body = format!("bad connect token: s3cr+t value; you sent {sent}");
             let answer = format!("HTTP/1.1 401 Unauthorized\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
             let _ = stream.write_all(answer.as_bytes()).await;
         }
@@ -186,6 +189,7 @@ async fn a_dial_reach_masks_an_echoed_edge_credential() {
     let error = error.to_string();
     assert!(error.contains("401"), "{error}");
     assert!(!error.contains("s3cr") && !error.contains("fragment"), "{error}");
+    assert!(error.contains("you sent") && !error.contains(token.secret()), "{error}");
 }
 
 // A gateway started for a platform stands in for a guest of that platform on

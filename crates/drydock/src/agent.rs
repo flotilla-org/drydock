@@ -196,6 +196,8 @@ impl AgentReach {
                     }
                     let token = drydock_transport::tcp::Token::parse(token.expose())
                         .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, format!("dial reach token: {e}")))?;
+                    // The edge sees the agent's token in transit, and may echo it.
+                    masker.lock().unwrap().remember(token.secret());
                     let stream = self.streams.connect(&url).await?;
                     let stream = drydock_transport::tcp::connect_at(stream, &url, &token).await?;
                     *choice.lock().unwrap() = Some(shown);
