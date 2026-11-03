@@ -5,7 +5,7 @@
 use crate::{api::ProviderApi, client::Error};
 use async_trait::async_trait;
 use drydock_protocol::{DiagnosticMasker, Platform, ProtocolError, Reach};
-use drydock_transport::{ByteStream, ssh::SshConfig};
+use drydock_transport::{ByteStream, ssh::SshConfig, websocket::StreamDialer};
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -26,6 +26,26 @@ pub const AGENT_SOCKET: &str = "/run/drydock/agent.sock";
 #[async_trait]
 pub trait SshDialer: Send + Sync {
     async fn dial(&self, config: SshConfig) -> io::Result<ByteStream>;
+}
+
+/// The production dialer for a dial reach, made on first use: building its
+/// TLS configuration reads the platform's trust store.
+struct Tls(std::sync::OnceLock<drydock_transport::websocket::TlsDialer>);
+
+#[async_trait]
+impl StreamDialer for Tls {
+    async fn connect(&self, url: &str) -> io::Result<ByteStream> {
+        let dialer = match self.0.get() {
+            Some(dialer) => dialer,
+            None => {
+                // Two first uses at once may both build one; the loser is
+                // dropped (`get_or_try_init` is unstable).
+                let dialer = drydock_transport::websocket::TlsDialer::new()?;
+                self.0.get_or_init(|| dialer)
+            }
+        };
+        dialer.connect(url).await
+    }
 }
 
 /// Drydock's OpenSSH transport.
@@ -61,8 +81,9 @@ pub struct AgentReport {
     pub module: String,
     /// The provider's environment ID for the vessel.
     pub environment: String,
-    /// The SSH endpoint the agent is reached through, without credentials, or
-    /// [`RELAY`] when the provider's host carries the connection.
+    /// The SSH endpoint the agent is reached through, without credentials;
+    /// [`RELAY`] when the provider's host carries the connection; or a dial
+    /// reach's URL without its query.
     pub endpoint: String,
 }
 
@@ -73,6 +94,7 @@ impl std::fmt::Display for AgentReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.endpoint.as_str() {
             RELAY => write!(f, "relay"),
+            endpoint if endpoint.contains("://") => write!(f, "dial {endpoint}"),
             endpoint => write!(f, "ssh {endpoint}"),
         }?;
         write!(f, " to {} vessel {} (provider {})", self.module, self.environment, self.provider)
@@ -89,6 +111,7 @@ pub struct ConnectedAgent {
 #[derive(Clone)]
 pub struct AgentReach {
     dialer: Arc<dyn SshDialer>,
+    streams: Arc<dyn StreamDialer>,
     timeout: Duration,
 }
 
@@ -100,11 +123,17 @@ impl Default for AgentReach {
 
 impl AgentReach {
     pub fn new() -> Self {
-        Self { dialer: Arc::new(OpenSsh), timeout: Duration::from_secs(60) }
+        Self { dialer: Arc::new(OpenSsh), streams: Arc::new(Tls(Default::default())), timeout: Duration::from_secs(60) }
     }
 
     pub fn with_dialer(mut self, dialer: Arc<dyn SshDialer>) -> Self {
         self.dialer = dialer;
+        self
+    }
+
+    /// The dialer a dial reach's connections are opened with.
+    pub fn with_streams(mut self, streams: Arc<dyn StreamDialer>) -> Self {
+        self.streams = streams;
         self
     }
 
@@ -148,8 +177,12 @@ impl AgentReach {
                     *choice.lock().unwrap() = Some(RELAY.to_owned());
                     return Ok(Box::new(stream) as ByteStream);
                 }
-                Reach::Dial { .. } => {
-                    return Err(io::Error::new(io::ErrorKind::Unsupported, "agent hello requires an SSH or relay reach"));
+                // The agent's TCP listener behind the provider's edge, which
+                // takes its own credential from the URL's query or a header.
+                Reach::Dial { url, token, headers, .. } => {
+                    let stream = self.dial(&url, &token, &headers, &masker).await?;
+                    *choice.lock().unwrap() = Some(url.split(['?', '#']).next().unwrap_or_default().to_owned());
+                    return Ok(stream);
                 }
             };
             masker.lock().unwrap().remember(user.expose());
@@ -179,6 +212,73 @@ impl AgentReach {
             endpoint,
         };
         Ok(ConnectedAgent { client, report })
+    }
+}
+
+impl AgentReach {
+    /// One connection to the agent through a dial reach's edge. Everything
+    /// the edge is given is masked first, since it may echo it: each query
+    /// value (raw and decoded), each header value and the agent's token. What
+    /// no fresh reach could make followable (userinfo in `url`, a header that
+    /// is not one, a token that cannot be an agent's) is `Unsupported`, so it
+    /// is refused at once rather than retried. The edge's refusal (a
+    /// [`drydock_transport::tcp::Refusal`]) is reported with its status,
+    /// naming the URL without its query.
+    async fn dial(
+        &self,
+        url: &str,
+        token: &drydock_protocol::Secret,
+        headers: &std::collections::BTreeMap<String, drydock_protocol::Secret>,
+        masker: &Mutex<DiagnosticMasker>,
+    ) -> io::Result<ByteStream> {
+        use http::header::{HeaderName, HeaderValue};
+        let unsupported = |reason: String| io::Error::new(io::ErrorKind::Unsupported, reason);
+        let base = url.split(['?', '#']).next().unwrap_or_default();
+        {
+            let mut masker = masker.lock().unwrap();
+            // An edge may echo its credential, raw or decoded, alone or with its name.
+            if let Some((_, query)) = url.split_once('?') {
+                let query = query.split('#').next().unwrap_or_default();
+                masker.remember(query);
+                for value in query.split('&').filter_map(|pair| pair.split_once('=').map(|(_, value)| value)) {
+                    masker.remember(value);
+                    let decoded = percent_encoding::percent_decode_str(&value.replace('+', " ")).decode_utf8_lossy().into_owned();
+                    masker.remember(&decoded);
+                }
+            }
+            for value in headers.values() {
+                masker.remember(value.expose());
+            }
+            // The edge sees the agent's token in transit too.
+            masker.remember(token.expose());
+        }
+        // Userinfo would go out in `Host`; it is never shown, so neither is the URL.
+        if url.split_once("://").is_some_and(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default().contains('@')) {
+            return Err(unsupported("dial reach URL must not carry userinfo".into()));
+        }
+        let token = drydock_transport::tcp::Token::parse(token.expose()).map_err(|e| unsupported(format!("dial reach token: {e}")))?;
+        let mut sent = http::HeaderMap::new();
+        for (name, value) in headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| unsupported(format!("dial reach header {name:?} is not a header name")))?;
+            let mut value = HeaderValue::from_str(value.expose())
+                .map_err(|_| unsupported(format!("dial reach header {name}'s value is not a header value")))?;
+            value.set_sensitive(true);
+            sent.insert(name, value);
+        }
+        // A refusal before anything is sent cannot change with a fresh reach.
+        let invalid = |error: io::Error| match error.kind() {
+            io::ErrorKind::InvalidInput => unsupported(format!("dial reach {base}: {error}")),
+            _ => error,
+        };
+        let stream = self.streams.connect(url).await.map_err(invalid)?;
+        drydock_transport::tcp::connect_at_with(stream, url, &token, sent).await.map_err(|error| {
+            match drydock_transport::tcp::Refusal::of(&error) {
+                // The edge's answer, or the agent's through it: which one shows in the status.
+                Some(refusal) => io::Error::new(error.kind(), format!("the edge at {base} {refusal}")),
+                None => invalid(error),
+            }
+        })
     }
 }
 

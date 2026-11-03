@@ -521,6 +521,7 @@ dependencies = [
  "hegeltest",
  "http",
  "libc",
+ "percent-encoding",
  "reqwest",
  "rigging-http-client",
  "rigging-http-serve",

@@ -618,9 +618,25 @@ pub enum Reach {
         #[serde(default)]
         reverse_forwards: bool,
     },
+    /// The agent's token-gated TCP listener behind a provider's HTTP edge:
+    /// drydock opens `url` (`https://`, or `http://` to a loopback address)
+    /// and asks for the agent's handshake at its path and query with `token`
+    /// as the Bearer; the bytes after the agent's 101 are its socket's. A
+    /// credential the edge wants rides in `url`'s query or in `headers`,
+    /// neither of which drydock ever shows.
     Dial {
         url: String,
+        /// The agent's TCP token.
         token: Secret,
+        /// Headers of the edge's own, sent with the handshake, for an edge
+        /// that takes its credential in one (E2B's
+        /// `e2b-traffic-access-token`). They may not replace the handshake's
+        /// own (`Host`, `Connection`, `Upgrade`, `Authorization`,
+        /// `Sec-WebSocket-Key`, `Sec-WebSocket-Version`).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        headers: BTreeMap<String, Secret>,
+        /// When `url`'s credential stops working; drydock asks for a fresh
+        /// reach for each connection.
         #[schema(format = DateTime)]
         expires_at: Timestamp,
     },

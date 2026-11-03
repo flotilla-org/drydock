@@ -502,8 +502,9 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
 
 // Launch waits for the agent hello because the provider declares that its
 // vessels run the agent, whatever its module. The reference module has no
-// guest, so a declaring provider must fail launch naming the agent, while an
-// identical provider that does not declare it launches as before.
+// guest, so a declaring provider must fail launch naming the agent (its dial
+// reach's token cannot be an agent's), while an identical provider that does
+// not declare it launches as before.
 #[tokio::test]
 async fn launch_waits_for_agent_hello_only_when_declared() {
     if drydock::launch::build_tools_digest().is_err() {
@@ -535,11 +536,11 @@ async fn launch_waits_for_agent_hello_only_when_declared() {
     daemon.launch("plain", &drydock::launch::LaunchOptions::default()).await.unwrap();
     let error = tokio::time::timeout(Duration::from_secs(10), daemon.launch("agent", &drydock::launch::LaunchOptions::default()))
         .await
-        .expect("a reach drydock cannot follow is refused at once, not retried")
+        .expect("a dial reach whose token cannot be an agent's is refused at once, not retried")
         .err()
         .unwrap();
     let message = error.to_string();
-    assert!(message.contains("drydock-agent") || message.contains("agent hello requires an SSH or relay reach"), "{message}");
+    assert!(message.contains("drydock-agent") || message.contains("dial reach token"), "{message}");
     // No build for the prepared platform: refused before anything is created.
     let error = daemon.launch("foreign", &drydock::launch::LaunchOptions::default()).await.err().unwrap().to_string();
     assert!(error.contains("no vessel agent build for linux/riscv64: install drydock-agent-linux-riscv64"), "{error}");

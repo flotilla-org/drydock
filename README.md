@@ -370,8 +370,11 @@ Wire conventions chosen for this first protocol version:
   optional suspend/resume, export, exec, usage and quota operations. A resume
   token is valid only at the same provider. Usage periods are RFC 3339 start/end;
   quota credit units are provider-defined.
-- Relay and exec responses upgrade to raw streams. Dial uses TCP or WebSocket
-  URLs and an expiring token; SSH carries endpoint, user and host key. Transport
+- Relay and exec responses upgrade to raw streams. Dial names the agent's TCP
+  listener behind a provider's HTTP edge: a URL, the agent's token, any headers
+  the edge wants its own credential in, and when the reach expires. drydockd
+  asks the edge for a WebSocket upgrade there and masks the URL's query and the
+  headers' values in what it reports. SSH carries endpoint, user and host key. Transport
   setup, authentication enforcement, semantic input validation and idempotency
   behaviour belong to hosts and their future conformance suite.
 
