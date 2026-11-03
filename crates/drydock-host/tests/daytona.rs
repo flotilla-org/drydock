@@ -2267,9 +2267,11 @@ async fn foreign_and_untagged_sandboxes_are_not_ours() {
     let mine = row(p.provision(request(prep.clone(), "mine"), &c).await.unwrap());
     assert_eq!(http.0.lock().unwrap().rows[&mine.id]["labels"]["drydock.provider"], "daytona");
     let derived = |l: &str| format!("drydock-environment-{}", &format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(l.as_bytes()))[..40]);
-    for (id, label, labels) in
-        [("other", "o", json!({"flotilla.label":"o","drydock.provider":"someone-else"})), ("bare", "b", json!({"flotilla.label":"b"}))]
-    {
+    for (id, label, labels) in [
+        ("other", "o", json!({"flotilla.label":"o","drydock.provider":"someone-else"})),
+        ("bare", "b", json!({"flotilla.label":"b"})),
+        ("half", "h", json!({"drydock.provider":"daytona"})),
+    ] {
         http.0
             .lock()
             .unwrap()
