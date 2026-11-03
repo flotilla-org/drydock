@@ -716,7 +716,13 @@ impl E2b {
         // answers differently there (or rebinds) is not caught. A name that does
         // not resolve here is left to E2B's builder rather than refused, since
         // this host's resolver may not see public names a builder does.
-        self.resolver.resolve(host).await.ok()?.into_iter().find(|ip| private(*ip))
+        match self.resolver.resolve(host).await {
+            Ok(addresses) => addresses.into_iter().find(|ip| private(*ip)),
+            Err(error) => {
+                tracing::debug!(provider = %self.name, registry = host, %error, "registry name did not resolve; the private-address check is skipped");
+                None
+            }
+        }
     }
     fn validate_size(&self, size: &Size) -> Result<()> {
         if !size.cpus.is_finite()
