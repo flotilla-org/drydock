@@ -63,13 +63,10 @@ pub fn check_prepared(vendor: Vendor, provider: &str, prepared: &Prepared, expec
     Ok(())
 }
 
-/// A Dockerfile that copies the tools image's /opt/drydock onto the base,
-/// both pinned to `platform`: no other instruction, so the base's
-/// entrypoint, command and init are kept.
-pub fn tools_dockerfile(base: &str, tools: &str, platform: &Platform) -> String {
-    format!(
-        "FROM --platform={platform} {tools} AS drydock_tools\nFROM --platform={platform} {base}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n"
-    )
+/// A Dockerfile that is the base alone, pinned to `platform`: no other
+/// instruction, so the base's entrypoint, command and init are kept.
+pub fn platform_dockerfile(base: &str, platform: &Platform) -> String {
+    format!("FROM --platform={platform} {base}\n")
 }
 
 #[cfg(test)]

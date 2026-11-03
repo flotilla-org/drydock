@@ -68,10 +68,12 @@ build when fingerprints differ, through the agent's frozen upgrade path. Before 
 is published the pin reads `unpublished`; publish through the operator workflow
 and merge its generated pin PR before using `launch` or `prepare` (or compile
 with a published image override). See the [tools image and module guide](ci/tools-image/README.md).
-Daytona prepare layers the tools under `/opt/drydock` without changing the base
-entrypoint or command. Launch returns after the agent hello and any required
-upgrade. Its baked supervisor restarts the agent after a crash; start and resume
-run bootstrap again. No Python, `flock`, or agent command setting is needed.
+Daytona takes upload bootstrap: prepare makes a snapshot of the base image
+alone, keyed without the tools pin, and launch puts drydockd's own agent build
+in the sandbox through the toolbox's file API, starts its supervisor, and
+returns after the agent's hello. The supervisor restarts the agent after a
+crash; drydockd starts it again after resume. No Python, `flock`, or agent
+command setting is needed.
 
 ```sh
 drydock providers
@@ -346,8 +348,8 @@ Wire conventions chosen for this first protocol version:
   credential comes from. Credential values travel separately: to the server
   through the credential refresh route, and to hosts in each request's
   `Drydock-Credential` header.
-- Prepare is look-up-or-build by a module-defined key (Daytona: image/tools
-  digests, platform and size); a prepared form belongs to its named provider. Hosts must
+- Prepare is look-up-or-build by a module-defined key (Daytona: image
+  digest, platform and size; never the tools pin); a prepared form belongs to its named provider. Hosts must
   refuse cross-provider use. Baking and upload start the agent with fixed flags,
   without per-vessel configuration.
 - Missing egress means deny-all with no direct destinations. `open` is explicit;
@@ -640,7 +642,7 @@ Daytona API key permissions for this module (see [Daytona API keys](https://www.
 | Launch, suspend, resume, export from a sandbox | `write:sandboxes` |
 | Destroy | `delete:sandboxes` |
 | List, inspect, poll, snapshot lookup | Read access is always granted |
-| Exec and bootstrap through toolbox | Valid organization key; no separate runtime scope |
+| Exec, file upload and bootstrap through toolbox | Valid organization key; no separate runtime scope |
 | Usage | `read:billing` or `write:sandboxes` |
 | Quota | `read:limits` |
 

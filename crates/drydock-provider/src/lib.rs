@@ -1,6 +1,7 @@
 //! Compiled Rust provider interface. Shared methods permit independent concurrent calls.
 pub mod rest;
 use async_trait::async_trait;
+pub use bytes::Bytes;
 use drydock_protocol::*;
 pub use rigging_http_client::HttpClient;
 pub use rigging_stream::ByteStream;
@@ -130,12 +131,13 @@ pub trait Provider: Send + Sync {
     fn rate_limits(&self) -> Vec<RateLimit> {
         vec![]
     }
-    /// Append this build's tools image under /opt/drydock, preserving the base's
-    /// entrypoint, command and init. Record the provider's prepared form using
-    /// the module's key (both digests, the platform and provider prepare-time
-    /// constraints). The request's platform is resolved and declared; build for
-    /// it (see [`prepare_platform`]) and return it in the prepared form.
-    /// Upload bootstrap installs the same files at the same paths instead.
+    /// On [`BootstrapRoute::Bake`], append this build's tools image under
+    /// /opt/drydock, preserving the base's entrypoint, command and init; on
+    /// Upload, make the base image alone available. Record the provider's
+    /// prepared form using the module's key (the base image, the platform and
+    /// provider prepare-time constraints, never the tools image). The
+    /// request's platform is resolved and declared; build for it (see
+    /// [`prepare_platform`]) and return it in the prepared form.
     /// See ci/tools-image/README.md for the full prepare/start outcome contract.
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
@@ -159,10 +161,21 @@ pub struct Operations<'a> {
     pub export: Option<&'a dyn ExportOperation>,
     pub usage: Option<&'a dyn UsageOperation>,
     pub quota: Option<&'a dyn QuotaOperation>,
+    pub files: Option<&'a dyn GuestFiles>,
 }
 #[async_trait]
 pub trait Exec: Send + Sync {
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream>;
+}
+/// Writes files into a guest through the provider's own file API. On
+/// [`BootstrapRoute::Upload`] drydockd puts the agent in each vessel this way
+/// and starts it through [`Exec`]; such a module starts no agent itself.
+#[async_trait]
+pub trait GuestFiles: Send + Sync {
+    /// Write `bytes` at `file.path` with `file.mode`, making its parents and
+    /// replacing what is there. The file is complete, and has its mode, only
+    /// when this returns: callers rely on neither before.
+    async fn put(&self, id: &str, file: GuestFile, bytes: bytes::Bytes, c: &Credentials) -> Result<()>;
 }
 #[async_trait]
 pub trait SuspendResume: Send + Sync {
@@ -190,6 +203,7 @@ impl From<Operations<'_>> for Ports {
             export: p.export.is_some(),
             usage: p.usage.is_some(),
             quota: p.quota.is_some(),
+            files: p.files.is_some(),
         }
     }
 }

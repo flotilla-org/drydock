@@ -123,7 +123,8 @@ async fn singleton_recovers_after_crash_and_start_resume() {
 }
 
 // The public bootstrap detaches from toolbox exec even with no guest PATH.
-// Two invocations must return and leave one supervisor and one helloing agent.
+// Two invocations must return, close their output (drydockd reads a guest
+// command to its end), and leave one supervisor and one helloing agent.
 #[tokio::test]
 async fn public_bootstrap_detaches_without_guest_packages() {
     // Runs even when an assertion fails, so detached supervisors never outlive
@@ -148,12 +149,15 @@ async fn public_bootstrap_detaches_without_guest_packages() {
             .args(["--supervise", "--socket"])
             .arg(&socket)
             .env("PATH", "/nonexistent")
-            .status()
+            .stdin(std::process::Stdio::null())
+            .output()
             .await
             .unwrap()
     };
-    let (first, second) = tokio::join!(invoke(), invoke());
-    assert!(first.success() && second.success());
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(invoke(), invoke()) })
+        .await
+        .expect("--supervise returned and closed its output");
+    assert!(first.status.success() && second.status.success());
     hello(&socket).await;
     assert_eq!(agents(&socket).len(), 1);
 }

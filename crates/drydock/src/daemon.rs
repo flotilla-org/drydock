@@ -459,11 +459,54 @@ impl Daemon {
         // Find the agent build for the prepared platform before creating anything.
         let agent_build = if agent { Some(self.agent_build(&platform).await?) } else { None };
         let client = host.handle.client.credentialed(self.credential.clone());
-        let environment = self.invalidating(provider, client.provision(provider, &request).await).await?.into_inner();
+        let provisioned = self.invalidating(provider, client.provision(provider, &request).await).await?;
         if let Some(build) = agent_build {
-            self.agent_ready(provider, &environment, &platform, &build).await?;
+            self.bootstrap(&client, provider, &provisioned, build.clone()).await?;
+            let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
+            self.agent_ready(provider, environment, &platform, &build).await?;
         }
-        Ok(environment)
+        Ok(provisioned.into_inner())
+    }
+    /// Whether drydock puts and starts this provider's vessel agents itself:
+    /// its vessels run one, on the upload route, through its files and exec ports.
+    fn uploads(&self, provider: &str) -> bool {
+        let Ok(host) = self.host(provider) else { return false };
+        let status = host.handle.status.borrow();
+        status.providers.iter().any(|d| {
+            d.provider == provider
+                && d.capabilities.agent
+                && d.capabilities.bootstrap == BootstrapRoute::Upload
+                && d.ports.files
+                && d.ports.exec
+        })
+    }
+    /// Upload bootstrap, for a running vessel of a provider that takes it:
+    /// its agent put in place (a re-adopted or resumed vessel's only when
+    /// absent) and started. Launch, a client's provision and resume all come
+    /// here. Returns what the start printed, if it ran.
+    async fn bootstrap(
+        &self,
+        api: &dyn ProviderApi,
+        provider: &str,
+        provisioned: &crate::api::Provisioned<Environment>,
+        build: bytes::Bytes,
+    ) -> Result<Option<Secret>, Error> {
+        let (environment, fresh) = match provisioned {
+            crate::api::Provisioned::Created(environment) => (environment, true),
+            crate::api::Provisioned::Existing(environment) => (environment, false),
+        };
+        if !self.uploads(provider) || !matches!(environment.state, Observation::Running) {
+            return Ok(None);
+        }
+        launch::upload_agent(api, provider, &environment.id, build, fresh).await.map(Some)
+    }
+    /// The agent build for a vessel's platform: `platform` when the caller
+    /// knows it, else the one the provider reports.
+    async fn build_for(&self, environment: &Environment, platform: Option<&Platform>) -> Result<bytes::Bytes, Error> {
+        let platform = platform.or(environment.platform.as_ref()).ok_or_else(|| {
+            Error::Protocol(ProtocolError::Refused { reason: "the vessel's platform is unknown, so no agent build can be chosen".into() })
+        })?;
+        self.agent_build(platform).await
     }
     /// Wait for the vessel agent's current hello, pushing `build` (the agent for
     /// the prepared `platform`) to an older one.
@@ -497,10 +540,11 @@ impl Daemon {
         let build = self.agent_build(&platform).await?;
         self.agent(provider, &environment, &platform, &build, timeout).await
     }
-    async fn agent_build(&self, platform: &Platform) -> Result<Vec<u8>, Error> {
+    async fn agent_build(&self, platform: &Platform) -> Result<bytes::Bytes, Error> {
         self.builds
             .build(platform)
             .await
+            .map(bytes::Bytes::from)
             .map_err(|reason| Error::Protocol(ProtocolError::Refused { reason: format!("no vessel agent build for {platform}: {reason}") }))
     }
 
@@ -636,7 +680,13 @@ impl ProviderApi for Daemon {
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
         let keyed = self.keyed(p, request).await?;
-        self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await
+        let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
+        if self.uploads(p) {
+            let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
+            let build = self.build_for(environment, Some(&request.prepared.platform)).await?;
+            self.bootstrap(&self.runtime(p)?, p, &provisioned, build).await?;
+        }
+        Ok(provisioned)
     }
     async fn list(&self, p: &str) -> Result<Vec<Environment>, Error> {
         if self.credential.is_some() {
@@ -664,7 +714,17 @@ impl ProviderApi for Daemon {
         result
     }
     async fn resume(&self, p: &str, id: &str, token: &ResumeToken) -> Result<(), Error> {
-        let result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
+        let mut result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
+        // The supervisor died with the vessel's processes; start it again.
+        if result.is_ok() && self.uploads(p) {
+            let runtime = self.runtime(p)?;
+            result = async {
+                let environment = runtime.inspect(p, id).await?;
+                let build = self.build_for(&environment, None).await?;
+                self.bootstrap(&runtime, p, &crate::api::Provisioned::Existing(environment), build).await.map(drop)
+            }
+            .await;
+        }
         self.exposures.poke(p, id);
         result
     }
@@ -682,6 +742,9 @@ impl ProviderApi for Daemon {
     }
     async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
         self.runtime(p)?.exec(p, id, command).await
+    }
+    async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
+        self.runtime(p)?.put_file(p, id, file, bytes).await
     }
     async fn put_inward(&self, p: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let (existed, exposure) = self.exposures.put_inward(self, p, id, name, request).await?;

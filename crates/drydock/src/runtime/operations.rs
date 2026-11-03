@@ -173,4 +173,13 @@ impl ProviderApi for Runtime {
             )
             .await?)
     }
+    async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> ApiResult<()> {
+        let (id, file) = (id.to_owned(), file.clone());
+        let instance = self.instance(p).await?;
+        Ok(instance
+            .call(Gate::Files, self.credential.clone(), |p, c| async move {
+                operation_port(p.operations().files)?.put(&id, file, bytes, &c).await
+            })
+            .await?)
+    }
 }

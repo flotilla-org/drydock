@@ -106,6 +106,11 @@ impl Manifest {
     fn config(&self) -> Result<Descriptor> {
         Descriptor::parse(&self.json["config"])
     }
+    /// Compressed bytes of its config and layers: a lower bound on the
+    /// unpacked image's size.
+    pub fn image_bytes(&self) -> Result<u64> {
+        Ok(std::iter::once(self.config()?).chain(self.layers()?).map(|d| d.size).sum())
+    }
     fn layers(&self) -> Result<Vec<Descriptor>> {
         self.json["layers"].as_array().ok_or_else(|| malformed("manifest has no layers"))?.iter().map(Descriptor::parse).collect()
     }

@@ -22,7 +22,6 @@ struct State {
     ssh_expiries: Vec<Option<String>>,
     rows: BTreeMap<String, Value>,
     creates: usize,
-    bootstraps: usize,
     mints: usize,
     requests: usize,
     failure: Option<u16>,
@@ -46,13 +45,15 @@ struct State {
     lifecycle_posts: Vec<String>,
     command_exit: Option<i32>,
     command_output: Option<String>,
-    require_bootstrap_budget: bool,
     exec_timeouts: Vec<u64>,
+    /// Guest files the toolbox wrote, by (sandbox, path): bytes and mode,
+    /// which an upload leaves unset until permissions are set.
+    files: BTreeMap<(String, String), (Bytes, Option<String>)>,
     oci: Registries,
 }
 /// In-memory OCI registries behind the distribution protocol: a private lab
-/// registry Daytona cannot reach, a public tools registry, and Daytona's
-/// transient push registry (Harbor). (The stand-in's client follows redirects
+/// registry Daytona cannot reach, a public tools registry nothing may read,
+/// and Daytona's transient push registry (Harbor). (The stand-in's client follows redirects
 /// itself, so blob redirects are covered in the oci module's tests.)
 #[derive(Default)]
 struct Registries {
@@ -215,12 +216,14 @@ impl StandIn {
                 return response(503, json!({"message":"usage not settled"}));
             }
         }
-        let body = request.body().and_then(|b| b.as_bytes()).filter(|b| !b.is_empty()).map(serde_json::from_slice::<Value>).transpose();
+        let raw = request.body().and_then(|b| b.as_bytes()).map(Bytes::copy_from_slice).unwrap_or_default();
+        let upload = path.starts_with("/toolbox/") && path.ends_with("/files/upload-v2");
+        let body = Some(&raw).filter(|b| !b.is_empty() && !upload).map(|b| serde_json::from_slice::<Value>(b)).transpose();
         let body = match body {
             Ok(value) => value.unwrap_or(Value::Null),
             Err(_) => reject!("invalid JSON"),
         };
-        if method == "POST" && request.headers().get("content-type").is_some() == body.is_null() {
+        if method == "POST" && request.headers().get("content-type").is_some() == raw.is_empty() {
             reject!("content-type does not match body");
         }
         match (method, path) {
@@ -270,7 +273,7 @@ impl StandIn {
                     if body.get("buildInfo").is_some() {
                         reject!("a snapshot takes an image or a build, not both");
                     }
-                    if let Err(problem) = pushed_image_ready(&s.oci, image) {
+                    if let Err(problem) = snapshot_image_ready(&s.oci, image) {
                         reject!(problem);
                     }
                 }
@@ -391,18 +394,40 @@ impl StandIn {
                 row["state"] = json!(if p.ends_with("/stop") { "stopped" } else { "started" });
                 response(200, row.clone())
             }
+            // The toolbox writes the whole body at `path`, making parents and
+            // replacing a file there; the upload sets no mode.
+            ("POST", p) if p.starts_with("/toolbox/") && p.ends_with("/files/upload-v2") => {
+                let id = p.trim_start_matches("/toolbox/").split('/').next().unwrap().to_owned();
+                let Some(path) = request.url().query_pairs().find(|(k, _)| k == "path").map(|(_, v)| v.into_owned()) else {
+                    reject!("upload needs a path");
+                };
+                if request.headers().get("content-type").and_then(|v| v.to_str().ok()) != Some("application/octet-stream") {
+                    reject!("a raw upload is application/octet-stream");
+                }
+                if !s.rows.get(&id).is_some_and(|row| row["state"] == "started") {
+                    return response(404, json!({"statusCode":404,"message":"sandbox not found or not started"}));
+                }
+                s.files.insert((id, path.clone()), (raw.clone(), None));
+                response(200, json!({"path":path,"size":raw.len()}))
+            }
+            ("POST", p) if p.starts_with("/toolbox/") && p.ends_with("/files/permissions") => {
+                let id = p.trim_start_matches("/toolbox/").split('/').next().unwrap().to_owned();
+                let query: BTreeMap<_, _> = request.url().query_pairs().into_owned().collect();
+                let (Some(path), Some(mode)) = (query.get("path"), query.get("mode")) else { reject!("permissions need a path and mode") };
+                if u32::from_str_radix(mode, 8).is_err() {
+                    reject!("mode is octal");
+                }
+                let Some(file) = s.files.get_mut(&(id, path.clone())) else {
+                    return response(404, json!({"statusCode":404,"message":"file not found"}));
+                };
+                file.1 = Some(mode.clone());
+                response(200, Value::Null)
+            }
             ("POST", p) if p.starts_with("/toolbox/") && p.ends_with("/process/execute") => {
                 let Some(command) = body["command"].as_str() else { reject!("missing command"); };
                 let Some(timeout) = body["timeout"].as_u64() else { reject!("missing timeout"); };
                 s.exec_timeouts.push(timeout);
                 if let Some(value) = &s.exec_response { return response(200, value.clone()); }
-                if s.require_bootstrap_budget && command.contains("--supervise") && timeout < 20 {
-                    return response(200, json!({"exitCode":124,"result":"bootstrap exceeded vendor deadline"}));
-                }
-                if command.contains("--supervise") {
-                    s.bootstraps += 1;
-                    if !command.contains("--socket /run/drydock/agent.sock") { reject!("bootstrap missing socket flag"); }
-                }
                 s.executed.push(command.into());
                 let output = s.command_output.clone().unwrap_or_else(|| "guest output".into());
                 let code = s.command_exit.unwrap_or(0);
@@ -435,26 +460,24 @@ impl Drop for StandIn {
             let state = self.0.lock().unwrap();
             assert!(state.violations.is_empty(), "vendor contract violations: {:?}", state.violations);
             for body in &state.snapshot_requests {
-                if let Some(image) = body.get("imageName") {
-                    // Daytona accepts digest references; never a tag or untagged name.
-                    assert!(image.as_str().unwrap().starts_with("harbor.invalid/daytona-transient/drydock-vessel@sha256:"));
-                    assert!(body.get("buildInfo").is_none() && body.get("entrypoint").is_none());
-                    assert_eq!(body["regionId"], "eu");
-                    continue;
-                }
-                let dockerfile = body["buildInfo"]["dockerfileContent"].as_str().expect("prepare must build the tools layer");
-                let instructions: Vec<_> = dockerfile.lines().collect();
-                assert_eq!(instructions.len(), 3, "only FROM and COPY preserve the base entrypoint and command");
-                assert!(instructions[0].starts_with("FROM --platform=linux/amd64 registry.invalid/drydock-tools@sha256:"));
-                assert!(instructions[1].starts_with("FROM --platform=linux/amd64 ") && instructions[1].contains("@sha256:"));
-                assert_eq!(instructions[2], "COPY --from=drydock_tools /opt/drydock/ /opt/drydock/");
+                // A snapshot is the base image alone, by digest: pushed, or
+                // pinned to amd64 in a one-line build. No tools layer and no
+                // other entrypoint, so the base's are kept.
+                let image = match body["buildInfo"]["dockerfileContent"].as_str() {
+                    Some(dockerfile) => dockerfile
+                        .strip_prefix("FROM --platform=linux/amd64 ")
+                        .and_then(|rest| rest.strip_suffix('\n'))
+                        .filter(|image| !image.contains('\n'))
+                        .unwrap_or_else(|| panic!("a build is the base pinned to amd64: {dockerfile:?}")),
+                    None => body["imageName"].as_str().expect("a snapshot names its base image"),
+                };
+                assert!(image.contains("@sha256:"), "{image}");
+                assert!(!image.contains("drydock-tools"), "{image}");
                 assert!(body.get("entrypoint").is_none());
-                assert!(body.get("imageName").is_none());
                 assert_eq!(body["sandboxClass"], "container");
                 assert_eq!(body["regionId"], "eu");
             }
             assert!(state.ssh_expiries.iter().all(|v| v.as_deref() == Some("5")), "reach must request a short expiry");
-            assert!(state.executed.iter().filter(|c| c.contains("--supervise")).all(|c| c.contains("--socket /run/drydock/agent.sock")));
             let spec: Value = serde_json::from_str(include_str!("fixtures/daytona-schemas.json")).unwrap();
             for row in &state.fixture_rows {
                 for key in spec["schemas"]["Sandbox"]["required"].as_array().unwrap() {
@@ -465,14 +488,23 @@ impl Drop for StandIn {
     }
 }
 /// Daytona refuses `:latest` and untagged names, and its builder can pull only
-/// what its registry already serves; the image must also be amd64.
-fn pushed_image_ready(oci: &Registries, image: &str) -> std::result::Result<(), String> {
+/// what its registry already serves; the image must also be amd64. An image
+/// outside Daytona's registry is in one the organization registered, which
+/// the stand-in does not model.
+fn snapshot_image_ready(oci: &Registries, image: &str) -> std::result::Result<(), String> {
     let (name, digest) = image.split_once('@').ok_or("snapshot image must be pinned by digest")?;
-    let (host, repository) = name.split_once('/').ok_or("snapshot image has no registry")?;
     if name.rsplit('/').next().is_some_and(|last| last.contains(':')) {
         return Err("snapshot image names a tag beside its digest".into());
     }
-    if host != HARBOR || oci.pending_reads.contains_key(digest) {
+    // A name without a registry host is Docker Hub's.
+    let Some((host, repository)) = name.split_once('/').filter(|(host, _)| host.contains('.')) else { return Ok(()) };
+    if [LAB, TOOLS].contains(&host) {
+        return Err(format!("Daytona cannot reach {host}"));
+    }
+    if host != HARBOR {
+        return Ok(());
+    }
+    if oci.pending_reads.contains_key(digest) {
         return Err(format!("snapshot image {image} is not visible to Daytona's builder"));
     }
     let (_, manifest) =
@@ -490,6 +522,10 @@ fn pushed_image_ready(oci: &Registries, image: &str) -> std::result::Result<(), 
 /// must never see a credential; Range reads and chunked uploads are honoured.
 fn registry_response(s: &mut State, request: &reqwest::Request) -> http::Response<Bytes> {
     let host = request.url().host_str().unwrap().to_owned();
+    if host == TOOLS {
+        // Upload bootstrap: no image Daytona runs carries the tools.
+        s.violations.push("the tools registry was read".into());
+    }
     let now = chrono::Utc::now();
     let reply = |status: u16, headers: &[(&str, String)], body: Bytes| {
         let mut response = http::Response::builder().status(status);
@@ -689,8 +725,6 @@ fn seed(s: &mut State, seed: Seed) -> (String, BTreeMap<String, Value>) {
 }
 const DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
 const DOCKER_LAYER: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
-const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-const OCI_LAYER: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 fn lab_base(platforms: &'static [&'static str]) -> Seed<'static> {
     Seed {
         host: LAB,
@@ -699,17 +733,6 @@ fn lab_base(platforms: &'static [&'static str]) -> Seed<'static> {
         layer_type: DOCKER_LAYER,
         platforms,
         layers: 3,
-        declared_layer_size: None,
-    }
-}
-fn published_tools() -> Seed<'static> {
-    Seed {
-        host: TOOLS,
-        repository: "drydock-tools",
-        manifest_type: OCI_MANIFEST,
-        layer_type: OCI_LAYER,
-        platforms: &["amd64", "arm64"],
-        layers: 1,
         declared_layer_size: None,
     }
 }
@@ -802,9 +825,9 @@ async fn lifecycle_and_credential_rotation() {
     let ops = p.operations();
     let token = ops.suspend_resume.unwrap().suspend(&id, &c).await.unwrap();
     assert!(matches!(p.inspect(&id, &c).await.unwrap().state, Observation::Stopped { .. }));
-    let before = http.0.lock().unwrap().bootstraps;
+    // Resume starts the sandbox alone: drydock starts its agent again.
     ops.suspend_resume.unwrap().resume(&id, token, &c).await.unwrap();
-    assert_eq!(http.0.lock().unwrap().bootstraps, before + 1);
+    assert!(http.0.lock().unwrap().executed.is_empty());
     assert_eq!(p.capabilities().suspend_preserves_memory, Some(false));
     let mut output = String::new();
     ops.exec
@@ -1029,8 +1052,9 @@ async fn name_conflict_readopts_without_retrying_creation() {
     assert!(matches!(row(stopped).state, Observation::Stopped { .. }));
 }
 
-// Concurrent prepare at independent hosts converges on one snapshot name,
-// which another tools digest shares: the agent in it is only a cache.
+// Concurrent prepare at independent hosts converges on one snapshot of the
+// base image alone. The tools pin plays no part: a bumped pin makes no new
+// snapshot, and no snapshot request names it.
 #[tokio::test]
 async fn preparation_converges_on_the_image_and_ignores_the_tools_image() {
     let http = Arc::new(StandIn::default());
@@ -1049,12 +1073,17 @@ async fn preparation_converges_on_the_image_and_ignores_the_tools_image() {
     let x = x.unwrap();
     assert_eq!(x, y.unwrap());
     assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
-    // The agent baked in is only a cache, so another tools image reuses the
-    // snapshot; the host upgrades its agent at the first hello.
+    let image = r.image_digest.clone();
     r.tools_digest = tools_image('b');
     let other = a.prepare(r, &c).await.unwrap();
     assert_eq!((other.id.as_str(), other.tools_digest.as_str()), (x.id.as_str(), tools_image('b').as_str()));
-    assert_eq!(http.0.lock().unwrap().snapshots.len(), 1);
+    {
+        let s = http.0.lock().unwrap();
+        assert_eq!(s.snapshots.len(), 1);
+        let pinned = format!("FROM --platform=linux/amd64 {image}\n");
+        assert!(s.snapshot_requests.iter().all(|body| body["buildInfo"]["dockerfileContent"] == pinned.as_str()));
+        assert!(!s.snapshot_requests.iter().any(|body| body.to_string().contains("drydock-tools")));
+    }
     assert!(
         a.prepare(
             PrepareRequest {
@@ -1232,16 +1261,14 @@ async fn inactive_snapshot_activates_once_then_polls() {
     assert!(start.elapsed() >= std::time::Duration::from_secs(2));
 }
 
-// Bootstrap retains a bounded vendor deadline for starting supervision.
 // Guest command failure is not a transient provider outage.
 #[tokio::test]
-async fn bootstrap_budget_and_command_failure() {
+async fn guest_command_failure_is_typed() {
     let http = Arc::new(StandIn::default());
     let p = provider(http.clone()).await;
     let c = credentials();
     let prep = prepared(p.as_ref(), &c).await;
-    http.0.lock().unwrap().require_bootstrap_budget = true;
-    let env = row(p.provision(request(prep, "budget"), &c).await.unwrap());
+    let env = row(p.provision(request(prep, "failing"), &c).await.unwrap());
     http.0.lock().unwrap().command_exit = Some(7);
     let err = p.operations().exec.unwrap().exec(&env.id, ExecRequest { command: vec!["false".into()] }, &c).await.err().unwrap();
     assert_eq!(err.class(), "command_failed");
@@ -1289,17 +1316,67 @@ async fn terminal_sandbox_and_snapshot_errors_fail_fast() {
     }
 }
 
-// Bootstrap delegates to the baked binary and needs no Python, flock, or shell
-// fragment setting. Lifecycle readiness belongs to the daemon's agent hello.
+// A launch through drydockd, with the Daytona module against its vendor
+// stand-in, puts drydockd's own agent build in the sandbox, executable, and
+// returns once that agent has said hello. The stand-in gateway serves a real
+// agent on this host in place of Daytona's SSH gateway.
 #[tokio::test]
-async fn bootstrap_uses_only_baked_tools() {
-    let http = Arc::new(StandIn::default());
-    let p = provider(http.clone()).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    p.provision(request(prep, "tools-only"), &c).await.unwrap();
-    let state = http.0.lock().unwrap();
-    assert_eq!(state.executed, ["/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock"]);
+async fn launch_puts_the_agent_in_the_sandbox_and_hears_its_hello() {
+    use drydock::{
+        HostConnection,
+        agent::stand_in::Gateway,
+        daemon::{AgentBuilds, Daemon, HostOption, Seams},
+        launch::ImageResolver,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    const BUILD: &[u8] = b"drydockd's agent build";
+    struct Digests;
+    #[async_trait]
+    impl ImageResolver for Digests {
+        async fn resolve(&self, image: &str) -> std::result::Result<String, drydock::client::Error> {
+            Ok(image.into())
+        }
+    }
+    struct Build;
+    #[async_trait]
+    impl AgentBuilds for Build {
+        async fn build(&self, _: &Platform) -> std::result::Result<Vec<u8>, String> {
+            Ok(BUILD.to_vec())
+        }
+    }
+    let vendor = Arc::new(StandIn::default());
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("host.sock");
+    let host = drydock_host::Host::new(BTreeMap::from([("daytona".into(), Arc::new(VendorModule(vendor.clone())) as Arc<dyn Module>)]));
+    let served = socket.clone();
+    let host = tokio::spawn(async move { host.serve_unix(served, std::future::pending()).await.unwrap() });
+    let key = dir.path().join("daytona.key");
+    std::fs::write(&key, "key-a").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = format!(
+        "[providers.daytona]\nmodule='daytona'\ncredential={{file={key:?}}}\nimage='docker.io/test/image@sha256:{}'\n\
+         settings={{organization_id='org-1', ssh_host_key='ssh-ed25519 AAAA'}}\n",
+        "a".repeat(64)
+    );
+    let vessel = dir.path().join("vessel");
+    std::fs::create_dir(&vessel).unwrap();
+    let gateway = Gateway::start_as(&vessel, BUILD, Platform::new("linux", "amd64")).unwrap();
+    let seams = Seams { dialer: gateway.clone(), builds: Arc::new(Build), ..Seams::new(Arc::new(Digests)) };
+    let option = HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } };
+    let run = dir.path().join("run");
+    let daemon = Daemon::start_with_seams(drydock::config::Config::parse(&config).unwrap(), &run, run.join("keys"), vec![option], seams)
+        .await
+        .unwrap();
+    let options = drydock::launch::LaunchOptions { image_route: Some(ImageRouteKind::RegistryPull), ..Default::default() };
+    let launched = daemon.launch("daytona", &options).await.unwrap();
+    let files = vendor.0.lock().unwrap().files.clone();
+    assert_eq!(
+        files.get(&(launched.id.clone(), "/opt/drydock/drydock-agent".into())),
+        Some(&(Bytes::from_static(BUILD), Some("0755".into())))
+    );
+    assert!(gateway.dials() > 0, "the launch heard the agent's hello");
+    host.abort();
 }
 
 // This network-boundary wrapper controls response latency without sleeping
@@ -1445,8 +1522,8 @@ async fn internal_retains_vendor_body() {
     assert!(provider_error.as_str().contains("key-a must never be echoed"));
 }
 
-// Lifecycle state checks run no guest command: suspend execs nothing, resume
-// performs only the agent bootstrap exec, and the row stays a vendor claim.
+// Lifecycle state checks run no guest command: neither suspend nor resume
+// execs anything (drydockd starts the agent), and the row stays a vendor claim.
 #[tokio::test]
 async fn lifecycle_state_checks_do_not_probe() {
     let http = Arc::new(StandIn::default());
@@ -1459,7 +1536,7 @@ async fn lifecycle_state_checks_do_not_probe() {
     let token = sr.suspend(&env.id, &c).await.unwrap();
     assert_eq!(http.0.lock().unwrap().executed.len(), before);
     sr.resume(&env.id, token, &c).await.unwrap();
-    assert_eq!(http.0.lock().unwrap().executed.len(), before + 1);
+    assert_eq!(http.0.lock().unwrap().executed.len(), before);
     let inspected = p.inspect(&env.id, &c).await.unwrap();
     assert!((inspected.egress, inspected.egress_measured) == (Enforcement::Advisory, false));
 }
@@ -1652,7 +1729,7 @@ async fn standin_validates_snapshot_create_schema() {
     let req = client.post("https://app.daytona.io/api/snapshots/missing/activate").bearer_auth("key-a").build().unwrap();
     assert_eq!(http.execute(req, &ChannelLabel::Default).await.unwrap().status(), 404);
     assert_eq!(http.0.lock().unwrap().activations, 0);
-    let base = json!({"name":"fixture","buildInfo":{"dockerfileContent":format!("FROM --platform=linux/amd64 {} AS drydock_tools\nFROM --platform=linux/amd64 image@sha256:{}\nCOPY --from=drydock_tools /opt/drydock/ /opt/drydock/\n", tools_image('a'), "b".repeat(64))},"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
+    let base = json!({"name":"fixture","imageName":format!("docker.io/test/image@sha256:{}", "b".repeat(64)),"regionId":"eu","sandboxClass":"container","cpu":2,"memory":4,"disk":10});
     let mut invalid = vec![json!({}), json!(null)];
     let mut unknown = base.clone();
     unknown["mem"] = json!(4);
@@ -1925,29 +2002,6 @@ async fn malformed_sensitive_responses_do_not_disclose_values() {
     }
 }
 
-// Concurrent provision retries both bootstrap the same started sandbox, without
-// holding a host-local creation lock. The baked supervisor enforces singleton.
-#[tokio::test]
-async fn concurrent_bootstraps_after_start_and_resume() {
-    let http = Arc::new(StandIn::default());
-    let p = provider(http.clone()).await;
-    let c = credentials();
-    let prep = prepared(p.as_ref(), &c).await;
-    let request = request(prep, "concurrent-bootstrap");
-    let (first, second) = tokio::join!(p.provision(request.clone(), &c), p.provision(request, &c));
-    let first = row(first.unwrap());
-    assert_eq!(first.id, row(second.unwrap()).id);
-    assert_eq!(http.0.lock().unwrap().bootstraps, 2);
-    let operations = p.operations();
-    let lifecycle = operations.suspend_resume.unwrap();
-    let token = lifecycle.suspend(&first.id, &c).await.unwrap();
-    let (first_resume, second_resume) =
-        tokio::join!(lifecycle.resume(&first.id, token.clone(), &c), lifecycle.resume(&first.id, token, &c));
-    first_resume.unwrap();
-    second_resume.unwrap();
-    assert_eq!(http.0.lock().unwrap().bootstraps, 4);
-}
-
 // Unpublished, mutable and instruction-injecting tools references must refuse
 // before contacting Daytona, as must instruction-injecting base references.
 #[tokio::test]
@@ -2013,24 +2067,20 @@ fn push_request(image_digest: String, tools_digest: String) -> PrepareRequest {
     }
 }
 
-// Push route (#103): the host appends the tools layer to a private base that
-// Daytona cannot reach, uploads it in bounded chunks with minted push access,
-// waits out the registry's visibility delay, and creates the snapshot by
-// digest. The stand-in refuses anything else Daytona would. Another host then
-// converges on the same snapshot without pushing again, and it launches.
+// Push route (#103): the module copies the base alone, for Daytona's one
+// platform, from a private registry Daytona cannot reach into Daytona's own,
+// in bounded chunks with minted push access, waits out the registry's
+// visibility delay, and creates the snapshot by digest. The tools image is
+// never read: another host with a bumped tools pin converges on the same
+// snapshot without pushing again, and it launches.
 #[tokio::test]
 async fn pushed_image_becomes_snapshot_by_digest() {
     let http = Arc::new(StandIn::default());
-    let (base, base_manifests, tools, tools_manifests) = {
-        let mut s = http.0.lock().unwrap();
-        let (base, base_manifests) = seed(&mut s, lab_base(&["arm64", "amd64"]));
-        let (tools, tools_manifests) = seed(&mut s, published_tools());
-        (base, base_manifests, tools, tools_manifests)
-    };
+    let (base, base_manifests) = seed(&mut http.0.lock().unwrap(), lab_base(&["arm64", "amd64"]));
     let chunk = 7;
     let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": chunk})).await;
     let c = credentials();
-    let prep = p.prepare(push_request(base.clone(), tools.clone()), &c).await.unwrap();
+    let prep = p.prepare(push_request(base.clone(), tools_image('a')), &c).await.unwrap();
 
     {
         let s = http.0.lock().unwrap();
@@ -2038,20 +2088,17 @@ async fn pushed_image_becomes_snapshot_by_digest() {
         let (name, digest) = image.split_once('@').unwrap();
         let repository = name.strip_prefix("harbor.invalid/").unwrap();
         let (_, pushed) = &s.oci.manifests[&(HARBOR.to_owned(), repository.to_owned(), digest.to_owned())];
-        let pushed: Value = serde_json::from_slice(pushed).unwrap();
-        // The base's amd64 layers, then the tools layer in the base's (Docker) media type.
-        let digests = |m: &Value| m["layers"].as_array().unwrap().iter().map(|l| l["digest"].clone()).collect::<Vec<_>>();
-        let mut expected = digests(&base_manifests["amd64"]);
-        expected.extend(digests(&tools_manifests["amd64"]));
-        assert_eq!(digests(&pushed), expected);
-        assert!(pushed["layers"].as_array().unwrap().iter().all(|l| l["mediaType"] == DOCKER_LAYER));
+        // The base's amd64 manifest, byte for byte, so its digest is kept.
+        assert_eq!(serde_json::from_slice::<Value>(pushed).unwrap(), base_manifests["amd64"]);
+        assert_eq!(digest, drydock_host::oci::sha256(pushed));
         assert!(s.oci.patch_sizes.len() > s.oci.blobs.len() / 4 && s.oci.patch_sizes.iter().all(|n| *n <= chunk));
         assert_eq!(s.oci.mints, 1);
     }
 
     let other_host = provider(http.clone()).await;
-    assert_eq!(other_host.prepare(push_request(base, tools), &c).await.unwrap(), prep);
+    assert_eq!(other_host.prepare(push_request(base, tools_image('b')), &c).await.unwrap().id, prep.id);
     assert_eq!(http.0.lock().unwrap().oci.mints, 1);
+    assert_eq!(http.0.lock().unwrap().snapshot_requests.len(), 1);
     assert!(matches!(other_host.provision(request(prep, "pushed"), &c).await.unwrap(), Provisioned::Created(_)));
 }
 
@@ -2065,7 +2112,7 @@ async fn push_route_refusals_are_typed() {
         let mut s = http.0.lock().unwrap();
         let arm_only = seed(&mut s, Seed { repository: "crew/arm", ..lab_base(&["arm64"]) }).0;
         let huge = seed(&mut s, Seed { repository: "crew/huge", declared_layer_size: Some(7 << 30), ..lab_base(&["amd64"]) }).0;
-        (arm_only, huge, seed(&mut s, lab_base(&["amd64"])).0, seed(&mut s, published_tools()).0)
+        (arm_only, huge, seed(&mut s, lab_base(&["amd64"])).0, tools_image('a'))
     };
     let p = provider(http.clone()).await;
     let c = credentials();
@@ -2104,7 +2151,7 @@ async fn unverifiable_source_blobs_are_refused() {
     let (base, base_manifests, tools) = {
         let mut s = http.0.lock().unwrap();
         let (base, base_manifests) = seed(&mut s, lab_base(&["amd64"]));
-        (base, base_manifests, seed(&mut s, published_tools()).0)
+        (base, base_manifests, tools_image('a'))
     };
     let layer = base_manifests["amd64"]["layers"][0]["digest"].as_str().unwrap().to_owned();
     let p = provider_with_settings(http.clone(), json!({"push_chunk_bytes": 7})).await;

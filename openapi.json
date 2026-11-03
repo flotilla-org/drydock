@@ -1590,6 +1590,109 @@
         "x-drydock-server-only": true
       }
     },
+    "/v1/providers/{provider}/environments/{id}/files": {
+      "put": {
+        "tags": [
+          "host"
+        ],
+        "operationId": "put_file",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "Absolute guest path; parents are made and an existing file replaced",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "Read, write and execute bits, at most 0o777 (511)",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The file's bytes",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "$ref": "#/components/schemas/FileBytes"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The file is in place"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
     "/v1/providers/{provider}/environments/{id}/reach": {
       "post": {
         "tags": [
@@ -2159,6 +2262,7 @@
     "schemas": {
       "BootstrapRoute": {
         "type": "string",
+        "description": "How a vessel's agent gets into it. On Upload a provider with the files and\nexec ports has drydockd put the agent in each vessel and start it, after\nprovision and resume: its module starts none, so a caller that bypasses\ndrydockd gets a vessel without one. One without those ports places and\nstarts its own.",
         "enum": [
           "bake",
           "upload"
@@ -2896,6 +3000,11 @@
           "refused",
           "unresolved"
         ]
+      },
+      "FileBytes": {
+        "type": "string",
+        "format": "binary",
+        "description": "A file's raw bytes, as the files route takes them."
       },
       "GoneCause": {
         "oneOf": [
@@ -3724,6 +3833,10 @@
           "export": {
             "type": "boolean"
           },
+          "files": {
+            "type": "boolean",
+            "description": "Writes a file into a guest: how drydock puts the agent in a vessel on\n[`BootstrapRoute::Upload`]."
+          },
           "quota": {
             "type": "boolean"
           },
@@ -3737,7 +3850,7 @@
       },
       "PrepareRequest": {
         "type": "object",
-        "description": "Preparation is look-up-or-build at the provider: append the tools image's\nfiles under /opt/drydock to the base, preserving its entrypoint, command and\ninit. tools_digest is the build-selected bootstrap agent OCI index reference.\nThe agent it carries is only a cache: the host always upgrades the vessel's\nagent to its own build at the first hello, so a matching agent saves an\nupload and any other is replaced. Build at the provider where possible,\notherwise append its layer; Upload bootstrap installs those same files\nunder /opt/drydock before the first hello.\nModules choose their own provider-recorded key from the image digest and\nany prepare-time constraints (Daytona also includes size). The tools\ndigest is not part of it, nor is configuration. Provision must match the\nrecorded prepared form. See ADR 0070 Vessel tools.",
+        "description": "Preparation is look-up-or-build at the provider. On Bake bootstrap, append\nthe tools image's files under /opt/drydock to the base, preserving its\nentrypoint, command and init; on Upload, make the base alone available, and\ndrydock puts the agent in each vessel at launch. tools_digest is the\nbuild-selected bootstrap agent OCI index reference. The agent it carries is\nonly a cache: the host always upgrades the vessel's agent to its own build\nat the first hello, so a matching agent saves an upload and any other is\nreplaced. Build at the provider where possible, otherwise append its layer.\nModules choose their own provider-recorded key from the image digest and\nany prepare-time constraints (Daytona also includes size). The tools\ndigest is not part of it, nor is configuration. Provision must match the\nrecorded prepared form. See ADR 0070 Vessel tools.",
         "required": [
           "size",
           "image_digest",
@@ -4590,7 +4703,8 @@
         "description": "Where the drydock tools layer joins the base image.",
         "enum": [
           "provider",
-          "host"
+          "host",
+          "upload"
         ]
       },
       "TransitionPhase": {

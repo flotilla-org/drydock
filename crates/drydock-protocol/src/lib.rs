@@ -126,6 +126,10 @@ pub struct Ports {
     pub export: bool,
     pub usage: bool,
     pub quota: bool,
+    /// Writes a file into a guest: how drydock puts the agent in a vessel on
+    /// [`BootstrapRoute::Upload`].
+    #[serde(default)]
+    pub files: bool,
 }
 /// How the server observes a provider: it polls the environment list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -206,6 +210,11 @@ pub enum CheckoutStrategy {
     HostClone,
     CloneInVessel,
 }
+/// How a vessel's agent gets into it. On Upload a provider with the files and
+/// exec ports has drydockd put the agent in each vessel and start it, after
+/// provision and resume: its module starts none, so a caller that bypasses
+/// drydockd gets a vessel without one. One without those ports places and
+/// starts its own.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapRoute {
@@ -316,6 +325,9 @@ pub enum ToolsLayer {
     Provider,
     /// The host appends it to the base image's manifest before handing it over.
     Host,
+    /// None joins the image: it is the base alone, and drydock uploads the
+    /// agent at launch ([`BootstrapRoute::Upload`]).
+    Upload,
 }
 /// Pull access to one registry. Hosts send it only to the registry that the
 /// reference it accompanies names.
@@ -453,14 +465,14 @@ pub enum Destination {
         cidr: Cidr,
     },
 }
-/// Preparation is look-up-or-build at the provider: append the tools image's
-/// files under /opt/drydock to the base, preserving its entrypoint, command and
-/// init. tools_digest is the build-selected bootstrap agent OCI index reference.
-/// The agent it carries is only a cache: the host always upgrades the vessel's
-/// agent to its own build at the first hello, so a matching agent saves an
-/// upload and any other is replaced. Build at the provider where possible,
-/// otherwise append its layer; Upload bootstrap installs those same files
-/// under /opt/drydock before the first hello.
+/// Preparation is look-up-or-build at the provider. On Bake bootstrap, append
+/// the tools image's files under /opt/drydock to the base, preserving its
+/// entrypoint, command and init; on Upload, make the base alone available, and
+/// drydock puts the agent in each vessel at launch. tools_digest is the
+/// build-selected bootstrap agent OCI index reference. The agent it carries is
+/// only a cache: the host always upgrades the vessel's agent to its own build
+/// at the first hello, so a matching agent saves an upload and any other is
+/// replaced. Build at the provider where possible, otherwise append its layer.
 /// Modules choose their own provider-recorded key from the image digest and
 /// any prepare-time constraints (Daytona also includes size). The tools
 /// digest is not part of it, nor is configuration. Provision must match the
@@ -918,6 +930,17 @@ pub struct ExecRequest {
     #[schema(min_items = 1)]
     pub command: Vec<String>,
 }
+/// Where the files port puts one file in a guest: an absolute, normal path
+/// (parents are made, an existing file is replaced) and its read, write and
+/// execute bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(try_from = "validation::UncheckedGuestFile")]
+pub struct GuestFile {
+    #[schema(pattern = "^/")]
+    pub path: String,
+    #[schema(maximum = 511)]
+    pub mode: u32,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ResumeToken {
     pub token: Secret,
@@ -996,6 +1019,22 @@ impl ProtocolError {
     /// Retryable unavailability without sensitive provider diagnostics.
     pub fn unavailable(reason: impl Into<String>, retry_after: Option<u64>) -> Self {
         Self::Unavailable { provider_error: None, reason: reason.into(), retry_after }
+    }
+
+    /// The same error, its reason saying what was being done: `"{doing}: {reason}"`.
+    pub fn context(mut self, doing: &str) -> Self {
+        let (Self::NotFound { reason }
+        | Self::MethodNotAllowed { reason }
+        | Self::Refused { reason }
+        | Self::ImageRefused { reason, .. }
+        | Self::Unavailable { reason, .. }
+        | Self::RateLimited { reason, .. }
+        | Self::QuotaExhausted { reason }
+        | Self::CredentialRejected { reason }
+        | Self::CommandFailed { reason, .. }
+        | Self::Internal { reason, .. }) = &mut self;
+        *reason = format!("{doing}: {reason}");
+        self
     }
 
     /// Static diagnostics label; never exposes vendor error text.

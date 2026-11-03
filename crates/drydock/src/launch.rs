@@ -1,5 +1,6 @@
 //! Standalone launch policy: defaults, immutable images and per-vessel SSH keys.
 use crate::{
+    api::ProviderApi,
     client::Error,
     config::{Egress, Provider, Quantity, SizeDefaults},
 };
@@ -197,6 +198,69 @@ impl ImageReference {
         }
         Ok(Self { name: name.into(), registry, repository, tag: tag.into(), digest })
     }
+}
+
+/// Where a vessel's agent lives, as the tools image lays it out.
+pub const AGENT_EXECUTABLE: &str = "/opt/drydock/drydock-agent";
+
+/// The agent's self-bootstrap: a detached singleton supervisor serving the
+/// agent's socket, reached by SSH or a relay. Repeating it is harmless.
+pub fn supervise() -> Vec<String> {
+    [AGENT_EXECUTABLE, "--supervise", "--socket", crate::agent::AGENT_SOCKET].map(String::from).to_vec()
+}
+
+/// Upload bootstrap, through the provider's files and exec ports: put `build`
+/// in place, unless the vessel is not `fresh` and already holds an agent,
+/// then start it. Returns what the start printed, which carries the
+/// `drydock-tcp-token` line when the start asks for one. A failure names the
+/// step. The exec port reports no exit status, so a start that fails shows as
+/// no hello, the caller's proof that the agent runs. The presence check is
+/// deliberately weak (any executable file there): the hello replaces an agent
+/// that is not this build.
+pub(crate) async fn upload_agent(
+    api: &dyn ProviderApi,
+    provider: &str,
+    id: &str,
+    build: bytes::Bytes,
+    fresh: bool,
+) -> Result<Secret, Error> {
+    let step = |doing: &'static str| {
+        move |error: Error| match error {
+            Error::Protocol(error) => Error::Protocol(error.context(doing)),
+            Error::Transport(reason) => Error::Transport(format!("{doing}: {reason}")),
+            Error::InvalidResponse(reason) => Error::InvalidResponse(format!("{doing}: {reason}")),
+            Error::InvalidRequest(reason) => Error::InvalidRequest(format!("{doing}: {reason}")),
+            other => other,
+        }
+    };
+    let present = !fresh
+        && run(api, provider, id, &["sh", "-c", &format!("if test -x {AGENT_EXECUTABLE}; then echo present; fi")])
+            .await
+            .map_err(step("look for the vessel agent"))?
+            .trim()
+            == "present";
+    if !present {
+        let file = GuestFile { path: AGENT_EXECUTABLE.into(), mode: 0o755 };
+        api.put_file(provider, id, &file, build).await.map_err(step("upload the vessel agent"))?;
+    }
+    let argv = supervise();
+    let output =
+        run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;
+    Ok(Secret::new(output))
+}
+/// A guest command's output, up to 64 KiB, once it has ended.
+async fn run(api: &dyn ProviderApi, provider: &str, id: &str, argv: &[&str]) -> Result<String, Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let command = ExecRequest { command: argv.iter().map(|s| s.to_string()).collect() };
+    let mut stream = api.exec(provider, id, &command).await?;
+    // The command reads nothing.
+    let _ = stream.shutdown().await;
+    let mut output = Vec::new();
+    tokio::time::timeout(Duration::from_secs(60), (&mut stream).take(64 << 10).read_to_end(&mut output))
+        .await
+        .map_err(|_| Error::Transport("guest command did not end within 60s".into()))?
+        .map_err(|e| Error::Transport(format!("guest command output: {e}")))?;
+    Ok(String::from_utf8_lossy(&output).into_owned())
 }
 
 pub(crate) async fn prepare_request(
