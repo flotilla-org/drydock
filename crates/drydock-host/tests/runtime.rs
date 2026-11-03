@@ -22,7 +22,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
-use drydock_agent::{Agent, Client, FileOptions, tcp::TokenListener};
+use drydock_agent::{Client, FileOptions};
 use drydock_host::{module::*, runtime::RuntimeModule};
 use drydock_protocol::*;
 use drydock_transport::{
@@ -42,7 +42,6 @@ use rigging_http_client::ChannelLabel;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -85,21 +84,6 @@ const CREATE_DOCUMENTED: &[&str] = &[
     "evictable",
 ];
 
-/// A guest's drydock agent: really listening on loopback, as the
-/// supervised agent would on the guest's.
-struct Guest {
-    address: SocketAddr,
-    token: Token,
-    task: tokio::task::JoinHandle<std::io::Result<std::path::PathBuf>>,
-    _dir: tempfile::TempDir,
-    _keep: drydock_transport::MemoryDialer,
-}
-impl Drop for Guest {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 #[derive(Default)]
 struct Network {
     internet: bool,
@@ -123,6 +107,9 @@ impl Network {
 
 /// A failed bootstrap's stdout and exit status.
 type FailedBootstrap = Option<(String, i64)>;
+#[path = "support/guest.rs"]
+mod guest;
+use guest::{BootstrapRun, Guest, run_bootstrap, start_guest, supervise};
 
 #[derive(Default)]
 struct Sandbox {
@@ -745,70 +732,6 @@ fn exec(s: &mut State, id: &str, body: Value) -> http::Response<Bytes> {
     reply(200, json!({"exitCode": code, "stdout": stdout, "stderr": stderr, "timedOut": false, "durationMs": 12}))
 }
 
-const AGENT: &str = "/opt/drydock/drydock-agent";
-/// What the guest's `drydock-agent --supervise` makes of the bootstrap's
-/// argv, through the supervisor's own parser.
-fn supervise(script: &str) -> std::result::Result<Vec<String>, String> {
-    let Some((_, argv)) = script.split_once(&format!("{AGENT} --supervise ")) else {
-        return Err(format!("sh: unexpected bootstrap {script}"));
-    };
-    let argv: Vec<std::ffi::OsString> = argv.split_whitespace().map(Into::into).collect();
-    drydock_agent::socket::supervised(&argv).map_err(|e| e.to_string())?;
-    Ok(argv.iter().map(|a| a.to_string_lossy().into_owned()).collect())
-}
-/// The bootstrap run for real by `sh`, with /run/drydock moved to a
-/// temporary directory, Runtime's identity variables in its environment and
-/// a stub in the agent's place recording the environment it gets, and a
-/// PATH of the tools it uses, with python3 unless the image lacks it.
-/// Returns the token file afterwards, that environment, and the shell's
-/// stdout and exit status when it failed.
-fn run_bootstrap(
-    script: &str,
-    existing: Option<&str>,
-    token: Option<&str>,
-    python3: bool,
-) -> (Option<String>, BTreeMap<String, String>, FailedBootstrap) {
-    let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for tool in ["mkdir", "chmod", "grep", "rm", "cat", "env"] {
-        let found = std::env::split_paths(&path).map(|d| d.join(tool)).find(|p| p.is_file()).unwrap();
-        std::os::unix::fs::symlink(found, bin.join(tool)).unwrap();
-    }
-    if python3 {
-        std::fs::write(bin.join("python3"), "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(bin.join("python3"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    }
-    let run = dir.path().join("run");
-    let stub = dir.path().join("agent");
-    let recorded = dir.path().join("env");
-    std::fs::write(&stub, format!("#!/bin/sh\nenv > {}\n", recorded.display())).unwrap();
-    std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let script = script.replace("/run/drydock", run.to_str().unwrap()).replace(AGENT, stub.to_str().unwrap());
-    if let Some(existing) = existing {
-        std::fs::create_dir(&run).unwrap();
-        std::fs::write(run.join("tcp.token"), existing).unwrap();
-    }
-    let output = std::process::Command::new("/bin/sh")
-        .args(["-c", &script])
-        .env("PATH", &bin)
-        .env("DRYDOCK_TCP_TOKEN", token.unwrap_or_default())
-        .env("RUNTIME_ID_TOKEN_REQUEST_TOKEN", "rt-identity-secret")
-        .env("RUNTIME_ID_TOKEN_REQUEST_URL", "http://169.254.169.254/token")
-        .output()
-        .unwrap();
-    assert!(output.status.success() || !python3, "bootstrap's shell code failed: {script}");
-    let failed = (!output.status.success())
-        .then(|| (String::from_utf8_lossy(&output.stdout).into_owned(), i64::from(output.status.code().unwrap_or(-1))));
-    let env = std::fs::read_to_string(&recorded)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
-        .collect();
-    (std::fs::read_to_string(run.join("tcp.token")).ok(), env, failed)
-}
-
 impl StandIn {
     /// The bootstrap, run as root with the token in its environment: writes
     /// the token file unless one holds a token, then starts the agent unless
@@ -841,7 +764,13 @@ impl StandIn {
             let existing = sandbox.token_file.clone();
             let python3 = !sandbox.no_python3;
             drop(s);
-            let (token_file, env, failed) = run_bootstrap(&script, existing.as_deref(), token.as_ref().map(Token::secret), python3);
+            let identity = [
+                ("RUNTIME_ID_TOKEN_REQUEST_TOKEN", "rt-identity-secret"),
+                ("RUNTIME_ID_TOKEN_REQUEST_URL", "http://169.254.169.254/token"),
+            ];
+            let BootstrapRun { token_file, env, failed } =
+                run_bootstrap(&script, existing.as_deref(), token.as_ref().map(Token::secret), &identity, python3);
+            assert!(failed.is_none() || !python3, "bootstrap's shell code failed: {script}");
             let mut s = self.state();
             if !missing && failed.is_none() {
                 s.agent_envs.push(env);
@@ -1140,16 +1069,6 @@ impl StandIn {
         }
     }
 }
-async fn start_guest(token: Token) -> Guest {
-    let dir = tempfile::tempdir().unwrap();
-    let (keep, control) = drydock_transport::memory();
-    let listener = TokenListener::bind("127.0.0.1:0".parse().unwrap(), token.clone()).await.unwrap();
-    let address = listener.local_addr();
-    let mut agent = Agent::new(control, "test-build".into(), dir.path().join("agent"));
-    agent.add_listener(listener);
-    Guest { address, token, task: tokio::spawn(agent.run()), _dir: dir, _keep: keep }
-}
-
 /// The host's HTTP client, answered in process by the stand-in.
 struct Wire(StandIn);
 #[async_trait]

@@ -14,7 +14,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
-use drydock_agent::{Agent, Client, tcp::TokenListener};
+use drydock_agent::Client;
 use drydock_host::{
     e2b::{E2bModule, Resolver},
     module::*,
@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{Arc, Mutex},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -98,20 +98,9 @@ fn images() -> Images {
     }
 }
 
-/// A guest's drydock agent: really listening on loopback, standing in for
-/// the guest's interface behind E2B's proxy.
-struct Guest {
-    address: SocketAddr,
-    token: Token,
-    task: tokio::task::JoinHandle<std::io::Result<std::path::PathBuf>>,
-    _dir: tempfile::TempDir,
-    _keep: drydock_transport::MemoryDialer,
-}
-impl Drop for Guest {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+#[path = "support/guest.rs"]
+mod guest;
+use guest::{Guest, listen, run_bootstrap, start_guest, supervise};
 
 struct Template {
     id: String,
@@ -467,14 +456,16 @@ impl StandIn {
             if !script.contains("umask 077") {
                 s.violations.push(format!("the token file is not written root-only: {script}"));
             }
-            let argv = supervised_argv(&script);
+            let argv = supervise(&script).ok();
             let starts = argv.is_some() && !s.agent_missing;
             let Some(sandbox) = s.sandboxes.get_mut(&id).filter(|sb| sb.state == "running") else { return };
             if header(request, "authorization") != Some("Basic cm9vdDo=") {
                 return;
             }
-            sandbox.token_file = token_file_after(&script, sandbox.token_file.as_deref(), token.as_ref());
-            sandbox.agent_bind = argv.and_then(|argv| argv.windows(2).find(|w| w[0] == "--tcp").map(|w| w[1].clone()));
+            let run = run_bootstrap(&script, sandbox.token_file.as_deref(), token.as_ref().map(Token::secret), &[], true);
+            assert!(run.failed.is_none(), "bootstrap's shell code failed: {script}");
+            sandbox.token_file = run.token_file;
+            sandbox.agent_bind = argv.as_deref().and_then(listen);
             match (&sandbox.guest, sandbox.token_file.as_deref().map(Token::parse)) {
                 (None, Some(Ok(token))) if starts => Some(token),
                 _ => None,
@@ -887,7 +878,7 @@ fn envd(s: &mut State, id: &str, request: &reqwest::Request) -> http::Response<B
     } else if script.contains("--supervise") {
         // StandIn::bootstrap has run the script's shell code and started the agent.
         let token = format!("drydock-tcp-token {}\n", sandbox.token_file.clone().unwrap_or_default());
-        match supervised_argv(&script) {
+        match supervise(&script).ok() {
             _ if !root => (format!("{token}mkdir: cannot create directory '/run/drydock': Permission denied\n").into(), 1),
             _ if s.agent_missing => (format!("{token}env: '/opt/drydock/drydock-agent': No such file or directory\n").into(), 127),
             Some(_) => (token.into(), 0),
@@ -902,46 +893,6 @@ fn process_error(code: &str, message: &str) -> http::Response<Bytes> {
     let body = envelope(2, &json!({"error": {"code": code, "message": message}}));
     http::Response::builder().status(200).header("content-type", "application/connect+json").body(Bytes::from(body)).unwrap()
 }
-/// The agent's argv as the guest's `drydock-agent --supervise` parses it,
-/// through the supervisor's own parser; None when it would refuse.
-fn supervised_argv(script: &str) -> Option<Vec<String>> {
-    const EXEC: &str = "exec env -u DRYDOCK_TCP_TOKEN /opt/drydock/drydock-agent --supervise ";
-    let (_, argv) = script.split_once(EXEC)?;
-    let argv: Vec<String> = argv.split_whitespace().map(str::to_owned).collect();
-    let os: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
-    drydock_agent::socket::supervised(&os).ok().map(|_| argv)
-}
-/// The guest's token file after the bootstrap's own shell code (everything
-/// before it execs the agent) runs over it, with /run/drydock moved to a
-/// temporary directory.
-fn token_file_after(script: &str, existing: Option<&str>, token: Option<&Token>) -> Option<String> {
-    let dir = tempfile::tempdir().unwrap();
-    let run = dir.path().join("run");
-    let (prefix, _) = script.split_once(" && exec ")?;
-    let prefix = prefix.replace("/run/drydock", run.to_str()?).replace("/workspace", dir.path().join("workspace").to_str()?);
-    if let Some(existing) = existing {
-        std::fs::create_dir(&run).unwrap();
-        std::fs::write(run.join("tcp.token"), existing).unwrap();
-    }
-    let status = std::process::Command::new("sh")
-        .args(["-c", &prefix])
-        .env("DRYDOCK_TCP_TOKEN", token.map(Token::secret).unwrap_or_default())
-        .stdout(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "bootstrap's shell code failed: {prefix}");
-    std::fs::read_to_string(run.join("tcp.token")).ok()
-}
-async fn start_guest(token: Token) -> Guest {
-    let dir = tempfile::tempdir().unwrap();
-    let (keep, control) = drydock_transport::memory();
-    let listener = TokenListener::bind("127.0.0.1:0".parse().unwrap(), token.clone()).await.unwrap();
-    let address = listener.local_addr();
-    let mut agent = Agent::new(control, "test-build".into(), dir.path().join("agent"));
-    agent.add_listener(listener);
-    Guest { address, token, task: tokio::spawn(agent.run()), _dir: dir, _keep: keep }
-}
-
 /// The host's HTTP client, answered in process by the stand-in.
 struct Wire(StandIn);
 #[async_trait]
