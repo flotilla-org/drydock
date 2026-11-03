@@ -61,8 +61,8 @@ impl Staging {
     }
     /// The request for an instance that pulls from `pull_from`, on the
     /// registry-pull route and `platform`. An image already in one of those
-    /// registries passes through untouched; any other is staged in the first. The tools image is public and never
-    /// staged on its own.
+    /// registries passes through untouched; any other is staged in the first.
+    /// The tools image is public and never staged on its own.
     pub(crate) async fn stage(&self, pull_from: &[String], request: PrepareRequest, platform: &Platform) -> Result<PrepareRequest> {
         let Some(name) = pull_from.first() else { return Ok(request) };
         let source = ImageRef::parse(&request.image_digest)?;
@@ -92,10 +92,10 @@ impl Staging {
         Ok(request)
     }
     /// The request for a provider's own registry, on the provider-push route:
-    /// the image copied there with push access the provider
-    /// mints (`mint`, called once the image is known to fit the limits),
-    /// tagged so the registry keeps it, and visible by digest. The provider
-    /// pulls its own registry, so the request carries no pull access.
+    /// the image copied there with push access the provider mints (`mint`,
+    /// called once the image is known to fit the limits), tagged so the
+    /// registry keeps it, and visible by digest. The provider pulls its own
+    /// registry, so the request carries no pull access.
     pub(crate) async fn push(
         &self,
         provider: &str,
@@ -233,4 +233,16 @@ async fn credential(registry: &str, purpose: &str, access: &RegistryAccess) -> R
     let reference = credential_reference(&access.credential, &rigging_process::ProcessEnvVars).map_err(|_| unavailable())?;
     let secret = BuiltinCredentials::default().resolve(&reference).await.map_err(|_| unavailable())?.value;
     Ok(RegistryCredential { username: access.username.clone(), secret })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fits;
+
+    #[test]
+    fn an_image_fills_the_limit_exactly() {
+        assert!(fits(1000, Some(1000)).is_ok());
+        assert!(fits(1001, Some(1000)).is_err());
+        assert!(fits(u64::MAX, None).is_ok());
+    }
 }

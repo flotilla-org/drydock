@@ -64,6 +64,7 @@ struct Registries {
     pending_reads: BTreeMap<String, usize>,
     /// Lifetime of minted push access; Daytona documents 3600 s.
     push_lifetime: Option<chrono::TimeDelta>,
+    push_registry: Option<&'static str>,
     mints: usize,
 }
 const LAB: &str = "lab.invalid";
@@ -255,7 +256,7 @@ impl StandIn {
                 let username = format!("robot$push-{}", s.oci.mints);
                 let secret = format!("push-secret-{}", s.oci.mints);
                 let expires = chrono::Utc::now() + s.oci.push_lifetime.unwrap_or(chrono::TimeDelta::seconds(3600));
-                response(200, json!({"username":username,"secret":secret,"registryUrl":HARBOR,"registryId":"registry-1","project":"daytona-transient","expiresAt":expires.to_rfc3339()}))
+                response(200, json!({"username":username,"secret":secret,"registryUrl":s.oci.push_registry.unwrap_or(HARBOR),"registryId":"registry-1","project":"daytona-transient","expiresAt":expires.to_rfc3339()}))
             }
             ("POST", "/api/snapshots") => {
                 if !snapshot_schema_valid(&body, "CreateSnapshot", true) {
@@ -1925,6 +1926,17 @@ async fn push_access_names_daytonas_registry() {
     let push = p.capabilities().image_routes.into_iter().find(|r| r.kind() == ImageRouteKind::ProviderPush).unwrap();
     let ImageRoute::ProviderPush { max_image_bytes, chunk_bytes, credential_lifetime_seconds, .. } = push else { unreachable!() };
     assert_eq!((max_image_bytes, chunk_bytes, credential_lifetime_seconds), (Some(30 << 30), Some(7), Some(3600)));
+}
+
+// Push access naming a registry host that cannot be one is refused, so the
+// minted secret is never sent where a reference cannot name.
+#[tokio::test]
+async fn push_access_refuses_an_unusable_registry_host() {
+    let http = Arc::new(StandIn::default());
+    http.0.lock().unwrap().oci.push_registry = Some("https://harbor.invalid/../evil?x=1");
+    let p = provider(http).await;
+    let err = p.operations().push_access.unwrap().push_access(&credentials()).await.unwrap_err();
+    assert!(matches!(err, ProtocolError::Internal { .. }), "{err:?}");
 }
 
 // Push route: drydockd has put the image in Daytona's registry, and the
