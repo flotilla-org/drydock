@@ -72,7 +72,9 @@ fn bootstrap(args: &[OsString]) -> io::Result<(Vec<OsString>, Option<String>, bo
             let name = args.next().and_then(|v| v.to_str()).filter(|v| !v.is_empty() && !v.starts_with("--"));
             variable = Some(name.ok_or_else(|| io::Error::other("--token-from-env requires a variable name"))?.to_owned());
         } else {
-            // Every other option takes a value, which is kept whole.
+            // Every other option takes exactly one value, which is kept whole;
+            // a future valueless flag must be handled above, or it would
+            // swallow its neighbour (as `check_tcp` and `provision` assume too).
             rest.push(arg.clone());
             rest.extend(args.next().cloned());
         }
@@ -91,6 +93,8 @@ fn provision(args: &[OsString], variable: Option<&str>, print: bool) -> io::Resu
         };
     };
     let path = std::path::Path::new(path);
+    // The file's directory is the agent's, as the socket's is: created 0700 if absent.
+    drydock_agent::socket::private_directory(path.parent().ok_or_else(|| io::Error::other("--tcp-token-file needs a directory"))?)?;
     let supplied = match variable {
         Some(name) => {
             let text = std::env::var(name).map_err(|_| io::Error::other(format!("--token-from-env: {name} is not set to text")))?;

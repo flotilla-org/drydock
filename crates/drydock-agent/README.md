@@ -54,15 +54,17 @@ as base64url (`Token::generate`). The agent refuses to start on anything else;
 `--supervise` instead replaces it before it detaches (below). The token is never on argv or in the agent's
 environment, which other users read through `/proc`; the module writes the file
 through its root exec or file push before starting the agent, and reads it back
-the same way on re-adoption. Or the agent does that itself: `--supervise ...
---tcp-token-file PATH [--token-from-env VAR] [--print-token] --socket PATH` keeps
-a valid file, and replaces a missing, malformed, wrong-mode, wrong-owner or
-symlinked one (written complete under a lock file beside it, then renamed, mode
-0600) with the token in `$VAR` (base64url, at least 32 bytes) or a fresh one;
-`--print-token` then writes `drydock-tcp-token <token>` to stdout before the
+the same way on re-adoption. Or the agent does that itself:
+`--supervise ... --tcp-token-file PATH [--token-from-env VAR] [--print-token] --socket PATH`
+first makes PATH's directory (as `private_directory` does: owned, mode 0700),
+then keeps a valid file, whatever `$VAR` holds. A missing, malformed,
+wrong-mode, wrong-owner or symlinked file is replaced, written complete under a
+lock file beside it and renamed into place at mode 0600, with the token in
+`$VAR` (base64url, at least 32 bytes) or a fresh one. `--print-token` then
+writes `drydock-tcp-token <token>`, the file's token, to stdout before the
 supervisor detaches. The variable is not passed on to the supervisor or agent.
-`drydock-agent --print-token --tcp-token-file PATH` reads it back later under
-the agent's own checks, replacing nothing. The agent reads the file once at startup (and
+`drydock-agent --print-token --tcp-token-file PATH` reads the token back later
+under the agent's own checks, replacing nothing. The agent reads the file once at startup (and
 again on each re-exec); a new token takes effect when the agent restarts.
 Under `--supervise` the path must be absolute. Keep the file in a private directory such
 as `/run/drydock`: the agent checks the file, not its parent, so in a directory

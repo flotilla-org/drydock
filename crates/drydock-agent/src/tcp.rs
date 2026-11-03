@@ -71,8 +71,12 @@ pub fn provision_token(path: &Path, supplied: Option<Token>) -> io::Result<Token
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(beside(".lock"))?;
+        // A FIFO planted here must fail fast, not block the open or the lock.
+        if !lock.metadata()?.is_file() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "tcp token lock must be a regular file"));
+        }
         lock.lock()?;
         if let Ok(token) = read_token(path) {
             return Ok(token);
@@ -91,6 +95,8 @@ pub fn provision_token(path: &Path, supplied: Option<Token>) -> io::Result<Token
             let _ = std::fs::remove_file(&staging);
         }
         placed?;
+        // Make the rename durable where the directory is on persistent storage.
+        std::fs::File::open(directory).and_then(|d| d.sync_all())?;
         read_token(path)
     })();
     result.map_err(|e| context("tcp.token", path.display(), e))
@@ -402,6 +408,15 @@ mod tests {
             left.sort();
             assert_eq!(left, ["tcp.token", "tcp.token.lock"]);
         }
+    }
+
+    // A FIFO planted as the lock fails at once instead of blocking the start.
+    #[test]
+    fn a_fifo_lock_is_refused_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("tcp.token.lock");
+        rustix::fs::mknodat(rustix::fs::CWD, &lock, rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap();
+        assert!(provision_token(&dir.path().join("tcp.token"), None).is_err());
     }
 
     #[test]

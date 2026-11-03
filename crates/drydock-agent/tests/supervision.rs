@@ -418,3 +418,40 @@ async fn supervise_provisions_and_prints_the_token() {
         Command::new(env!("CARGO_BIN_EXE_drydock-agent")).args(["--print-token", "--tcp-token-file"]).arg(&file).output().unwrap();
     assert!(!refused.status.success() && refused.stdout.is_empty());
 }
+
+// The bootstrap flags fail before anything detaches: a variable that is unset
+// or not a token, and either flag without a token file. A missing directory
+// for the token file is made private; nothing is printed on a failure.
+#[test]
+fn supervise_refuses_bad_bootstrap_flags_before_detaching() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("run/agent.sock");
+    let file = directory.path().join("secrets/tcp.token");
+    let run = |args: &[&str], token: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_drydock-agent"));
+        command.arg("--supervise").args(args).arg("--socket").arg(&socket).env("PATH", "/nonexistent").env_remove("TEST_TOKEN");
+        if let Some(token) = token {
+            command.env("TEST_TOKEN", token);
+        }
+        command.output().unwrap()
+    };
+    let tcp = ["--tcp", "127.0.0.1:0", "--tcp-token-file", file.to_str().unwrap()];
+    for (extra, token) in [
+        (vec!["--token-from-env", "TEST_TOKEN"], None),
+        (vec!["--token-from-env", "TEST_TOKEN"], Some("short")),
+        (vec!["--token-from-env"], None),
+        (vec!["--print-token"], None),
+    ] {
+        let args: Vec<&str> =
+            if extra == ["--print-token"] { extra.clone() } else { tcp.iter().copied().chain(extra.iter().copied()).collect() };
+        let output = run(&args, token);
+        assert!(!output.status.success() && output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(!socket.exists(), "{args:?}");
+    }
+    let bare = run(&["--token-from-env", "TEST_TOKEN"], Some("x"));
+    assert!(!bare.status.success());
+    // The failed variable checks left the token's directory private, and no token.
+    assert_eq!(std::fs::metadata(file.parent().unwrap()).unwrap().permissions().mode() & 0o7777, 0o700);
+    assert!(!file.exists());
+}
