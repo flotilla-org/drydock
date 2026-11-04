@@ -191,6 +191,8 @@ function protocolError(error: unknown): ProtocolFailure {
       reason: `Modal refused the request: ${brief(detail)}`,
     });
   // The SDK's class and the raw gRPC RESOURCE_EXHAUSTED code are one condition.
+  // The SDK gives one code for a quota and a rate limit; a quota read as a rate
+  // limit is retried, so tell them apart here if Modal ever words them differently.
   if (error instanceof ResourceExhaustedError)
     return failure({
       kind: "rate_limited",
@@ -451,6 +453,7 @@ class Modal implements Provider {
       [TAGS.size]: `${cpu}/${memoryMiB}`,
     };
     const name = sandboxName("drydock-", this.name, request.label);
+    const legacyName = `drydock-${hex(request.label).slice(0, 24)}`;
     return this.using(credential, async (client) => {
       const app = await this.app(client);
       let image;
@@ -463,7 +466,16 @@ class Modal implements Provider {
       signal.throwIfAborted();
       let created = true;
       let sandbox: Sandbox;
+      // A sandbox made before the name held the instance has the old name.
+      const legacy = await call(() =>
+        client.sandboxes.fromName(this.appName, legacyName, {
+          environment: this.settings.environment,
+        }),
+      ).catch((error) => {
+        if (kind(error) !== "not_found") throw error;
+      });
       try {
+        if (legacy) throw new AlreadyExistsError("legacy name");
         sandbox = await client.sandboxes.create(app, image, {
           name,
           tags: {
@@ -481,11 +493,13 @@ class Modal implements Provider {
         });
       } catch (error) {
         if (!alreadyExists(error)) throw protocolError(error);
-        sandbox = await call(() =>
-          client.sandboxes.fromName(this.appName, name, {
-            environment: this.settings.environment,
-          }),
-        );
+        sandbox =
+          legacy ??
+          (await call(() =>
+            client.sandboxes.fromName(this.appName, name, {
+              environment: this.settings.environment,
+            }),
+          ));
         created = false;
       }
       try {

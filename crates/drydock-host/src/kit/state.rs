@@ -31,8 +31,11 @@ impl Suspensions {
     pub fn record(&self, id: &str) {
         self.memory.recover().insert(id.to_owned());
         if let Some(file) = self.file(id) {
-            let _ = file.parent().map(std::fs::create_dir_all);
-            let _ = std::fs::write(file, b"");
+            // A few bytes in a local file, written once per suspend: blocking I/O here is cheaper than a task.
+            let written = file.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::write(&file, b""));
+            if let Err(error) = written {
+                tracing::warn!(%error, "could not record a suspend; after a host restart it will read as the provider's");
+            }
         }
     }
     pub fn forget(&self, id: &str) {

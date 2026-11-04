@@ -168,7 +168,8 @@ fn bytes(n: u64) -> String {
 /// The identity of an egress policy, which a module normalizes first (sorted
 /// sets, canonical hosts and CIDRs) so the same request always has the same one:
 /// 128 bits of the digest of its JSON. It is what [`Environment`]'s
-/// `egress_policy` reports and what [`check_readopt`] compares.
+/// `egress_policy` reports and what [`check_readopt`] compares. Sets and maps in
+/// it must be BTree collections: a hash collection serializes in no fixed order.
 pub fn fingerprint(normalized_policy: &impl serde::Serialize) -> String {
     digest(&serde_json::to_string(normalized_policy).expect("a policy is JSON"))[..32].to_owned()
 }

@@ -590,7 +590,9 @@ impl SuspendResume for Local {
     async fn resume(&self, id: &str, token: ResumeToken, _: &Credentials) -> Result<()> {
         let _changing = self.lifecycle.lock().await;
         self.record(id).await?;
-        if token != resume_token(&self.name, id) {
+        // Environments suspended before the kit's marker hold the `{provider}:{id}` form.
+        let legacy = ResumeToken { token: Secret::new(format!("{}:{id}", self.name)) };
+        if token != resume_token(&self.name, id) && token != legacy {
             return Err(refused("invalid resume token for this provider/environment"));
         }
         let dir = self.dir(id);

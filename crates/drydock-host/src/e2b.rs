@@ -831,7 +831,11 @@ impl Provider for E2b {
                 kit::require_ours(E2B, id, &v.metadata, &self.name)?;
                 self.environment(&v)
             }
-            None => Ok(self.gone(id)),
+            None => {
+                // Gone, perhaps destroyed outside drydock: its marker must not outlive the id.
+                self.suspended.forget(id);
+                Ok(self.gone(id))
+            }
         }
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
