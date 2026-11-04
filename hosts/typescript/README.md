@@ -28,7 +28,9 @@ formats, and never coerces values, inserts defaults or strips fields.
 
 The root `package.json` repeats the pnpm pin so Corepack selects the same version
 when CI invokes `corepack pnpm --dir hosts/typescript ...` from the repository root.
-Keep both pins aligned; `--dir` is interpreted by pnpm after Corepack selects it.
+pnpm is pinned to 10 because corepack 0.34 cannot run pnpm 12 (it ships
+`pnpm.mjs`, not `pnpm.cjs`; drydock#252); lift the pin once the corepack in use
+supports it. Keep both pins aligned; `--dir` is interpreted by pnpm after Corepack selects it.
 
 Unpack the tarball into a dedicated installation directory, run `corepack pnpm
 install --prod --frozen-lockfile`, and link executable `dist/main.js` beside
@@ -156,9 +158,10 @@ and sandbox backend from those, so run the host without them.
   that is a best-effort check, as Modal resolves the name again itself.
 - Provision creates a sandbox named from the label (unique per app), tagged
   with the instance, the label, its egress policy, size and expiry, with a
-  timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory (Modal's
-  disk is fixed and cannot be sized, so a requested disk is accepted and not
-  applied, and the granted disk is reported as 0), and `sleep infinity` as its command, which only keeps it alive. A
+  timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory, and `sleep infinity` as its command, which
+  only keeps it alive. Modal's disk is fixed and cannot be sized, so a
+  requested disk is accepted and not applied, and the granted disk is
+  reported as 0. A
   label whose name is taken re-adopts that sandbox when its tags say it is
   this instance's, with the same size and policy, and refuses it otherwise.
   Either way the module then starts the agent by a root exec that gets a
