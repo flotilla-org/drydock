@@ -6,7 +6,7 @@ use crate::{
     kit::{
         self, GIB, MIB, StateTable, Vendor, Verdict, Wait,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found, says},
-        egress::{ipv6, normal_cidr, normal_host, private_host},
+        egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
         guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile, sandbox_name as hashed_name},
     },
@@ -54,13 +54,18 @@ const STATES: StateTable = &[
 
 pub struct TensorlakeModule {
     dialer: Arc<dyn WebSocketDialer>,
+    resolver: Arc<dyn Resolver>,
 }
 impl TensorlakeModule {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self::with_dialer(Arc::new(TlsDialer::new()?)))
     }
     pub fn with_dialer(dialer: Arc<dyn WebSocketDialer>) -> Self {
-        Self { dialer }
+        Self { dialer, resolver: Arc::new(SystemResolver) }
+    }
+    /// Resolves registry names for prepare's private-address check.
+    pub fn with_resolver(self, resolver: Arc<dyn Resolver>) -> Self {
+        Self { resolver, ..self }
     }
 }
 
@@ -252,7 +257,14 @@ impl Module for TensorlakeModule {
                 "Tensorlake requires a sandbox_domain host name, a tunnel port, and positive max_cpus, max_memory and poll_interval_ms",
             ));
         }
-        Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone(), agents: AgentTokens::default() }))
+        Ok(Arc::new(Tensorlake {
+            name: name.to_owned(),
+            settings,
+            api,
+            dialer: self.dialer.clone(),
+            resolver: self.resolver.clone(),
+            agents: AgentTokens::default(),
+        }))
     }
 }
 
@@ -261,6 +273,7 @@ pub struct Tensorlake {
     settings: Settings,
     api: Api,
     dialer: Arc<dyn WebSocketDialer>,
+    resolver: Arc<dyn Resolver>,
     agents: AgentTokens,
 }
 
@@ -700,7 +713,7 @@ impl Provider for Tensorlake {
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
         let (_, platform) = check_prepare(TENSORLAKE, &r, &[ImageRouteKind::RegistryPull], &self::platform())?;
         let base = ImageRef::parse(&r.image_digest)?;
-        if let Some(private) = private_host(&base.registry) {
+        if let Some(private) = private_registry(&base.registry, self.resolver.as_ref()).await {
             return Err(refused(format!(
                 "Tensorlake's builders cannot reach the private registry {}{}; stage the image in a registry they can reach",
                 base.registry,

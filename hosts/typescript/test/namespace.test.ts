@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Code, ConnectError } from "@connectrpc/connect";
@@ -21,6 +24,8 @@ const SIZE = { cpus: 4, memory_bytes: 8 * GiB, disk_bytes: 0 };
 const kind = (k: string) => (e: any) => e.detail?.kind === k;
 
 async function setup(settings: Record<string, unknown> = {}) {
+  // Each provider records its suspends under a state directory of its own.
+  process.env.DRYDOCK_ROOT = mkdtempSync(join(tmpdir(), "drydock-"));
   const standIn = new StandIn(),
     registries = new Registries();
   const module = namespaceModule((token) => {
@@ -423,6 +428,26 @@ test("list and inspect observe without starting anything", async () => {
   });
   assert.equal(standIn.activations, 0);
   await assert.rejects(provider.inspect("missing", context), kind("not_found"));
+});
+
+// A stop drydock requested is still its own after the host restarts: a new
+// provider over the same state reads it as requested, not as the provider's.
+test("a suspend is remembered across a host restart", async () => {
+  const { standIn, registries, provider, context, provision } = await setup();
+  const { environment } = await provision("kept");
+  await provider.suspend!(environment.id, context);
+  const restarted: Provider = await namespaceModule(
+    () => standIn,
+    registries.fetch as any,
+  ).configure(
+    "ns",
+    { module: "namespace", settings: { workspace: "acme" } },
+    context.signal,
+  );
+  assert.deepEqual((await restarted.inspect(environment.id, context)).state, {
+    state: "stopped",
+    cause: "suspended_by_request",
+  });
 });
 
 // Suspend is devbox stop and resume is start; the token is stable and bound

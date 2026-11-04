@@ -22,19 +22,8 @@ use drydock_client::{
 use drydock_protocol::*;
 use module::*;
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::{RwLock, watch};
-trait RecoverLock<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T>;
-}
-impl<T> RecoverLock<T> for Mutex<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
 struct Binding {
     config: ProviderConfiguration,
     provider: Arc<dyn Provider>,

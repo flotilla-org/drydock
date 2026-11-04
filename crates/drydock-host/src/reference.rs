@@ -1,5 +1,5 @@
 //! In-memory conformance module. Relay echoes (or reaches a configured agent socket); exec supports cat/echo without a subprocess.
-use crate::{RecoverLock, module::*};
+use crate::{kit::Recover, module::*};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use std::{

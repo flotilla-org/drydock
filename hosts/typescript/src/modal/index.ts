@@ -22,7 +22,13 @@ import {
   type ProviderModule,
   type Types,
 } from "../provider.js";
-import { checkReadopt, hex, requireOurs, sandboxName } from "../kit.js";
+import {
+  checkReadopt,
+  hex,
+  privateRegistry,
+  requireOurs,
+  sandboxName,
+} from "../kit.js";
 import { compile } from "../validation.js";
 import { Clients } from "../clients.js";
 
@@ -71,30 +77,6 @@ const settingsValid = compile({
     concurrency_limit: { type: "integer", minimum: 1 },
   },
 });
-
-const PRIVATE = new BlockList();
-for (const [address, prefix] of [
-  ["0.0.0.0", 8],
-  ["10.0.0.0", 8],
-  ["100.64.0.0", 10],
-  ["127.0.0.0", 8],
-  ["169.254.0.0", 16],
-  ["172.16.0.0", 12],
-  ["192.168.0.0", 16],
-] as const)
-  PRIVATE.addSubnet(address, prefix, "ipv4");
-for (const [address, prefix] of [
-  ["::", 127],
-  ["fc00::", 7],
-  ["fe80::", 10],
-] as const)
-  PRIVATE.addSubnet(address, prefix, "ipv6");
-
-function privateAddress(address: string) {
-  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address)?.[1];
-  if (mapped) return PRIVATE.check(mapped, "ipv4");
-  return PRIVATE.check(address, isIPv6(address) ? "ipv6" : "ipv4");
-}
 
 type Network = Pick<
   SandboxCreateParams,
@@ -398,17 +380,9 @@ class Modal implements Provider {
   }
 
   private async publicRegistry(ref: ImageRef) {
-    const host = ref.registry.replace(/:\d+$/, "");
-    let addresses = [host];
-    try {
-      if (!isIP(host))
-        addresses = (await lookup(host, { all: true })).map((a) => a.address);
-    } catch {
-      return;
-    }
-    if (addresses.some(privateAddress))
+    if (await privateRegistry(ref.registry))
       refused(
-        `${ref.registry} resolves to a private address; Modal pulls only from registries on the public internet`,
+        `${ref.registry} is a private address or name; Modal pulls only from registries on the public internet`,
       );
   }
 

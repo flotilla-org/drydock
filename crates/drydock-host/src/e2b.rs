@@ -1,11 +1,12 @@
 //! E2B: https://github.com/e2b-dev/infra (spec/openapi.yml; packages/envd/spec).
 use crate::{
     kit::{
-        self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor, Verdict, Wait,
+        self, LABEL_TAG, MIB, PROVIDER_TAG, Recover, SizeLimits, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, says, sensitive},
         egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
         guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name},
+        state::Suspensions,
     },
     module::*,
     oci::{ImageRef, Registry},
@@ -21,7 +22,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned, de::IgnoredAny};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -342,7 +343,7 @@ impl Module for E2bModule {
             api,
             resolver: self.resolver.clone(),
             access: Mutex::default(),
-            suspended: Mutex::default(),
+            suspended: Suspensions::new(E2B, name),
             agents: AgentTokens::default(),
         }))
     }
@@ -369,17 +370,8 @@ pub struct E2b {
     api: Api,
     resolver: Arc<dyn Resolver>,
     access: Mutex<HashMap<String, Access>>,
-    suspended: Mutex<HashSet<String>>,
+    suspended: Suspensions,
     agents: AgentTokens,
-}
-
-trait Recover<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T>;
-}
-impl<T> Recover<T> for Mutex<T> {
-    fn recover(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 fn platform() -> Platform {
@@ -438,7 +430,7 @@ impl E2b {
     fn environment(&self, v: &Sandbox) -> Result<Environment> {
         let state = match self.state(v) {
             "running" => Observation::Running,
-            "paused" if self.suspended.recover().contains(&*v.id) => kit::stopped(StopCause::SuspendedByRequest),
+            "paused" if self.suspended.contains(&v.id) => kit::stopped(StopCause::SuspendedByRequest),
             "paused" => kit::stopped(StopCause::PausedByProvider),
             _ => Observation::Unknown { reason: UnknownReason::ProviderStateUnknown },
         };
@@ -849,7 +841,7 @@ impl Provider for E2b {
         }
         self.access.recover().remove(id);
         self.agents.forget(id);
-        self.suspended.recover().remove(id);
+        self.suspended.forget(id);
         Ok(())
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
@@ -895,7 +887,7 @@ impl SuspendResume for E2b {
         }
         self.wait_state(id, "paused", c).await?;
         self.agents.forget(id);
-        self.suspended.recover().insert(id.to_owned());
+        self.suspended.record(id);
         Ok(E2B.resume_marker(RESUME_PREFIX, &self.name, id))
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
@@ -903,7 +895,7 @@ impl SuspendResume for E2b {
         self.agents.forget(id);
         self.connect(id, c).await?;
         self.wait_state(id, "running", c).await?;
-        self.suspended.recover().remove(id);
+        self.suspended.forget(id);
         Ok(())
     }
 }

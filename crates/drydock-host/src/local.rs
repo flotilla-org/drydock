@@ -10,7 +10,7 @@
 //! Nothing else is remembered in memory: environments are found by their
 //! directories, so they survive a restart of the host.
 mod scope;
-use crate::module::*;
+use crate::{kit::Vendor, module::*};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use scope::Scope;
@@ -138,8 +138,9 @@ fn environment_id(label: &str) -> String {
 fn prepared_id(image_digest: &str, platform: &Platform) -> String {
     format!("prepared-{}", &format!("{:x}", Sha256::digest(format!("{image_digest}\n{platform}").as_bytes()))[..12])
 }
+const LOCAL: Vendor = Vendor("Local");
 fn resume_token(provider: &str, id: &str) -> ResumeToken {
-    ResumeToken { token: Secret::new(format!("{provider}:{id}")) }
+    LOCAL.resume_marker("local-resume-", provider, id)
 }
 
 impl Local {

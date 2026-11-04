@@ -2,7 +2,7 @@
 //! vendor's exec API): what a command printed and how it ended, the errors
 //! that makes, and a user's exec on top. A module supplies only
 //! [`Guest::run`].
-use super::{Vendor, shell_command};
+use super::{Recover, Vendor, shell_command};
 use crate::module::{ByteStream, Credentials, Result};
 use async_trait::async_trait;
 use drydock_protocol::*;
@@ -94,7 +94,7 @@ impl AgentTokens {
     /// The token the agent in `id` prints. A guest that cannot print one yet
     /// (the agent is not up, or the file is not written) is Unavailable: try again.
     pub async fn get(&self, guest: &(impl Guest + ?Sized), id: &str, c: &Credentials) -> Result<Token> {
-        if let Some(token) = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
+        if let Some(token) = self.0.recover().get(id) {
             return Ok(token.clone());
         }
         let output = guest.run(id, &print_token(), BTreeMap::new(), c).await?;
@@ -103,11 +103,11 @@ impl AgentTokens {
             .then(|| stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).and_then(|line| Token::parse(line).ok()))
             .flatten()
             .ok_or_else(|| ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", guest.vendor()), Some(2)))?;
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_owned(), token.clone());
+        self.0.recover().insert(id.to_owned(), token.clone());
         Ok(token)
     }
     pub fn forget(&self, id: &str) {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+        self.0.recover().remove(id);
     }
 }
 

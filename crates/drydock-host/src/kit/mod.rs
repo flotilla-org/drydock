@@ -8,6 +8,7 @@ pub mod api;
 pub mod egress;
 pub mod guest;
 pub mod image;
+pub mod state;
 
 use crate::module::{Result, refused};
 use drydock_protocol::*;
@@ -21,6 +22,18 @@ pub const GIB: u64 = 1 << 30;
 pub const PROVIDER_TAG: &str = OWNER_TAG;
 /// The provider-side tag holding the environment's label.
 pub const LABEL_TAG: &str = "flotilla.label";
+
+/// A lock held across no `.await`, taken whether or not a panicking holder
+/// poisoned it: the state under it is a cache or a record, never an invariant
+/// a panic could leave half-made.
+pub trait Recover<T> {
+    fn recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> Recover<T> for std::sync::Mutex<T> {
+    fn recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// A vendor's display name, as errors and refusals say it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

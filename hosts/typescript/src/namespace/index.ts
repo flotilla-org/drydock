@@ -25,6 +25,7 @@ import {
   type Types,
 } from "../provider.js";
 import { Clients } from "../clients.js";
+import { Suspensions } from "../kit.js";
 import { compile } from "../validation.js";
 import {
   call,
@@ -248,10 +249,10 @@ class Namespace implements Provider {
   rateLimits: Types["RateLimit"][] = [];
   /**
    * Devboxes this host stopped, so their stop reads as requested. Labels are
-   * fixed at create, so this is process-local: after a host restart such a stop
-   * reads as paused_by_provider, which is still resumable.
+   * fixed at create, so the record is a file under the host's state directory
+   * and survives a restart.
    */
-  private suspended = new Set<string>();
+  private suspended: Suspensions;
   /** SDK clients by token. */
   private clients: Clients<Vendor>;
 
@@ -262,6 +263,7 @@ class Namespace implements Provider {
     private fetcher: Fetch,
   ) {
     this.clients = new Clients(connect);
+    this.suspended = new Suspensions("Namespace", name);
   }
 
   /** The SDK client for the credential a call carries, held until `release`. */
@@ -730,7 +732,7 @@ class Namespace implements Provider {
       await box.delete({ signal });
       return true;
     }, gone);
-    this.suspended.delete(id);
+    this.suspended.forget(id);
   }
 
   async reach(
@@ -785,7 +787,7 @@ class Namespace implements Provider {
           (await vendor.devboxes.get(id, { signal })).info.state ===
             "stopped" || undefined,
       );
-    this.suspended.add(id);
+    this.suspended.record(id);
     return this.resumeToken(id);
   }
 
@@ -813,7 +815,7 @@ class Namespace implements Provider {
       );
       box = await this.current(vendor, id, signal);
     }
-    this.suspended.delete(id);
+    this.suspended.forget(id);
     await this.ensureAgent(box, signal);
   }
 
