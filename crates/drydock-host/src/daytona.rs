@@ -594,6 +594,8 @@ impl Provider for Daytona {
             host_filesystem: false,
             exclusive_label: true,
             agent_tcp_port: None,
+            // The agent carries outward exposures; the sandbox has no network of drydockd's.
+            reach_ways: vec![ReachWay::OutwardExposure],
         }
     }
     fn observation(&self) -> ObservationMode {

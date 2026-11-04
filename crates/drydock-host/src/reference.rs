@@ -157,6 +157,7 @@ impl Provider for Reference {
             host_filesystem: self.settings.host_filesystem,
             exclusive_label: true,
             agent_tcp_port: None,
+            reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

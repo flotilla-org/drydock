@@ -220,6 +220,8 @@ class Namespace implements Provider {
     usage: false,
     quota: true,
     agent: true,
+    // The agent carries outward exposures.
+    reach_ways: ["outward_exposure"],
     // Enforced per environment only when the operator's probe passes as
     // root (see `egress_probe`).
     egress: { routes: ["none", "explicit_proxy", "open"], model: EGRESS_MODEL },

@@ -764,6 +764,8 @@ impl Provider for E2b {
             host_filesystem: false,
             agent_tcp_port: std::num::NonZeroU16::new(AGENT_PORT),
             exclusive_label: false,
+            // The agent carries outward exposures; the sandbox has no network of drydockd's.
+            reach_ways: vec![ReachWay::OutwardExposure],
         }
     }
     fn observation(&self) -> ObservationMode {

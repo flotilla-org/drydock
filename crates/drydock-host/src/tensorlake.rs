@@ -699,6 +699,8 @@ impl Provider for Tensorlake {
             usage: self.settings.organization_id.is_some(),
             quota: false,
             host_filesystem: false,
+            // The agent carries outward exposures; the sandbox has no network of drydockd's.
+            reach_ways: vec![ReachWay::OutwardExposure],
         }
     }
     fn observation(&self) -> ObservationMode {

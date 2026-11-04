@@ -503,7 +503,118 @@ fn capabilities(hello: &Hello, declaration: &ProviderDeclaration) -> Result<()> 
     require(
         declaration.rate_limits.iter().all(|limit| limit.requests > 0 && limit.period_seconds > 0 && !limit.operation.is_empty()),
         "invalid rate-limit declaration",
+    )?;
+    reach_ways_declaration(c)
+}
+/// The declared ways are distinct, and an outward exposure is declared exactly
+/// when the module runs the agent, which carries it.
+fn reach_ways_declaration(c: &Capabilities) -> Result<()> {
+    let distinct = c.reach_ways.iter().enumerate().all(|(i, way)| !c.reach_ways[..i].contains(way));
+    require(distinct, "reach ways must be distinct")?;
+    require(
+        c.reach_ways.contains(&ReachWay::OutwardExposure) == c.agent,
+        "outward_exposure is a way exactly when the module runs the agent",
     )
+}
+
+/// An address inside a vessel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuestAddress {
+    /// `host:port`.
+    Tcp(String),
+    /// An absolute Unix socket path.
+    Unix(String),
+}
+/// Makes a connection from inside a vessel; the conformance run has no
+/// standing in the guest, so the caller supplies how (an exec, an agent
+/// process, or the host itself where the vessel is a process of the host).
+#[async_trait::async_trait]
+pub trait GuestConnect: Sync {
+    /// Connect to `address` from the vessel, send `payload`, and return what
+    /// comes back before the peer closes.
+    async fn echo(&self, address: &GuestAddress, payload: &[u8]) -> std::result::Result<Vec<u8>, String>;
+}
+const WAY_PAYLOAD: &[u8] = b"drydock-reach-way\0\xff\n";
+/// An echo server on this machine, which is drydockd's side and answers the
+/// connections a way carries. It binds loopback only, so only a vessel that
+/// shares this machine's network or has a connection carried here reaches it.
+async fn echo_listener() -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(SafeError::category)?;
+    let address = listener.local_addr().map_err(SafeError::category)?;
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut read, mut write) = stream.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    Ok((address, task))
+}
+/// Check that one declared way works for `environment`, which must run on a
+/// machine that shares this process's view of drydockd's side:
+/// - `outward_exposure`: an outward exposure to a listener here becomes ready,
+///   and a connection made inside the vessel reaches that listener.
+/// - `host_network`: a connection made inside the vessel reaches a listener
+///   bound to loopback here, which nothing outside this host can reach.
+///
+/// `guest_directory` is a directory in the vessel that its agent's user owns
+/// and that is not sticky, where the exposure puts its socket (a module's
+/// `workspace_root` is the usual choice). A way the provider does not declare
+/// is an error.
+pub async fn reach_way<A: ProviderApi + ?Sized>(
+    api: &A,
+    provider: &str,
+    environment: &Environment,
+    way: ReachWay,
+    guest: &dyn GuestConnect,
+    guest_directory: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let declared = api
+        .providers()
+        .await
+        .map_err(SafeError::category)?
+        .into_iter()
+        .find(|d| d.provider == provider)
+        .ok_or("provider is not declared")?;
+    require(declared.capabilities.reach_ways.contains(&way), "the provider does not declare this way")?;
+    let (address, listener) = echo_listener().await?;
+    let result = tokio::time::timeout(timeout, async {
+        match way {
+            ReachWay::HostNetwork => {
+                let reply = guest.echo(&GuestAddress::Tcp(address.to_string()), WAY_PAYLOAD).await?;
+                require(reply == WAY_PAYLOAD, "the vessel did not reach a host-only listener")
+            }
+            ReachWay::OutwardExposure => {
+                let name = "drydock-conformance-reach";
+                let socket = format!("{}/{name}.sock", guest_directory.trim_end_matches('/'));
+                let request = OutwardRequest {
+                    guest: Guest::Unix { unix: socket.clone() },
+                    destination: OutwardDestination::Tcp(address.to_string()),
+                };
+                api.put_outward(provider, &environment.id, name, &request).await.map_err(SafeError::category)?;
+                let outcome = async {
+                    loop {
+                        let exposure = api.outward(provider, &environment.id, name).await.map_err(SafeError::category)?;
+                        if exposure.ready {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    let reply = guest.echo(&GuestAddress::Unix(socket), WAY_PAYLOAD).await?;
+                    require(reply == WAY_PAYLOAD, "the exposure did not carry the vessel's connection to the destination")
+                }
+                .await;
+                let removed = api.remove_outward(provider, &environment.id, name).await.map_err(SafeError::category);
+                outcome.and(removed)
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("timed out".into()));
+    listener.abort();
+    result
 }
 struct Target<'a> {
     client: &'a Client,

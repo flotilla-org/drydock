@@ -139,6 +139,8 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     assert!(!c.usage && !c.quota && !c.export && !c.fallback_runner);
     assert_eq!(c.workspace_root, root.path().to_str().unwrap());
     assert!(c.host_filesystem, "vessels share this machine's filesystem");
+    // The network is the host's, and the agent carries exposures all the same.
+    assert_eq!(c.reach_ways, [ReachWay::HostNetwork, ReachWay::OutwardExposure]);
     let ports = Ports::from(p.operations());
     assert_eq!(ports, Ports { suspend_resume: true, ..Ports::default() });
     assert_eq!(p.readiness(&credentials()), Readiness::Ready);

@@ -311,6 +311,8 @@ class Modal implements Provider {
     usage: false,
     quota: true,
     agent: true,
+    // The agent carries outward exposures.
+    reach_ways: ["outward_exposure"],
     egress: { routes: ["none", "explicit_proxy", "open"], model: EGRESS_MODEL },
     bootstrap: "bake",
     platforms: [PLATFORM],
