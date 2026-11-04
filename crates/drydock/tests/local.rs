@@ -115,7 +115,8 @@ impl drydock::conformance::GuestConnect for ThroughAgent {
             sys.stdout.buffer.write(data)";
         let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
         let request = drydock_agent::Exec::new("python3", ["-c", script, kind, &target, &hex]);
-        let (out, err, status) = self.0.run(request, 1 << 16).await.map_err(|e| e.to_string())?;
+        let (out, err, status) =
+            self.0.run(request, 1 << 16).await.map_err(|e| format!("running python3 in the vessel (it must be installed): {e}"))?;
         if status.success() { Ok(out) } else { Err(String::from_utf8_lossy(&err).into_owned()) }
     }
 }

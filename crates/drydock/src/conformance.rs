@@ -507,7 +507,9 @@ fn capabilities(hello: &Hello, declaration: &ProviderDeclaration) -> Result<()> 
     reach_ways_declaration(c)
 }
 /// The declared ways are distinct, and an outward exposure is declared exactly
-/// when the module runs the agent, which carries it.
+/// when the module runs the agent, which carries it. That coupling is
+/// intended: the agent is what carries an exposure, so a module that runs it
+/// supports exposures, and one that does not cannot.
 fn reach_ways_declaration(c: &Capabilities) -> Result<()> {
     let distinct = c.reach_ways.iter().enumerate().all(|(i, way)| !c.reach_ways[..i].contains(way));
     require(distinct, "reach ways must be distinct")?;
@@ -580,6 +582,8 @@ pub async fn reach_way<A: ProviderApi + ?Sized>(
         .ok_or("provider is not declared")?;
     require(declared.capabilities.reach_ways.contains(&way), "the provider does not declare this way")?;
     let (address, listener) = echo_listener().await?;
+    let name = format!("drydock-conformance-reach-{}", std::process::id());
+    let socket = format!("{}/{name}.sock", guest_directory.trim_end_matches('/'));
     let result = tokio::time::timeout(timeout, async {
         match way {
             ReachWay::HostNetwork => {
@@ -587,33 +591,34 @@ pub async fn reach_way<A: ProviderApi + ?Sized>(
                 require(reply == WAY_PAYLOAD, "the vessel did not reach a host-only listener")
             }
             ReachWay::OutwardExposure => {
-                let name = "drydock-conformance-reach";
-                let socket = format!("{}/{name}.sock", guest_directory.trim_end_matches('/'));
                 let request = OutwardRequest {
                     guest: Guest::Unix { unix: socket.clone() },
                     destination: OutwardDestination::Tcp(address.to_string()),
                 };
-                api.put_outward(provider, &environment.id, name, &request).await.map_err(SafeError::category)?;
-                let outcome = async {
-                    loop {
-                        let exposure = api.outward(provider, &environment.id, name).await.map_err(SafeError::category)?;
-                        if exposure.ready {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                api.put_outward(provider, &environment.id, &name, &request).await.map_err(SafeError::category)?;
+                loop {
+                    let exposure = api.outward(provider, &environment.id, &name).await.map_err(SafeError::category)?;
+                    if exposure.ready {
+                        break;
                     }
-                    let reply = guest.echo(&GuestAddress::Unix(socket), WAY_PAYLOAD).await?;
-                    require(reply == WAY_PAYLOAD, "the exposure did not carry the vessel's connection to the destination")
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                .await;
-                let removed = api.remove_outward(provider, &environment.id, name).await.map_err(SafeError::category);
-                outcome.and(removed)
+                let reply = guest.echo(&GuestAddress::Unix(socket.clone()), WAY_PAYLOAD).await?;
+                require(reply == WAY_PAYLOAD, "the exposure did not carry the vessel's connection to the destination")
             }
         }
     })
     .await
     .unwrap_or_else(|_| Err("timed out".into()));
     listener.abort();
+    if way == ReachWay::OutwardExposure {
+        // Outside the timeout, so a timed-out or failed check still leaves no exposure behind.
+        let removed = tokio::time::timeout(Duration::from_secs(10), api.remove_outward(provider, &environment.id, &name))
+            .await
+            .map_err(SafeError::category)
+            .and_then(|r| r.map_err(SafeError::category));
+        return result.and(removed);
+    }
     result
 }
 struct Target<'a> {
@@ -1321,6 +1326,41 @@ mod tests {
     use super::*;
     // Conformance reports preserve the host-masked provider reasons and details;
     // low-level decode/IO failures retain their stable categories.
+    #[test]
+    fn reach_ways_declaration_rules() {
+        let mut c = crate::conformance::tests::capabilities_fixture();
+        c.agent = false;
+        c.reach_ways = vec![];
+        assert!(reach_ways_declaration(&c).is_ok());
+        c.reach_ways = vec![ReachWay::HostNetwork];
+        assert!(reach_ways_declaration(&c).is_ok());
+        c.reach_ways = vec![ReachWay::OutwardExposure];
+        assert!(reach_ways_declaration(&c).is_err(), "exposure without an agent");
+        c.agent = true;
+        assert!(reach_ways_declaration(&c).is_ok());
+        c.reach_ways = vec![ReachWay::HostNetwork];
+        assert!(reach_ways_declaration(&c).is_err(), "agent without an exposure");
+        c.reach_ways = vec![ReachWay::OutwardExposure, ReachWay::OutwardExposure];
+        assert!(reach_ways_declaration(&c).is_err(), "duplicates");
+    }
+    #[test]
+    fn reach_way_serialization_and_default() {
+        assert_eq!(
+            serde_json::to_string(&[ReachWay::OutwardExposure, ReachWay::HostNetwork]).unwrap(),
+            r#"["outward_exposure","host_network"]"#
+        );
+        let mut value = serde_json::to_value(capabilities_fixture()).unwrap();
+        value.as_object_mut().unwrap().remove("reach_ways");
+        assert!(serde_json::from_value::<Capabilities>(value).unwrap().reach_ways.is_empty(), "an older host omits the field");
+    }
+    pub(crate) fn capabilities_fixture() -> Capabilities {
+        serde_json::from_value(serde_json::json!({
+            "material_modes": [], "checkout_strategies": [], "workspace_root": "/w", "suspend_resume": false, "export": false,
+            "egress": {"routes": ["open"], "model": {"shapes": ["open"], "enforced": "none", "mutable_while_running": false}},
+            "fallback_runner": false, "bootstrap": "bake", "usage": false, "quota": false
+        }))
+        .unwrap()
+    }
     #[test]
     fn diagnostic_categories_and_provider_messages() {
         let secret = "vendor explanation";
