@@ -638,6 +638,7 @@ impl Provider for Runtime {
             usage: true,
             quota: true,
             host_filesystem: false,
+            exclusive_label: true,
         }
     }
     fn observation(&self) -> ObservationMode {
