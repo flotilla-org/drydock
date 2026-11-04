@@ -82,7 +82,6 @@ struct Memory {
     tools_generation: BTreeMap<String, u64>,
     provider_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     inventory_error: bool,
-    /// Environments some other instance made: listed by no one's, inspected and destroyed by no one else.
     foreign: std::collections::BTreeSet<String>,
     running_since: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     usage: Vec<(Size, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
@@ -98,7 +97,6 @@ impl Memory {
     }
 }
 impl Reference {
-    /// The one ownership rule: what another instance made is refused and left alone.
     fn require_ours(&self, id: &str) -> Result<()> {
         if self.state.recover().foreign.contains(id) {
             Err(crate::kit::not_ours(crate::kit::Vendor("Reference"), id, &self.name))

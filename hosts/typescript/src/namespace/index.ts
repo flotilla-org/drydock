@@ -247,13 +247,8 @@ class Namespace implements Provider {
   };
   observation: Types["ObservationMode"] = { mode: "poll", interval_ms: 30_000 };
   rateLimits: Types["RateLimit"][] = [];
-  /**
-   * Devboxes this host stopped, so their stop reads as requested. Labels are
-   * fixed at create, so the record is a file under the host's state directory
-   * and survives a restart.
-   */
+  // Labels are fixed at create, so the stops this host requested are recorded in the kit.
   private suspended: Suspensions;
-  /** SDK clients by token. */
   private clients: Clients<Vendor>;
 
   constructor(
@@ -266,7 +261,6 @@ class Namespace implements Provider {
     this.suspended = new Suspensions("Namespace", name);
   }
 
-  /** The SDK client for the credential a call carries, held until `release`. */
   private acquire(credential: string | undefined) {
     return this.clients.acquire(credentialToken(credential));
   }

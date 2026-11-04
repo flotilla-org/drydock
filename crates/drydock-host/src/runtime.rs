@@ -5,7 +5,7 @@ use crate::{
         self, GIB, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, StateTable, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::normal_host,
-        guest::{AgentTokens, Guest, GuestOutput},
+        guest::{Guest, GuestOutput, read_token},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile, sandbox_name},
     },
     module::*,
@@ -262,7 +262,7 @@ impl Module for RuntimeModule {
             return Err(refused("a Runtime provider's name becomes a label value: no ':' and at most 256 characters"));
         }
         let api = Api::new(RUNTIME, &settings.api_url, Auth::Bearer, http)?.classify(classify).retry_after(retry_hint);
-        Ok(Arc::new(Runtime { name: name.to_owned(), settings, api, agents: AgentTokens::default() }))
+        Ok(Arc::new(Runtime { name: name.to_owned(), settings, api }))
     }
 }
 
@@ -270,7 +270,6 @@ pub struct Runtime {
     name: String,
     settings: Settings,
     api: Api,
-    agents: AgentTokens,
 }
 
 // The header, else the body's `retryAfterMs` (whole seconds, rounded up).
@@ -413,7 +412,7 @@ impl Runtime {
                 v.name, self.name
             )));
         }
-        kit::check_readopt(RUNTIME, &self.environment(v)?, size, &policy.fingerprint(), kit::DiskMatch::Exact)
+        kit::check_readopt(RUNTIME, &self.environment(v)?, size, &policy.fingerprint())
     }
     async fn confirm(&self, id: &str, policy: &Policy, c: &Credentials) -> Result<()> {
         let network = self.wait_enforced(id, c).await?;
@@ -698,7 +697,6 @@ impl Provider for Runtime {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         let Some(v) = absent_on_not_found(self.sandbox(id, c).await)? else { return Ok(()) };
         kit::require_ours(RUNTIME, id, &v.labels, &self.name)?;
-        self.agents.forget(id);
         let port = self.settings.agent_port.to_string();
         for url in [self.sandbox_url(id, None, &["previews", &port])?, self.sandbox_url(id, None, &[])?] {
             absent_on_not_found(self.act(Method::DELETE, url, Body::None, c, false).await)?;
@@ -712,7 +710,7 @@ impl Provider for Runtime {
         if &*v.state != "running" {
             return Err(refused(format!("Runtime sandbox {id} is {}, not running; resume it first", &*v.state)));
         }
-        let token = Secret::new(self.agents.get(self, id, c).await?.secret());
+        let token = Secret::new(read_token(self, id, c).await?.secret());
         let preview = self.preview(id, c).await?;
         let Some(preview_token) = preview.token.filter(|token| !token.is_empty() && sensitive(token).is_ok()) else {
             return Err(refused("Runtime signs no preview token for this key: it needs the right to run commands in the sandbox"));
@@ -740,7 +738,6 @@ impl SuspendResume for Runtime {
         if &*state == "running" {
             self.act(Method::POST, self.sandbox_url(id, Some("pause"), &[])?, Body::None, c, true).await?;
         }
-        self.agents.forget(id);
         let read = async || Ok(self.sandbox(id, c).await?.state);
         STATE_WAIT
             .until("Runtime sandbox has not paused", read, |state| match &*state {
@@ -752,7 +749,6 @@ impl SuspendResume for Runtime {
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         RUNTIME.check_resume("runtime-resume-", &self.name, id, &token)?;
-        self.agents.forget(id);
         let action = match &*self.ours(id, c).await?.state {
             "paused" | "pausing" => Some("wake"),
             "stopped" => Some("restart"),

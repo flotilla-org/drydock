@@ -1,6 +1,4 @@
-// What a TypeScript module shares with the others, as the Rust kit does for
-// its modules: ownership, names and re-adoption. A module keeps only what its
-// vendor does differently.
+// Shared by the TypeScript modules, as the Rust kit is by its modules.
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -11,20 +9,13 @@ import { refused } from "./provider.js";
 export const hex = (value: string) =>
   createHash("sha256").update(value).digest("hex");
 
-/** The provider-side tags (the Rust kit's `PROVIDER_TAG` and `LABEL_TAG`). */
 export const PROVIDER_TAG = "drydock.provider";
 export const LABEL_TAG = "flotilla.label";
 
-/**
- * The deterministic name of the sandbox holding `label` under `instance`:
- * `prefix` and 160 bits of identity. The instance is in it, so two instances
- * sharing one vendor account never name the same sandbox.
- */
 export function sandboxName(prefix: string, instance: string, label: string) {
   return `${prefix}${hex(`${instance}\0${label}`).slice(0, 40)}`;
 }
 
-/** Destroy and inspect refuse what another instance made, and leave it alone. */
 export function requireOurs(
   vendor: string,
   id: string,
@@ -37,10 +28,6 @@ export function requireOurs(
     );
 }
 
-/**
- * Re-adoption of a label: what the module read back holds the size and egress
- * policy now requested, else it is refused and the caller provisions a new label.
- */
 export function checkReadopt(
   vendor: string,
   held: { size: string | null; egress: string | null },
@@ -52,13 +39,7 @@ export function checkReadopt(
     );
 }
 
-/**
- * Addresses no public builder or proxy reaches, as the Rust kit's
- * `kit::egress::private` has them: private, loopback, link-local, unspecified,
- * broadcast, shared (100.64/10), IETF protocol (192.0.0/24) and benchmarking
- * (198.18/15) IPv4; loopback, unique-local, link- and site-local IPv6;
- * IPv4-mapped IPv6 by its IPv4 address.
- */
+// The ranges of the Rust kit's `kit::egress::private`.
 const PRIVATE = new BlockList();
 for (const [address, prefix] of [
   ["0.0.0.0", 8],
@@ -97,12 +78,6 @@ const PRIVATE_SUFFIXES = [
   ".invalid",
 ];
 
-/**
- * Whether a registry (host, perhaps with a port) is plainly private: a private
- * address literal, a name that cannot be public, or a name that resolves to a
- * private address (best effort: a name that does not resolve here is left to
- * the vendor). This is `kit::egress::private_registry`, for TypeScript.
- */
 export async function privateRegistry(registry: string): Promise<boolean> {
   // A bare IPv6 literal is whole; any other host may carry a port or brackets.
   const bare = registry.toLowerCase();
@@ -116,9 +91,7 @@ export async function privateRegistry(registry: string): Promise<boolean> {
     PRIVATE_SUFFIXES.some((s) => host.endsWith(s))
   )
     return true;
-  // Best effort: the vendor's builder resolves the name from its own network
-  // (split-horizon DNS can answer differently), and a name that does not
-  // resolve here is left to the vendor.
+  // A name that does not resolve here is left to the vendor.
   try {
     return (await lookup(host, { all: true })).some((a) =>
       privateAddress(a.address),
@@ -128,13 +101,7 @@ export async function privateRegistry(registry: string): Promise<boolean> {
   }
 }
 
-/**
- * The resources this host suspended, so a vendor's "paused" reads as suspended
- * by request. For vendors that cannot change a resource's labels once it is
- * made (Namespace), it is a file per resource under the host's state directory,
- * as the Rust kit's `Suspensions`: it survives a restart. With no usable
- * directory it is in memory alone.
- */
+// Suspends this host made, one file each under the state directory so they survive a restart.
 export class Suspensions {
   private memory = new Set<string>();
   private dir: string | undefined;
@@ -161,9 +128,7 @@ export class Suspensions {
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, "");
     } catch (error) {
-      console.warn(
-        `could not record a suspend; after a host restart it will read as the provider's: ${error}`,
-      );
+      console.warn(`could not record a suspend: ${error}`);
     }
   }
 
@@ -184,7 +149,6 @@ export class Suspensions {
   }
 }
 
-/** The host's state directory, as rigging-paths resolves it for `drydock`. */
 function defaultStateDir(): string | undefined {
   const root = process.env.DRYDOCK_ROOT;
   if (root) return join(root, "state");

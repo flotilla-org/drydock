@@ -33,7 +33,6 @@ pub struct Failure<'a> {
     pub operation: &'a str,
     pub status: u16,
     pub body: &'a [u8],
-    /// From the answer, as [`Api::retry_after`] reads it.
     pub retry_after: Option<u64>,
 }
 impl Failure<'_> {
@@ -157,7 +156,7 @@ pub struct Paging {
 pub enum Next {
     Body(&'static [&'static str]),
     Header(&'static str),
-    /// An offset: the rows read so far, while a page comes back full at this size.
+    /// An offset: the rows so far, while a page comes back full.
     Offset(usize),
 }
 
@@ -190,8 +189,7 @@ impl Api {
         self.classify = classify;
         self
     }
-    /// How the vendor says when to retry (whole seconds, from an answer's headers
-    /// and body), in place of the `Retry-After` header.
+    /// How the vendor says when to retry, in place of `Retry-After`.
     pub fn retry_after(mut self, retry_after: fn(&HeaderMap, &[u8]) -> Option<u64>) -> Self {
         self.retry_after = retry_after;
         self
@@ -327,17 +325,12 @@ impl Api {
     pub async fn find<T: DeserializeOwned>(&self, url: Url, c: &Credentials) -> Result<Option<T>> {
         absent_on_not_found(self.get(url, c).await)
     }
-    /// Every row of a paged list, following each cursor once: a repeated cursor,
-    /// one that is not text, or more than [`MAX_PAGES`] pages is a bad response,
-    /// never a loop or a silently short list.
+    /// Every row of a paged list; a repeated cursor or more than [`MAX_PAGES`] pages is a bad response.
     pub async fn paged<T: DeserializeOwned>(&self, url: Url, paging: &Paging, c: &Credentials) -> Result<Vec<T>> {
         let (rows, ended) = self.paged_until(url, paging, MAX_PAGES, c, |_| false).await?;
         if ended { Ok(rows) } else { Err(self.vendor.bad_response()) }
     }
-    /// The rows of a paged list read until `done` says a page holds what the
-    /// caller needs (a list newest first, read back to a date), the list ends, or
-    /// `max_pages` have been read. True when the list ended or `done` said so:
-    /// false is a list cut short at `max_pages`, for the caller to say what that means.
+    /// Rows read until `done` says a page holds enough, the list ends, or `max_pages`. False: cut short at `max_pages`.
     pub async fn paged_until<T: DeserializeOwned>(
         &self,
         url: Url,
@@ -377,7 +370,6 @@ impl Api {
                     Some(value) => Some(value.to_str().map_err(|_| self.vendor.bad_response())?.to_owned()),
                     None => None,
                 },
-                // A full page means there may be more, at the offset after the rows so far.
                 Next::Offset(size) => (count >= *size).then(|| rows.len().to_string()),
             };
             match next.filter(|n| !n.is_empty()) {
@@ -405,10 +397,7 @@ pub fn absent_on_not_found<T>(result: Result<T>) -> Result<Option<T>> {
         Err(error) => Err(error),
     }
 }
-/// Whether a refusal's `text` has any of `wording`, ignoring case. For a vendor
-/// that gives no code or status for a condition (a quota, say) and says it only
-/// in words: the module names the wording it matches next to the vendor it is
-/// from, so the match is one thing to read, check and replace.
+/// Whether `text` has any of `wording`, ignoring case: for a vendor that says a condition only in words.
 pub fn says(text: &str, wording: &[&str]) -> bool {
     let text = text.to_ascii_lowercase();
     wording.iter().any(|w| text.contains(&w.to_ascii_lowercase()))
@@ -517,9 +506,6 @@ mod tests {
         assert_eq!(api.paged::<u8>(url, &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
     }
 
-    // An offset cursor is the rows so far, followed while pages come back full;
-    // a stop condition ends the read at the page that satisfies it, and a page
-    // cap says so rather than returning a list that looks whole.
     #[tokio::test]
     async fn offset_paging_stops_when_told_or_capped() {
         let paging = Paging { rows: None, cursor: "offset", next: Next::Offset(2) };
@@ -615,7 +601,6 @@ mod tests {
         }
     }
 
-    // A vendor's hint is read from the answer's headers and body; its wording is matched without case.
     #[tokio::test]
     async fn retry_hints_and_wording() {
         let (api, _) = api(Auth::Bearer, vec![(503, vec![], r#"{"wait":4}"#)]);

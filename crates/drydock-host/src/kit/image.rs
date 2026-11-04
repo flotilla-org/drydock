@@ -52,10 +52,7 @@ pub fn content_name(prefix: &str, chars: usize, parts: &[&str]) -> String {
     format!("{prefix}{}", &digest(&parts.join("\0"))[..chars])
 }
 
-/// The deterministic name of the sandbox that holds `label` under `instance`:
-/// `prefix` and 160 bits of identity. The instance is in it, so two instances
-/// sharing one vendor account never name the same sandbox; a vendor whose names
-/// must also show the label wraps this for the labels it cannot encode.
+/// `prefix` and 160 bits of identity; the instance is in it, so two instances never share a name.
 pub fn sandbox_name(prefix: &str, instance: &str, label: &str) -> String {
     content_name(prefix, 40, &[instance, label])
 }

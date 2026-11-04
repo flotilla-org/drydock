@@ -1,9 +1,3 @@
-/**
- * SDK clients by credential, with the calls and relays using each. The client
- * for the credential a call carries is held until `release`. A client a newer
- * credential replaced closes once its last call and relay end, so rotating the
- * credential never cuts a live connection.
- */
 export class Clients<V extends { close(): void }> {
   private clients = new Map<
     string,

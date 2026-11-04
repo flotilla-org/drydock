@@ -23,9 +23,7 @@ pub const PROVIDER_TAG: &str = OWNER_TAG;
 /// The provider-side tag holding the environment's label.
 pub const LABEL_TAG: &str = "flotilla.label";
 
-/// A lock held across no `.await`, taken whether or not a panicking holder
-/// poisoned it: the state under it is a cache or a record, never an invariant
-/// a panic could leave half-made.
+/// Locks here guard a cache or a record, so a poisoned one is taken anyway.
 pub trait Recover<T> {
     fn recover(&self) -> std::sync::MutexGuard<'_, T>;
 }
@@ -78,19 +76,13 @@ pub fn digest(input: &str) -> String {
     format!("{:x}", Sha256::digest(input.as_bytes()))
 }
 
-/// What one reading of a vendor's state means to a wait.
 pub enum Verdict<T> {
-    /// The state wanted: the wait ends with this value.
     Done(T),
-    /// Not yet: look again after the interval.
     Pending,
-    /// A state it cannot leave for the wanted one: the wait ends with this error.
     Failed(ProtocolError),
 }
 
-/// A wait's budget: how often to look, how long between looks, and the
-/// retry hint (seconds) when the budget runs out. Every wait in a module is
-/// one of these; a vendor's own long-poll or SDK wait stays the vendor's.
+/// A wait's budget; `retry_after` (seconds) is the hint when it runs out.
 #[derive(Clone, Copy)]
 pub struct Wait {
     pub attempts: u32,
@@ -98,10 +90,7 @@ pub struct Wait {
     pub retry_after: u64,
 }
 impl Wait {
-    /// Reads the vendor's state (`read`) up to `attempts` times, `interval` apart,
-    /// until `judge` says [`Verdict::Done`]. A failed read or [`Verdict::Failed`] ends
-    /// the wait at once: retrying failures is the caller's policy, not this
-    /// loop's. A spent budget is Unavailable with `still` as its reason.
+    /// Reads until `judge` says Done. A failed read or Failed ends the wait; retrying is the caller's policy.
     pub async fn until<S, T, F, Fut>(&self, still: impl Into<String>, mut read: F, judge: impl Fn(S) -> Verdict<T>) -> Result<T>
     where
         F: FnMut() -> Fut,
@@ -165,36 +154,17 @@ fn bytes(n: u64) -> String {
     }
 }
 
-/// The identity of an egress policy, which a module normalizes first (sorted
-/// sets, canonical hosts and CIDRs) so the same request always has the same one:
-/// 128 bits of the digest of its JSON. It is what [`Environment`]'s
-/// `egress_policy` reports and what [`check_readopt`] compares. Sets and maps in
-/// it must be BTree collections: a hash collection serializes in no fixed order.
+/// The identity of a normalized egress policy. Its sets and maps must be BTree: a hash collection has no fixed order.
 pub fn fingerprint(normalized_policy: &impl serde::Serialize) -> String {
     digest(&serde_json::to_string(normalized_policy).expect("a policy is JSON"))[..32].to_owned()
 }
 
-/// Whether a disk read back may be larger than the request (a vendor whose
-/// disk comes with the prepared form), or must equal it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DiskMatch {
-    Exact,
-    AtLeast,
-}
-/// Re-adoption of a label: the environment the module read back for it holds
-/// the size and egress policy now requested, else it is refused and the caller
-/// provisions a new label. `held` is the module's own reading of the vendor's
-/// resource (its `granted_size` and `egress_policy`); `egress_policy` is what
-/// [`fingerprint`] says of the request.
-pub fn check_readopt(vendor: Vendor, held: &Environment, size: &Size, egress_policy: &str, disk: DiskMatch) -> Result<()> {
-    let same_size = held.granted_size.as_ref().is_some_and(|g| {
-        g.cpus == size.cpus
-            && g.memory_bytes == size.memory_bytes
-            && match disk {
-                DiskMatch::Exact => g.disk_bytes == size.disk_bytes,
-                DiskMatch::AtLeast => size.disk_bytes <= g.disk_bytes,
-            }
-    });
+/// Refuses to re-adopt a label whose size or egress policy differs from the request.
+pub fn check_readopt(vendor: Vendor, held: &Environment, size: &Size, egress_policy: &str) -> Result<()> {
+    let same_size = held
+        .granted_size
+        .as_ref()
+        .is_some_and(|g| g.cpus == size.cpus && g.memory_bytes == size.memory_bytes && g.disk_bytes == size.disk_bytes);
     if same_size && held.egress_policy.as_deref() == Some(egress_policy) {
         return Ok(());
     }
@@ -248,14 +218,11 @@ pub fn ours(tags: &BTreeMap<String, String>, instance: &str) -> Option<String> {
     (tags.get(PROVIDER_TAG).map(String::as_str) == Some(instance)).then(|| tags.get(LABEL_TAG).cloned()).flatten()
 }
 
-/// The refusal for a resource this instance did not make. One rule for every
-/// module: destroy and inspect of a foreign resource are refused, and it is
-/// left alone. A resource that is absent is not foreign (destroy of it is done).
+/// The refusal for a resource another instance made; it is left alone.
 pub fn not_ours(vendor: Vendor, id: &str, instance: &str) -> ProtocolError {
     refused(format!("{vendor} resource {id} was not made by provider {instance}; it is left alone"))
 }
-/// The label of a resource whose tags make it this instance's, else
-/// [`not_ours`].
+/// The label of a resource whose tags make it this instance's, else [`not_ours`].
 pub fn require_ours(vendor: Vendor, id: &str, tags: &BTreeMap<String, String>, instance: &str) -> Result<String> {
     ours(tags, instance).ok_or_else(|| not_ours(vendor, id, instance))
 }
@@ -289,8 +256,6 @@ mod tests {
         }
     }
 
-    // Pending until the state is wanted, then its value; a failure or a spent
-    // budget ends the wait, and a zero budget never reads.
     #[tokio::test(start_paused = true)]
     async fn waits_end_on_done_failure_or_budget() {
         let wait = Wait { attempts: 3, interval: Duration::from_secs(1), retry_after: 7 };
@@ -322,8 +287,6 @@ mod tests {
         assert!(none.until("slow", async || -> Result<u32> { panic!("read") }, judge).await.is_err());
     }
 
-    // A policy has one identity however its sets were written down, and a
-    // label is re-adopted only when size and policy both match.
     #[test]
     fn readoption_compares_size_and_policy() {
         let v = Vendor("Test");
@@ -343,16 +306,13 @@ mod tests {
             egress_policy: Some(policy.into()),
             timestamp: None,
         };
-        assert!(check_readopt(v, &held(size.clone(), &id), &size, &id, DiskMatch::Exact).is_ok());
+        assert!(check_readopt(v, &held(size.clone(), &id), &size, &id).is_ok());
         let bigger = Size { disk_bytes: 8 * GIB, ..size.clone() };
-        assert!(check_readopt(v, &held(bigger.clone(), &id), &size, &id, DiskMatch::Exact).is_err());
-        assert!(check_readopt(v, &held(bigger, &id), &size, &id, DiskMatch::AtLeast).is_ok());
-        let smaller = Size { disk_bytes: 2 * GIB, ..size.clone() };
-        assert!(check_readopt(v, &held(smaller, &id), &size, &id, DiskMatch::AtLeast).is_err());
-        assert!(check_readopt(v, &held(size.clone(), "other"), &size, &id, DiskMatch::Exact).is_err());
+        assert!(check_readopt(v, &held(bigger.clone(), &id), &size, &id).is_err());
+        assert!(check_readopt(v, &held(size.clone(), "other"), &size, &id).is_err());
         let mut unsized_ = held(size.clone(), &id);
         unsized_.granted_size = None;
-        assert!(check_readopt(v, &unsized_, &size, &id, DiskMatch::Exact).is_err());
+        assert!(check_readopt(v, &unsized_, &size, &id).is_err());
     }
 
     #[test]

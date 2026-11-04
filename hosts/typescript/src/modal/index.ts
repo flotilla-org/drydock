@@ -190,13 +190,11 @@ function protocolError(error: unknown): ProtocolFailure {
       kind: "refused",
       reason: `Modal refused the request: ${brief(detail)}`,
     });
-  // The SDK's class and the raw gRPC RESOURCE_EXHAUSTED code are one condition.
-  // The SDK gives one code for a quota and a rate limit; a quota read as a rate
-  // limit is retried, so tell them apart here if Modal ever words them differently.
   if (error instanceof ResourceExhaustedError)
     return failure({
-      kind: "rate_limited",
-      reason: `Modal: ${brief(detail)}`,
+      kind: "unavailable",
+      reason: "Modal has no capacity for the sandbox",
+      provider_error: detail,
     });
   if (error instanceof ClientClosedError)
     return failure({
@@ -615,8 +613,6 @@ class Modal implements Provider {
   private async owned(client: ModalClient, id: string) {
     const sandbox = await call(() => client.sandboxes.fromId(id));
     const tags = await call(() => sandbox.getTags());
-    // Absent is not_found, which destroy treats as done; a sandbox that exists
-    // but was not made by this provider is refused, and left alone.
     requireOurs("Modal", id, tags, this.name);
     return { sandbox, tags };
   }

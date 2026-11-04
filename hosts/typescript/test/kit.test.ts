@@ -5,8 +5,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { privateAddress, privateRegistry, Suspensions } from "../dist/kit.js";
 
-// The ranges are the Rust kit's, including the ones Modal's own list missed,
-// and an IPv4-mapped IPv6 address is judged by its IPv4 address in either form.
 test("private addresses and registries", async () => {
   for (const address of [
     "10.1.2.3",

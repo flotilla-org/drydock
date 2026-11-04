@@ -808,7 +808,11 @@ impl Provider for E2b {
         if let Some(v) = self.ours_listed(Some(&r.label), c).await?.into_iter().next() {
             let existing = self.environment(&v)?;
             // The template fixes the disk: a sandbox may hold more than the request.
-            kit::check_readopt(E2B, &existing, &r.size, &policy.fingerprint(), kit::DiskMatch::AtLeast)?;
+            let mut held = existing.clone();
+            if let Some(g) = held.granted_size.as_mut().filter(|g| g.disk_bytes >= r.size.disk_bytes) {
+                g.disk_bytes = r.size.disk_bytes;
+            }
+            kit::check_readopt(E2B, &held, &r.size, &policy.fingerprint())?;
             return Ok(Provisioned::Existing(existing));
         }
         let body = NewSandbox {
@@ -949,7 +953,6 @@ impl UsageOperation for E2b {
             .append_pair("orderAsc", "false")
             .append_pair("types", "sandbox.lifecycle.paused")
             .append_pair("types", "sandbox.lifecycle.killed");
-        // Newest first: read back to the first page that reaches `from`.
         let reached = |page: &[Event]| page.iter().any(|e| e.timestamp < from);
         let (events, complete) = self.api.paged_until(url, &EVENT_PAGES_BY_OFFSET, EVENT_PAGES, c, reached).await?;
         for event in &events {

@@ -63,7 +63,6 @@ impl TensorlakeModule {
     pub fn with_dialer(dialer: Arc<dyn WebSocketDialer>) -> Self {
         Self { dialer, resolver: Arc::new(SystemResolver) }
     }
-    /// Resolves registry names for prepare's private-address check.
     pub fn with_resolver(self, resolver: Arc<dyn Resolver>) -> Self {
         Self { resolver, ..self }
     }
@@ -377,7 +376,7 @@ impl Tensorlake {
     }
     async fn adopt(&self, row: Sandbox, size: &Size, policy: &Policy, c: &Credentials) -> Result<Environment> {
         let existing = self.environment(&row)?;
-        kit::check_readopt(TENSORLAKE, &existing, size, &policy.fingerprint(), kit::DiskMatch::Exact)?;
+        kit::check_readopt(TENSORLAKE, &existing, size, &policy.fingerprint())?;
         if &*row.status == "pending" {
             self.wait_running(&existing.id, c).await?;
             return self.inspect(&existing.id, c).await;
