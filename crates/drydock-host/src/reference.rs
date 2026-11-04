@@ -82,6 +82,8 @@ struct Memory {
     tools_generation: BTreeMap<String, u64>,
     provider_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     inventory_error: bool,
+    /// Environments some other instance made: listed by no one's, inspected and destroyed by no one else.
+    foreign: std::collections::BTreeSet<String>,
     running_since: BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     usage: Vec<(Size, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 }
@@ -96,6 +98,14 @@ impl Memory {
     }
 }
 impl Reference {
+    /// The one ownership rule: what another instance made is refused and left alone.
+    fn require_ours(&self, id: &str) -> Result<()> {
+        if self.state.recover().foreign.contains(id) {
+            Err(crate::kit::not_ours(crate::kit::Vendor("Reference"), id, &self.name))
+        } else {
+            Ok(())
+        }
+    }
     fn find(&self, id: &str) -> Result<Environment> {
         self.state.recover().environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })
     }
@@ -219,6 +229,7 @@ impl Provider for Reference {
         Ok(state
             .environments
             .values()
+            .filter(|e| !state.foreign.contains(&e.id))
             .cloned()
             .map(|environment| Environment { egress_measured: true, timestamp: state.provider_timestamp.map(Into::into), ..environment })
             .collect())
@@ -226,11 +237,13 @@ impl Provider for Reference {
     async fn inspect(&self, id: &str, _: &Credentials) -> Result<Environment> {
         self.check()?;
         let environment = self.find(id)?;
+        self.require_ours(id)?;
         let timestamp = self.state.recover().provider_timestamp.map(Into::into);
         Ok(Environment { egress_measured: true, timestamp, ..environment })
     }
     async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
         self.check()?;
+        self.require_ours(id)?;
         let mut state = self.state.recover();
         state.stop_billing(id);
         state.environments.remove(id);
@@ -330,6 +343,11 @@ impl Exec for Reference {
                         state.running_since.insert(target.into(), chrono::Utc::now());
                     }
                     state.environments.get_mut(target).ok_or_else(|| refused("unknown fixture target"))?.state = observation;
+                    serde_json::Value::Null
+                }
+                "foreign" => {
+                    state.environments.get(target).ok_or_else(|| refused("unknown fixture target"))?;
+                    state.foreign.insert(target.into());
                     serde_json::Value::Null
                 }
                 "pause" => {

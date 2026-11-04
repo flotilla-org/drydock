@@ -338,9 +338,7 @@ impl Runtime {
     }
     async fn ours(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
         let v = self.sandbox(id, c).await?;
-        if kit::ours(&v.labels, &self.name).is_none() {
-            return Err(ProtocolError::NotFound { reason: format!("Runtime sandbox {id} is not one of provider {}'s", self.name) });
-        }
+        kit::require_ours(RUNTIME, id, &v.labels, &self.name)?;
         Ok(v)
     }
     async fn listed(&self, c: &Credentials) -> Result<Vec<Sandbox>> {
@@ -716,12 +714,7 @@ impl Provider for Runtime {
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         let Some(v) = absent_on_not_found(self.sandbox(id, c).await)? else { return Ok(()) };
-        if kit::ours(&v.labels, &self.name).is_none() {
-            return Err(refused(format!(
-                "Runtime sandbox {id} must carry both {PROVIDER_TAG}={} and {LABEL_TAG} to be ours; it is left alone",
-                self.name
-            )));
-        }
+        kit::require_ours(RUNTIME, id, &v.labels, &self.name)?;
         let port = self.settings.agent_port.to_string();
         for url in [self.sandbox_url(id, None, &["previews", &port])?, self.sandbox_url(id, None, &[])?] {
             absent_on_not_found(self.act(Method::DELETE, url, Body::None, c, false).await)?;

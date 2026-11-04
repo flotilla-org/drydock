@@ -631,11 +631,10 @@ class Modal implements Provider {
   private async owned(client: ModalClient, id: string) {
     const sandbox = await call(() => client.sandboxes.fromId(id));
     const tags = await call(() => sandbox.getTags());
+    // Absent is not_found, which destroy treats as done; a sandbox that exists
+    // but was not made by this provider is refused, and left alone.
     if (tags[TAGS.provider] !== this.name)
-      throw new ProtocolFailure({
-        kind: "not_found",
-        reason: "no such sandbox for this provider",
-      });
+      refused(`Modal sandbox ${id} was not made by provider ${this.name}`);
     return { sandbox, tags };
   }
 

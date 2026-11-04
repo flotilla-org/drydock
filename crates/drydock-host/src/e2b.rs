@@ -847,15 +847,16 @@ impl Provider for E2b {
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         match absent_on_not_found(self.sandbox(id, c).await)? {
-            Some(v) => self.environment(&v),
+            Some(v) => {
+                kit::require_ours(E2B, id, &v.metadata, &self.name)?;
+                self.environment(&v)
+            }
             None => Ok(self.gone(id)),
         }
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         if let Some(v) = absent_on_not_found(self.sandbox(id, c).await)? {
-            if self.label(&v).is_none() {
-                return Err(refused(format!("E2B sandbox {id} is not this provider's")));
-            }
+            kit::require_ours(E2B, id, &v.metadata, &self.name)?;
             absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
         }
         self.access.recover().remove(id);

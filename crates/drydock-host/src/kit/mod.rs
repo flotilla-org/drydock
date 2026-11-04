@@ -171,6 +171,18 @@ pub fn ours(tags: &BTreeMap<String, String>, instance: &str) -> Option<String> {
     (tags.get(PROVIDER_TAG).map(String::as_str) == Some(instance)).then(|| tags.get(LABEL_TAG).cloned()).flatten()
 }
 
+/// The refusal for a resource this instance did not make. One rule for every
+/// module: destroy and inspect of a foreign resource are refused, and it is
+/// left alone. A resource that is absent is not foreign (destroy of it is done).
+pub fn not_ours(vendor: Vendor, id: &str, instance: &str) -> ProtocolError {
+    refused(format!("{vendor} resource {id} was not made by provider {instance}; it is left alone"))
+}
+/// The label of a resource whose tags make it this instance's, else
+/// [`not_ours`].
+pub fn require_ours(vendor: Vendor, id: &str, tags: &BTreeMap<String, String>, instance: &str) -> Result<String> {
+    ours(tags, instance).ok_or_else(|| not_ours(vendor, id, instance))
+}
+
 /// `argv` as one POSIX shell command line.
 pub fn shell_command(argv: &[String]) -> String {
     argv.iter().map(|s| format!("'{}'", s.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")
@@ -195,6 +207,7 @@ mod tests {
         assert_eq!(ours(&tags(&[(PROVIDER_TAG, "a"), (LABEL_TAG, "l")]), "a").as_deref(), Some("l"));
         for other in [tags(&[(PROVIDER_TAG, "b"), (LABEL_TAG, "l")]), tags(&[(PROVIDER_TAG, "a")]), tags(&[(LABEL_TAG, "l")])] {
             assert_eq!(ours(&other, "a"), None, "{other:?}");
+            assert!(matches!(require_ours(Vendor("Test"), "x", &other, "a"), Err(ProtocolError::Refused { .. })), "{other:?}");
         }
     }
 

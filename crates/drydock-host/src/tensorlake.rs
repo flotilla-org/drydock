@@ -309,6 +309,11 @@ impl Tensorlake {
     async fn sandbox(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
         self.api.get(self.api.url(&["sandboxes", id])?, c).await
     }
+    // Sandboxes carry no labels: the name's prefix says whose it is.
+    fn require_ours(&self, row: &Sandbox) -> Result<()> {
+        let name = row.name.as_deref().unwrap_or("");
+        if name.starts_with(&sandbox_prefix(&self.name)) { Ok(()) } else { Err(kit::not_ours(TENSORLAKE, name, &self.name)) }
+    }
     async fn status(&self, id: &str, c: &Credentials) -> Result<String> {
         Ok(self.sandbox(id, c).await?.status.into())
     }
@@ -781,20 +786,29 @@ impl Provider for Tensorlake {
         match self.sandbox(id, c).await {
             Err(ProtocolError::NotFound { reason }) => match self.archived(id, c).await? {
                 Some(mut row) => {
+                    self.require_ours(&row)?;
                     row.status = Text::try_from("terminated".to_owned()).map_err(|_| TENSORLAKE.bad_response())?;
                     self.environment(&row)
                 }
                 None => Err(ProtocolError::NotFound { reason }),
             },
-            row => self.environment(&row?),
+            row => {
+                let row = row?;
+                self.require_ours(&row)?;
+                self.environment(&row)
+            }
         }
     }
     // Every suspend leaves a snapshot that outlives the sandbox and bills until deleted.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        let sandbox_id = match self.sandbox(id, c).await {
-            Err(ProtocolError::NotFound { .. }) => self.archived(id, c).await?.map(|row| row.id.to_string()),
-            row => Some(row?.id.to_string()),
+        let row = match self.sandbox(id, c).await {
+            Err(ProtocolError::NotFound { .. }) => self.archived(id, c).await?,
+            row => Some(row?),
         };
+        if let Some(row) = &row {
+            self.require_ours(row)?;
+        }
+        let sandbox_id = row.map(|row| row.id.to_string());
         absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
         locked(&self.tokens).remove(id);
         let Some(sandbox_id) = sandbox_id else { return Ok(()) };
