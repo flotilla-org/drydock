@@ -161,8 +161,7 @@ and sandbox backend from those, so run the host without them.
   timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory, and `sleep infinity` as its command, which
   only keeps it alive. Modal's disk is fixed and cannot be sized, so a
   requested disk is accepted and not applied, and the granted disk is
-  reported as 0. A
-  label whose name is taken re-adopts that sandbox when its tags say it is
+  reported as 0. A label whose name is taken re-adopts that sandbox when its tags say it is
   this instance's, with the same size and policy, and refuses it otherwise.
   Either way the module then starts the agent by a root exec that gets a
   fresh TCP token on stdin: it keeps the token already in

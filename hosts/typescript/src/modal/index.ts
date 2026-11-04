@@ -154,8 +154,8 @@ function policyIdentity(network: Network) {
   return `allow-${hex(JSON.stringify(network)).slice(0, 24)}`;
 }
 
-// Modal's disk is fixed and cannot be sized, so a requested disk is a floor
-// Modal neither checks nor raises; the granted disk stays 0 (not stated).
+// Modal's disk is fixed and cannot be sized, so a requested disk is accepted
+// but not applied; the granted disk stays 0 (not stated).
 export function resources(size: Types["Size"]) {
   if (size.memory_bytes % MiB !== 0 || size.memory_bytes <= 0)
     refused("Modal sandbox memory is whole MiB");
