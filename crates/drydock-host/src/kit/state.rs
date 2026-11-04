@@ -40,8 +40,11 @@ impl Suspensions {
     }
     pub fn forget(&self, id: &str) {
         self.memory.recover().remove(id);
-        if let Some(file) = self.file(id) {
-            let _ = std::fs::remove_file(file);
+        if let Some(file) = self.file(id)
+            && let Err(error) = std::fs::remove_file(file)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "could not clear a suspend record; it may read as ours after the sandbox id is reused");
         }
     }
     pub fn contains(&self, id: &str) -> bool {
@@ -70,5 +73,19 @@ mod tests {
         assert!(memory.contains("a"));
         memory.forget("a");
         assert!(!memory.contains("a"));
+    }
+
+    // A directory that cannot be written leaves the record in memory: the suspend still reads
+    // as ours in this process, and nothing panics.
+    #[test]
+    fn an_unwritable_directory_falls_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"").unwrap();
+        let record = Suspensions::in_dir(Some(blocker.join("below")));
+        record.record("a");
+        assert!(record.contains("a"));
+        record.forget("a");
+        assert!(!record.contains("a"));
     }
 }
