@@ -55,6 +55,7 @@ class Memory implements Provider {
     usage: false,
     quota: false,
     agent: false,
+    reach_ways: [],
     // A fixture with no guest network: it accepts deny-all and open, and enforces neither.
     egress: {
       routes: ["none", "open"],

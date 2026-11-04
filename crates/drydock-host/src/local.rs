@@ -455,6 +455,8 @@ impl Provider for Local {
             host_filesystem: true,
             exclusive_label: true,
             agent_tcp_port: None,
+            // Vessels are processes on this machine: its network is theirs.
+            reach_ways: vec![ReachWay::HostNetwork, ReachWay::OutwardExposure],
         }
     }
     fn observation(&self) -> ObservationMode {

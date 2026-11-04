@@ -639,6 +639,8 @@ impl Provider for Runtime {
             quota: true,
             host_filesystem: false,
             exclusive_label: true,
+            // The agent carries outward exposures; the sandbox has no network of drydockd's.
+            reach_ways: vec![ReachWay::OutwardExposure],
         }
     }
     fn observation(&self) -> ObservationMode {

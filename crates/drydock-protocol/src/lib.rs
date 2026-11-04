@@ -213,6 +213,24 @@ pub struct Capabilities {
     /// provisions may each create one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_label: bool,
+    /// The ways, beyond the guest's own egress, that a vessel can reach a
+    /// destination, preferred first. A client chooses among them per
+    /// destination; the guest's own egress (public destinations, under the
+    /// egress policy) stays described by `egress`.
+    #[serde(default)]
+    pub reach_ways: Vec<ReachWay>,
+}
+/// One way, beyond the guest's own egress, that a vessel can reach a destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachWay {
+    /// Drydock carries the connection from the vessel to drydockd's side
+    /// under the destination's own name and port, as an outward exposure.
+    /// Present when the module runs the agent.
+    OutwardExposure,
+    /// The vessel shares drydockd's host network, so a destination reachable
+    /// from that host is reachable from the vessel.
+    HostNetwork,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

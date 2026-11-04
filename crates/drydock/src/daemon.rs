@@ -1004,5 +1004,6 @@ fn conservative_capabilities() -> Capabilities {
         host_filesystem: false,
         exclusive_label: false,
         agent_tcp_port: None,
+        reach_ways: vec![],
     }
 }

@@ -2422,6 +2422,13 @@
           "quota": {
             "type": "boolean"
           },
+          "reach_ways": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReachWay"
+            },
+            "description": "The ways, beyond the guest's own egress, that a vessel can reach a\ndestination, preferred first. A client chooses among them per\ndestination; the guest's own egress (public destinations, under the\negress policy) stays described by `egress`."
+          },
           "suspend_preserves_memory": {
             "type": [
               "boolean",
@@ -4596,6 +4603,14 @@
               }
             }
           }
+        ]
+      },
+      "ReachWay": {
+        "type": "string",
+        "description": "One way, beyond the guest's own egress, that a vessel can reach a destination.",
+        "enum": [
+          "outward_exposure",
+          "host_network"
         ]
       },
       "Readiness": {

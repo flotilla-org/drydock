@@ -155,6 +155,9 @@ async fn host_configuration_document() {
         .unwrap();
     let names: Vec<_> = client.providers().await.unwrap().into_iter().map(|d| (d.provider, d.capabilities.agent)).collect();
     assert_eq!(names, [("a".into(), false), ("b".into(), true)]);
+    // The reference declares the outward exposure the agent carries, and nothing without one.
+    let ways: Vec<_> = client.providers().await.unwrap().into_iter().map(|d| d.capabilities.reach_ways).collect();
+    assert_eq!(ways, [vec![], vec![ReachWay::OutwardExposure]]);
     // The reference keeps prepared forms in memory: the same form proves the same provider.
     assert_eq!(client.prepare("a", &preparation()).await.unwrap(), prepared);
     // Refused documents apply nothing: a server-only key, or a provider that

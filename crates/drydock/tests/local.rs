@@ -94,3 +94,78 @@ async fn launch_reaches_an_agent_and_the_vessel_lives_through_its_lifecycle() {
     assert!(daemon.list("local").await.unwrap().is_empty());
     assert!(!dir.path().join("vessels").join(&vessel.id).exists());
 }
+
+/// Connects from inside a local vessel by running a command through its agent.
+struct ThroughAgent(drydock_agent::Client);
+#[async_trait::async_trait]
+impl drydock::conformance::GuestConnect for ThroughAgent {
+    async fn echo(&self, address: &drydock::conformance::GuestAddress, payload: &[u8]) -> Result<Vec<u8>, String> {
+        use drydock::conformance::GuestAddress;
+        let (kind, target) = match address {
+            GuestAddress::Tcp(a) => ("tcp", a.clone()),
+            GuestAddress::Unix(p) => ("unix", p.clone()),
+        };
+        let script = "import socket,sys\n\
+            kind,target,payload=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3])\n\
+            if kind=='unix':\n s=socket.socket(socket.AF_UNIX); s.connect(target)\n\
+            else:\n host,port=target.rsplit(':',1); s=socket.create_connection((host,int(port)),timeout=10)\n\
+            s.settimeout(10); s.sendall(payload); s.shutdown(socket.SHUT_WR)\n\
+            data=b''\n\
+            while True:\n chunk=s.recv(4096)\n if not chunk: break\n data+=chunk\n\
+            sys.stdout.buffer.write(data)";
+        let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+        let request = drydock_agent::Exec::new("python3", ["-c", script, kind, &target, &hex]);
+        let (out, err, status) =
+            self.0.run(request, 1 << 16).await.map_err(|e| format!("running python3 in the vessel (it must be installed): {e}"))?;
+        if status.success() { Ok(out) } else { Err(String::from_utf8_lossy(&err).into_owned()) }
+    }
+}
+
+// Each way the local module declares works: the vessel reaches a listener
+// that only this host can reach, over the host's own network and through an
+// outward exposure.
+#[tokio::test]
+async fn local_ways_to_reach_a_destination_work() {
+    use drydock::conformance::reach_way;
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = start(dir.path()).await;
+    let providers = daemon.providers();
+    let local = providers.iter().find(|p| p.provider == "local").unwrap();
+    assert_eq!(local.capabilities.reach_ways, [ReachWay::HostNetwork, ReachWay::OutwardExposure]);
+    // A module that runs no agent carries no exposure and declares no way.
+    let guarded = providers.iter().find(|p| p.provider == "guarded").unwrap();
+    assert!(guarded.capabilities.reach_ways.is_empty());
+
+    let vessel = daemon.launch("local", &LaunchOptions::default()).await.unwrap();
+    let build = std::fs::read(agent::agent_binary()).unwrap();
+    let open = || async {
+        let stream = daemon.relay("local", &vessel.id).await.map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(Box::new(stream) as _)
+    };
+    let client = drydock_agent::Client::connect_current(open, &Platform::current(), &build, Duration::from_secs(10)).await.unwrap();
+    let guest = ThroughAgent(client);
+    let environment = daemon.inspect("local", &vessel.id).await.unwrap();
+    let directory = dir.path().join("vessels").join(&vessel.id);
+    for way in [ReachWay::HostNetwork, ReachWay::OutwardExposure] {
+        reach_way(&*daemon, "local", &environment, way, &guest, directory.to_str().unwrap(), Duration::from_secs(30))
+            .await
+            .unwrap_or_else(|e| panic!("{way:?}: {e}"));
+    }
+    // A check that times out still removes its exposure.
+    struct Hangs;
+    #[async_trait::async_trait]
+    impl drydock::conformance::GuestConnect for Hangs {
+        async fn echo(&self, _: &drydock::conformance::GuestAddress, _: &[u8]) -> Result<Vec<u8>, String> {
+            std::future::pending().await
+        }
+    }
+    let timed_out =
+        reach_way(&*daemon, "local", &environment, ReachWay::OutwardExposure, &Hangs, directory.to_str().unwrap(), Duration::from_secs(2))
+            .await;
+    assert_eq!(timed_out, Err("timed out waiting for the way to work".into()));
+    assert!(daemon.outwards("local", &vessel.id).await.unwrap().is_empty(), "the exposure was left behind");
+    // The module declares no way it does not have.
+    let reference = daemon.inspect("local", &vessel.id).await.unwrap();
+    assert!(reach_way(&*daemon, "guarded", &reference, ReachWay::HostNetwork, &guest, "/", Duration::from_secs(5)).await.is_err());
+    daemon.destroy("local", &vessel.id).await.unwrap();
+}
