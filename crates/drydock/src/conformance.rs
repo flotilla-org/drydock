@@ -610,7 +610,7 @@ pub async fn reach_way<A: ProviderApi + ?Sized>(
         }
     })
     .await
-    .unwrap_or_else(|_| Err("timed out".into()));
+    .unwrap_or_else(|_| Err("timed out waiting for the way to work".into()));
     listener.abort();
     if way == ReachWay::OutwardExposure {
         // Outside the timeout, so a timed-out or failed check still leaves no exposure behind.

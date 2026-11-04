@@ -162,7 +162,7 @@ async fn local_ways_to_reach_a_destination_work() {
     let timed_out =
         reach_way(&*daemon, "local", &environment, ReachWay::OutwardExposure, &Hangs, directory.to_str().unwrap(), Duration::from_secs(2))
             .await;
-    assert_eq!(timed_out, Err("timed out".into()));
+    assert_eq!(timed_out, Err("timed out waiting for the way to work".into()));
     assert!(daemon.outwards("local", &vessel.id).await.unwrap().is_empty(), "the exposure was left behind");
     // The module declares no way it does not have.
     let reference = daemon.inspect("local", &vessel.id).await.unwrap();
