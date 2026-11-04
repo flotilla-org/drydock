@@ -108,8 +108,8 @@ impl drydock::conformance::GuestConnect for ThroughAgent {
         let script = "import socket,sys\n\
             kind,target,payload=sys.argv[1],sys.argv[2],bytes.fromhex(sys.argv[3])\n\
             if kind=='unix':\n s=socket.socket(socket.AF_UNIX); s.connect(target)\n\
-            else:\n host,port=target.rsplit(':',1); s=socket.create_connection((host,int(port)))\n\
-            s.sendall(payload); s.shutdown(socket.SHUT_WR)\n\
+            else:\n host,port=target.rsplit(':',1); s=socket.create_connection((host,int(port)),timeout=10)\n\
+            s.settimeout(10); s.sendall(payload); s.shutdown(socket.SHUT_WR)\n\
             data=b''\n\
             while True:\n chunk=s.recv(4096)\n if not chunk: break\n data+=chunk\n\
             sys.stdout.buffer.write(data)";
@@ -151,6 +151,19 @@ async fn local_ways_to_reach_a_destination_work() {
             .await
             .unwrap_or_else(|e| panic!("{way:?}: {e}"));
     }
+    // A check that times out still removes its exposure.
+    struct Hangs;
+    #[async_trait::async_trait]
+    impl drydock::conformance::GuestConnect for Hangs {
+        async fn echo(&self, _: &drydock::conformance::GuestAddress, _: &[u8]) -> Result<Vec<u8>, String> {
+            std::future::pending().await
+        }
+    }
+    let timed_out =
+        reach_way(&*daemon, "local", &environment, ReachWay::OutwardExposure, &Hangs, directory.to_str().unwrap(), Duration::from_secs(2))
+            .await;
+    assert_eq!(timed_out, Err("timed out".into()));
+    assert!(daemon.outwards("local", &vessel.id).await.unwrap().is_empty(), "the exposure was left behind");
     // The module declares no way it does not have.
     let reference = daemon.inspect("local", &vessel.id).await.unwrap();
     assert!(reach_way(&*daemon, "guarded", &reference, ReachWay::HostNetwork, &guest, "/", Duration::from_secs(5)).await.is_err());

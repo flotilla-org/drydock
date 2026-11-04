@@ -582,7 +582,8 @@ pub async fn reach_way<A: ProviderApi + ?Sized>(
         .ok_or("provider is not declared")?;
     require(declared.capabilities.reach_ways.contains(&way), "the provider does not declare this way")?;
     let (address, listener) = echo_listener().await?;
-    let name = format!("drydock-conformance-reach-{}", std::process::id());
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!("drydock-conformance-reach-{}-{}", std::process::id(), RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let socket = format!("{}/{name}.sock", guest_directory.trim_end_matches('/'));
     let result = tokio::time::timeout(timeout, async {
         match way {
@@ -616,7 +617,8 @@ pub async fn reach_way<A: ProviderApi + ?Sized>(
         let removed = tokio::time::timeout(Duration::from_secs(10), api.remove_outward(provider, &environment.id, &name))
             .await
             .map_err(SafeError::category)
-            .and_then(|r| r.map_err(SafeError::category));
+            .and_then(|r| r.map_err(SafeError::category))
+            .map_err(|e| format!("could not remove the conformance exposure: {e}"));
         return result.and(removed);
     }
     result
@@ -1324,8 +1326,6 @@ async fn semantic_requests(client: &Client, provider: &str, options: &Options, o
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Conformance reports preserve the host-masked provider reasons and details;
-    // low-level decode/IO failures retain their stable categories.
     #[test]
     fn reach_ways_declaration_rules() {
         let mut c = crate::conformance::tests::capabilities_fixture();
@@ -1361,6 +1361,8 @@ mod tests {
         }))
         .unwrap()
     }
+    // Conformance reports preserve the host-masked provider reasons and details;
+    // low-level decode/IO failures retain their stable categories.
     #[test]
     fn diagnostic_categories_and_provider_messages() {
         let secret = "vendor explanation";
