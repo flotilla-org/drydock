@@ -6,7 +6,11 @@ use super::{Vendor, shell_command};
 use crate::module::{ByteStream, Credentials, Result};
 use async_trait::async_trait;
 use drydock_protocol::*;
-use std::collections::BTreeMap;
+use drydock_transport::tcp::Token;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Mutex,
+};
 
 /// What one guest command printed and how it ended.
 #[derive(Default, Debug)]
@@ -73,9 +77,81 @@ pub trait Guest: Send + Sync {
     }
 }
 
+/// The drydock agent's path in a guest and the file its TCP listener's token is in.
+const AGENT: &str = "/opt/drydock/drydock-agent";
+const TOKEN_FILE: &str = "/run/drydock/tcp-token";
+const TOKEN_LINE: &str = "drydock-tcp-token ";
+/// The agent prints this line for `--print-token`.
+fn print_token() -> String {
+    format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}")
+}
+/// The token of the TCP agent in a guest, read once and kept until the module
+/// drops it. A module drops it when the guest could have a new agent (suspend,
+/// resume, destroy) or the agent refused it; the next [`AgentTokens::get`] reads it again.
+#[derive(Default)]
+pub struct AgentTokens(Mutex<HashMap<String, Token>>);
+impl AgentTokens {
+    /// The token the agent in `id` prints. A guest that cannot print one yet
+    /// (the agent is not up, or the file is not written) is Unavailable: try again.
+    pub async fn get(&self, guest: &(impl Guest + ?Sized), id: &str, c: &Credentials) -> Result<Token> {
+        if let Some(token) = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
+            return Ok(token.clone());
+        }
+        let output = guest.run(id, &print_token(), BTreeMap::new(), c).await?;
+        let stdout = String::from_utf8_lossy(&output.stdout()).into_owned();
+        let token = (output.exit_code() == 0)
+            .then(|| stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).and_then(|line| Token::parse(line).ok()))
+            .flatten()
+            .ok_or_else(|| ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", guest.vendor()), Some(2)))?;
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_owned(), token.clone());
+        Ok(token)
+    }
+    pub fn forget(&self, id: &str) {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Printer(std::sync::atomic::AtomicUsize, &'static str, i64);
+    #[async_trait]
+    impl Guest for Printer {
+        fn vendor(&self) -> Vendor {
+            Vendor("Test")
+        }
+        async fn run(&self, _: &str, script: &str, _: BTreeMap<&str, String>, _: &Credentials) -> Result<GuestOutput> {
+            assert!(script.contains("--print-token"));
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(GuestOutput::from_text(self.1, "", Some(self.2)))
+        }
+    }
+
+    // The token is read once and kept until dropped; a guest that prints none,
+    // or exits nonzero, is Unavailable and caches nothing.
+    #[tokio::test]
+    async fn agent_tokens_are_read_once_and_forgotten() {
+        let token = "A".repeat(43);
+        let c = Credentials::default();
+        let tokens = AgentTokens::default();
+        let guest = Printer(0.into(), Box::leak(format!("noise\ndrydock-tcp-token {token}\n").into_boxed_str()), 0);
+        for _ in 0..2 {
+            assert_eq!(tokens.get(&guest, "a", &c).await.unwrap().secret(), token);
+        }
+        assert_eq!(guest.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        tokens.forget("a");
+        tokens.get(&guest, "a", &c).await.unwrap();
+        assert_eq!(guest.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        for bad in [
+            Printer(0.into(), "", 0),
+            Printer(0.into(), "drydock-tcp-token short\n", 0),
+            Printer(0.into(), "drydock-tcp-token AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", 1),
+        ] {
+            let error = AgentTokens::default().get(&bad, "a", &c).await.unwrap_err();
+            assert!(matches!(error, ProtocolError::Unavailable { retry_after: Some(2), .. }), "{error:?}");
+        }
+    }
 
     // A failure carries the merged output and the vendor's note; a timeout
     // says so and has no exit status, whatever the vendor reported.

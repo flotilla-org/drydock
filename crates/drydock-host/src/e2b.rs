@@ -4,7 +4,7 @@ use crate::{
         self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
-        guest::{Guest, GuestOutput},
+        guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name},
     },
     module::*,
@@ -30,8 +30,6 @@ use std::{
 const E2B: Vendor = Vendor("E2B");
 const ENVD_PORT: u16 = 49983;
 const AGENT_PORT: u16 = 7811;
-const PRINT_TOKEN: &str = "/opt/drydock/drydock-agent --print-token --tcp-token-file /run/drydock/tcp-token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
 const RUN_TIMEOUT_MS: u64 = 25_000;
 const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
@@ -344,6 +342,7 @@ impl Module for E2bModule {
             resolver: self.resolver.clone(),
             access: Mutex::default(),
             suspended: Mutex::default(),
+            agents: AgentTokens::default(),
         }))
     }
 }
@@ -369,6 +368,7 @@ pub struct E2b {
     resolver: Arc<dyn Resolver>,
     access: Mutex<HashMap<String, Access>>,
     suspended: Mutex<HashSet<String>>,
+    agents: AgentTokens,
 }
 
 trait Recover<T> {
@@ -579,13 +579,6 @@ impl E2b {
             }
         }
         unreachable!()
-    }
-    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<String> {
-        let run = self.run(id, PRINT_TOKEN, BTreeMap::new(), c).await?.success(E2B)?;
-        let stdout = String::from_utf8_lossy(&run.stdout()).into_owned();
-        stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).filter(|t| !t.is_empty()).map(str::to_owned).ok_or_else(|| {
-            ProtocolError::Internal { reason: "the agent's TCP token was not read back".into(), provider_error: String::new() }
-        })
     }
 }
 
@@ -857,6 +850,7 @@ impl Provider for E2b {
             absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
         }
         self.access.recover().remove(id);
+        self.agents.forget(id);
         self.suspended.recover().remove(id);
         Ok(())
     }
@@ -876,11 +870,11 @@ impl Provider for E2b {
             };
             headers.insert(TRAFFIC_HEADER.to_owned(), Secret::new(traffic));
         }
-        let token = self.agent_token(id, c).await?;
+        let token = self.agents.get(self, id, c).await?;
         let expires_at = v.end_at.unwrap_or_else(|| Utc::now() + chrono::TimeDelta::seconds(self.settings.lifetime_seconds.into()));
         Ok(Reach::Dial {
             url: self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string(),
-            token: Secret::new(token),
+            token: Secret::new(token.secret()),
             headers,
             expires_at: expires_at.into(),
         })
@@ -902,11 +896,13 @@ impl SuspendResume for E2b {
             }
         }
         self.wait_state(id, "paused", c).await?;
+        self.agents.forget(id);
         self.suspended.recover().insert(id.to_owned());
         Ok(E2B.resume_marker(RESUME_PREFIX, &self.name, id))
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         E2B.check_resume(RESUME_PREFIX, &self.name, id, &token)?;
+        self.agents.forget(id);
         self.connect(id, c).await?;
         self.wait_state(id, "running", c).await?;
         self.suspended.recover().remove(id);

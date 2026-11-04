@@ -5,7 +5,7 @@ use crate::{
         self, GIB, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, StateTable, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::normal_host,
-        guest::{Guest, GuestOutput},
+        guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile},
     },
     module::*,
@@ -31,9 +31,6 @@ const RUNTIME: Vendor = Vendor("Runtime");
 const SIZES: SizeLimits =
     SizeLimits { cpus: (1, 16), memory: (128 * MIB, 64 * GIB), memory_step: MIB, disk: (3 * GIB, 400 * GIB), disk_step: MIB };
 const PAGED: Paging = Paging { rows: Some("data"), cursor: "cursor", next: Next::Body(&["nextCursor"]) };
-const AGENT: &str = "/opt/drydock/drydock-agent";
-const TOKEN_FILE: &str = "/run/drydock/tcp-token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 const POLICY_LABEL: &str = "drydock.egress";
 const ENFORCED_LABEL: &str = "drydock.enforced";
 const LABEL_LIMIT: usize = 256;
@@ -271,7 +268,7 @@ impl Module for RuntimeModule {
             return Err(refused("a Runtime provider's name becomes a label value: no ':' and at most 256 characters"));
         }
         let api = Api::new(RUNTIME, &settings.api_url, Auth::Bearer, http)?.classify(classify);
-        Ok(Arc::new(Runtime { name: name.to_owned(), settings, api }))
+        Ok(Arc::new(Runtime { name: name.to_owned(), settings, api, agents: AgentTokens::default() }))
     }
 }
 
@@ -279,6 +276,7 @@ pub struct Runtime {
     name: String,
     settings: Settings,
     api: Api,
+    agents: AgentTokens,
 }
 
 // Runtime marks a refusal that may succeed when sent again (`retryable` with
@@ -504,14 +502,6 @@ impl Runtime {
         }
         Ok(preview)
     }
-    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<Secret> {
-        let output = self.run(id, &format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}"), BTreeMap::new(), c).await?;
-        let token = String::from_utf8_lossy(&output.stdout()).lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).map(str::to_owned);
-        match token {
-            Some(token) if output.exit_code() == 0 => Ok(Secret::new(token)),
-            _ => Err(ProtocolError::unavailable(format!("Runtime sandbox {id}'s agent has no TCP token yet"), Some(2))),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -718,6 +708,7 @@ impl Provider for Runtime {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         let Some(v) = absent_on_not_found(self.sandbox(id, c).await)? else { return Ok(()) };
         kit::require_ours(RUNTIME, id, &v.labels, &self.name)?;
+        self.agents.forget(id);
         let port = self.settings.agent_port.to_string();
         for url in [self.sandbox_url(id, None, &["previews", &port])?, self.sandbox_url(id, None, &[])?] {
             absent_on_not_found(self.act(Method::DELETE, url, Body::None, c, false).await)?;
@@ -731,7 +722,7 @@ impl Provider for Runtime {
         if &*v.state != "running" {
             return Err(refused(format!("Runtime sandbox {id} is {}, not running; resume it first", &*v.state)));
         }
-        let token = self.agent_token(id, c).await?;
+        let token = Secret::new(self.agents.get(self, id, c).await?.secret());
         let preview = self.preview(id, c).await?;
         let Some(preview_token) = preview.token.filter(|token| !token.is_empty() && sensitive(token).is_ok()) else {
             return Err(refused("Runtime signs no preview token for this key: it needs the right to run commands in the sandbox"));
@@ -759,6 +750,7 @@ impl SuspendResume for Runtime {
         if &*state == "running" {
             self.act(Method::POST, self.sandbox_url(id, Some("pause"), &[])?, Body::None, c, true).await?;
         }
+        self.agents.forget(id);
         let read = async || Ok(self.sandbox(id, c).await?.state);
         STATE_WAIT
             .until("Runtime sandbox has not paused", read, |state| match &*state {
@@ -770,6 +762,7 @@ impl SuspendResume for Runtime {
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         RUNTIME.check_resume("runtime-resume-", &self.name, id, &token)?;
+        self.agents.forget(id);
         let action = match &*self.ours(id, c).await?.state {
             "paused" | "pausing" => Some("wake"),
             "stopped" => Some("restart"),

@@ -7,7 +7,7 @@ use crate::{
         self, GIB, MIB, StateTable, Vendor, Verdict, Wait,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found},
         egress::{ipv6, normal_cidr, normal_host, private_host},
-        guest::{Guest, GuestOutput},
+        guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile},
     },
     module::*,
@@ -26,10 +26,10 @@ use reqwest::{
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     net::Ipv4Addr,
     num::NonZeroU16,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -38,8 +38,6 @@ const TENSORLAKE: Vendor = Vendor("Tensorlake");
 const TUNNEL_FRAME: usize = 64 << 10;
 const DISK_MB: std::ops::RangeInclusive<u64> = 10_240..=102_400;
 const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
-const TOKEN_FILE: &str = "/run/drydock/tcp-token";
-const AGENT: &str = "/opt/drydock/drydock-agent";
 const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
 const STATE_WAIT: Wait = Wait { attempts: 120, interval: Duration::from_secs(1), retry_after: 5 };
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
@@ -254,7 +252,7 @@ impl Module for TensorlakeModule {
                 "Tensorlake requires a sandbox_domain host name, a tunnel port, and positive max_cpus, max_memory and poll_interval_ms",
             ));
         }
-        Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone(), tokens: Mutex::default() }))
+        Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone(), agents: AgentTokens::default() }))
     }
 }
 
@@ -263,7 +261,7 @@ pub struct Tensorlake {
     settings: Settings,
     api: Api,
     dialer: Arc<dyn WebSocketDialer>,
-    tokens: Mutex<HashMap<String, Token>>,
+    agents: AgentTokens,
 }
 
 // Guest-plane and Image Service refusals carry `error`; plan limits are 400s
@@ -286,9 +284,6 @@ const fn paging(rows: &'static str) -> Paging {
 }
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
-}
-fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Tensorlake {
@@ -356,19 +351,6 @@ impl Tensorlake {
             timestamp: None,
             vendor: None,
         })
-    }
-    async fn token(&self, id: &str, c: &Credentials) -> Result<Token> {
-        if let Some(token) = locked(&self.tokens).get(id) {
-            return Ok(token.clone());
-        }
-        let output = self.run(id, &format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}"), BTreeMap::new(), c).await?;
-        let stdout = String::from_utf8_lossy(&output.success(TENSORLAKE)?.stdout()).into_owned();
-        let token =
-            stdout.lines().find_map(|line| line.strip_prefix("drydock-tcp-token ")).and_then(|line| Token::parse(line).ok()).ok_or_else(
-                || ProtocolError::Internal { reason: "the agent's TCP token was not read back".into(), provider_error: String::new() },
-            )?;
-        locked(&self.tokens).insert(id.to_owned(), token.clone());
-        Ok(token)
     }
     async fn wait_running(&self, id: &str, c: &Credentials) -> Result<()> {
         let status = async || self.status(id, c).await;
@@ -808,7 +790,7 @@ impl Provider for Tensorlake {
         }
         let sandbox_id = row.map(|row| row.id.to_string());
         absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
-        locked(&self.tokens).remove(id);
+        self.agents.forget(id);
         let Some(sandbox_id) = sandbox_id else { return Ok(()) };
         let mut remaining = 0;
         for snapshot in self.snapshots(&sandbox_id, c).await? {
@@ -852,10 +834,10 @@ impl Provider for Tensorlake {
             })?;
             Ok::<_, ProtocolError>(tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await)
         };
-        let mut connected = connect(self.token(id, c).await?).await?;
+        let mut connected = connect(self.agents.get(self, id, c).await?).await?;
         if connected.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
-            locked(&self.tokens).remove(id);
-            connected = connect(self.token(id, c).await?).await?;
+            self.agents.forget(id);
+            connected = connect(self.agents.get(self, id, c).await?).await?;
         }
         connected.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
             reason: "the agent's TCP listener did not accept the tunnel".into(),
@@ -886,7 +868,7 @@ impl SuspendResume for Tensorlake {
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         TENSORLAKE.check_resume(RESUME, &self.name, id, &token)?;
-        locked(&self.tokens).remove(id);
+        self.agents.forget(id);
         if self.status(id, c).await? != "running" {
             let mut url = self.api.url(&["sandboxes", id, "resume"])?;
             url.query_pairs_mut().append_pair("wait_ms", "30000");
