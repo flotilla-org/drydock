@@ -267,7 +267,7 @@ impl Module for RuntimeModule {
         if name.contains(':') || name.len() > LABEL_LIMIT {
             return Err(refused("a Runtime provider's name becomes a label value: no ':' and at most 256 characters"));
         }
-        let api = Api::new(RUNTIME, &settings.api_url, Auth::Bearer, http)?.classify(classify);
+        let api = Api::new(RUNTIME, &settings.api_url, Auth::Bearer, http)?.classify(classify).retry_after(retry_hint);
         Ok(Arc::new(Runtime { name: name.to_owned(), settings, api, agents: AgentTokens::default() }))
     }
 }
@@ -279,6 +279,11 @@ pub struct Runtime {
     agents: AgentTokens,
 }
 
+// The header, else the body's `retryAfterMs` (whole seconds, rounded up).
+fn retry_hint(headers: &reqwest::header::HeaderMap, body: &[u8]) -> Option<u64> {
+    kit::api::retry_after_header(headers)
+        .or_else(|| serde_json::from_slice::<ErrorBody>(body).ok()?.error.retry_after_ms.map(|ms| ms.div_ceil(1000)))
+}
 // Runtime marks a refusal that may succeed when sent again (`retryable` with
 // `retryAfterMs`): https://withruntime.com/docs/api
 fn classify(f: &Failure) -> ProtocolError {
@@ -289,7 +294,7 @@ fn classify(f: &Failure) -> ProtocolError {
         (None, _) => f.message(),
     };
     let code = error.code;
-    let retry_after = f.retry_after.or(error.retry_after_ms.map(|ms| ms.div_ceil(1000)));
+    let retry_after = f.retry_after;
     let reason = f.reason(&if code.is_empty() { message } else { format!("{code}: {message}") });
     let quota = code == "quota_exceeded" || code.starts_with("no_credit_") || code.ends_with("_limit_reached") || code == "daily_limit";
     match f.status {
@@ -299,7 +304,7 @@ fn classify(f: &Failure) -> ProtocolError {
         400..=499 if retry_after.is_some() && ![401, 402, 403, 404].contains(&f.status) => {
             ProtocolError::Unavailable { reason, retry_after, provider_error: None }
         }
-        _ => Failure { retry_after, ..*f }.standard(reason),
+        _ => f.standard(reason),
     }
 }
 fn platform() -> Platform {

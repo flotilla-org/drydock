@@ -33,7 +33,7 @@ pub struct Failure<'a> {
     pub operation: &'a str,
     pub status: u16,
     pub body: &'a [u8],
-    /// From the answer's headers, as [`Api::retry_after`] reads them.
+    /// From the answer, as [`Api::retry_after`] reads it.
     pub retry_after: Option<u64>,
 }
 impl Failure<'_> {
@@ -168,21 +168,29 @@ pub struct Api {
     auth: Auth,
     http: Arc<dyn HttpClient>,
     classify: fn(&Failure) -> ProtocolError,
-    retry_after: fn(&HeaderMap) -> Option<u64>,
+    retry_after: fn(&HeaderMap, &[u8]) -> Option<u64>,
 }
 impl Api {
     /// `base` must be an HTTPS URL without credentials or query.
     pub fn new(vendor: Vendor, base: &str, auth: Auth, http: Arc<dyn HttpClient>) -> Result<Self> {
         let base = https_base(vendor, base)?;
-        Ok(Self { vendor, base, auth, http, classify: |f| f.standard(f.reason(&f.message())), retry_after: retry_after_header })
+        Ok(Self {
+            vendor,
+            base,
+            auth,
+            http,
+            classify: |f| f.standard(f.reason(&f.message())),
+            retry_after: |headers, _| retry_after_header(headers),
+        })
     }
     /// The vendor's status table, in place of [`Failure::standard`] on its message.
     pub fn classify(mut self, classify: fn(&Failure) -> ProtocolError) -> Self {
         self.classify = classify;
         self
     }
-    /// How the vendor says when to retry, in place of `Retry-After` seconds.
-    pub fn retry_after(mut self, retry_after: fn(&HeaderMap) -> Option<u64>) -> Self {
+    /// How the vendor says when to retry (whole seconds, from an answer's headers
+    /// and body), in place of the `Retry-After` header.
+    pub fn retry_after(mut self, retry_after: fn(&HeaderMap, &[u8]) -> Option<u64>) -> Self {
         self.retry_after = retry_after;
         self
     }
@@ -264,7 +272,7 @@ impl Api {
     }
     /// The error a non-2xx answer is, by this vendor's table.
     pub fn failure(&self, operation: &str, response: &http::Response<Bytes>) -> ProtocolError {
-        let retry_after = (self.retry_after)(response.headers());
+        let retry_after = (self.retry_after)(response.headers(), response.body());
         (self.classify)(&Failure { vendor: self.vendor, operation, status: response.status().as_u16(), body: response.body(), retry_after })
     }
     /// A 2xx answer decoded as `T`; any other status as its error.
@@ -372,6 +380,14 @@ pub fn absent_on_not_found<T>(result: Result<T>) -> Result<Option<T>> {
         Err(ProtocolError::NotFound { .. }) => Ok(None),
         Err(error) => Err(error),
     }
+}
+/// Whether a refusal's `text` has any of `wording`, ignoring case. For a vendor
+/// that gives no code or status for a condition (a quota, say) and says it only
+/// in words: the module names the wording it matches next to the vendor it is
+/// from, so the match is one thing to read, check and replace.
+pub fn says(text: &str, wording: &[&str]) -> bool {
+    let text = text.to_ascii_lowercase();
+    wording.iter().any(|w| text.contains(&w.to_ascii_lowercase()))
 }
 /// A header value never shown in Debug output.
 pub fn sensitive(value: &str) -> std::result::Result<HeaderValue, http::header::InvalidHeaderValue> {
@@ -555,6 +571,17 @@ mod tests {
             assert_eq!(error, Vendor("Test").incomplete("GET /v1/a%20b"));
             assert!(!format!("{error:?}").contains("secret"), "{error:?}");
         }
+    }
+
+    // A vendor's hint is read from the answer's headers and body; its wording is matched without case.
+    #[tokio::test]
+    async fn retry_hints_and_wording() {
+        let (api, _) = api(Auth::Bearer, vec![(503, vec![], r#"{"wait":4}"#)]);
+        let api = api.retry_after(|_, body| serde_json::from_slice::<Value>(body).ok()?.get("wait")?.as_u64());
+        let down = api.get::<Value>(api.url(&["a"]).unwrap(), &key()).await.unwrap_err();
+        assert!(matches!(down, ProtocolError::Unavailable { retry_after: Some(4), .. }), "{down:?}");
+        assert!(says("Concurrent sandbox LIMIT reached", &["concurrent"]));
+        assert!(!says("slow down", &["concurrent", "quota"]));
     }
 
     // The standard table on the body's message, cut.

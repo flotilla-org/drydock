@@ -2,7 +2,7 @@
 use crate::{
     kit::{
         self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor, Verdict, Wait,
-        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
+        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, says, sensitive},
         egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
         guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name},
@@ -349,7 +349,8 @@ impl Module for E2bModule {
 
 fn classify(f: &Failure) -> ProtocolError {
     let message = f.message();
-    if f.status == 429 && message.to_ascii_lowercase().contains("concurrent") {
+    // E2B gives the concurrency quota a 429 like a rate limit and tells them apart only in words.
+    if f.status == 429 && says(&message, &["concurrent"]) {
         return ProtocolError::QuotaExhausted { reason: f.reason(&message) };
     }
     f.standard(f.reason(&message))
@@ -558,6 +559,9 @@ impl E2b {
     }
     async fn envd(&self, id: &str, url: &Url, body: impl Fn() -> Body, c: &Credentials) -> Result<http::Response<bytes::Bytes>> {
         let operation = kit::api::operation(&Method::POST, url);
+        // Not a retry policy: envd's access token is rotated by E2B (a connect or resume
+        // issues a new one), so a 401 on a held token is part of its auth. Read the current
+        // token from the sandbox and send the same request once more.
         for refreshed in [false, true] {
             let envd = match self.cached(id).envd {
                 Some(token) if !refreshed => Some(token),

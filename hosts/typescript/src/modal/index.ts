@@ -208,11 +208,11 @@ function protocolError(error: unknown): ProtocolFailure {
       kind: "refused",
       reason: `Modal refused the request: ${brief(detail)}`,
     });
+  // The SDK's class and the raw gRPC RESOURCE_EXHAUSTED code are one condition.
   if (error instanceof ResourceExhaustedError)
     return failure({
-      kind: "unavailable",
-      reason: "Modal has no capacity for the sandbox",
-      provider_error: detail,
+      kind: "rate_limited",
+      reason: `Modal: ${brief(detail)}`,
     });
   if (error instanceof ClientClosedError)
     return failure({

@@ -5,7 +5,7 @@
 use crate::{
     kit::{
         self, GIB, MIB, StateTable, Vendor, Verdict, Wait,
-        api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found},
+        api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found, says},
         egress::{ipv6, normal_cidr, normal_host, private_host},
         guest::{AgentTokens, Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile, sandbox_name as hashed_name},
@@ -273,9 +273,9 @@ fn classify(f: &Failure) -> ProtocolError {
     }
     let text =
         serde_json::from_slice::<Refusal>(f.body).map_or_else(|_| f.message(), |r| kit::api::cut(&r.error, kit::api::EXPLANATION_CHARS));
-    let lower = text.to_ascii_lowercase();
     match f.status {
-        400 if lower.contains("quota") || lower.contains("capacity") => ProtocolError::QuotaExhausted { reason: f.reason(&text) },
+        // A plan limit is a 400 like any other, told apart only in words.
+        400 if says(&text, &["quota", "capacity"]) => ProtocolError::QuotaExhausted { reason: f.reason(&text) },
         _ => f.standard(f.reason(&text)),
     }
 }
@@ -828,14 +828,16 @@ impl Provider for Tensorlake {
             })?;
             Ok::<_, ProtocolError>(tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await)
         };
-        let mut connected = connect(self.agents.get(self, id, c).await?).await?;
-        if connected.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
+        let connected = connect(self.agents.get(self, id, c).await?).await?;
+        // An agent that refuses the token may have restarted with a new one: drop ours,
+        // and the retry drydockd makes reads it again.
+        let retry_after = connected.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied).then(|| {
             self.agents.forget(id);
-            connected = connect(self.agents.get(self, id, c).await?).await?;
-        }
+            1
+        });
         connected.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
             reason: "the agent's TCP listener did not accept the tunnel".into(),
-            retry_after: None,
+            retry_after,
             provider_error: Some(error.to_string()),
         })
     }

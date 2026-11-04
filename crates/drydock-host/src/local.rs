@@ -604,7 +604,9 @@ impl SuspendResume for Local {
     }
 }
 
-/// Spawns `command`, retrying while its executable is busy. A thread of this
+/// Spawns `command`, retrying while its executable is busy. This is an operating-system
+/// race inside this process, not an answer from a provider, so no typed answer could carry
+/// it: it is gone before `provision` or `exec` could return one. A thread of this
 /// process that forks while another holds a just-copied executable open for
 /// writing passes the descriptor to its child until that child execs, and
 /// exec then fails with ETXTBSY. That lasts milliseconds, so up to eight
