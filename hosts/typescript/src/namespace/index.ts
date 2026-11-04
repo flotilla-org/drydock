@@ -24,6 +24,7 @@ import {
   type ProviderModule,
   type Types,
 } from "../provider.js";
+import { Clients } from "../clients.js";
 import { compile } from "../validation.js";
 import {
   call,
@@ -251,53 +252,21 @@ class Namespace implements Provider {
    * reads as paused_by_provider, which is still resumable.
    */
   private suspended = new Set<string>();
-  /** SDK clients by token, with the calls and relays using each. */
-  private clients = new Map<
-    string,
-    { vendor: Vendor; users: number; current: boolean }
-  >();
+  /** SDK clients by token. */
+  private clients: Clients<Vendor>;
 
   constructor(
     private name: string,
     private settings: Settings,
-    private connect: (token: string) => Vendor,
+    connect: (token: string) => Vendor,
     private fetcher: Fetch,
-  ) {}
-
-  /**
-   * The SDK client for the credential a call carries, held until `release`.
-   * A client a newer credential replaced closes once its last call and relay
-   * end, so rotating the credential never cuts a live agent connection.
-   */
-  private acquire(credential: string | undefined) {
-    const token = credentialToken(credential);
-    let client = this.clients.get(token);
-    if (!client?.current) {
-      for (const other of this.clients.values()) other.current = false;
-      client ??= { vendor: this.connect(token), users: 0, current: true };
-      client.current = true;
-      this.clients.set(token, client);
-    }
-    const held = client;
-    held.users++;
-    this.retire();
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      held.users--;
-      this.retire();
-    };
-    return { vendor: held.vendor, release };
+  ) {
+    this.clients = new Clients(connect);
   }
 
-  /** Closes replaced clients that nothing uses any more. */
-  private retire() {
-    for (const [token, client] of this.clients)
-      if (!client.current && client.users === 0) {
-        client.vendor.close();
-        this.clients.delete(token);
-      }
+  /** The SDK client for the credential a call carries, held until `release`. */
+  private acquire(credential: string | undefined) {
+    return this.clients.acquire(credentialToken(credential));
   }
 
   private async using<T>(

@@ -24,7 +24,7 @@ import {
 } from "../provider.js";
 import { checkReadopt, hex, requireOurs, sandboxName } from "../kit.js";
 import { compile } from "../validation.js";
-import { Clients } from "./clients.js";
+import { Clients } from "../clients.js";
 
 const MiB = 1024 * 1024;
 const TAGS = {
