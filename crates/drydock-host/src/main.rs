@@ -9,6 +9,7 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut registry = reference::registry();
     registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
+    registry.insert("e2b".into(), std::sync::Arc::new(drydock_host::e2b::E2bModule::new()));
     registry.insert("local".into(), std::sync::Arc::new(drydock_host::local::LocalModule));
     registry.insert("tensorlake".into(), std::sync::Arc::new(drydock_host::tensorlake::TensorlakeModule::new()?));
     let host = Host::new(registry);
