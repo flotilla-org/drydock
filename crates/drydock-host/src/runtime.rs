@@ -6,7 +6,7 @@ use crate::{
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::normal_host,
         guest::{AgentTokens, Guest, GuestOutput},
-        image::{check_prepare, check_prepared, content_name, platform_dockerfile},
+        image::{check_prepare, check_prepared, content_name, platform_dockerfile, sandbox_name},
     },
     module::*,
 };
@@ -414,13 +414,7 @@ impl Runtime {
                 v.name, self.name
             )));
         }
-        if self.environment(v)?.granted_size.as_ref() != Some(size) {
-            return Err(refused("an existing Runtime sandbox holds this label with a different size; provision a new label"));
-        }
-        if v.labels.get(POLICY_LABEL) != Some(&policy.fingerprint()) {
-            return Err(refused("an existing Runtime sandbox holds this label with a different egress policy; provision a new label"));
-        }
-        Ok(())
+        kit::check_readopt(RUNTIME, &self.environment(v)?, size, &policy.fingerprint(), kit::DiskMatch::Exact)
     }
     async fn confirm(&self, id: &str, policy: &Policy, c: &Credentials) -> Result<()> {
         let network = self.wait_enforced(id, c).await?;
@@ -553,7 +547,7 @@ impl Policy {
         Self { internet: self.internet || !allow.is_empty(), allow, deny: list(&self.deny), connect: list(&self.connect) }
     }
     fn fingerprint(&self) -> String {
-        kit::digest(&json!([self.internet, self.allow, self.deny, self.connect]).to_string())[..32].to_owned()
+        kit::fingerprint(&(self.internet, &self.allow, &self.deny, &self.connect))
     }
 }
 fn host_entry(host: &str) -> Result<String> {
@@ -583,9 +577,6 @@ fn egress_model() -> EgressModel {
     }
 }
 
-fn sandbox_name(instance: &str, label: &str) -> String {
-    content_name("dd-", 40, &[instance, label])
-}
 fn image_name(image: &str, platform: &Platform) -> String {
     content_name("dd-", 40, &[image, &platform.to_string()])
 }
@@ -672,7 +663,7 @@ impl Provider for Runtime {
         let policy = Policy::request(&r.egress)?;
         let paid = !trial(&self.limits(c).await?);
         let body = CreateSandbox {
-            name: sandbox_name(&self.name, &r.label),
+            name: sandbox_name("dd-", &self.name, &r.label),
             labels: BTreeMap::from([(PROVIDER_TAG, self.name.clone()), (LABEL_TAG, r.label.clone()), (POLICY_LABEL, policy.fingerprint())]),
             image: &r.prepared.id,
             vcpu: r.size.cpus as u64,

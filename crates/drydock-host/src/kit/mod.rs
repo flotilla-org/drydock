@@ -152,6 +152,41 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// The identity of an egress policy, which a module normalizes first (sorted
+/// sets, canonical hosts and CIDRs) so the same request always has the same one:
+/// 128 bits of the digest of its JSON. It is what [`Environment`]'s
+/// `egress_policy` reports and what [`check_readopt`] compares.
+pub fn fingerprint(normalized_policy: &impl serde::Serialize) -> String {
+    digest(&serde_json::to_string(normalized_policy).expect("a policy is JSON"))[..32].to_owned()
+}
+
+/// Whether a disk read back may be larger than the request (a vendor whose
+/// disk comes with the prepared form), or must equal it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DiskMatch {
+    Exact,
+    AtLeast,
+}
+/// Re-adoption of a label: the environment the module read back for it holds
+/// the size and egress policy now requested, else it is refused and the caller
+/// provisions a new label. `held` is the module's own reading of the vendor's
+/// resource (its `granted_size` and `egress_policy`); `egress_policy` is what
+/// [`fingerprint`] says of the request.
+pub fn check_readopt(vendor: Vendor, held: &Environment, size: &Size, egress_policy: &str, disk: DiskMatch) -> Result<()> {
+    let same_size = held.granted_size.as_ref().is_some_and(|g| {
+        g.cpus == size.cpus
+            && g.memory_bytes == size.memory_bytes
+            && match disk {
+                DiskMatch::Exact => g.disk_bytes == size.disk_bytes,
+                DiskMatch::AtLeast => size.disk_bytes <= g.disk_bytes,
+            }
+    });
+    if same_size && held.egress_policy.as_deref() == Some(egress_policy) {
+        return Ok(());
+    }
+    Err(refused(format!("an existing {vendor} sandbox holds this label with a different size or egress policy; provision a new label")))
+}
+
 /// A size read back from the vendor in whole units: all three positive, or
 /// none. A size too large for bytes is a bad response.
 pub fn granted(
@@ -214,6 +249,7 @@ pub fn shell_command(argv: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     // Each argument survives sh -c as itself, quotes included.
     #[test]
@@ -265,6 +301,39 @@ mod tests {
         assert!(matches!(wait.until("slow", async || Ok(9), judge).await, Err(ProtocolError::Refused { .. })));
         let none = Wait { attempts: 0, ..wait };
         assert!(none.until("slow", async || -> Result<u32> { panic!("read") }, judge).await.is_err());
+    }
+
+    // A policy has one identity however its sets were written down, and a
+    // label is re-adopted only when size and policy both match.
+    #[test]
+    fn readoption_compares_size_and_policy() {
+        let v = Vendor("Test");
+        let id = fingerprint(&(true, BTreeSet::from(["a".to_owned(), "b".to_owned()])));
+        assert_eq!(id, fingerprint(&(true, BTreeSet::from(["b".to_owned(), "a".to_owned()]))));
+        assert_ne!(id, fingerprint(&(false, BTreeSet::from(["a".to_owned(), "b".to_owned()]))));
+        let size = Size { cpus: 2.0, memory_bytes: GIB, disk_bytes: 4 * GIB };
+        let held = |size: Size, policy: &str| Environment {
+            id: "x".into(),
+            provider: "p".into(),
+            label: None,
+            state: Observation::Running,
+            granted_size: Some(size),
+            egress: Enforcement::Advisory,
+            platform: None,
+            egress_measured: false,
+            egress_policy: Some(policy.into()),
+            timestamp: None,
+        };
+        assert!(check_readopt(v, &held(size.clone(), &id), &size, &id, DiskMatch::Exact).is_ok());
+        let bigger = Size { disk_bytes: 8 * GIB, ..size.clone() };
+        assert!(check_readopt(v, &held(bigger.clone(), &id), &size, &id, DiskMatch::Exact).is_err());
+        assert!(check_readopt(v, &held(bigger, &id), &size, &id, DiskMatch::AtLeast).is_ok());
+        let smaller = Size { disk_bytes: 2 * GIB, ..size.clone() };
+        assert!(check_readopt(v, &held(smaller, &id), &size, &id, DiskMatch::AtLeast).is_err());
+        assert!(check_readopt(v, &held(size.clone(), "other"), &size, &id, DiskMatch::Exact).is_err());
+        let mut unsized_ = held(size.clone(), &id);
+        unsized_.granted_size = None;
+        assert!(check_readopt(v, &unsized_, &size, &id, DiskMatch::Exact).is_err());
     }
 
     #[test]

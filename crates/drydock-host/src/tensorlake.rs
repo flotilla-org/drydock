@@ -8,7 +8,7 @@ use crate::{
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found},
         egress::{ipv6, normal_cidr, normal_host, private_host},
         guest::{AgentTokens, Guest, GuestOutput},
-        image::{check_prepare, check_prepared, content_name, platform_dockerfile},
+        image::{check_prepare, check_prepared, content_name, platform_dockerfile, sandbox_name as hashed_name},
     },
     module::*,
     oci::ImageRef,
@@ -364,11 +364,7 @@ impl Tensorlake {
     }
     async fn adopt(&self, row: Sandbox, size: &Size, policy: &Policy, c: &Credentials) -> Result<Environment> {
         let existing = self.environment(&row)?;
-        if existing.granted_size.as_ref() != Some(size) || &Policy::read(row.network_policy.as_ref()) != policy {
-            return Err(refused(
-                "an existing Tensorlake sandbox holds this label with a different size or egress policy; provision a new label",
-            ));
-        }
+        kit::check_readopt(TENSORLAKE, &existing, size, &policy.fingerprint(), kit::DiskMatch::Exact)?;
         if &*row.status == "pending" {
             self.wait_running(&existing.id, c).await?;
             return self.inspect(&existing.id, c).await;
@@ -560,10 +556,7 @@ impl Policy {
         Self(Some(Rules { allow_internet_access, allow_out }))
     }
     fn fingerprint(&self) -> String {
-        kit::digest(&match &self.0 {
-            None => "open".to_owned(),
-            Some(rules) => format!("{}\0{}", rules.allow_internet_access, rules.allow_out.iter().cloned().collect::<Vec<_>>().join("\0")),
-        })
+        kit::fingerprint(&self.0.as_ref().map(|rules| (rules.allow_internet_access, &rules.allow_out)))
     }
 }
 
@@ -587,7 +580,8 @@ fn sandbox_name(instance: &str, label: &str) -> String {
     if !label.is_empty() && encoded.len() <= room {
         return format!("{prefix}b-{encoded}");
     }
-    format!("{prefix}h-{}", &kit::digest(&format!("{instance}\0{label}"))[..40])
+    // The label cannot be read back from this form.
+    hashed_name(&format!("{prefix}h-"), instance, label)
 }
 fn label_of(prefix: &str, name: &str) -> Option<String> {
     let rest = name.strip_prefix(prefix)?;

@@ -693,7 +693,7 @@ impl Policy {
         }
     }
     fn fingerprint(&self) -> String {
-        kit::digest(&format!("{:?}", (&self.deny_out, &self.allow_out, self.public_traffic)))
+        kit::fingerprint(&(&self.deny_out, &self.allow_out, self.public_traffic))
     }
 }
 
@@ -810,15 +810,8 @@ impl Provider for E2b {
         let policy = Policy::request(&r.egress)?;
         if let Some(v) = self.ours_listed(Some(&r.label), c).await?.into_iter().next() {
             let existing = self.environment(&v)?;
-            let same_size = existing
-                .granted_size
-                .as_ref()
-                .is_some_and(|g| g.cpus == r.size.cpus && g.memory_bytes == r.size.memory_bytes && r.size.disk_bytes <= g.disk_bytes);
-            if !same_size || v.network.as_ref().map(Policy::read) != Some(policy) {
-                return Err(refused(
-                    "an existing E2B sandbox holds this label with a different size or egress policy; provision a new label",
-                ));
-            }
+            // The template fixes the disk: a sandbox may hold more than the request.
+            kit::check_readopt(E2B, &existing, &r.size, &policy.fingerprint(), kit::DiskMatch::AtLeast)?;
             return Ok(Provisioned::Existing(existing));
         }
         let body = NewSandbox {

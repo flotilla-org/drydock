@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
 import {
@@ -22,6 +22,7 @@ import {
   type ProviderModule,
   type Types,
 } from "../provider.js";
+import { checkReadopt, hex, requireOurs, sandboxName } from "../kit.js";
 import { compile } from "../validation.js";
 import { Clients } from "./clients.js";
 
@@ -70,8 +71,6 @@ const settingsValid = compile({
     concurrency_limit: { type: "integer", minimum: 1 },
   },
 });
-
-const hex = (value: string) => createHash("sha256").update(value).digest("hex");
 
 const PRIVATE = new BlockList();
 for (const [address, prefix] of [
@@ -477,7 +476,7 @@ class Modal implements Provider {
       [TAGS.egress]: policyIdentity(network),
       [TAGS.size]: `${cpu}/${memoryMiB}`,
     };
-    const name = `drydock-${hex(request.label).slice(0, 24)}`;
+    const name = sandboxName("drydock-", this.name, request.label);
     return this.using(credential, async (client) => {
       const app = await this.app(client);
       let image;
@@ -543,14 +542,11 @@ class Modal implements Provider {
       refused(
         "a Modal sandbox with this label's name belongs to another provider or label",
       );
-    for (const [tag, what] of [
-      [TAGS.size, "size"],
-      [TAGS.egress, "egress policy"],
-    ])
-      if (actual[tag] !== wanted[tag])
-        refused(
-          `existing Modal sandbox for this label has a different ${what} (${actual[tag] ?? "none"}, requested ${wanted[tag]}); provision a new label`,
-        );
+    checkReadopt(
+      "Modal",
+      { size: actual[TAGS.size] ?? null, egress: actual[TAGS.egress] ?? null },
+      { size: wanted[TAGS.size], egress: wanted[TAGS.egress] },
+    );
   }
 
   private async ensureAgent(sandbox: Sandbox) {
@@ -633,8 +629,7 @@ class Modal implements Provider {
     const tags = await call(() => sandbox.getTags());
     // Absent is not_found, which destroy treats as done; a sandbox that exists
     // but was not made by this provider is refused, and left alone.
-    if (tags[TAGS.provider] !== this.name)
-      refused(`Modal sandbox ${id} was not made by provider ${this.name}`);
+    requireOurs("Modal", id, tags, this.name);
     return { sandbox, tags };
   }
 
