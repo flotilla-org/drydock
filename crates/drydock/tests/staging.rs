@@ -291,6 +291,7 @@ impl Provider for PullingProvider {
             usage: false,
             quota: false,
             host_filesystem: false,
+            exclusive_label: false,
             agent_tcp_port: None,
         }
     }

@@ -554,7 +554,13 @@ impl Target<'_> {
         let options = self.options;
 
         owned_ids.register(&options.request);
-        let (first, second) = tokio::join!(client.provision(provider, &options.request), client.provision(provider, &options.request));
+        let (first, second) = if self.caps.exclusive_label {
+            let (first, second) = tokio::join!(client.provision(provider, &options.request), client.provision(provider, &options.request));
+            (first, Some(second))
+        } else {
+            report.not_applicable("concurrent_label", "the provider declares no exclusive label");
+            (client.provision(provider, &options.request).await, None)
+        };
         let first_created = first.as_ref().ok().map(|row| matches!(row, Provisioned::Created(_)));
         let environment = match first {
             Ok(row) => row.into_inner(),
@@ -565,18 +571,23 @@ impl Target<'_> {
             }
         };
         owned_ids.insert(environment.id.clone());
-        report.record(
-            "concurrent_label",
-            async {
-                let second = second.map_err(SafeError::category)?;
-                let created = matches!(second, Provisioned::Created(_));
-                let other = second.into_inner();
-                let same = other.id == environment.id;
-                owned_ids.insert(other.id.clone());
-                require(first_created == Some(!created) && same, "concurrent retries must return one creation and one existing resource")
-            }
-            .await,
-        );
+        if let Some(second) = second {
+            report.record(
+                "concurrent_label",
+                async {
+                    let second = second.map_err(SafeError::category)?;
+                    let created = matches!(second, Provisioned::Created(_));
+                    let other = second.into_inner();
+                    let same = other.id == environment.id;
+                    owned_ids.insert(other.id.clone());
+                    require(
+                        first_created == Some(!created) && same,
+                        "concurrent retries must return one creation and one existing resource",
+                    )
+                }
+                .await,
+            );
+        }
         report.record(
             "provision",
             require(

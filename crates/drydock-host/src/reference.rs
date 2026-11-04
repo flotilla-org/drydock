@@ -147,6 +147,7 @@ impl Provider for Reference {
             usage: true,
             quota: true,
             host_filesystem: self.settings.host_filesystem,
+            exclusive_label: true,
             agent_tcp_port: None,
         }
     }

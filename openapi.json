@@ -2315,6 +2315,10 @@
           "egress": {
             "$ref": "#/components/schemas/EgressCapability"
           },
+          "exclusive_label": {
+            "type": "boolean",
+            "description": "Concurrent provisions of one label return one environment: the provider\nrefuses a second sandbox for a label. Without it, a retry after a\nprovision has returned still returns that environment, but concurrent\nprovisions may each create one."
+          },
           "export": {
             "type": "boolean"
           },
