@@ -198,6 +198,11 @@ pub fn check_readopt(vendor: Vendor, held: &Environment, size: &Size, egress_pol
     if same_size && held.egress_policy.as_deref() == Some(egress_policy) {
         return Ok(());
     }
+    if held.granted_size.is_none() || held.egress_policy.is_none() {
+        return Err(refused(format!(
+            "an existing {vendor} sandbox holds this label but its size or egress policy cannot be read; provision a new label"
+        )));
+    }
     Err(refused(format!("an existing {vendor} sandbox holds this label with a different size or egress policy; provision a new label")))
 }
 

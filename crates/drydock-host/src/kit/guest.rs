@@ -96,8 +96,14 @@ const TOKEN_TTL: Duration = Duration::from_secs(60);
 /// (suspend, resume, destroy) or the agent refused it; the next
 /// [`AgentTokens::get`] reads it again.
 pub struct AgentTokens {
-    tokens: Mutex<HashMap<String, (Token, Instant)>>,
+    state: Mutex<Kept>,
     ttl: Duration,
+}
+#[derive(Default)]
+struct Kept {
+    tokens: HashMap<String, (Token, Instant)>,
+    /// Drops so far: a read that began before one must not keep what it read.
+    forgets: u64,
 }
 impl Default for AgentTokens {
     fn default() -> Self {
@@ -106,25 +112,34 @@ impl Default for AgentTokens {
 }
 impl AgentTokens {
     pub fn with_ttl(ttl: Duration) -> Self {
-        Self { tokens: Mutex::default(), ttl }
+        Self { state: Mutex::default(), ttl }
     }
     /// The token the agent in `id` prints. A guest that cannot print one yet
     /// (the agent is not up, or the file is not written) is Unavailable: try again.
     pub async fn get(&self, guest: &(impl Guest + ?Sized), id: &str, c: &Credentials) -> Result<Token> {
-        if let Some((token, _)) = self.tokens.recover().get(id).filter(|(_, read)| read.elapsed() < self.ttl) {
-            return Ok(token.clone());
-        }
+        let forgets = {
+            let kept = self.state.recover();
+            if let Some((token, _)) = kept.tokens.get(id).filter(|(_, read)| read.elapsed() < self.ttl) {
+                return Ok(token.clone());
+            }
+            kept.forgets
+        };
         let output = guest.run(id, &print_token(), BTreeMap::new(), c).await?;
         let stdout = String::from_utf8_lossy(&output.stdout()).into_owned();
         let token = (output.exit_code() == 0)
             .then(|| stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).and_then(|line| Token::parse(line).ok()))
             .flatten()
             .ok_or_else(|| ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", guest.vendor()), Some(2)))?;
-        self.tokens.recover().insert(id.to_owned(), (token.clone(), Instant::now()));
+        let mut kept = self.state.recover();
+        if kept.forgets == forgets {
+            kept.tokens.insert(id.to_owned(), (token.clone(), Instant::now()));
+        }
         Ok(token)
     }
     pub fn forget(&self, id: &str) {
-        self.tokens.recover().remove(id);
+        let mut kept = self.state.recover();
+        kept.forgets += 1;
+        kept.tokens.remove(id);
     }
 }
 
@@ -143,6 +158,27 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(GuestOutput::from_text(self.1, "", Some(self.2)))
         }
+    }
+
+    // A drop that lands while a read is in flight wins: the token that read is not kept.
+    #[tokio::test]
+    async fn a_forget_during_a_read_is_not_overwritten() {
+        struct Racing<'a>(&'a AgentTokens, String);
+        #[async_trait]
+        impl Guest for Racing<'_> {
+            fn vendor(&self) -> Vendor {
+                Vendor("Test")
+            }
+            async fn run(&self, id: &str, _: &str, _: BTreeMap<&str, String>, _: &Credentials) -> Result<GuestOutput> {
+                self.0.forget(id);
+                Ok(GuestOutput::from_text(&format!("drydock-tcp-token {}\n", self.1), "", Some(0)))
+            }
+        }
+        let tokens = AgentTokens::default();
+        let guest = Racing(&tokens, "A".repeat(43));
+        let c = Credentials::default();
+        tokens.get(&guest, "a", &c).await.unwrap();
+        assert!(tokens.state.recover().tokens.is_empty());
     }
 
     // The token is read once and kept until dropped; a guest that prints none,
