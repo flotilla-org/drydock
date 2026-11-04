@@ -188,12 +188,6 @@ struct Charge {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Events {
-    data: Vec<Event>,
-    next_cursor: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Event {
     #[serde(rename = "type")]
     kind: String,
@@ -914,26 +908,17 @@ impl UsageOperation for Runtime {
 impl Runtime {
     // Events come newest first: https://withruntime.com/docs/api
     async fn events(&self, resource: Option<&str>, from: DateTime<Utc>, c: &Credentials) -> Result<Vec<Event>> {
-        let mut events = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..kit::api::MAX_PAGES {
-            let mut url = self.api.url(&["events"])?;
-            url.query_pairs_mut().append_pair("limit", "100");
-            if let Some(id) = resource {
-                url.query_pairs_mut().append_pair("resourceId", id);
-            }
-            if let Some(cursor) = &cursor {
-                url.query_pairs_mut().append_pair("cursor", cursor);
-            }
-            let page: Events = self.api.get(url, c).await?;
-            let past = page.data.last().is_none_or(|e| e.created_at < from);
-            events.extend(page.data);
-            match page.next_cursor {
-                Some(next) if !past => cursor = Some(next),
-                _ => return Ok(events),
-            }
+        let mut url = self.api.url(&["events"])?;
+        url.query_pairs_mut().append_pair("limit", "100");
+        if let Some(id) = resource {
+            url.query_pairs_mut().append_pair("resourceId", id);
         }
-        Err(RUNTIME.bad_response())
+        // Read back to the first page that reaches `from`.
+        let reached = |page: &[Event]| page.last().is_none_or(|e| e.created_at < from);
+        match self.api.paged_until(url, &PAGED, kit::api::MAX_PAGES, c, reached).await? {
+            (events, true) => Ok(events),
+            _ => Err(RUNTIME.bad_response()),
+        }
     }
 }
 fn is_lifecycle(e: &Event) -> bool {

@@ -38,6 +38,7 @@ const DETAIL_READS: usize = 8;
 const EVENT_PAGE: usize = 100;
 const EVENT_PAGES: usize = 100;
 const SANDBOX_PAGES: Paging = Paging { rows: None, cursor: "nextToken", next: Next::Header("x-next-token") };
+const EVENT_PAGES_BY_OFFSET: Paging = Paging { rows: None, cursor: "offset", next: Next::Offset(EVENT_PAGE) };
 const BUILD_PAGES: Paging = Paging { rows: Some("builds"), cursor: "nextToken", next: Next::Header("x-next-token") };
 const RESUME_PREFIX: &str = "e2b-resume-";
 
@@ -946,34 +947,27 @@ impl UsageOperation for E2b {
         let (from, to) = (period.start().instant(), period.end().instant());
         let mut executions: BTreeMap<(String, DateTime<Utc>), (DateTime<Utc>, u64, u64, Disk)> = BTreeMap::new();
         let mut seen = BTreeSet::new();
-        let mut complete = false;
-        'pages: for page in 0..EVENT_PAGES {
-            let mut url = self.api.url(&["events", "sandboxes"])?;
-            url.query_pairs_mut()
-                .append_pair("offset", &(page * EVENT_PAGE).to_string())
-                .append_pair("limit", &EVENT_PAGE.to_string())
-                .append_pair("orderAsc", "false")
-                .append_pair("types", "sandbox.lifecycle.paused")
-                .append_pair("types", "sandbox.lifecycle.killed");
-            let events: Vec<Event> = self.api.get(url, c).await?;
-            for event in &events {
-                if event.timestamp < from {
-                    complete = true;
-                    break 'pages;
-                }
-                if !seen.insert(event.id.to_string()) || event.data.sandbox_metadata.get(PROVIDER_TAG) != Some(&self.name) {
-                    continue;
-                }
-                let Some(x) = &event.data.execution else { continue };
-                let row = (event.timestamp, x.vcpu_count, x.memory_mb, Disk::Build(event.template.to_string(), event.build.to_string()));
-                let entry = executions.entry((event.sandbox.to_string(), x.started_at)).or_insert_with(|| row.clone());
-                if event.timestamp < entry.0 {
-                    *entry = row;
-                }
-            }
-            if events.len() < EVENT_PAGE {
-                complete = true;
+        let mut url = self.api.url(&["events", "sandboxes"])?;
+        url.query_pairs_mut()
+            .append_pair("limit", &EVENT_PAGE.to_string())
+            .append_pair("orderAsc", "false")
+            .append_pair("types", "sandbox.lifecycle.paused")
+            .append_pair("types", "sandbox.lifecycle.killed");
+        // Newest first: read back to the first page that reaches `from`.
+        let reached = |page: &[Event]| page.iter().any(|e| e.timestamp < from);
+        let (events, complete) = self.api.paged_until(url, &EVENT_PAGES_BY_OFFSET, EVENT_PAGES, c, reached).await?;
+        for event in &events {
+            if event.timestamp < from {
                 break;
+            }
+            if !seen.insert(event.id.to_string()) || event.data.sandbox_metadata.get(PROVIDER_TAG) != Some(&self.name) {
+                continue;
+            }
+            let Some(x) = &event.data.execution else { continue };
+            let row = (event.timestamp, x.vcpu_count, x.memory_mb, Disk::Build(event.template.to_string(), event.build.to_string()));
+            let entry = executions.entry((event.sandbox.to_string(), x.started_at)).or_insert_with(|| row.clone());
+            if event.timestamp < entry.0 {
+                *entry = row;
             }
         }
         if !complete {

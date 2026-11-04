@@ -157,6 +157,8 @@ pub struct Paging {
 pub enum Next {
     Body(&'static [&'static str]),
     Header(&'static str),
+    /// An offset: the rows read so far, while a page comes back full at this size.
+    Offset(usize),
 }
 
 /// One vendor API: its base URL, how its key travels, and how its refusals
@@ -325,14 +327,29 @@ impl Api {
     pub async fn find<T: DeserializeOwned>(&self, url: Url, c: &Credentials) -> Result<Option<T>> {
         absent_on_not_found(self.get(url, c).await)
     }
-    /// Every row of a cursor-paged list, following each cursor once: a
-    /// repeated cursor, one that is not text, or more than [`MAX_PAGES`]
-    /// pages is a bad response, never a loop or a silently short list.
+    /// Every row of a paged list, following each cursor once: a repeated cursor,
+    /// one that is not text, or more than [`MAX_PAGES`] pages is a bad response,
+    /// never a loop or a silently short list.
     pub async fn paged<T: DeserializeOwned>(&self, url: Url, paging: &Paging, c: &Credentials) -> Result<Vec<T>> {
+        let (rows, ended) = self.paged_until(url, paging, MAX_PAGES, c, |_| false).await?;
+        if ended { Ok(rows) } else { Err(self.vendor.bad_response()) }
+    }
+    /// The rows of a paged list read until `done` says a page holds what the
+    /// caller needs (a list newest first, read back to a date), the list ends, or
+    /// `max_pages` have been read. True when the list ended or `done` said so:
+    /// false is a list cut short at `max_pages`, for the caller to say what that means.
+    pub async fn paged_until<T: DeserializeOwned>(
+        &self,
+        url: Url,
+        paging: &Paging,
+        max_pages: usize,
+        c: &Credentials,
+        mut done: impl FnMut(&[T]) -> bool,
+    ) -> Result<(Vec<T>, bool)> {
         let mut rows = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = BTreeSet::new();
-        loop {
+        for _ in 0..max_pages.min(MAX_PAGES) {
             let mut page_url = url.clone();
             if let Some(cursor) = &cursor {
                 page_url.query_pairs_mut().append_pair(paging.cursor, cursor);
@@ -346,7 +363,11 @@ impl Api {
             };
             let page_rows: Vec<T> =
                 serde_json::from_value(page_rows.unwrap_or_default()).map_err(|_| self.vendor.incomplete(&operation))?;
+            let (count, finished) = (page_rows.len(), done(&page_rows));
             rows.extend(page_rows);
+            if finished {
+                return Ok((rows, true));
+            }
             let next = match &paging.next {
                 Next::Body(keys) => match keys.iter().find_map(|key| page.get(*key).filter(|v| !v.is_null())) {
                     Some(value) => Some(value.as_str().ok_or_else(|| self.vendor.bad_response())?.to_owned()),
@@ -356,13 +377,16 @@ impl Api {
                     Some(value) => Some(value.to_str().map_err(|_| self.vendor.bad_response())?.to_owned()),
                     None => None,
                 },
+                // A full page means there may be more, at the offset after the rows so far.
+                Next::Offset(size) => (count >= *size).then(|| rows.len().to_string()),
             };
             match next.filter(|n| !n.is_empty()) {
-                None => return Ok(rows),
-                Some(next) if seen.len() + 1 < MAX_PAGES && seen.insert(next.clone()) => cursor = Some(next),
+                None => return Ok((rows, true)),
+                Some(next) if seen.insert(next.clone()) => cursor = Some(next),
                 Some(_) => return Err(self.vendor.bad_response()),
             }
         }
+        Ok((rows, false))
     }
 }
 
@@ -491,6 +515,24 @@ mod tests {
         answer.headers_mut().insert("x-next", HeaderValue::from_bytes(b"\xff").unwrap());
         script.raw.lock().unwrap().push(answer);
         assert_eq!(api.paged::<u8>(url, &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
+    }
+
+    // An offset cursor is the rows so far, followed while pages come back full;
+    // a stop condition ends the read at the page that satisfies it, and a page
+    // cap says so rather than returning a list that looks whole.
+    #[tokio::test]
+    async fn offset_paging_stops_when_told_or_capped() {
+        let paging = Paging { rows: None, cursor: "offset", next: Next::Offset(2) };
+        let fresh = || api(Auth::Bearer, vec![(200, vec![], "[1,2]"), (200, vec![], "[3,4]"), (200, vec![], "[5]")]);
+        let (client, script) = fresh();
+        let url = client.url(&["rows"]).unwrap();
+        assert_eq!(client.paged_until::<u8>(url.clone(), &paging, 10, &key(), |_| false).await.unwrap(), (vec![1, 2, 3, 4, 5], true));
+        let asked: Vec<_> = script.asked.lock().unwrap().iter().map(|r| r.url().to_string()).collect();
+        assert_eq!(asked, ["https://api.test/v1/rows", "https://api.test/v1/rows?offset=2", "https://api.test/v1/rows?offset=4"]);
+        let stop = |page: &[u8]| page.contains(&3);
+        assert_eq!(fresh().0.paged_until::<u8>(url.clone(), &paging, 10, &key(), stop).await.unwrap(), (vec![1, 2, 3, 4], true));
+        assert_eq!(fresh().0.paged_until::<u8>(url.clone(), &paging, 1, &key(), |_| false).await.unwrap(), (vec![1, 2], false));
+        assert_eq!(fresh().0.paged::<u8>(url, &paging, &key()).await.unwrap(), [1, 2, 3, 4, 5]);
     }
 
     // A vendor that never stops handing out fresh cursors ends the list
