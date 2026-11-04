@@ -228,6 +228,10 @@ impl ProviderApi for Host {
         let provider = self.instance(p).await?;
         Ok(port(provider.operations().files)?.put(id, file.clone(), bytes, &self.credentials).await?)
     }
+    async fn push_access(&self, p: &str) -> ApiResult<PushAccess> {
+        let provider = self.instance(p).await?;
+        Ok(port(provider.operations().push_access)?.push_access(&self.credentials).await?)
+    }
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi> {
         Arc::new(Self { credentials: Credentials::new(Some(credential)), ..self.clone() })
     }

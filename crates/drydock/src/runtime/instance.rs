@@ -83,6 +83,7 @@ pub(super) enum Gate {
     Export,
     Exec,
     Files,
+    PushAccess,
     Usage,
     Quota,
 }
@@ -101,6 +102,7 @@ impl Gate {
             Self::Export => "export",
             Self::Exec => "exec",
             Self::Files => "files",
+            Self::PushAccess => "push_access",
             Self::Usage => "usage",
             Self::Quota => "quota",
         }
@@ -128,7 +130,7 @@ impl Gate {
             Self::Export => c.export,
             Self::Exec => c.fallback_runner,
             // The port itself is the declaration.
-            Self::Files => true,
+            Self::Files | Self::PushAccess => true,
             Self::Usage => c.usage,
             Self::Quota => c.quota,
         }

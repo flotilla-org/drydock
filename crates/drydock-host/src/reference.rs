@@ -112,7 +112,15 @@ impl Provider for Reference {
         ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
     }
     fn operations(&self) -> Operations<'_> {
-        Operations { exec: Some(self), suspend_resume: Some(self), export: Some(self), usage: Some(self), quota: Some(self), files: None }
+        Operations {
+            exec: Some(self),
+            suspend_resume: Some(self),
+            export: Some(self),
+            usage: Some(self),
+            quota: Some(self),
+            files: None,
+            push_access: None,
+        }
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {

@@ -162,6 +162,7 @@ pub struct Operations<'a> {
     pub usage: Option<&'a dyn UsageOperation>,
     pub quota: Option<&'a dyn QuotaOperation>,
     pub files: Option<&'a dyn GuestFiles>,
+    pub push_access: Option<&'a dyn PushAccessOperation>,
 }
 #[async_trait]
 pub trait Exec: Send + Sync {
@@ -176,6 +177,12 @@ pub trait GuestFiles: Send + Sync {
     /// replacing what is there. The file is complete, and has its mode, only
     /// when this returns: callers rely on neither before.
     async fn put(&self, id: &str, file: GuestFile, bytes: bytes::Bytes, c: &Credentials) -> Result<()>;
+}
+/// Mints push access to the provider's own registry, where drydockd copies
+/// an image for the [`ImageRoute::ProviderPush`] route.
+#[async_trait]
+pub trait PushAccessOperation: Send + Sync {
+    async fn push_access(&self, c: &Credentials) -> Result<PushAccess>;
 }
 #[async_trait]
 pub trait SuspendResume: Send + Sync {
@@ -204,6 +211,7 @@ impl From<Operations<'_>> for Ports {
             usage: p.usage.is_some(),
             quota: p.quota.is_some(),
             files: p.files.is_some(),
+            push_access: p.push_access.is_some(),
         }
     }
 }
@@ -240,6 +248,8 @@ mod tests {
             protocol: PushProtocol::OciDistribution,
             credential_lifetime_seconds: None,
             tools_layer: ToolsLayer::Host,
+            max_image_bytes: None,
+            chunk_bytes: None,
         };
         let pull = ImageRoute::RegistryPull {
             auth: RegistryAuthKind::Basic,

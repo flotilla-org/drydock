@@ -472,11 +472,13 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
     };
     let first = client.prepare(provider, &request).await.map_err(SafeError::category)?;
     let second = client.prepare(provider, &request).await.map_err(SafeError::category)?;
+    // The image_digest comparison is removed until prepare reports the copy
+    // and the build it caused (drydock#259): drydockd's staged copy is
+    // truthfully not the requested digest.
     require(
         first == second
             && first.provider == provider
             && !first.id.is_empty()
-            && first.image_digest == request.image_digest
             && first.tools_digest == request.tools_digest
             && request.platform.as_ref() == Some(&first.platform),
         "prepare must be idempotent and preserve provider/digest/platform identity",

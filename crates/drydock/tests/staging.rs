@@ -1,6 +1,7 @@
 //! Staging through drydockd's prepare: an image a registry-pull provider cannot
 //! reach is copied once into a registry it can pull from, and the host is
-//! handed that copy. drydock#190.
+//! handed that copy (drydock#190). On the provider-push route the copy goes
+//! into the provider's own registry with access it mints.
 #![cfg(unix)]
 use async_trait::async_trait;
 use base64::Engine;
@@ -26,6 +27,11 @@ const LAB: &str = "lab.test";
 const STAGE: &str = "stage.test";
 const STAGED: &str = "stage.test/org/staging";
 const MIRROR: &str = "quay.test/org/mirror";
+/// A provider's own registry, which it mints push access to.
+const OWN: &str = "harbor.test";
+const OWN_REPOSITORY: &str = "project/drydock-vessel";
+/// The public tools registry: anyone may pull.
+const TOOLS: &str = "tools.test";
 const CHUNK: u64 = 256;
 /// GHCR's limit on one upload request's body.
 const PATCH_LIMIT: usize = 4 << 20;
@@ -48,10 +54,11 @@ struct Account {
     secret: &'static str,
     push: bool,
 }
-const ACCOUNTS: [Account; 3] = [
+const ACCOUNTS: [Account; 4] = [
     Account { host: LAB, user: "lab-user", secret: "lab-secret", push: false },
     Account { host: STAGE, user: "bot", secret: "push-token", push: true },
     Account { host: STAGE, user: "bot", secret: "pull-token", push: false },
+    Account { host: OWN, user: "robot$drydock", secret: "minted-secret", push: true },
 ];
 
 #[derive(Default)]
@@ -70,6 +77,13 @@ struct Oci {
     refuse_push: Option<u16>,
     /// The message it refuses with, when not the usual one.
     refusal_message: Option<String>,
+    /// The provider's registry serves a new manifest only after this many reads.
+    visibility_delay: usize,
+    hidden: BTreeMap<String, usize>,
+    /// Source registries answer ranged reads with the whole blob.
+    ignore_range: bool,
+    /// The provider's registry refuses the next tag put.
+    refuse_tag_once: bool,
     violations: Vec<String>,
 }
 /// Stands in for the network boundary to every registry: the OCI distribution
@@ -102,6 +116,11 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
     let authorization = request.headers().get("authorization").map(|v| v.to_str().unwrap().to_owned());
     if path == "/token" {
         let account = ACCOUNTS.iter().find(|a| authorization.as_deref() == Some(&basic(a.user, a.secret)));
+        if account.is_none() && authorization.is_none() && host == TOOLS {
+            let token = format!("token-{}", s.tokens.len());
+            s.tokens.insert(token.clone(), (host, false));
+            return reply(200, &[], Bytes::from(json!({ "token": token }).to_string()));
+        }
         let Some(account) = account else { return reply(401, &[], Bytes::new()) };
         s.signins.push((host.clone(), account.host));
         if account.host != host {
@@ -128,13 +147,27 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
                 s.violations.push("manifest put before its blobs".into());
                 return reply(400, &[], Bytes::new());
             }
-            if reference != sha256(&body) {
+            // Only the provider's own registry, which drops untagged images, is tagged.
+            if reference != sha256(&body) && (host != OWN || reference != sha256(&body).replace(':', "-")) {
                 s.violations.push(format!("manifest put under {reference}, not its digest"));
                 return reply(400, &[], Bytes::new());
+            }
+            if host == OWN && reference != sha256(&body) && std::mem::take(&mut s.refuse_tag_once) {
+                return reply(503, &[], Bytes::new());
+            }
+            if host == OWN && reference == sha256(&body) && s.visibility_delay > 0 {
+                s.hidden.insert(reference.into(), s.visibility_delay);
             }
             let media_type = request.headers()["content-type"].to_str().unwrap().to_owned();
             s.manifests.insert((host, repository.into(), reference.into()), (media_type, body.clone()));
             return reply(201, &[("docker-content-digest", sha256(&body))], Bytes::new());
+        }
+        if let Some(reads) = s.hidden.get_mut(reference) {
+            *reads -= 1;
+            if *reads == 0 {
+                s.hidden.remove(reference);
+            }
+            return reply(404, &[], Bytes::new());
         }
         return match s.manifests.get(&(host, repository.into(), reference.into())) {
             Some((media_type, bytes)) => reply(
@@ -189,6 +222,7 @@ fn respond(s: &mut Oci, request: &reqwest::Request) -> http::Response<Bytes> {
             return reply(200, &[("content-length", bytes.len().to_string())], Bytes::new());
         }
         let range = request.headers().get("range").and_then(|v| v.to_str().ok()).and_then(|r| r.strip_prefix("bytes="));
+        let range = range.filter(|_| !s.ignore_range);
         let Some((start, end)) = range.and_then(|r| r.split_once('-')) else { return reply(200, &[], bytes) };
         let (start, end): (usize, usize) = (start.parse().unwrap(), end.parse::<usize>().unwrap().min(bytes.len() - 1));
         return reply(206, &[("content-range", format!("bytes {start}-{end}/{}", bytes.len()))], bytes.slice(start..=end));
@@ -251,21 +285,39 @@ impl Registries {
     }
 }
 
-/// A registry-pull provider that records the prepare requests its host hands it.
+/// A provider that records the prepare requests its host hands it, and how
+/// often it minted push access. By default it pulls from registries; its
+/// `route` setting makes it push into its own (`push`, with the route's
+/// `max_image_bytes`, `chunk_bytes` and minted access's `lifetime_seconds`).
 #[derive(Clone, Default)]
-struct Pulling(Arc<Mutex<Vec<(String, PrepareRequest)>>>);
+struct Pulling(Arc<Mutex<Vec<(String, PrepareRequest)>>>, Arc<std::sync::atomic::AtomicUsize>);
 #[async_trait]
 impl Module for Pulling {
     fn version(&self) -> &str {
         "test"
     }
-    async fn configure(&self, name: &str, _: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> ModuleResult<Arc<dyn Provider>> {
-        Ok(Arc::new(PullingProvider { name: name.into(), seen: self.0.clone() }))
+    async fn configure(&self, name: &str, c: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> ModuleResult<Arc<dyn Provider>> {
+        let settings = serde_json::to_value(&c.settings).unwrap();
+        Ok(Arc::new(PullingProvider { name: name.into(), seen: self.0.clone(), mints: self.1.clone(), settings }))
     }
 }
 struct PullingProvider {
     name: String,
     seen: Arc<Mutex<Vec<(String, PrepareRequest)>>>,
+    mints: Arc<std::sync::atomic::AtomicUsize>,
+    settings: Value,
+}
+#[async_trait]
+impl drydock_host::module::PushAccessOperation for PullingProvider {
+    async fn push_access(&self, _: &Credentials) -> ModuleResult<PushAccess> {
+        self.mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let lifetime = self.settings["lifetime_seconds"].as_i64().unwrap_or(3600);
+        Ok(PushAccess {
+            repository: format!("{OWN}/{OWN_REPOSITORY}"),
+            credential: credential("robot$drydock", "minted-secret"),
+            expires_at: Some((chrono::Utc::now() + chrono::TimeDelta::seconds(lifetime)).into()),
+        })
+    }
 }
 #[async_trait]
 impl Provider for PullingProvider {
@@ -282,11 +334,20 @@ impl Provider for PullingProvider {
             bootstrap: BootstrapRoute::Bake,
             agent: false,
             platforms: vec![Platform::new("linux", "amd64")],
-            image_routes: vec![ImageRoute::RegistryPull {
-                auth: RegistryAuthKind::Basic,
-                registration: CredentialRegistration::PerRequest,
-                digest_references: true,
-                tools_layer: ToolsLayer::Provider,
+            image_routes: vec![match self.settings["route"].as_str() {
+                Some("push") => ImageRoute::ProviderPush {
+                    protocol: PushProtocol::OciDistribution,
+                    credential_lifetime_seconds: Some(3600),
+                    tools_layer: ToolsLayer::Upload,
+                    max_image_bytes: self.settings["max_image_bytes"].as_u64(),
+                    chunk_bytes: self.settings["chunk_bytes"].as_u64(),
+                },
+                _ => ImageRoute::RegistryPull {
+                    auth: RegistryAuthKind::Basic,
+                    registration: CredentialRegistration::PerRequest,
+                    digest_references: true,
+                    tools_layer: ToolsLayer::Provider,
+                },
             }],
             usage: false,
             quota: false,
@@ -297,6 +358,12 @@ impl Provider for PullingProvider {
     }
     fn observation(&self) -> ObservationMode {
         ObservationMode::Poll { interval_ms: 60_000 }
+    }
+    fn operations(&self) -> drydock_host::module::Operations<'_> {
+        drydock_host::module::Operations {
+            push_access: (self.settings["route"] == "push").then_some(self as &dyn drydock_host::module::PushAccessOperation),
+            ..Default::default()
+        }
     }
     fn readiness(&self, _: &Credentials) -> Readiness {
         Readiness::Ready
@@ -379,6 +446,15 @@ pull_from = ["ghcr", "quay"]
 [providers.modal]
 module = "pulling"
 pull_from = ["ghcr"]
+[providers.daytona]
+module = "pulling"
+settings = {{ route = "push", chunk_bytes = 100 }}
+[providers.small]
+module = "pulling"
+settings = {{ route = "push", max_image_bytes = 1000 }}
+[providers.brief]
+module = "pulling"
+settings = {{ route = "push", lifetime_seconds = 10 }}
 "#,
         push = dir.join("push").display(),
         pull = dir.join("pull").display(),
@@ -586,4 +662,145 @@ async fn a_refusal_never_repeats_the_push_secret() {
         assert!(matches!(&error, drydock::client::Error::Protocol(ProtocolError::ImageRefused { .. })), "{error:?}");
         assert!(!format!("{error:?}").contains(secret), "{error:?}");
     }
+}
+
+/// The provider-push request a provider of `route` is handed, and its source.
+fn lab_request(image: &str) -> PrepareRequest {
+    request(image, Some(credential("lab-user", "lab-secret")))
+}
+fn refusal(result: Result<Prepared, drydock::client::Error>) -> ImageRefusal {
+    match result {
+        Err(drydock::client::Error::Protocol(ProtocolError::ImageRefused { refusal, .. })) => refusal,
+        other => panic!("{other:?}"),
+    }
+}
+
+// Provider-push route (Daytona's): drydockd copies the base alone, for the
+// provider's platform, from a private registry the provider cannot reach into
+// the provider's own, in requests of the route's chunk size, with the push
+// access the provider minted; tags it so the registry keeps it; waits out the
+// registry's visibility delay; and hands the module the copy by digest with no
+// pull credential. Another prepare, under a bumped tools pin, uploads nothing.
+#[tokio::test]
+async fn pushed_into_the_providers_own_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    registries.0.lock().unwrap().visibility_delay = 2;
+    let module = Pulling::default();
+    let (image, amd64) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+
+    let started = std::time::Instant::now();
+    let prepared = ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await.unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(1), "waited for the registry to serve the copy");
+    let copy = format!("{OWN}/{OWN_REPOSITORY}@{amd64}");
+    assert_eq!(prepared.image_digest, copy);
+    let (_, seen) = module.0.lock().unwrap()[0].clone();
+    assert_eq!((seen.image_digest.as_str(), seen.image_pull, seen.route), (copy.as_str(), None, Some(ImageRouteKind::ProviderPush)));
+    {
+        let s = registries.0.lock().unwrap();
+        let own = |reference: &str| s.manifests[&(OWN.to_owned(), OWN_REPOSITORY.to_owned(), reference.to_owned())].1.clone();
+        let source = &s.manifests[&(LAB.to_owned(), "crew/base".to_owned(), amd64.clone())].1;
+        assert_eq!(&own(&amd64), source, "the base's manifest, verbatim");
+        assert_eq!(&own(&amd64.replace(':', "-")), source, "tagged so the registry keeps it");
+        let patches: Vec<_> = s.requests.iter().filter(|(h, m, _)| h == OWN && m == "PATCH").collect();
+        assert!(patches.len() > 4, "layers go in bounded requests");
+        assert!(!s.requests.iter().any(|(h, ..)| h == TOOLS), "the tools image is never read");
+        assert!(s.signins.iter().all(|(at, owner)| at == owner), "{:?}", s.signins);
+    }
+    let uploads = registries.uploads_to(OWN);
+
+    let mut bumped = lab_request(&image);
+    bumped.tools_digest = format!("ghcr.io/flotilla-org/drydock-tools@sha256:{}", "8".repeat(64));
+    assert_eq!(ProviderApi::prepare(&*daemon, "daytona", &bumped).await.unwrap().image_digest, copy);
+    assert_eq!(registries.uploads_to(OWN), uploads, "nothing is put again");
+    assert_eq!(module.1.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(registries.violations(), Vec::<String>::new());
+}
+
+// A platform the base does not offer and an image over the route's declared
+// limit are each the typed refusal before push access is minted; push access
+// that expires before the upload completes is the typed expiry. The module is
+// never asked to prepare.
+#[tokio::test]
+async fn push_route_refusals_are_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    let module = Pulling::default();
+    let (image, _) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+
+    let arm = Platform::new("linux", "arm64");
+    let mut other = lab_request(&image);
+    other.platform = Some(arm.clone());
+    let declared = refusal(ProviderApi::prepare(&*daemon, "daytona", &other).await);
+    assert_eq!(declared, ImageRefusal::UnsupportedPlatform { platform: arm });
+    assert!(matches!(
+        refusal(ProviderApi::prepare(&*daemon, "small", &lab_request(&image)).await),
+        ImageRefusal::TooLarge { bytes, limit_bytes: 1000 } if bytes > 1000
+    ));
+    assert_eq!(module.1.load(std::sync::atomic::Ordering::SeqCst), 0, "refused before minting push access");
+    assert_eq!(refusal(ProviderApi::prepare(&*daemon, "brief", &lab_request(&image)).await), ImageRefusal::PushCredentialExpired);
+    assert_eq!(registries.uploads_to(OWN), 0);
+    // The provider's registry refusing the copy is its staging refusal, not
+    // a rejection of the provider's own credential.
+    registries.0.lock().unwrap().refuse_push = Some(403);
+    let refused = refusal(ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await);
+    assert_eq!(refused, ImageRefusal::StagingRefused { registry: "daytona".into() });
+    assert!(module.0.lock().unwrap().is_empty());
+}
+
+// A source blob is copied only when it can be verified inside bounded
+// requests: a registry that ignores Range for a blob larger than one request,
+// and a blob whose bytes do not match its digest, are each refused before the
+// upload commits, so the provider's registry never holds the layer.
+#[tokio::test]
+async fn unverifiable_source_blobs_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    let module = Pulling::default();
+    let (image, amd64) = registries.seed(LAB, "crew/base");
+    let layer = {
+        let s = registries.0.lock().unwrap();
+        let manifest: Value = serde_json::from_slice(&s.manifests[&(LAB.to_owned(), "crew/base".to_owned(), amd64)].1).unwrap();
+        manifest["layers"][0]["digest"].as_str().unwrap().to_owned()
+    };
+    let daemon = start(dir.path(), &registries, &module).await;
+    let refused_unstored = |result: Result<Prepared, drydock::client::Error>| {
+        assert!(matches!(result, Err(drydock::client::Error::Protocol(ProtocolError::Internal { .. }))), "{result:?}");
+        assert!(!registries.0.lock().unwrap().blobs.contains_key(&(OWN.to_owned(), layer.clone())));
+    };
+    registries.0.lock().unwrap().ignore_range = true;
+    refused_unstored(ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await);
+    {
+        let mut s = registries.0.lock().unwrap();
+        s.ignore_range = false;
+        let stored = s.blobs.get_mut(&(LAB.to_owned(), layer.clone())).unwrap();
+        let mut corrupt = stored.to_vec();
+        corrupt[0] ^= 1;
+        *stored = Bytes::from(corrupt);
+    }
+    refused_unstored(ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await);
+    assert!(module.0.lock().unwrap().is_empty());
+}
+
+// A copy whose retention tag failed to go in (the manifest put, then the tag
+// refused) gets its tag on the next prepare, which finds the copy already
+// there: the registry never holds it untagged for long.
+#[tokio::test]
+async fn a_lost_retention_tag_is_put_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let registries = Registries::default();
+    registries.0.lock().unwrap().refuse_tag_once = true;
+    let module = Pulling::default();
+    let (image, amd64) = registries.seed(LAB, "crew/base");
+    let daemon = start(dir.path(), &registries, &module).await;
+    let tagged =
+        || registries.0.lock().unwrap().manifests.contains_key(&(OWN.to_owned(), OWN_REPOSITORY.to_owned(), amd64.replace(':', "-")));
+
+    assert!(ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await.is_err());
+    assert!(!tagged());
+    ProviderApi::prepare(&*daemon, "daytona", &lab_request(&image)).await.unwrap();
+    assert!(tagged());
+    assert_eq!(registries.violations(), Vec::<String>::new());
 }

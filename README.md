@@ -140,6 +140,15 @@ staging and its duration. Staged images are not yet garbage-collected
 (drydock#61); `scripts/live-staging-registry.py` checks staging against a real
 private GHCR package.
 
+A provider's own registry is a staging target too. On the `provider_push`
+route, a provider with the push-access port (Daytona) mints push access to its
+registry for each prepare, once the image is known to fit the route's
+`max_image_bytes` (compared with its compressed size, a lower bound); drydockd
+copies the image there in the route's `chunk_bytes` requests, tags it `sha256-<hex>` so the registry keeps it, waits until the
+registry serves it (up to a minute), and hands the module that reference with
+no pull credential. Push access that expires mid-copy is the
+`push_credential_expired` refusal.
+
 Rigging resolves XDG paths: `XDG_CONFIG_HOME/drydock/drydock.toml`, falling back
 to `~/.config/drydock/drydock.toml`. `DRYDOCK_ROOT` overrides all directories
 (config under `$DRYDOCK_ROOT/config`). The socket intentionally lives at

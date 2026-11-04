@@ -81,6 +81,8 @@ pub trait ProviderApi: Send + Sync {
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error>;
     /// Write one file into a guest, through the provider's files port.
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
+    /// Mint push access to the provider's own registry.
+    async fn push_access(&self, provider: &str) -> Result<PushAccess, Error>;
     /// The same API, using `credential` instead of any held one for each call.
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi>;
     /// Server only: replace the held credential.
@@ -217,6 +219,9 @@ impl ProviderApi for Client {
         self.execute_response::<()>(request).await?;
         Ok(())
     }
+    async fn push_access(&self, provider: &str) -> Result<PushAccess, Error> {
+        self.call::<_, ()>(Method::POST, &["v1", "providers", provider, "push-access"], None).await
+    }
     async fn put_inward(&self, provider: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let request =
             self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "inward", name])?.json(request);
@@ -318,6 +323,7 @@ fn routes() -> OpenApiRouter<Surface> {
         .routes(routes!(relay))
         .routes(routes!(exec))
         .routes(routes!(put_file))
+        .routes(routes!(push_access))
         .routes(routes!(suspend))
         .routes(routes!(resume))
         .routes(routes!(export))
@@ -630,6 +636,13 @@ async fn put_file(
         .map_err(|_| Error::InvalidRequest(format!("file body unreadable or over {GUEST_FILE_LIMIT} bytes")))?;
     api.put_file(&p, &id, &file, bytes).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/push-access",
+params(("provider" = String, Path, description = "Opaque provider")),
+responses((status = 200, description = "Push access to the provider's own registry", body = PushAccess), ErrorResponses)
+)]
+async fn push_access(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<PushAccess>> {
+    Ok(Json(api.push_access(&p).await?))
 }
 
 #[derive(Deserialize)]

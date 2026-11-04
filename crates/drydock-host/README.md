@@ -184,24 +184,17 @@ no agent itself: a caller that provisions or resumes without drydockd gets a
 sandbox without one.
 
 Daytona declares two image routes, both `tools_layer: upload`. The default is
-`provider_push`, for images in registries Daytona cannot reach. The host reads
-the base's `linux/amd64` manifest (with `PrepareRequest.image_pull`, sent only
-to the base's registry, for a private base), mints push access with
-`GET /docker-registry/registry-push-access`, copies the config and layers into
-Daytona's registry in `push_chunk_bytes` requests (default 16 MiB), puts the
-manifest verbatim (so its digest is the base's), waits until a pull by digest
-succeeds, and creates the snapshot from
-`imageName: <registry>/<project>/drydock-vessel@sha256:…` with no `buildInfo`.
-Images above `max_image_gib` (default 20, Daytona's default snapshot maximum;
-compressed size is the lower bound checked), platforms other than amd64 and
-push access that expires mid-upload are typed refusals.
-
-On this route the host itself contacts the registries the request names, and
-their token realms, over HTTPS. It applies no registry allowlist or address
-policy, because lab registries usually sit on private networks. Prepare callers
-are authenticated host clients and are trusted to name registries. A pull
-credential goes only to its registry's origin, or to Docker Hub's
-`auth.docker.io` token service for `docker.io`.
+`provider_push`, for images in registries Daytona cannot reach: Daytona's
+registry is a drydockd staging target. The push-access port mints a robot with
+`GET /docker-registry/registry-push-access` and names
+`<registry>/<project>/drydock-vessel`; the route declares `max_image_bytes`
+(from `max_image_gib`, default 20, Daytona's default snapshot maximum) and
+`chunk_bytes` (from `push_chunk_bytes`, default 16 MiB). drydockd copies the
+base's `linux/amd64` image there and waits until Daytona's registry serves it
+(see staging in the top-level README), and the module creates the snapshot
+from that `imageName` with no `buildInfo`. The module itself reads no
+registry. Images over the limit, platforms other than amd64 and push access
+that expires mid-copy are typed refusals.
 
 The fallback, `registry_pull`, creates the snapshot from `imageName` set to the
 base reference itself; Daytona pulls it, so a private registry must first be

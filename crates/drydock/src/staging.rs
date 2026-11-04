@@ -10,6 +10,7 @@ use drydock_protocol::*;
 use rigging_http_client::HttpClient;
 use std::{
     collections::BTreeMap,
+    future::Future,
     sync::{Arc, Mutex, Weak},
     time::Instant,
 };
@@ -61,8 +62,8 @@ impl Staging {
     /// The request for an instance that pulls from `pull_from`, on the
     /// registry-pull route and `platform`. An image already in one of those
     /// registries passes through untouched; any other is staged in the first.
-    /// The tools image is public and never staged.
-    pub(crate) async fn stage(&self, pull_from: &[String], mut request: PrepareRequest, platform: &Platform) -> Result<PrepareRequest> {
+    /// The tools image is public and never staged on its own.
+    pub(crate) async fn stage(&self, pull_from: &[String], request: PrepareRequest, platform: &Platform) -> Result<PrepareRequest> {
         let Some(name) = pull_from.first() else { return Ok(request) };
         let source = ImageRef::parse(&request.image_digest)?;
         let located = format!("{}/{}", source.registry, source.repository);
@@ -79,20 +80,97 @@ impl Staging {
             Some(access) => Some(credential(name, "pull", access).await?),
             None => None,
         };
+        let target = Target {
+            registry: Registry::new(self.transfer.http.clone(), &host, Some(push), None)?.staging(name),
+            name: name.clone(),
+            repository,
+            chunk: declared.chunk_bytes.unwrap_or(self.transfer.chunk_bytes),
+            retain: false,
+        };
+        let mut request = self.put(async { Ok(target) }, None, request, platform).await?;
+        request.image_pull = pull;
+        Ok(request)
+    }
+    /// The request for a provider's own registry, on the provider-push route:
+    /// the image copied there with push access the provider mints (`mint`,
+    /// called once the image is known to fit the limits), tagged so the
+    /// registry keeps it, and visible by digest. The provider pulls its own
+    /// registry, so the request carries no pull access.
+    pub(crate) async fn push(
+        &self,
+        provider: &str,
+        mint: impl Future<Output = Result<PushAccess>>,
+        request: PrepareRequest,
+        platform: &Platform,
+        limits: Limits,
+    ) -> Result<PrepareRequest> {
+        let target = async {
+            let access = mint.await?;
+            let bad = || ProtocolError::Internal {
+                reason: format!("provider {provider} minted unusable push access"),
+                provider_error: String::new(),
+            };
+            let (host, repository) = access.repository.split_once('/').filter(|(_, path)| !path.is_empty()).ok_or_else(bad)?;
+            if !drydock_oci::registry_host_valid(host) {
+                return Err(bad());
+            }
+            let expires = access.expires_at.map(|at| at.instant());
+            Ok(Target {
+                registry: Registry::new(self.transfer.http.clone(), host, Some(access.credential), expires)
+                    .map_err(|_| bad())?
+                    .staging(provider),
+                name: provider.to_owned(),
+                repository: repository.to_owned(),
+                chunk: limits.chunk_bytes.unwrap_or(self.transfer.chunk_bytes),
+                retain: true,
+            })
+        };
+        let mut request = self.put(target, limits.max_image_bytes, request, platform).await?;
+        request.image_pull = None;
+        Ok(request)
+    }
+    /// The image for `platform`, put by digest once into `target` (awaited once the image is
+    /// known to fit `max_bytes`); the request names the copy.
+    async fn put(
+        &self,
+        target: impl Future<Output = Result<Target>>,
+        max_bytes: Option<u64>,
+        mut request: PrepareRequest,
+        platform: &Platform,
+    ) -> Result<PrepareRequest> {
+        let source = ImageRef::parse(&request.image_digest)?;
         // The request's pull credential goes to the source registry only, and
-        // the staging registry's credential goes nowhere but there.
-        let http = self.transfer.http.clone();
-        let from = Registry::new(http.clone(), &source.registry, request.image_pull.take(), None)?;
-        let to = Registry::new(http, &host, Some(push), None)?.staging(name);
-        let chunk = declared.chunk_bytes.unwrap_or(self.transfer.chunk_bytes);
+        // the target's credential goes nowhere but there.
+        let from = Registry::new(self.transfer.http.clone(), &source.registry, request.image_pull.take(), None)?;
         let started = Instant::now();
         let manifest = from.platform_manifest(&source, platform).await?;
-        let staged = format!("{}@{}", declared.repository, manifest.digest);
-        let lock = self.lock(&staged);
+        fits(manifest.image_bytes()?, max_bytes)?;
+        let target = target.await?;
+        let to = &target.registry;
+        let lock = self.lock(&format!("{}@{}", target.location(), manifest.digest));
         let _copying = lock.lock().await;
-        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, &to, &repository, chunk).await?;
+        let copied = drydock_oci::copy_image(&from, &source.repository, &manifest, to, &target.repository, target.chunk).await?;
+        let (digest, media_type, bytes) = (manifest.digest, manifest.media_type, manifest.bytes);
+        // The tag is put after the manifest, so a copy found already there may
+        // have lost its tag to a failure between the two: one read finds out.
+        let tag = retention_tag(&digest);
+        if target.retain && (copied || !to.manifest_visible(&target.repository, &tag).await?) {
+            to.put_manifest(&target.repository, &tag, &media_type, bytes).await?;
+        }
+        // A registry can serve a new manifest only after a delay (Daytona's
+        // does), and the provider pulls it once, at its prepare.
+        let visible = async || to.manifest_visible(&target.repository, &digest).await;
+        let mut waited = 0;
+        while !visible().await? {
+            waited += 1;
+            if waited >= VISIBILITY_ATTEMPTS {
+                return Err(ProtocolError::unavailable(format!("the image put in {} is not yet visible", target.name), Some(5)));
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let staged = format!("{}@{digest}", target.location());
         tracing::info!(
-            registry = %name,
+            registry = %target.name,
             image = %request.image_digest,
             staged = %staged,
             copied,
@@ -101,9 +179,49 @@ impl Staging {
             if copied { "image staged" } else { "image already staged" }
         );
         request.image_digest = staged;
-        request.image_pull = pull;
         request.platform = Some(platform.clone());
         Ok(request)
+    }
+}
+/// What a provider's own registry takes, as its provider-push route declares.
+pub(crate) struct Limits {
+    /// The largest image, in compressed bytes.
+    pub(crate) max_image_bytes: Option<u64>,
+    /// The most bytes one upload request carries.
+    pub(crate) chunk_bytes: Option<u64>,
+}
+/// How many times staging reads a put manifest back before giving up, a
+/// second apart.
+const VISIBILITY_ATTEMPTS: u32 = 60;
+/// Where staging puts an image, and what it takes there.
+struct Target {
+    /// Push access to the registry.
+    registry: Registry,
+    /// How logs and errors name it.
+    name: String,
+    /// The path below the registry's host.
+    repository: String,
+    chunk: u64,
+    /// Tag the copy too, for a registry that discards untagged manifests.
+    retain: bool,
+}
+impl Target {
+    fn location(&self) -> String {
+        format!("{}/{}", self.registry.host(), self.repository)
+    }
+}
+/// A tag naming the manifest whose digest is `digest`, as cosign's do.
+fn retention_tag(digest: &str) -> String {
+    digest.replacen(':', "-", 1)
+}
+/// An image fills a provider's limit exactly; one byte more is refused.
+fn fits(bytes: u64, limit: Option<u64>) -> Result<()> {
+    match limit {
+        Some(limit_bytes) if bytes > limit_bytes => Err(ProtocolError::ImageRefused {
+            reason: format!("image needs at least {bytes} bytes; the provider takes {limit_bytes}"),
+            refusal: ImageRefusal::TooLarge { bytes, limit_bytes },
+        }),
+        _ => Ok(()),
     }
 }
 /// Whether `located` (`host/path`) is `repository` or a path below it.
@@ -115,4 +233,16 @@ async fn credential(registry: &str, purpose: &str, access: &RegistryAccess) -> R
     let reference = credential_reference(&access.credential, &rigging_process::ProcessEnvVars).map_err(|_| unavailable())?;
     let secret = BuiltinCredentials::default().resolve(&reference).await.map_err(|_| unavailable())?.value;
     Ok(RegistryCredential { username: access.username.clone(), secret })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fits;
+
+    #[test]
+    fn an_image_fills_the_limit_exactly() {
+        assert!(fits(1000, Some(1000)).is_ok());
+        assert!(fits(1001, Some(1000)).is_err());
+        assert!(fits(u64::MAX, None).is_ok());
+    }
 }
