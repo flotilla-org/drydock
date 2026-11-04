@@ -89,7 +89,9 @@ fn print_token() -> String {
 /// How long a token read from a guest is kept: a module that hands the token to a
 /// client to dial never sees the agent refuse it, so a token the agent replaced
 /// (a restart that wrote a new one) would otherwise be handed out until the next
-/// suspend, resume or destroy.
+/// suspend, resume or destroy. 60 s is a judgement, not a vendor figure: long enough
+/// that a burst of reaches costs one guest command, short enough that a replaced
+/// token is out of use within a minute.
 const TOKEN_TTL: Duration = Duration::from_secs(60);
 /// The token of the TCP agent in a guest, kept for [`TOKEN_TTL`] or until the
 /// module drops it. A module drops it when the guest could have a new agent
