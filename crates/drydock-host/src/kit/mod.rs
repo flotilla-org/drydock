@@ -65,24 +65,47 @@ pub fn digest(input: &str) -> String {
     format!("{:x}", Sha256::digest(input.as_bytes()))
 }
 
-/// `body` is called up to `attempts` times, `interval` apart, until it
-/// returns a value; Ok(None) when it never did. An error ends the wait at
-/// once: retrying failures is the caller's policy, not this loop's. Zero
-/// attempts never call `body`.
-pub async fn poll<T, F, Fut>(attempts: u32, interval: Duration, mut body: F) -> Result<Option<T>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Option<T>>>,
-{
-    for attempt in 0..attempts {
-        if attempt > 0 {
-            tokio::time::sleep(interval).await;
+/// What one reading of a vendor's state means to a wait.
+pub enum Verdict<T> {
+    /// The state wanted: the wait ends with this value.
+    Done(T),
+    /// Not yet: look again after the interval.
+    Pending,
+    /// A state it cannot leave for the wanted one: the wait ends with this error.
+    Failed(ProtocolError),
+}
+
+/// A wait's budget: how often to look, how long between looks, and the
+/// retry hint (seconds) when the budget runs out. Every wait in a module is
+/// one of these; a vendor's own long-poll or SDK wait stays the vendor's.
+#[derive(Clone, Copy)]
+pub struct Wait {
+    pub attempts: u32,
+    pub interval: Duration,
+    pub retry_after: u64,
+}
+impl Wait {
+    /// Reads the vendor's state (`read`) up to `attempts` times, `interval` apart,
+    /// until `judge` says [`Verdict::Done`]. A failed read or [`Verdict::Failed`] ends
+    /// the wait at once: retrying failures is the caller's policy, not this
+    /// loop's. A spent budget is Unavailable with `still` as its reason.
+    pub async fn until<S, T, F, Fut>(&self, still: impl Into<String>, mut read: F, judge: impl Fn(S) -> Verdict<T>) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<S>>,
+    {
+        for attempt in 0..self.attempts {
+            if attempt > 0 {
+                tokio::time::sleep(self.interval).await;
+            }
+            match judge(read().await?) {
+                Verdict::Done(value) => return Ok(value),
+                Verdict::Failed(error) => return Err(error),
+                Verdict::Pending => {}
+            }
         }
-        if let Some(value) = body().await? {
-            return Ok(Some(value));
-        }
+        Err(ProtocolError::unavailable(still, Some(self.retry_after)))
     }
-    Ok(None)
 }
 
 /// A vendor's size limits, checked before any request.
@@ -209,6 +232,39 @@ mod tests {
             assert_eq!(ours(&other, "a"), None, "{other:?}");
             assert!(matches!(require_ours(Vendor("Test"), "x", &other, "a"), Err(ProtocolError::Refused { .. })), "{other:?}");
         }
+    }
+
+    // Pending until the state is wanted, then its value; a failure or a spent
+    // budget ends the wait, and a zero budget never reads.
+    #[tokio::test(start_paused = true)]
+    async fn waits_end_on_done_failure_or_budget() {
+        let wait = Wait { attempts: 3, interval: Duration::from_secs(1), retry_after: 7 };
+        let judge = |n: u32| match n {
+            2 => Verdict::Done("up"),
+            9 => Verdict::Failed(refused("down")),
+            _ => Verdict::Pending,
+        };
+        for states in [[1, 2, 2], [1, 1, 2]] {
+            let states = std::cell::RefCell::new(states.into_iter());
+            assert_eq!(wait.until("slow", async || Ok(states.borrow_mut().next().unwrap()), judge).await.unwrap(), "up");
+        }
+        let reads = std::cell::Cell::new(0);
+        let spent = wait
+            .until(
+                "slow",
+                async || {
+                    reads.set(reads.get() + 1);
+                    Ok(1)
+                },
+                judge,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(reads.get(), 3);
+        assert!(matches!(spent, ProtocolError::Unavailable { retry_after: Some(7), .. }));
+        assert!(matches!(wait.until("slow", async || Ok(9), judge).await, Err(ProtocolError::Refused { .. })));
+        let none = Wait { attempts: 0, ..wait };
+        assert!(none.until("slow", async || -> Result<u32> { panic!("read") }, judge).await.is_err());
     }
 
     #[test]

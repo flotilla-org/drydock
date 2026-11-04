@@ -1,7 +1,7 @@
 //! E2B: https://github.com/e2b-dev/infra (spec/openapi.yml; packages/envd/spec).
 use crate::{
     kit::{
-        self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor,
+        self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
         guest::{Guest, GuestOutput},
@@ -34,10 +34,8 @@ const PRINT_TOKEN: &str = "/opt/drydock/drydock-agent --print-token --tcp-token-
 const TOKEN_LINE: &str = "drydock-tcp-token ";
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
 const RUN_TIMEOUT_MS: u64 = 25_000;
-const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 150;
-const STATE_POLL: Duration = Duration::from_secs(1);
-const STATE_POLLS: u32 = 60;
+const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
+const STATE_WAIT: Wait = Wait { attempts: 60, interval: Duration::from_secs(1), retry_after: 5 };
 const DETAIL_READS: usize = 8;
 const EVENT_PAGE: usize = 100;
 const EVENT_PAGES: usize = 100;
@@ -472,9 +470,10 @@ impl E2b {
         }
     }
     async fn wait_state(&self, id: &str, wanted: &str, c: &Credentials) -> Result<()> {
-        kit::poll(STATE_POLLS, STATE_POLL, async || Ok((self.state(&self.sandbox(id, c).await?) == wanted).then_some(())))
-            .await?
-            .ok_or_else(|| ProtocolError::unavailable(format!("E2B sandbox {id} is not {wanted} yet"), Some(5)))
+        let state = async || Ok(self.state(&self.sandbox(id, c).await?) == wanted);
+        STATE_WAIT
+            .until(format!("E2B sandbox {id} is not {wanted} yet"), state, |ready| if ready { Verdict::Done(()) } else { Verdict::Pending })
+            .await
     }
     async fn listed(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Sandbox>> {
         let filter = {
@@ -534,21 +533,19 @@ impl E2b {
         self.await_build(&created.template, &created.build, c).await
     }
     async fn await_build(&self, template: &str, build: &str, c: &Credentials) -> Result<()> {
-        kit::poll(BUILD_POLLS, BUILD_POLL, async || {
-            let status: BuildStatus = self.get(&["templates", template, "builds", build, "status"], c).await?;
-            match &*status.status {
-                "ready" => Ok(Some(())),
+        let status = async || self.get::<BuildStatus>(&["templates", template, "builds", build, "status"], c).await;
+        BUILD_WAIT
+            .until(format!("E2B template build {build} is still running"), status, |status| match &*status.status {
+                "ready" => Verdict::Done(()),
                 "error" => {
                     let reason = status.reason.map_or_else(|| "no reason recorded".into(), |r| r.message);
                     let tail: Vec<&str> = status.logs.iter().rev().take(5).rev().map(|e| e.message.as_str()).collect();
                     let text = format!("E2B template build {build} failed: {reason}\n{}", tail.join("\n"));
-                    Err(refused(cut(text.trim_end(), EXPLANATION_CHARS)))
+                    Verdict::Failed(refused(cut(text.trim_end(), EXPLANATION_CHARS)))
                 }
-                _ => Ok(None),
-            }
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable(format!("E2B template build {build} is still running"), Some(30)))
+                _ => Verdict::Pending,
+            })
+            .await
     }
     fn sizes(&self) -> SizeLimits {
         SizeLimits {

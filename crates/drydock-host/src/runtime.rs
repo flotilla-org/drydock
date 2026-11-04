@@ -2,7 +2,7 @@
 //! preview of the agent's port. API: https://api.withruntime.com/v1/openapi.json
 use crate::{
     kit::{
-        self, GIB, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, StateTable, Vendor,
+        self, GIB, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, StateTable, Vendor, Verdict, Wait,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::normal_host,
         guest::{Guest, GuestOutput},
@@ -39,10 +39,9 @@ const ENFORCED_LABEL: &str = "drydock.enforced";
 const LABEL_LIMIT: usize = 256;
 const WAIT_SECONDS: u64 = 25;
 const PREFER_WAIT: &str = "wait=25";
-const STATE_POLL: Duration = Duration::from_secs(1);
-const STATE_POLLS: u32 = 120;
-const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 150;
+const STATE_WAIT: Wait = Wait { attempts: 120, interval: Duration::from_secs(1), retry_after: 5 };
+const ENFORCE_WAIT: Wait = Wait { interval: Duration::from_millis(500), ..STATE_WAIT };
+const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
 const PREVIEW_TOKEN_HEADER: &str = "x-runtime-preview-token";
 const PREVIEW_TTL_SECONDS: u32 = 86_400;
 const EVENT_DAYS: i64 = 14;
@@ -379,26 +378,31 @@ impl Runtime {
         })
     }
     async fn wait_running(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
-        kit::poll(STATE_POLLS, STATE_POLL, async || {
+        // The vendor's own long-poll (waitFor) holds each look for up to 20 s.
+        let read = async || {
             let mut url = self.sandbox_url(id, None, &[])?;
             url.query_pairs_mut().append_pair("waitFor", "running").append_pair("timeoutSeconds", "20");
-            let v: Sandbox = self.api.get(url, c).await?;
-            match &*v.state {
-                "running" => Ok(Some(v)),
-                state @ ("stopped" | "paused") => Err(refused(format!("Runtime sandbox {id} is {state} instead of running"))),
-                _ => Ok(None),
-            }
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("Runtime sandbox has not started", Some(5)))
+            self.api.get::<Sandbox>(url, c).await
+        };
+        STATE_WAIT
+            .until("Runtime sandbox has not started", read, |v| match &*v.state {
+                "running" => Verdict::Done(v),
+                state @ ("stopped" | "paused") => Verdict::Failed(refused(format!("Runtime sandbox {id} is {state} instead of running"))),
+                _ => Verdict::Pending,
+            })
+            .await
     }
     async fn wait_enforced(&self, id: &str, c: &Credentials) -> Result<Network> {
-        kit::poll(STATE_POLLS, Duration::from_millis(500), async || {
-            let network = self.network(id, c).await?;
-            Ok((network.enforced != Some(false) && network.enforced_version == network.version).then_some(network))
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("Runtime has not yet enforced the sandbox's network rules", Some(5)))
+        let read = async || self.network(id, c).await;
+        ENFORCE_WAIT
+            .until("Runtime has not yet enforced the sandbox's network rules", read, |network| {
+                if network.enforced != Some(false) && network.enforced_version == network.version {
+                    Verdict::Done(network)
+                } else {
+                    Verdict::Pending
+                }
+            })
+            .await
     }
     async fn by_name(&self, name: &str, c: &Credentials) -> Result<Option<Sandbox>> {
         let mut url = self.api.url(&["sandboxes"])?;
@@ -462,21 +466,20 @@ impl Runtime {
         }
     }
     async fn await_build(&self, id: &str, c: &Credentials) -> Result<Image> {
-        for _ in 0..BUILD_POLLS {
-            let image: Image = self.api.get(self.api.url(&["images", id])?, c).await?;
-            match &*image.state {
-                "ready" => return Ok(image),
+        let read = async || self.api.get::<Image>(self.api.url(&["images", id])?, c).await;
+        BUILD_WAIT
+            .until(format!("Runtime image build {id} is still running"), read, |image| match &*image.state {
+                "ready" => Verdict::Done(image),
                 "failed" => {
                     let error = image.error.as_deref().unwrap_or("no error recorded");
-                    return Err(refused(format!("Runtime image build {id} failed: {error}")));
+                    Verdict::Failed(refused(format!("Runtime image build {id} failed: {error}")))
                 }
                 "deleting" | "deleted" => {
-                    return Err(ProtocolError::unavailable(format!("Runtime image {id} was deleted while building"), None));
+                    Verdict::Failed(ProtocolError::unavailable(format!("Runtime image {id} was deleted while building"), None))
                 }
-                _ => tokio::time::sleep(BUILD_POLL).await,
-            }
-        }
-        Err(ProtocolError::unavailable(format!("Runtime image build {id} is still running"), Some(30)))
+                _ => Verdict::Pending,
+            })
+            .await
     }
     async fn create(&self, body: &CreateSandbox<'_>, c: &Credentials) -> Result<http::Response<bytes::Bytes>> {
         let prefer = [(HeaderName::from_static("prefer"), HeaderValue::from_static(PREFER_WAIT))];
@@ -756,13 +759,14 @@ impl SuspendResume for Runtime {
         if &*state == "running" {
             self.act(Method::POST, self.sandbox_url(id, Some("pause"), &[])?, Body::None, c, true).await?;
         }
-        kit::poll(STATE_POLLS, STATE_POLL, async || match &*self.sandbox(id, c).await?.state {
-            "paused" | "stopped" => Ok(Some(RUNTIME.resume_marker("runtime-resume-", &self.name, id))),
-            "pausing" | "running" => Ok(None),
-            other => Err(refused(format!("Runtime sandbox {id} is {other}, not pausing"))),
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("Runtime sandbox has not paused", Some(5)))
+        let read = async || Ok(self.sandbox(id, c).await?.state);
+        STATE_WAIT
+            .until("Runtime sandbox has not paused", read, |state| match &*state {
+                "paused" | "stopped" => Verdict::Done(RUNTIME.resume_marker("runtime-resume-", &self.name, id)),
+                "pausing" | "running" => Verdict::Pending,
+                other => Verdict::Failed(refused(format!("Runtime sandbox {id} is {other}, not pausing"))),
+            })
+            .await
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         RUNTIME.check_resume("runtime-resume-", &self.name, id, &token)?;

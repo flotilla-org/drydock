@@ -4,7 +4,7 @@
 //! (https://github.com/tensorlakeai/tensorlake, crates/cloud-sdk).
 use crate::{
     kit::{
-        self, GIB, MIB, StateTable, Vendor,
+        self, GIB, MIB, StateTable, Vendor, Verdict, Wait,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found},
         egress::{ipv6, normal_cidr, normal_host, private_host},
         guest::{Guest, GuestOutput},
@@ -40,10 +40,8 @@ const DISK_MB: std::ops::RangeInclusive<u64> = 10_240..=102_400;
 const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
 const TOKEN_FILE: &str = "/run/drydock/tcp-token";
 const AGENT: &str = "/opt/drydock/drydock-agent";
-const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 150;
-const STATE_POLL: Duration = Duration::from_secs(1);
-const STATE_POLLS: u32 = 120;
+const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
+const STATE_WAIT: Wait = Wait { attempts: 120, interval: Duration::from_secs(1), retry_after: 5 };
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 const RESUME: &str = "tensorlake-resume-";
 const STATES: StateTable = &[
@@ -373,13 +371,14 @@ impl Tensorlake {
         Ok(token)
     }
     async fn wait_running(&self, id: &str, c: &Credentials) -> Result<()> {
-        let running = kit::poll(STATE_POLLS, STATE_POLL, async || match self.status(id, c).await?.as_str() {
-            "running" => Ok(Some(())),
-            "terminated" | "resume_failed" => Err(refused(format!("Tensorlake sandbox {id} stopped before it ran"))),
-            _ => Ok(None),
-        })
-        .await?;
-        running.ok_or_else(|| ProtocolError::unavailable("Tensorlake sandbox has not started", Some(5)))
+        let status = async || self.status(id, c).await;
+        STATE_WAIT
+            .until("Tensorlake sandbox has not started", status, |status| match status.as_str() {
+                "running" => Verdict::Done(()),
+                "terminated" | "resume_failed" => Verdict::Failed(refused(format!("Tensorlake sandbox {id} stopped before it ran"))),
+                _ => Verdict::Pending,
+            })
+            .await
     }
     async fn adopt(&self, row: Sandbox, size: &Size, policy: &Policy, c: &Credentials) -> Result<Environment> {
         let existing = self.environment(&row)?;
@@ -441,19 +440,18 @@ impl Tensorlake {
             let url = self.api.url(&["images", "v4", "builds", &id, "context", "seal"])?;
             self.api.call::<IgnoredAny>(Method::POST, url, Body::json(&seal)?, c).await?;
         }
-        let built = kit::poll(BUILD_POLLS, BUILD_POLL, async || {
-            let build: BuildState = self.api.get(self.api.url(&["images", "v4", "builds", &id])?, c).await?;
-            match &*build.status {
-                "succeeded" => Ok(Some(())),
-                "failed" => {
-                    Err(refused(format!("Tensorlake image build {id} failed: {}", build.error.as_deref().unwrap_or("no error recorded"))))
-                }
-                "cancelled" => Err(ProtocolError::unavailable(format!("Tensorlake image build {id} was cancelled"), None)),
-                _ => Ok(None),
-            }
-        })
-        .await?;
-        built.ok_or_else(|| ProtocolError::unavailable(format!("Tensorlake image build {id} is still running"), Some(30)))
+        let build = async || self.api.get::<BuildState>(self.api.url(&["images", "v4", "builds", &id])?, c).await;
+        BUILD_WAIT
+            .until(format!("Tensorlake image build {id} is still running"), build, |build| match &*build.status {
+                "succeeded" => Verdict::Done(()),
+                "failed" => Verdict::Failed(refused(format!(
+                    "Tensorlake image build {id} failed: {}",
+                    build.error.as_deref().unwrap_or("no error recorded")
+                ))),
+                "cancelled" => Verdict::Failed(ProtocolError::unavailable(format!("Tensorlake image build {id} was cancelled"), None)),
+                _ => Verdict::Pending,
+            })
+            .await
     }
     fn resources(&self, size: &Size) -> Result<SizeRequest> {
         let (memory_mb, disk_mb, cpus) = (size.memory_bytes / MIB, size.disk_bytes / MIB, size.cpus);
@@ -877,13 +875,14 @@ impl SuspendResume for Tensorlake {
         if status == "running" {
             self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", id, "suspend"])?, Body::None, c).await?;
         }
-        let suspended = kit::poll(STATE_POLLS, STATE_POLL, async || match self.status(id, c).await?.as_str() {
-            "suspended" => Ok(Some(TENSORLAKE.resume_marker(RESUME, &self.name, id))),
-            "suspending" | "snapshotting" | "running" => Ok(None),
-            other => Err(refused(format!("Tensorlake sandbox {id} is {other}, not suspending"))),
-        })
-        .await?;
-        suspended.ok_or_else(|| ProtocolError::unavailable("Tensorlake sandbox has not suspended", Some(5)))
+        let status = async || self.status(id, c).await;
+        STATE_WAIT
+            .until("Tensorlake sandbox has not suspended", status, |status| match status.as_str() {
+                "suspended" => Verdict::Done(TENSORLAKE.resume_marker(RESUME, &self.name, id)),
+                "suspending" | "snapshotting" | "running" => Verdict::Pending,
+                other => Verdict::Failed(refused(format!("Tensorlake sandbox {id} is {other}, not suspending"))),
+            })
+            .await
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         TENSORLAKE.check_resume(RESUME, &self.name, id, &token)?;
