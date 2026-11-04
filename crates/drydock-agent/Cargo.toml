@@ -15,7 +15,7 @@ http-body = "1"
 percent-encoding = "2"
 rustix = { version = "1", features = ["fs", "process"] }
 serde_urlencoded = "0.7"
-tar = { version = "0.4", default-features = false }
+tar.workspace = true
 tokio-util = { version = "0.7", features = ["codec", "io", "io-util"] }
 bytes = "1"
 http = "1"
