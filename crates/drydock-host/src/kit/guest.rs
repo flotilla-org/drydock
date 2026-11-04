@@ -132,6 +132,9 @@ impl AgentTokens {
             .ok_or_else(|| ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", guest.vendor()), Some(2)))?;
         let mut kept = self.state.recover();
         if kept.forgets == forgets {
+            // Expired entries of ids never read again (a sandbox deleted elsewhere) go now.
+            let ttl = self.ttl;
+            kept.tokens.retain(|_, (_, read)| read.elapsed() < ttl);
             kept.tokens.insert(id.to_owned(), (token.clone(), Instant::now()));
         }
         Ok(token)

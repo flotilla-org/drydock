@@ -104,10 +104,11 @@ const PRIVATE_SUFFIXES = [
  * the vendor). This is `kit::egress::private_registry`, for TypeScript.
  */
 export async function privateRegistry(registry: string): Promise<boolean> {
-  const host = registry
-    .replace(/^\[|\](:\d+)?$|:\d+$/g, "")
-    .toLowerCase()
-    .replace(/\.$/, "");
+  // A bare IPv6 literal is whole; any other host may carry a port or brackets.
+  const bare = registry.toLowerCase();
+  const host = isIP(bare)
+    ? bare
+    : bare.replace(/^\[|\](:\d+)?$|:\d+$/g, "").replace(/\.$/, "");
   if (isIP(host)) return privateAddress(host);
   if (
     host === "localhost" ||
@@ -115,6 +116,9 @@ export async function privateRegistry(registry: string): Promise<boolean> {
     PRIVATE_SUFFIXES.some((s) => host.endsWith(s))
   )
     return true;
+  // Best effort: the vendor's builder resolves the name from its own network
+  // (split-horizon DNS can answer differently), and a name that does not
+  // resolve here is left to the vendor.
   try {
     return (await lookup(host, { all: true })).some((a) =>
       privateAddress(a.address),
@@ -156,13 +160,22 @@ export class Suspensions {
     try {
       mkdirSync(dirname(file), { recursive: true });
       writeFileSync(file, "");
-    } catch {}
+    } catch (error) {
+      console.warn(
+        `could not record a suspend; after a host restart it will read as the provider's: ${error}`,
+      );
+    }
   }
 
   forget(id: string) {
     this.memory.delete(id);
     const file = this.file(id);
-    if (file) rmSync(file, { force: true });
+    if (!file) return;
+    try {
+      rmSync(file, { force: true });
+    } catch (error) {
+      console.warn(`could not clear a suspend record: ${error}`);
+    }
   }
 
   has(id: string) {
