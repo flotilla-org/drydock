@@ -493,13 +493,12 @@ impl E2b {
         let details: Vec<Option<Sandbox>> = futures::stream::iter(reads).buffered(DETAIL_READS).try_collect().await?;
         Ok(details.into_iter().flatten().collect())
     }
-    async fn builds(&self, template: &str, c: &Credentials) -> Result<(BTreeMap<String, u64>, Option<u64>)> {
-        let gone = || refused(format!("E2B template {template} is gone, so its sandboxes' disk is unknown"));
-        let disk = absent_on_not_found(self.get::<Template>(&["templates", template], c).await)?.ok_or_else(gone)?.disk_mb;
+    async fn builds(&self, template: &str, c: &Credentials) -> Result<BTreeMap<String, u64>> {
         let mut url = self.api.url(&["templates", template])?;
         url.query_pairs_mut().append_pair("limit", "100");
-        let builds: Vec<TemplateBuild> = absent_on_not_found(self.api.paged(url, &BUILD_PAGES, c).await)?.ok_or_else(gone)?;
-        Ok((builds.into_iter().filter_map(|b| Some((b.id.to_string(), b.disk_mb?))).collect(), disk))
+        let builds: Vec<TemplateBuild> = absent_on_not_found(self.api.paged(url, &BUILD_PAGES, c).await)?
+            .ok_or_else(|| refused(format!("E2B template {template} is gone, so its sandboxes' disk is unknown")))?;
+        Ok(builds.into_iter().filter_map(|b| Some((b.id.to_string(), b.disk_mb?))).collect())
     }
     async fn template(&self, name: &str, c: &Credentials) -> Result<Option<Template>> {
         let Some(alias) = absent_on_not_found(self.get::<Alias>(&["templates", "aliases", name], c).await)? else { return Ok(None) };
@@ -1009,12 +1008,9 @@ impl UsageOperation for E2b {
         for ((sandbox, started), (ended, cpus, memory, disk)) in executions {
             let disk = match disk {
                 Disk::Granted(disk) => disk,
-                Disk::Build(template, build) => {
-                    let (listed, disk) = &builds[&template];
-                    listed.get(&build).copied().or(*disk).ok_or_else(|| {
-                        refused(format!("E2B reports no disk for build {build} of template {template}, which sandbox {sandbox} ran"))
-                    })?
-                }
+                Disk::Build(template, build) => builds[&template].get(&build).copied().ok_or_else(|| {
+                    refused(format!("E2B reports no disk for build {build} of template {template}, which sandbox {sandbox} ran"))
+                })?,
             };
             let (start, end) = (started.max(from), ended.min(to));
             let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
