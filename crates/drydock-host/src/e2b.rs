@@ -763,6 +763,7 @@ impl Provider for E2b {
             quota: true,
             host_filesystem: false,
             agent_tcp_port: std::num::NonZeroU16::new(AGENT_PORT),
+            exclusive_label: false,
         }
     }
     fn observation(&self) -> ObservationMode {
