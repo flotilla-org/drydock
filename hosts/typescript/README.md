@@ -59,7 +59,8 @@ that outlive one call (a relay does).
 
 Providers return generated Environment values; provision's internal `created`
 flag chooses HTTP201 or200 without a wire wrapper. Provider declarations expose
-facts; observation is polling performed by the main server. There are no host
+facts; observation is polling performed by the main server (TypeScript modules
+declare only a `poll` way in). There are no host
 handles, push subscriptions, cursors, credential refresh routes or policy loops.
 Modules validate opaque settings and honor cancellation; cancellation does not
 prove rollback. Factories own cleanup on rejection/abort, and modules own their

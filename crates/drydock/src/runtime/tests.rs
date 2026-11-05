@@ -141,8 +141,8 @@ mod operation_tests {
     struct Basic(Arc<dyn Provider>, bool);
     #[async_trait::async_trait]
     impl Provider for Basic {
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             let mut c = self.0.capabilities();
@@ -183,8 +183,8 @@ mod operation_tests {
     struct Lying(Arc<dyn Provider>);
     #[async_trait::async_trait]
     impl Provider for Lying {
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             self.0.capabilities()
@@ -681,8 +681,8 @@ mod semantics_layer {
         fn operations(&self) -> Operations<'_> {
             Operations { suspend_resume: Some(self), ..Default::default() }
         }
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             let mut c = self.0.capabilities();

@@ -121,7 +121,16 @@ pub trait Provider: Send + Sync {
         Operations::default()
     }
     fn capabilities(&self) -> Capabilities;
-    fn observation(&self) -> ObservationMode;
+    /// The ways the vendor offers to hear about environments. A webhook way
+    /// needs the [`VendorEvents`] port.
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![self.observation().into()]
+    }
+    /// List polling alone, for a module that has not moved to [`Self::ways_in`].
+    /// Remove with [`ObservationMode`].
+    fn observation(&self) -> ObservationMode {
+        ObservationMode::Poll { interval_ms: 30_000 }
+    }
     fn readiness(&self, c: &Credentials) -> Readiness {
         if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
     }
@@ -163,6 +172,14 @@ pub struct Operations<'a> {
     pub quota: Option<&'a dyn QuotaOperation>,
     pub files: Option<&'a dyn GuestFiles>,
     pub push_access: Option<&'a dyn PushAccessOperation>,
+    pub events: Option<&'a dyn VendorEvents>,
+}
+/// Reads the vendor's own event deliveries.
+#[async_trait]
+pub trait VendorEvents: Send + Sync {
+    /// What one delivery says: each environment it is about, in the vendor's
+    /// state. A delivery about nothing drydock follows says nothing.
+    async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>>;
 }
 #[async_trait]
 pub trait Exec: Send + Sync {

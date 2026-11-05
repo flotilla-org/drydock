@@ -253,7 +253,7 @@ fn cache_budget_sequences(tc: hegel::TestCase) {
     tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(async {
         let http = Arc::new(Http { calls: Mutex::new(vec![]), version: "1" });
         let client = Client::unix("/unused").unwrap().with_http(http.clone());
-        let mut declaration: ProviderDeclaration = serde_json::from_value(serde_json::json!({"provider":"a","module":"memory","capabilities":{"material_modes":[],"checkout_strategies":[],"workspace_root":"/","suspend_resume":false,"export":false,"egress":{"routes":[],"model":{"shapes":[],"enforced":"none","mutable_while_running":false}},"fallback_runner":false,"bootstrap":"bake","usage":false,"quota":false},"readiness":{"status":"ready"},"rate_limits":[],"ports":{"exec":false,"suspend_resume":false,"export":false,"usage":false,"quota":false},"observation":{"mode":"poll","interval_ms":10}})).unwrap();
+        let mut declaration: ProviderDeclaration = serde_json::from_value(serde_json::json!({"provider":"a","module":"memory","capabilities":{"material_modes":[],"checkout_strategies":[],"workspace_root":"/","suspend_resume":false,"export":false,"egress":{"routes":[],"model":{"shapes":[],"enforced":"none","mutable_while_running":false}},"fallback_runner":false,"bootstrap":"bake","usage":false,"quota":false},"readiness":{"status":"ready"},"rate_limits":[],"ports":{"exec":false,"suspend_resume":false,"export":false,"usage":false,"quota":false},"ways_in":[{"way":"poll","interval_ms":10}]})).unwrap();
         declaration.rate_limits = vec![RateLimit { operation:"list".into(), requests, period_seconds:seconds }];
         let cache = StatusCache::new(client, &[declaration]);
         let mut calls = Vec::new(); let mut now = 0;

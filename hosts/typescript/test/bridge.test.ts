@@ -51,7 +51,7 @@ const capabilities = {
 function provider(): Provider {
   return {
     capabilities,
-    observation: { mode: "poll", interval_ms: 1000 },
+    waysIn: [{ way: "poll", interval_ms: 1000 }],
     rateLimits: [],
     readiness: () => ({ status: "ready" }),
     prepare: async (r) => ({
@@ -173,7 +173,7 @@ test("shared UDS API delegates lifecycle and atomic configuration", async (t) =>
     id = encodeURIComponent(environment.id);
   assert.equal((await stat(f.socketPath)).mode & 0o777, 0o600);
   const hello = await request(f.socketPath, "/v1/hello", undefined, "GET");
-  assert.equal(hello.body.protocol_version, "12");
+  assert.equal(hello.body.protocol_version, "13");
   assert.equal(hello.body.loadable_modules[0].name, f.name);
   assert.equal(
     (await request(f.socketPath, "/v1/hello", undefined, "HEAD")).status,

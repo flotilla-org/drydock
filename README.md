@@ -307,11 +307,13 @@ document (`PUT /v1/config`, or an RFC 7396 merge patch with `PATCH`), with
 providers keyed by instance name; hosts receive it without the server-only
 `credential` key. `GET /v1/providers` and `GET /v1/providers/{provider}` declare
 each provider's module, capabilities, readiness, rate limits, optional `ports`
-and `observation`; hello keeps only the versions and loadable modules. Egress
+and `ways_in`; hello keeps only the versions and loadable modules. Egress
 evidence (`egress_measured`, `egress_policy`) and the provider `timestamp` are
 optional `Environment` fields. `Reach` is the one reach type; SSH
 `reverse_forwards` defaults to false, and drydock no longer depends on it. The server observes every provider by
-polling its list.
+polling its list, and, when an instance has a relay, by its vendor's webhook
+deliveries, which it hands to the host's `POST /v1/providers/{provider}/event`
+(host only) to read.
 
 Protocol version 7 adds platforms. Capabilities list the platforms a provider
 runs, preferred first (absent decodes as none). Prepare takes an optional
@@ -685,9 +687,11 @@ The values shown are the defaults.
 
 - `settle`: provision and resume return once drydockd observes the
   environment running, and suspend once it observes it stopped. The wait reads
-  drydockd's own observer: it asks for one poll at once, then follows the
+  drydockd's own observer and wakes on each event it logs. On an instance
+  without a push way in it asks for one poll at once, then follows the
   observer's polls, so it can take up to one observation interval after the
-  vendor got there, and it makes no vendor calls of its own. It needs the
+  vendor got there; with a relay it waits for the vendor's event. It makes no
+  vendor calls of its own. It needs the
   credential drydockd holds for the instance, since that is what the observer
   polls with. A wait ends early, refused, when the environment is gone or its
   state unknown, and unavailable at its deadline, naming the last poll's
@@ -711,6 +715,37 @@ The values shown are the defaults.
   ([#276](https://github.com/flotilla-org/drydock/issues/276)). On an
   `owned_account` nothing is tagged, filtered or refused. Only a module that leaves ownership to drydockd (does
   not declare `owner_scoped`) takes `owned_account`.
+
+### Vendor events
+
+A module declares its `ways_in`: how drydockd can hear of a change. Every
+module has `poll` (list at an interval); Daytona also declares `webhook`, its
+`sandbox.state.updated` deliveries. The installation chooses: an instance
+reads its vendor's webhooks from a [webhook relay](https://github.com/flotilla-org/rigging)
+stream when given one:
+
+```toml
+[providers.daytona.events]
+relay = "https://relay.example/i/drydock"
+source = "daytona"
+token = { file = "~/.config/drydock/relay.token" }
+poll_seconds = 300
+```
+
+`relay`, `source` and `token` go together; `poll_seconds` may be given alone,
+to change the listing interval. With a relay drydockd still lists, every
+`poll_seconds` (300 by default), to fill gaps. Each event says how it was
+observed (`observed.way`: `webhook` with its `delivery_id`, `poll`, or
+`reconstruction`) and carries the vendor's state verbatim (`vendor`).
+Transitional states arrive as `transitioning` events. drydockd stores the
+relay cursor under its run directory (`events/<instance>.cursor`) and resumes
+from it after a restart. With no stored cursor, or when the relay reports a
+`gap` (deliveries lost to its retention), drydockd lists the provider and
+marks what changed as a `reconstruction`. Daytona sends no
+`sandbox.created`: the first update for an unknown id is its creation. On a
+`shared_account` an update for an id this instance neither listed nor made is
+ignored. Several drydockd instances reading one account's events are not
+designed for. Without `events`, observation is polling alone, as before.
 
 A label is the client's name for what it made, not a handle: drydockd does
 not adopt environments by label. Only a module that declares

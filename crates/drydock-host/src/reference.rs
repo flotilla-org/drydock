@@ -108,8 +108,8 @@ impl Provider for Reference {
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.settings.rate_limits.clone()
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {
@@ -120,6 +120,7 @@ impl Provider for Reference {
             quota: Some(self),
             files: None,
             push_access: None,
+            events: None,
         }
     }
     fn capabilities(&self) -> Capabilities {

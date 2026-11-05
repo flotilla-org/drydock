@@ -1,7 +1,9 @@
 //! Provider-only user configuration. Module settings are passed through unchanged.
 use crate::credentials::CredentialReference;
 use drydock_agent::Target;
-use drydock_protocol::{Configuration, CredentialLocation, EgressRequest, Ownership, ProviderConfiguration, SemanticOptions, Size};
+use drydock_protocol::{
+    Configuration, CredentialLocation, EgressRequest, EventsConfiguration, Ownership, ProviderConfiguration, SemanticOptions, Size,
+};
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -68,6 +70,8 @@ pub struct Provider {
     pub ownership: Ownership,
     #[serde(default)]
     pub semantics: SemanticOptions,
+    /// How drydockd hears about this instance's environments.
+    pub events: Option<EventsConfiguration>,
 }
 /// A registry drydock can copy images into and providers can pull them from.
 #[derive(Clone, Deserialize)]
@@ -115,6 +119,7 @@ impl Provider {
             credential: self.credential.clone(),
             ownership: self.ownership,
             semantics: self.semantics.clone(),
+            events: self.events.clone(),
         }
     }
 }
@@ -203,6 +208,9 @@ impl Config {
                 return Err("provider and module names must not be empty".into());
             }
             p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 })?;
+            if let Some(events) = &p.events {
+                crate::runtime::relay::stream(events).map_err(|e| format!("provider {name}: {e}"))?;
+            }
             if let Some(unknown) = p.pull_from.iter().find(|r| !config.registries.contains_key(*r)) {
                 return Err(format!("provider {name} pulls from unknown registry {unknown:?}"));
             }

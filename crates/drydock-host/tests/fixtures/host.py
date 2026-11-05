@@ -112,7 +112,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return {"provider": name, "module": providers[name]["module"], "capabilities": capabilities, "rate_limits": [],
                 "readiness": {"status": status, **({"reason": "missing"} if status == "missing_credential" else {})},
                 "ports": {"exec": True, "suspend_resume": True, "export": True, "usage": True, "quota": True},
-                "observation": {"mode": "poll", "interval_ms": 10}}
+                "ways_in": [{"way": "poll", "interval_ms": 10}]}
 
     def refused(self):
         self.respond(422, {"kind": "refused", "reason": "invalid"})
@@ -131,7 +131,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "12", "host_version": "fixture",
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "13", "host_version": "fixture",
                 "loadable_modules": [{"name": "reference", "version": "fixture", "smallest_size": size}]})
         if parsed.path == "/v1/providers":
             return self.respond(200, [self.declaration(name) for name in providers])

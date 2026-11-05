@@ -9,6 +9,7 @@ mod evidence;
 mod instance;
 mod observer;
 mod operations;
+pub(crate) mod relay;
 pub(crate) mod remote;
 mod semantics;
 #[cfg(test)]
@@ -52,6 +53,8 @@ pub struct Runtime {
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// A request's credential, used instead of the held one; never stored.
     credential: Option<Secret>,
+    /// Where relay cursors are kept across restarts.
+    state: Option<std::path::PathBuf>,
 }
 impl Runtime {
     pub fn new(registry: Registry) -> Self {
@@ -78,7 +81,13 @@ impl Runtime {
             stopping: watch::channel(false).0,
             tasks: Arc::new(Mutex::new(vec![])),
             credential: None,
+            state: None,
         }
+    }
+    /// Keep relay cursors in `directory`, so a restart resumes where the last run stopped.
+    pub fn with_state_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.state = Some(directory);
+        self
     }
     /// Deadline for ordinary provider calls; long mutations get `LONG_CALL`.
     /// It never bounds provider polling or subscription lifetime.
@@ -158,6 +167,7 @@ impl Runtime {
                 continue;
             }
             let module = &registry[&p.module];
+            let relay = p.events.as_ref().map(relay::stream).transpose().map_err(|e| refused(format!("provider {name}: {e}")))?.flatten();
             let http = Arc::new(
                 rigging_http_client::ReqwestHttpClient::restricted(None, None)
                     .map_err(|error| refused(format!("invalid HTTP transport configuration: {error}")))?,
@@ -173,7 +183,9 @@ impl Runtime {
                     error
                 })?,
             };
-            let observed = Observed::new(&self.events, name);
+            let observed = Observed::new(&self.events, name, relay.is_some());
+            let declared = provider.capabilities().semantics;
+            let foreign_possible = p.ownership == Ownership::SharedAccount && !declared.owner_scoped;
             let provider = semantics::apply(p, observed.clone(), provider)?;
             let credentials = Credentials::default();
             let (credential_changes, _) = watch::channel(credentials.clone());
@@ -191,8 +203,12 @@ impl Runtime {
             if rate_limits.iter().any(|r| r.requests == 0 || r.period_seconds == 0) {
                 return Err(refused("invalid declared rate limit"));
             }
-            let observation = provider.observation();
-            let poll_interval = observer::poll_interval(observation, &rate_limits)?;
+            let ways_in = provider.ways_in();
+            if relay.is_some() && !(ways_in.iter().any(|w| matches!(w, WayIn::Webhook { .. })) && provider.operations().events.is_some()) {
+                return Err(refused(format!("provider {name}: a relay is configured, but its module reads no webhooks")));
+            }
+            let interval = observer::listing_interval(&ways_in, p.events.as_ref(), relay.is_some())?;
+            let poll_interval = observer::poll_interval(interval, &rate_limits)?;
             additions.insert(
                 name.clone(),
                 Arc::new(Instance {
@@ -204,7 +220,9 @@ impl Runtime {
                     capabilities,
                     rate_limits,
                     events: sink,
-                    observation,
+                    ways_in,
+                    relay,
+                    foreign_possible,
                     poll_interval,
                     poll_error: Mutex::new(None),
                     credential_changes,
@@ -235,7 +253,7 @@ impl Runtime {
         }
         for instance in observers {
             tracing::info!(provider = %instance.name, readiness = readiness_status(&instance.readiness(&instance.auth.recover())), "provider configured");
-            let task = observer::spawn(instance, self.stopping.subscribe());
+            let task = observer::spawn(instance, self.stopping.subscribe(), self.state.clone());
             tasks.push(task);
         }
         self.events.changed.send_modify(|serial| *serial += 1);

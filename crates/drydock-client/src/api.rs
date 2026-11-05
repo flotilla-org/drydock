@@ -83,6 +83,11 @@ pub trait ProviderApi: Send + Sync {
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
     /// Mint push access to the provider's own registry.
     async fn push_access(&self, provider: &str) -> Result<PushAccess, Error>;
+    /// Host only: what one of the vendor's event deliveries says, read by the
+    /// provider's module. drydockd reads deliveries itself and does not serve this.
+    async fn event(&self, _provider: &str, _delivery: &VendorDelivery) -> Result<Vec<VendorObservation>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
     /// The same API, using `credential` instead of any held one for each call.
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi>;
     /// Server only: replace the held credential.
@@ -222,6 +227,9 @@ impl ProviderApi for Client {
     async fn push_access(&self, provider: &str) -> Result<PushAccess, Error> {
         self.call::<_, ()>(Method::POST, &["v1", "providers", provider, "push-access"], None).await
     }
+    async fn event(&self, provider: &str, delivery: &VendorDelivery) -> Result<Vec<VendorObservation>, Error> {
+        self.call(Method::POST, &["v1", "providers", provider, "event"], Some(delivery)).await
+    }
     async fn put_inward(&self, provider: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let request =
             self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "inward", name])?.json(request);
@@ -324,6 +332,7 @@ fn routes() -> OpenApiRouter<Surface> {
         .routes(routes!(exec))
         .routes(routes!(put_file))
         .routes(routes!(push_access))
+        .routes(routes!(event))
         .routes(routes!(suspend))
         .routes(routes!(resume))
         .routes(routes!(export))
@@ -643,6 +652,18 @@ responses((status = 200, description = "Push access to the provider's own regist
 )]
 async fn push_access(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<PushAccess>> {
     Ok(Json(api.push_access(&p).await?))
+}
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/event",
+params(("provider" = String, Path, description = "Opaque provider")),
+request_body = VendorDelivery,
+responses((status = 200, description = "What the delivery says of each environment it is about", body = Vec<VendorObservation>), ErrorResponses)
+)]
+async fn event(
+    Api(api): Api,
+    ApiPath(p): ApiPath<String>,
+    ApiJson(delivery): ApiJson<VendorDelivery>,
+) -> ApiResult<Json<Vec<VendorObservation>>> {
+    Ok(Json(api.event(&p, &delivery).await?))
 }
 
 #[derive(Deserialize)]

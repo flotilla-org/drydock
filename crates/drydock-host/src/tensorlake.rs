@@ -706,8 +706,8 @@ impl Provider for Tensorlake {
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {

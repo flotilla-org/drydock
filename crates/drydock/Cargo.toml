@@ -15,6 +15,7 @@ rigging-http-serve.workspace = true
 rigging-http-client.workspace = true
 rigging-tls.workspace = true
 rigging-stream.workspace = true
+rigging-relay-protocol.workspace = true
 reqwest = { workspace = true, features = ["json", "stream", "query"] }
 sha2.workspace = true
 http.workspace = true

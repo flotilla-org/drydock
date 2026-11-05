@@ -20,41 +20,60 @@ pub(super) struct Log {
     pub(super) epoch: String,
     pub(super) inventories: BTreeMap<String, Vec<Environment>>,
 }
+/// An event waiting for its commit: the environment, its label, the vendor's
+/// timestamp and own state, and the transition.
+pub(super) struct Pending {
+    pub(super) id: String,
+    pub(super) label: Option<String>,
+    pub(super) timestamp: Option<Timestamp>,
+    pub(super) vendor: Option<VendorState>,
+    pub(super) kind: EventKind,
+}
 impl EventSink {
-    fn append(
-        log: &mut Log,
-        provider: &str,
-        id: String,
-        label: Option<String>,
-        timestamp: Option<chrono::DateTime<chrono::Utc>>,
-        event: EventKind,
-    ) {
-        tracing::debug!(provider, environment_id = %id, route = "observe", "environment observation");
+    fn append(log: &mut Log, provider: &str, observed: &ObservedBy, p: Pending) {
+        tracing::debug!(provider, environment_id = %p.id, route = "observe", "environment observation");
         log.serial += 1;
         let cursor = format!("{}:{}", log.epoch, log.serial);
+        let timestamp = p.timestamp.as_ref().map(Timestamp::instant);
         log.records.push_back(Event {
             cursor,
-            id,
+            id: p.id,
             provider: provider.to_owned(),
-            label,
+            label: p.label,
             timestamp: timestamp.unwrap_or_else(chrono::Utc::now).into(),
             timestamp_source: if timestamp.is_some() { TimestampSource::Provider } else { TimestampSource::Adaptor },
-            event,
+            event: p.kind,
+            // An event carries the vendor's state and reason, not its tags.
+            vendor: p.vendor.map(|v| VendorState { tags: BTreeMap::new(), ..v }),
+            observed: Some(observed.clone()),
         });
         if log.records.len() > EVENT_HISTORY_CAPACITY {
             log.records.pop_front();
         }
     }
-    pub(super) fn commit(&self, rows: Vec<Environment>, events: Vec<PendingEvent>) {
+    /// A complete list: the whole inventory and its transitions.
+    pub(super) fn commit(&self, rows: Vec<Environment>, events: Vec<Pending>, observed: &ObservedBy) {
         let mut log = self.shared.log.recover();
         log.inventories.insert(self.provider.clone(), rows);
-        for (id, label, timestamp, event) in events {
-            Self::append(&mut log, &self.provider, id, label, timestamp, event);
+        for event in events {
+            Self::append(&mut log, &self.provider, observed, event);
+        }
+        self.shared.changed.send_replace(log.serial);
+    }
+    /// One environment's row and its transitions. Before the first list there
+    /// is no inventory to complete, so only the events are kept.
+    pub(super) fn update(&self, row: Environment, events: Vec<Pending>, observed: &ObservedBy) {
+        let mut log = self.shared.log.recover();
+        if let Some(rows) = log.inventories.get_mut(&self.provider) {
+            rows.retain(|old| old.id != row.id);
+            rows.push(row);
+        }
+        for event in events {
+            Self::append(&mut log, &self.provider, observed, event);
         }
         self.shared.changed.send_replace(log.serial);
     }
 }
-pub(super) type PendingEvent = (String, Option<String>, Option<chrono::DateTime<chrono::Utc>>, EventKind);
 
 impl Runtime {
     /// Replay from a retained cursor, otherwise start from a snapshot; then follow new events.

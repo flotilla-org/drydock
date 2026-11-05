@@ -74,7 +74,7 @@ impl Host {
             readiness: p.readiness(&self.credentials),
             rate_limits: p.rate_limits(),
             ports: p.operations().into(),
-            observation: p.observation(),
+            ways_in: p.ways_in(),
         }
     }
     async fn bindings(&self) -> Vec<(String, String, Arc<dyn Provider>)> {
@@ -234,6 +234,10 @@ impl ProviderApi for Host {
     async fn push_access(&self, p: &str) -> ApiResult<PushAccess> {
         let provider = self.instance(p).await?;
         Ok(port(provider.operations().push_access)?.push_access(&self.credentials).await?)
+    }
+    async fn event(&self, p: &str, delivery: &VendorDelivery) -> ApiResult<Vec<VendorObservation>> {
+        let provider = self.instance(p).await?;
+        Ok(port(provider.operations().events)?.event(delivery.clone()).await?)
     }
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi> {
         Arc::new(Self { credentials: Credentials::new(Some(credential)), ..self.clone() })

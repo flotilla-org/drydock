@@ -49,7 +49,7 @@ impl Module for RemoteModule {
         self.module.smallest_size.clone()
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        let config = ProviderConfiguration { credential: None, semantics: Default::default(), ..config.clone() };
+        let config = ProviderConfiguration { credential: None, semantics: Default::default(), events: None, ..config.clone() };
         let patch = serde_json::json!({ "providers": { name: config } });
         self.client.configure(crate::api::ConfigUpdate::MergePatch(patch)).await.map_err(error)?;
         let declaration = self.client.provider(name).await.map_err(error)?;
@@ -78,8 +78,8 @@ impl Provider for RemoteProvider {
     fn capabilities(&self) -> Capabilities {
         self.declaration.capabilities.clone()
     }
-    fn observation(&self) -> ObservationMode {
-        self.declaration.observation
+    fn ways_in(&self) -> Vec<WayIn> {
+        self.declaration.ways_in.clone()
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.declaration.rate_limits.clone()
@@ -115,6 +115,8 @@ impl Provider for RemoteProvider {
             quota: ports.quota.then_some(self),
             files: ports.files.then_some(self),
             push_access: ports.push_access.then_some(self),
+            // The webhook way in is the declaration of this port.
+            events: self.declaration.ways_in.iter().any(|w| matches!(w, WayIn::Webhook { .. })).then_some(self),
         }
     }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {
@@ -155,6 +157,12 @@ impl GuestFiles for RemoteProvider {
 impl PushAccessOperation for RemoteProvider {
     async fn push_access(&self, c: &Credentials) -> Result<PushAccess> {
         self.host(c).push_access(self.name()).await.map_err(error)
+    }
+}
+#[async_trait]
+impl VendorEvents for RemoteProvider {
+    async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
+        self.client.event(self.name(), &delivery).await.map_err(error)
     }
 }
 #[async_trait]
