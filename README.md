@@ -705,8 +705,11 @@ The values shown are the defaults.
 - `ownership`: on a `shared_account`, what the instance makes carries
   `drydock.provider=<instance>`, and drydockd lists only what carries it and
   refuses to destroy, suspend or resume anything else, or anything whose tag
-  the vendor cannot report at the time. On an `owned_account` nothing is tagged,
-  filtered or refused. Only a module that leaves ownership to drydockd (does
+  the vendor cannot report at the time. The check and the operation are two
+  vendor calls, not one atomic step. Inspect, reach and relay are not checked,
+  so a client can open a path into another tool's environment by its id
+  ([#276](https://github.com/flotilla-org/drydock/issues/276)). On an
+  `owned_account` nothing is tagged, filtered or refused. Only a module that leaves ownership to drydockd (does
   not declare `owner_scoped`) takes `owned_account`.
 
 A label is the client's name for what it made, not a handle: drydockd does

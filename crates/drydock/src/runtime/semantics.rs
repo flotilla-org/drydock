@@ -213,6 +213,8 @@ impl Provider for Added {
             Err(busy @ ProtocolError::Unavailable { .. }) if self.idempotent => match self.inner.inspect(id, c).await {
                 Err(ProtocolError::NotFound { .. }) => Ok(()),
                 Ok(e) if !e.live() => Ok(()),
+                // Still live, or unreadable: the vendor's busy answer is the
+                // one the client can act on.
                 _ => Err(busy),
             },
             result => result,
