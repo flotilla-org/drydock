@@ -1,12 +1,13 @@
-//! Stateless Daytona REST translator. The host owns inventory, event diffs and retries.
+//! Daytona REST translator: each verb is Daytona's own operation, and each
+//! answer is what Daytona said. Waiting, idempotence and ownership are
+//! drydockd's, as the declared [`Semantics`] leave them (see `capabilities`).
 //! API contract: https://www.daytona.io/docs/openapi.json (2026-10-20).
 use crate::{
     kit::{
-        self, GIB, LABEL_TAG, PROVIDER_TAG, SizeLimits, StateTable, Vendor,
-        api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found, https_base, join},
-        egress::normal_cidr,
+        self, GIB, LABEL_TAG, SizeLimits, StateTable, Vendor,
+        api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, https_base, join},
         guest::{Guest, GuestOutput},
-        image::{check_prepare, check_prepared, content_name, platform_dockerfile},
+        image::{check_prepare, content_name, platform_dockerfile},
     },
     module::*,
     oci,
@@ -25,17 +26,6 @@ use std::{
 
 const DAYTONA: Vendor = Vendor("Daytona");
 pub struct DaytonaModule;
-const SSH_TOKEN_TTL_MINUTES: &str = "5";
-/// Container sandboxes: whole vCPUs and GiB.
-const SIZES: SizeLimits = SizeLimits { cpus: (1, 4), memory: (GIB, 8 * GIB), memory_step: GIB, disk: (GIB, 10 * GIB), disk_step: GIB };
-const PAGED: Paging = Paging { rows: Some("items"), cursor: "cursor", next: Next::Body(&["nextCursor"]) };
-/// Bounds destroy's wait for an in-progress state change to about 8s (4 sleeps), long
-/// enough for a just-resumed sandbox to settle without stalling the caller.
-const DESTROY_ATTEMPTS: u32 = 5;
-const DESTROY_RETRY_DELAY: Duration = Duration::from_secs(2);
-/// A file upload is one toolbox request: an agent build (about 12 MB) needs
-/// longer than an ordinary call on a slow link.
-const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
 
 const STATES: StateTable = &[
     ("started", Observation::Running),
@@ -56,6 +46,9 @@ const STATES: StateTable = &[
     ("stopped", kit::stopped(StopCause::SuspendedByRequest)),
     ("archived", kit::stopped(StopCause::SuspendedByRequest)),
     ("paused", kit::stopped(StopCause::PausedByProvider)),
+    // Daytona's errorReason, reported beside it, says why.
+    ("error", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+    ("build_failed", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
 ];
 
 // Daytona's wire types (see the API contract above), only the fields read.
@@ -73,13 +66,12 @@ struct Sandbox {
     error_reason: Option<String>,
     updated_at: Option<DateTime<Utc>>,
     created_at: Option<DateTime<Utc>>,
-    toolbox_proxy_url: Option<Text>,
     #[serde(flatten)]
     policy: Policy,
 }
 /// A sandbox's network policy, as created and as read back: one of the
 /// three, or none.
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct Policy {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,54 +81,12 @@ struct Policy {
     #[serde(skip_serializing_if = "Option::is_none")]
     domain_allow_list: Option<String>,
 }
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSandbox<'a> {
-    name: String,
-    snapshot: &'a str,
-    labels: BTreeMap<&'static str, &'a str>,
-    target: &'a str,
-    auto_stop_interval: u32,
-    auto_pause_interval: u32,
-    auto_delete_interval: i32,
-    public: bool,
-    #[serde(flatten)]
-    policy: &'a Policy,
-}
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Snapshot {
     id: Text,
     state: Text,
-    cpu: Amount,
-    /// RAM, unlike CreateSnapshot's `memory`.
-    mem: Amount,
-    disk: Amount,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSnapshot<'a> {
-    name: &'a str,
-    region_id: &'a str,
-    sandbox_class: &'static str,
-    cpu: u64,
-    memory: u64,
-    disk: u64,
-    /// The base image, by digest, in Daytona's registry (push route).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    image_name: Option<String>,
-    /// The base pinned to the prepared platform (pull route).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    build_info: Option<BuildInfo>,
-}
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildInfo {
-    dockerfile_content: String,
-}
-#[derive(Serialize)]
-struct Execute<'a> {
-    command: &'a str,
-    timeout: u64,
+    error_reason: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,78 +141,88 @@ struct AggregatedUsage {
     gpu: Amount,
     #[serde(rename = "sandboxCount")]
     sandboxes: Amount,
-    /// The vendor's decimal lexeme: money never passes through f64.
+    /// Daytona's number text, passed through: money never passes through f64.
     #[serde(rename = "totalPrice")]
     price: Box<RawValue>,
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SandboxUsage {
-    sandbox_id: Text,
-}
-#[derive(Deserialize)]
-struct UsagePeriod {
-    cpu: Amount,
-    #[serde(rename = "startAt")]
-    start: Option<DateTime<Utc>>,
-    #[serde(rename = "endAt")]
-    end: Option<DateTime<Utc>>,
-    #[serde(rename = "ramGB")]
-    memory: Option<u64>,
-    #[serde(rename = "diskGB")]
-    disk: Option<u64>,
-}
 
+/// Every key but the two Daytona names alone has a default.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Settings {
     organization_id: String,
     /// Pinned out of band: the REST API supplies no gateway host public key.
     ssh_host_key: String,
-    #[serde(default = "api_url")]
     api_url: String,
-    #[serde(default)]
-    toolbox_url: Option<String>,
-    /// Explicit organization limits, including Enterprise custom contracts.
-    #[serde(default)]
-    rate_limits: Option<Vec<RateLimit>>,
-    #[serde(default = "ssh_endpoint")]
-    ssh_endpoint: String,
-    #[serde(default = "region")]
-    region: String,
-    #[serde(default = "tier")]
-    tier: u8,
-    #[serde(default = "analytics_url")]
     analytics_url: String,
+    /// The region's toolbox proxy, which Daytona also reports on each sandbox.
+    /// The control plane is trusted to delegate bearer authentication to it.
+    toolbox_url: String,
+    ssh_endpoint: String,
+    /// Where sandboxes and snapshots are made; set `toolbox_url` to match.
+    region: String,
+    /// Container sandboxes take whole vCPUs and GiB, up to these.
+    max_cpus: u64,
+    max_memory_gib: u64,
+    max_disk_gib: u64,
+    /// The organization's limits. The default is Tier 1's; Tier 2 is 20,000
+    /// and 400, Tier 3 40,000 and 500, Tier 4 50,000 and 600.
+    rate_limits: Vec<RateLimit>,
     /// Largest image a snapshot may hold, in GiB: Daytona's default snapshot
     /// maximum is 20. Organizations with a raised limit configure it.
-    #[serde(default = "max_image_gib")]
     max_image_gib: u64,
     /// Bytes per blob request drydockd sends on the push route. Each request
     /// must finish inside drydockd's HTTP deadline, so slow links want smaller chunks.
-    #[serde(default = "push_chunk_bytes")]
     push_chunk_bytes: u64,
+    /// How long minted registry push access lasts, as Daytona mints it.
+    push_credential_seconds: u64,
+    /// How long an SSH gateway token lasts.
+    ssh_token_minutes: u64,
+    /// A file upload is one toolbox request: an agent build (about 12 MB)
+    /// needs longer than an ordinary call on a slow link.
+    upload_seconds: u64,
+    /// Daytona's limit on one toolbox command.
+    exec_seconds: u64,
+    /// How often drydockd lists sandboxes.
+    poll_seconds: u64,
+    page_size: u32,
 }
-fn max_image_gib() -> u64 {
-    20
+impl Default for Settings {
+    fn default() -> Self {
+        let limit = |operation: &str, requests| RateLimit { operation: operation.into(), requests, period_seconds: 60 };
+        Self {
+            organization_id: String::new(),
+            ssh_host_key: String::new(),
+            api_url: "https://app.daytona.io/api/".into(),
+            analytics_url: "https://analytics.app.daytona.io/".into(),
+            toolbox_url: "https://proxy.app-eu.daytona.io/toolbox/".into(),
+            ssh_endpoint: "ssh.app.daytona.io:22".into(),
+            region: "eu".into(),
+            max_cpus: 4,
+            max_memory_gib: 8,
+            max_disk_gib: 10,
+            rate_limits: vec![limit("*", 10_000), limit("provision", 300), limit("suspend", 10_000), limit("resume", 10_000)],
+            max_image_gib: 20,
+            push_chunk_bytes: 16 << 20,
+            push_credential_seconds: 3600,
+            ssh_token_minutes: 5,
+            upload_seconds: 300,
+            exec_seconds: 20,
+            poll_seconds: 30,
+            page_size: 200,
+        }
+    }
 }
-fn push_chunk_bytes() -> u64 {
-    16 << 20
-}
-fn analytics_url() -> String {
-    "https://analytics.app.daytona.io/".into()
-}
-fn api_url() -> String {
-    "https://app.daytona.io/api/".into()
-}
-fn ssh_endpoint() -> String {
-    "ssh.app.daytona.io:22".into()
-}
-fn region() -> String {
-    "eu".into()
-}
-fn tier() -> u8 {
-    1
+impl Settings {
+    fn sizes(&self) -> SizeLimits {
+        SizeLimits {
+            cpus: (1, self.max_cpus),
+            memory: (GIB, self.max_memory_gib.saturating_mul(GIB)),
+            memory_step: GIB,
+            disk: (GIB, self.max_disk_gib.saturating_mul(GIB)),
+            disk_step: GIB,
+        }
+    }
 }
 
 #[async_trait]
@@ -272,92 +232,58 @@ impl Module for DaytonaModule {
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings = serde_json::from_value(json!(config.settings)).map_err(|_| refused("invalid Daytona settings"))?;
-        if !(1..=4).contains(&settings.tier)
-            || settings.organization_id.is_empty()
+        let positive =
+            [settings.max_cpus, settings.max_memory_gib, settings.max_disk_gib, settings.max_image_gib, settings.push_chunk_bytes];
+        if settings.organization_id.is_empty()
             || settings.ssh_host_key.is_empty()
             || settings.region.is_empty()
-            || settings.max_image_gib == 0
-            || settings.push_chunk_bytes == 0
+            || positive.contains(&0)
+            || [settings.ssh_token_minutes, settings.upload_seconds, settings.exec_seconds, settings.poll_seconds].contains(&0)
+            || settings.page_size == 0
         {
-            return Err(refused("Daytona requires organization_id, ssh_host_key, region, tier 1..4 and positive image limits"));
+            return Err(refused("Daytona requires organization_id, ssh_host_key, region and positive limits"));
         }
-        for endpoint in [&settings.api_url, &settings.analytics_url].into_iter().chain(settings.toolbox_url.iter()) {
+        for endpoint in [&settings.api_url, &settings.analytics_url, &settings.toolbox_url] {
             if !https_base(DAYTONA, endpoint)?.path().ends_with('/') {
                 return Err(refused("Daytona's configured bases must end in /"));
             }
         }
         let api = Api::new(DAYTONA, &settings.api_url, Auth::Bearer, http.clone())?.classify(classify).retry_after(retry_delay);
         let analytics = Api::new(DAYTONA, &settings.analytics_url, Auth::Bearer, http)?.classify(classify).retry_after(retry_delay);
-        Ok(Arc::new(Daytona { name: name.to_owned(), settings, api, analytics }))
+        Ok(Arc::new(Daytona { name: name.to_owned(), ownership: config.ownership, settings, api, analytics }))
     }
 }
 pub struct Daytona {
     name: String,
+    ownership: Ownership,
     settings: Settings,
     api: Api,
     analytics: Api,
 }
 /// Daytona's statuses, its whole body kept as the explanation (the host
-/// masks credential echoes before limiting it). A 4xx the table does not
-/// name (400, 409, 422) is a request drydock should never have made:
-/// Internal, never a refusal the caller might act on.
+/// masks credential echoes before limiting it). Daytona answers 409 while a
+/// sandbox's state change is in progress: retryable. 400 is Daytona refusing
+/// the request in the sandbox's state, in its own words.
 fn classify(f: &Failure) -> ProtocolError {
-    let raw = String::from_utf8_lossy(f.body).into_owned();
+    let reason = f.reason(&String::from_utf8_lossy(f.body));
     match f.status {
-        408 => ProtocolError::unavailable(f.reason(&raw), None),
-        401..=404 | 429 | 500..=599 => f.standard(f.reason(&raw)),
-        status => ProtocolError::Internal { reason: format!("unexpected Daytona {} HTTP {status}", f.operation), provider_error: raw },
+        409 => ProtocolError::Unavailable { reason, retry_after: f.retry_after, provider_error: None },
+        _ => f.standard(reason),
     }
 }
 impl Daytona {
     fn sandbox_url(&self, id: &str, action: Option<&str>) -> Result<Url> {
         self.api.url(&[&["sandbox", id][..], action.as_slice()].concat())
     }
-    async fn sandbox(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
-        self.api.get(self.sandbox_url(id, None)?, c).await
-    }
-    /// A POST whose answer drydock does not read (it must still be JSON).
+    /// A POST answered with the sandbox, which drydock does not read.
     async fn post(&self, url: Url, c: &Credentials) -> Result<()> {
         self.api.call::<IgnoredAny>(Method::POST, url, Body::None, c).await.map(drop)
     }
-    /// None represents a provider uniqueness conflict (409), for
-    /// look-up-or-create and destroy's wait only.
-    async fn unless_conflict<T: DeserializeOwned>(&self, method: Method, url: Url, body: Body, c: &Credentials) -> Result<Option<T>> {
-        let operation = kit::api::operation(&method, &url);
-        let response = self.api.send(method, url, body, c, true, &[]).await?;
-        if response.status() == 409 {
-            return Ok(None);
-        }
-        self.api.answer(&operation, &response).map(Some)
-    }
-    /// Daytona's `GET /sandbox/{idOrName}` accepts the name derived from a label.
-    async fn by_label_name(&self, label: &str, c: &Credentials) -> Result<Option<Sandbox>> {
-        // Anything but a 404 fails provision; the caller retries it.
-        let Some(v) = self.api.find::<Sandbox>(self.sandbox_url(&name("environment", label), None)?, c).await? else { return Ok(None) };
-        self.check_ours(&v)?;
-        if v.labels.get(LABEL_TAG).map(String::as_str) != Some(label) {
-            return Err(refused("Daytona sandbox name belongs to a different label"));
-        }
-        Ok(Some(v))
-    }
-    /// Refuses a sandbox this instance did not tag as its own (drydock#168). Applied to
-    /// list, adoption and destroy; by-id operations on an id the caller already holds
-    /// (inspect, suspend, resume, reach) are deliberately not guarded.
-    fn check_ours(&self, v: &Sandbox) -> Result<()> {
-        if kit::ours(&v.labels, &self.name).is_some() {
-            return Ok(());
-        }
-        Err(refused(format!(
-            "Daytona sandbox {} must carry both {PROVIDER_TAG}={} and {LABEL_TAG} to be ours; it belongs to another instance or tool",
-            &*v.id, self.name
-        )))
-    }
-    fn environment(&self, v: &Sandbox) -> Result<Environment> {
-        let state = match &*v.state {
-            "destroyed" if v.spot_evicted_at.is_some() => Observation::Gone { cause: GoneCause::EvictedByProvider },
-            "destroyed" => Observation::Gone { cause: GoneCause::DestroyedAtProvider },
-            "error" | "build_failed" => error_state(v.error_reason.as_deref().unwrap_or("")),
-            state => kit::observe(STATES, state),
+    fn environment(&self, v: Sandbox) -> Result<Environment> {
+        let state = match (&*v.state, &v.spot_evicted_at) {
+            ("destroyed", Some(_)) => Observation::Gone { cause: GoneCause::EvictedByProvider },
+            ("destroyed", None) => Observation::Gone { cause: GoneCause::DestroyedAtProvider },
+            (state, _) => kit::observe(STATES, state),
         };
         let p = &v.policy;
         let policy = json!({"block":p.network_block_all,"cidrs":p.network_allow_list,"domains":p.domain_allow_list});
@@ -373,58 +299,13 @@ impl Daytona {
             egress_measured: false,
             egress_policy: Some(kit::digest(&policy.to_string())),
             timestamp: v.updated_at.or(v.created_at).map(Into::into),
+            vendor: Some(VendorState { state: v.state.into(), reason: v.error_reason, tags: v.labels }),
         })
     }
-    fn check_existing_request(&self, v: &Sandbox, size: &Size, policy: &Policy) -> Result<()> {
-        let row = self.environment(v)?;
-        if row.granted_size.as_ref() != Some(size) || !policy_matches(&v.policy, policy) {
-            return Err(refused("existing Daytona label has a different or unknown size/egress policy; provision a new label"));
-        }
-        Ok(())
-    }
-    /// A route on the sandbox's toolbox.
-    async fn toolbox(&self, id: &str, segments: &[&str], c: &Credentials) -> Result<Url> {
-        let base = match &self.settings.toolbox_url {
-            Some(base) => base.clone(),
-            None => {
-                // Fetch the canonical route per call so resume/migration cannot
-                // leave a cached runner URL stale. This extra GET is intentional;
-                // individual-call admission accounting is tracked in drydock#35.
-                // The control plane is trusted to delegate bearer authentication
-                // to this proxy host. Pin toolbox_url when that delegation is not
-                // acceptable; HTTPS validation alone is not a host allowlist.
-                self.sandbox(id, c).await?.toolbox_proxy_url.ok_or_else(|| DAYTONA.bad_response())?.into()
-            }
-        };
-        let base = https_base(DAYTONA, &base).map_err(|_| DAYTONA.bad_response())?;
-        join(&base, &[&[id], segments].concat()).map_err(|_| DAYTONA.bad_response())
-    }
-    async fn execute(&self, id: &str, command: &str, timeout: u64, c: &Credentials) -> Result<GuestOutput> {
-        let url = self.toolbox(id, &["process", "execute"], c).await?;
-        let v: Executed = self.api.call(Method::POST, url, Body::json(&Execute { command, timeout })?, c).await?;
-        Ok(GuestOutput::from_text(&v.result, "", Some(v.exit_code.into())))
-    }
-    // Lifecycle state checks deliberately avoid explicit inspect's root probe.
-    async fn lifecycle_state(&self, id: &str, c: &Credentials) -> Result<Observation> {
-        Ok(self.environment(&self.sandbox(id, c).await?)?.state)
-    }
-    /// Observes only successful asynchronous operations: a failed GET ends
-    /// the wait. A successful async start may briefly still report stopped,
-    /// so stopped alone is not terminal here; conflict re-adoption handles
-    /// stopped rows.
-    async fn wait_started(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        kit::poll(60, Duration::from_secs(2), async || {
-            let v = self.sandbox(id, c).await?;
-            match &*v.state {
-                "started" => self.environment(&v).map(Some),
-                "error" | "build_failed" | "destroyed" | "destroying" => {
-                    Err(refused("Daytona sandbox entered a terminal state before startup"))
-                }
-                _ => Ok(None),
-            }
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("Daytona sandbox has not started", Some(5)))
+    /// A route on the region's toolbox.
+    fn toolbox(&self, id: &str, segments: &[&str]) -> Result<Url> {
+        let base = https_base(DAYTONA, &self.settings.toolbox_url)?;
+        join(&base, &[&[id], segments].concat())
     }
     fn analytics_url(&self, segments: &[&str], from: &str, to: &str) -> Result<Url> {
         let mut url = self.analytics.url(&[&["organization", self.settings.organization_id.as_str()], segments].concat())?;
@@ -448,34 +329,15 @@ impl Guest for Daytona {
         if !env.is_empty() {
             return Err(refused("Daytona's toolbox passes no environment to a command"));
         }
-        self.execute(id, script, 20, c).await
+        let body = Body::json(&json!({"command": script, "timeout": self.settings.exec_seconds}))?;
+        let v: Executed = self.api.call(Method::POST, self.toolbox(id, &["process", "execute"])?, body, c).await?;
+        Ok(GuestOutput::from_text(&v.result, "", Some(v.exit_code.into())))
     }
 }
 
-/// An error state's cause, from Daytona's free-text reason.
-fn error_state(reason: &str) -> Observation {
-    match reason.to_ascii_lowercase().as_str() {
-        reason if reason.contains("out of memory") || reason.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == "oom") => {
-            Observation::Gone { cause: GoneCause::HostOutOfMemory }
-        }
-        reason if reason.contains("evict") => Observation::Gone { cause: GoneCause::EvictedByProvider },
-        reason if reason.contains("unreachable") => Observation::Unknown { reason: UnknownReason::HostUnreachable },
-        _ => Observation::Unknown { reason: UnknownReason::ProviderApiError },
-    }
-}
 fn name(prefix: &str, input: &str) -> String {
     // Keep vendor names below 63 bytes, with 160 bits of digest identity.
     content_name(&format!("drydock-{prefix}-"), 40, &[input])
-}
-fn policy_matches(row: &Policy, policy: &Policy) -> bool {
-    // Compare stable requested destinations, never a DNS resolution at retry.
-    fn set(list: &Option<String>, normal: fn(&str) -> String) -> BTreeSet<String> {
-        list.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(|s| normal(s.trim())).collect()
-    }
-    let cidr = |s: &str| normal_cidr(s).unwrap_or_else(|| s.into());
-    row.network_block_all.unwrap_or(false) == policy.network_block_all.unwrap_or(false)
-        && set(&row.network_allow_list, cidr) == set(&policy.network_allow_list, cidr)
-        && set(&row.domain_allow_list, kit::egress::normal_host) == set(&policy.domain_allow_list, kit::egress::normal_host)
 }
 fn allowlist(request: EgressRequest) -> Result<Policy> {
     match request {
@@ -560,7 +422,6 @@ impl Provider for Daytona {
             workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(false),
-            export: false,
             egress: EgressCapability {
                 routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
                 model: egress_model(),
@@ -575,7 +436,7 @@ impl Provider for Daytona {
                 // reach, so drydockd copies them into Daytona's own.
                 ImageRoute::ProviderPush {
                     protocol: PushProtocol::OciDistribution,
-                    credential_lifetime_seconds: Some(3600),
+                    credential_lifetime_seconds: Some(self.settings.push_credential_seconds),
                     tools_layer: ToolsLayer::Upload,
                     max_image_bytes: Some(self.settings.max_image_gib.saturating_mul(GIB)),
                     chunk_bytes: Some(self.settings.push_chunk_bytes),
@@ -591,16 +452,17 @@ impl Provider for Daytona {
             ],
             usage: true,
             quota: true,
-            host_filesystem: false,
-            host_processes: false,
-            exclusive_label: true,
-            agent_tcp_port: None,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
+            // Create, start and stop answer once Daytona accepted them; a second
+            // stop is refused (400), a delete mid-change conflicts (409), list
+            // and delete reach the whole account, and start needs no token.
+            semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..Capabilities::default()
         }
     }
     fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 30_000 }
+        ObservationMode::Poll { interval_ms: self.settings.poll_seconds.saturating_mul(1000) }
     }
     fn operations(&self) -> Operations<'_> {
         Operations {
@@ -614,31 +476,17 @@ impl Provider for Daytona {
         }
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
-        if let Some(limits) = &self.settings.rate_limits {
-            return limits.clone();
-        }
-        let (general, create) = match self.settings.tier {
-            2 => (20_000, 400),
-            3 => (40_000, 500),
-            4 => (50_000, 600),
-            _ => (10_000, 300),
-        };
-        vec![
-            RateLimit { operation: "*".into(), requests: general, period_seconds: 60 },
-            RateLimit { operation: "provision".into(), requests: create, period_seconds: 60 },
-            RateLimit { operation: "suspend".into(), requests: general, period_seconds: 60 },
-            RateLimit { operation: "resume".into(), requests: general, period_seconds: 60 },
-        ]
+        self.settings.rate_limits.clone()
     }
+    /// Looks the snapshot up by its content name and creates it when absent;
+    /// unavailable while Daytona builds it.
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
         let routes = [ImageRouteKind::ProviderPush, ImageRouteKind::RegistryPull];
         let (route, platform) = check_prepare(DAYTONA, &r, &routes, &platform())?;
-        SIZES.check(DAYTONA, &r.size)?;
+        self.settings.sizes().check(DAYTONA, &r.size)?;
         // CreateSnapshot labels memory/disk "GB", but the resource guide and
         // default snapshot table specify GiB for the resulting sandbox:
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
-        // Keep binary units consistent with sandbox readback; decimal conversion
-        // would also produce fractions rejected by CreateSnapshot's integer fields.
         // Both routes produce the same filesystem, the base's, so the route
         // is not part of the key; nor is the tools image, which no snapshot
         // holds: drydock uploads the agent to each sandbox.
@@ -646,165 +494,87 @@ impl Provider for Daytona {
         let snapshot = match self.api.find::<Snapshot>(self.api.url(&["snapshots", &snapshot_name])?, c).await? {
             Some(v) => v,
             None => {
-                let mut body = CreateSnapshot {
-                    name: &snapshot_name,
-                    region_id: &self.settings.region,
-                    sandbox_class: "container",
-                    cpu: r.size.cpus as u64,
-                    memory: r.size.memory_bytes / GIB,
-                    disk: r.size.disk_bytes / GIB,
-                    image_name: None,
-                    build_info: None,
-                };
+                let mut body = json!({
+                    "name": snapshot_name,
+                    "regionId": self.settings.region,
+                    "sandboxClass": "container",
+                    "cpu": r.size.cpus as u64,
+                    "memory": r.size.memory_bytes / GIB,
+                    "disk": r.size.disk_bytes / GIB,
+                });
                 match route {
                     // drydockd has put the amd64 image in Daytona's registry.
-                    ImageRouteKind::ProviderPush => body.image_name = Some(r.image_digest.clone()),
+                    ImageRouteKind::ProviderPush => body["imageName"] = json!(r.image_digest),
+                    // Daytona's snapshot API takes no platform; pin the
+                    // multi-arch base in the build so the snapshot
+                    // matches the prepared form.
                     ImageRouteKind::RegistryPull => {
-                        // Daytona's snapshot API takes no platform; pin the
-                        // multi-arch base in the build so the snapshot
-                        // matches the prepared form.
-                        let dockerfile_content = platform_dockerfile(&r.image_digest, &platform);
-                        body.build_info = Some(BuildInfo { dockerfile_content });
+                        body["buildInfo"] = json!({"dockerfileContent": platform_dockerfile(&r.image_digest, &platform)})
                     }
                     ImageRouteKind::RemoteBuild => unreachable!("check_prepare admits declared routes only"),
                 }
-                match self.unless_conflict(Method::POST, self.api.url(&["snapshots"])?, Body::json(&body)?, c).await? {
-                    Some(snapshot) => snapshot,
-                    None => self.api.get(self.api.url(&["snapshots", &snapshot_name])?, c).await?,
-                }
+                self.api.call(Method::POST, self.api.url(&["snapshots"])?, Body::json(&body)?, c).await?
             }
         };
-        let id = snapshot.id.clone();
-        let mut snapshot = snapshot;
-        let mut activation_submitted = false;
-        for _ in 0..120 {
-            match &*snapshot.state {
-                "active" => {
-                    if snapshot.cpu.get() != r.size.cpus
-                        || snapshot.mem.get() != (r.size.memory_bytes / GIB) as f64
-                        || snapshot.disk.get() != (r.size.disk_bytes / GIB) as f64
-                    {
-                        return Err(refused("Daytona snapshot resources do not match the requested size"));
-                    }
-                    return Ok(Prepared {
-                        provider: self.name.clone(),
-                        id: snapshot_name,
-                        platform,
-                        image_digest: r.image_digest,
-                        tools_digest: r.tools_digest,
-                    });
+        match &*snapshot.state {
+            "active" => Ok(Prepared {
+                provider: self.name.clone(),
+                id: snapshot_name,
+                platform,
+                image_digest: r.image_digest,
+                tools_digest: r.tools_digest,
+            }),
+            "error" | "build_failed" => Err(refused(format!(
+                "Daytona snapshot {snapshot_name} is {}: {}",
+                &*snapshot.state,
+                snapshot.error_reason.as_deref().unwrap_or("no reason given")
+            ))),
+            state => {
+                // Daytona keeps an unused snapshot inactive until activated.
+                if state == "inactive" {
+                    self.post(self.api.url(&["snapshots", &snapshot.id, "activate"])?, c).await?;
                 }
-                "inactive" if !activation_submitted => {
-                    // A successful activation response can lag at inactive.
-                    // Submit once; all subsequent observations use paced GETs.
-                    self.post(self.api.url(&["snapshots", &id, "activate"])?, c).await?;
-                    activation_submitted = true;
-                }
-                "error" | "build_failed" => return Err(refused("Daytona snapshot build failed")),
-                _ => {}
+                Err(ProtocolError::unavailable(format!("Daytona snapshot {snapshot_name} is {state}"), None))
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            snapshot = self.api.get(self.api.url(&["snapshots", &id])?, c).await?;
         }
-        Err(ProtocolError::unavailable("Daytona snapshot is still building", Some(5)))
     }
+    /// One create. The sandbox is named by Daytona, not by the label.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        let policy = allowlist(r.egress)?;
-        let size = &r.size;
-        SIZES.check(DAYTONA, size)?;
-        check_prepared(DAYTONA, &self.name, &r.prepared, &snapshot_name(&r.prepared.image_digest, &r.prepared.platform, size))?;
-        // The sandbox name derives from the label, so re-adoption is a direct read:
-        // the list lags creation by seconds, so a quick retry must not rely on it.
-        if let Some(v) = self.by_label_name(&r.label, c).await? {
-            self.check_existing_request(&v, size, &policy)?;
-            // Re-adoption returns the observed stopped/error state unchanged;
-            // provision does not implicitly resume an existing label. A sandbox still
-            // starting is likewise returned as observed (unlike the create-conflict
-            // path below, which waits): the caller polls it.
-            let row = self.environment(&v)?;
-            if matches!(row.state, Observation::Running) {
-                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
-            }
-            return Ok(Provisioned::Existing(row));
+        let mut labels = BTreeMap::from([(LABEL_TAG, r.label.as_str())]);
+        if self.ownership == Ownership::SharedAccount {
+            labels.insert(OWNER_TAG, &self.name);
         }
-        let body = CreateSandbox {
-            name: name("environment", &r.label),
-            snapshot: &r.prepared.id,
-            labels: BTreeMap::from([(LABEL_TAG, r.label.as_str()), (PROVIDER_TAG, self.name.as_str())]),
-            target: &self.settings.region,
-            auto_stop_interval: 0,
-            auto_pause_interval: 0,
-            auto_delete_interval: -1,
-            public: false,
-            policy: &policy,
-        };
-        let created: Option<Sandbox> = self.unless_conflict(Method::POST, self.api.url(&["sandbox"])?, Body::json(&body)?, c).await?;
-        let v = match created {
-            None => {
-                let v = self
-                    .by_label_name(&r.label, c)
-                    .await?
-                    .ok_or_else(|| ProtocolError::NotFound { reason: "Daytona sandbox vanished after a name conflict".into() })?;
-                self.check_existing_request(&v, size, &policy)?;
-                let existing = self.environment(&v)?;
-                if matches!(existing.state, Observation::Stopped { .. } | Observation::Unknown { .. } | Observation::Gone { .. }) {
-                    return Ok(Provisioned::Existing(existing));
-                }
-
-                let row = self.wait_started(&v.id, c).await?;
-                return Ok(Provisioned::Existing(self.inspect(&row.id, c).await?));
-            }
-            Some(v) => v,
-        };
-        let row = self.wait_started(&v.id, c).await?;
-        Ok(Provisioned::Created(self.inspect(&row.id, c).await?))
+        let mut body = json!({
+            "snapshot": r.prepared.id,
+            "labels": labels,
+            "target": self.settings.region,
+            "autoStopInterval": 0,
+            "autoPauseInterval": 0,
+            "autoDeleteInterval": -1,
+            "public": false,
+        });
+        if let (Some(body), serde_json::Value::Object(policy)) = (body.as_object_mut(), json!(allowlist(r.egress)?)) {
+            body.extend(policy);
+        }
+        let v: Sandbox = self.api.call(Method::POST, self.api.url(&["sandbox"])?, Body::json(&body)?, c).await?;
+        Ok(Provisioned::Created(self.environment(v)?))
     }
+    /// Every sandbox Daytona lists, in whatever state it reports.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
-        // Daytona keeps a deleted sandbox listed as destroying/destroyed for a while;
-        // once destroy has returned it must not read as present. Intended contract: a
-        // sandbox mid-destroy is absent from `list`, while `inspect` still reports
-        // `Destroying`.
-        let mut rows = Vec::new();
+        const PAGED: Paging = Paging { rows: Some("items"), cursor: "cursor", next: Next::Body(&["nextCursor"]) };
         let mut url = self.api.url(&["sandbox"])?;
-        url.query_pairs_mut().append_pair("limit", "200");
-        for v in self.api.paged::<Sandbox>(url, &PAGED, c).await? {
-            if kit::ours(&v.labels, &self.name).is_none() {
-                continue;
-            }
-            let row = self.environment(&v)?;
-            if !matches!(
-                row.state,
-                Observation::Transitioning { phase: TransitionPhase::Destroying }
-                    | Observation::Gone { cause: GoneCause::DestroyedAtProvider }
-            ) {
-                rows.push(row);
-            }
-        }
-        Ok(rows)
+        url.query_pairs_mut().append_pair("limit", &self.settings.page_size.to_string());
+        self.api.paged::<Sandbox>(url, &PAGED, c).await?.into_iter().map(|v| self.environment(v)).collect()
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        self.environment(&self.sandbox(id, c).await?)
+        self.environment(self.api.get(self.sandbox_url(id, None)?, c).await?)
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        // Daytona answers 409 while a state change is in progress; wait it out briefly,
-        // then surface the retryable `unavailable` error.
-        if let Some(v) = self.api.find::<Sandbox>(self.sandbox_url(id, None)?, c).await? {
-            self.check_ours(&v)?;
-        }
-        for attempt in 1..=DESTROY_ATTEMPTS {
-            let url = self.sandbox_url(id, None)?;
-            match absent_on_not_found(self.unless_conflict::<IgnoredAny>(Method::DELETE, url, Body::None, c).await) {
-                Ok(None | Some(Some(_))) => return Ok(()),
-                Ok(Some(None)) if attempt < DESTROY_ATTEMPTS => tokio::time::sleep(DESTROY_RETRY_DELAY).await,
-                Ok(Some(None)) => break,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(ProtocolError::unavailable("Daytona sandbox state change still in progress; retry destroy", None))
+        self.api.call::<IgnoredAny>(Method::DELETE, self.sandbox_url(id, None)?, Body::None, c).await.map(drop)
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
         let mut url = self.sandbox_url(id, Some("ssh-access"))?;
-        url.query_pairs_mut().append_pair("expiresInMinutes", SSH_TOKEN_TTL_MINUTES);
+        url.query_pairs_mut().append_pair("expiresInMinutes", &self.settings.ssh_token_minutes.to_string());
         let access: SshAccess = self.api.call(Method::POST, url, Body::None, c).await?;
         Ok(Reach::Ssh {
             endpoint: self.settings.ssh_endpoint.clone(),
@@ -818,33 +588,15 @@ impl Provider for Daytona {
         Err(refused("Daytona uses the SSH gateway"))
     }
 }
+/// Stop and start. Daytona resumes by id alone, so the token is the id.
 #[async_trait]
 impl SuspendResume for Daytona {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        if !matches!(
-            self.lifecycle_state(id, c).await?,
-            Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping }
-        ) {
-            self.post(self.sandbox_url(id, Some("stop"))?, c).await?;
-        }
-        kit::poll(60, Duration::from_secs(2), async || {
-            Ok(matches!(self.lifecycle_state(id, c).await?, Observation::Stopped { .. })
-                .then(|| DAYTONA.resume_marker("drydock-resume-", &self.name, id)))
-        })
-        .await?
-        .ok_or_else(|| ProtocolError::unavailable("Daytona sandbox has not stopped", Some(5)))
+        self.post(self.sandbox_url(id, Some("stop"))?, c).await?;
+        Ok(ResumeToken { token: Secret::new(id) })
     }
-    async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        DAYTONA.check_resume("drydock-resume-", &self.name, id, &token)?;
-        let state = self.lifecycle_state(id, c).await?;
-        if matches!(state, Observation::Running) {
-            return Ok(());
-        }
-        if !matches!(state, Observation::Transitioning { phase: TransitionPhase::Starting }) {
-            self.post(self.sandbox_url(id, Some("start"))?, c).await?;
-        }
-        self.wait_started(id, c).await?;
-        Ok(())
+    async fn resume(&self, id: &str, _: ResumeToken, c: &Credentials) -> Result<()> {
+        self.post(self.sandbox_url(id, Some("start"))?, c).await
     }
 }
 #[async_trait]
@@ -876,10 +628,11 @@ impl PushAccessOperation for Daytona {
 #[async_trait]
 impl GuestFiles for Daytona {
     async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, c: &Credentials) -> Result<()> {
-        let mut url = self.toolbox(id, &["files", "upload-v2"], c).await?;
+        let mut url = self.toolbox(id, &["files", "upload-v2"])?;
         url.query_pairs_mut().append_pair("path", &file.path);
-        self.api.call_within::<IgnoredAny>(Method::POST, url, Body::Bytes(bytes, "application/octet-stream"), c, UPLOAD_DEADLINE).await?;
-        let mut url = self.toolbox(id, &["files", "permissions"], c).await?;
+        let deadline = Duration::from_secs(self.settings.upload_seconds);
+        self.api.call_within::<IgnoredAny>(Method::POST, url, Body::Bytes(bytes, "application/octet-stream"), c, deadline).await?;
+        let mut url = self.toolbox(id, &["files", "permissions"])?;
         url.query_pairs_mut().append_pair("path", &file.path).append_pair("mode", &format!("{:04o}", file.mode));
         self.post(url, c).await
     }
@@ -888,50 +641,33 @@ impl GuestFiles for Daytona {
 impl QuotaOperation for Daytona {
     async fn quota(&self, c: &Credentials) -> Result<Quota> {
         let v: OrganizationUsage = self.api.get(self.api.url(&["organizations", &self.settings.organization_id, "usage"])?, c).await?;
+        let gib = GIB as f64;
+        let row = |region: Option<&RegionUsage>, resource, unit: &str, factor: f64, in_use: Amount, limit: Amount| ResourceQuota {
+            key: QuotaKey { region: region.map(|r| r.region_id.to_string()), class: region.map(|r| r.sandbox_class.to_string()), resource },
+            unit: unit.into(),
+            in_use: in_use.get() * factor,
+            limit: Some(limit.get() * factor),
+        };
         let mut resources = Vec::new();
-        for region in &v.region_usage {
-            for (resource, unit, factor, in_use, limit) in [
-                (ResourceKind::Cpu, "{vCPU}", 1.0, region.current_cpu_usage, region.total_cpu_quota),
-                (ResourceKind::Memory, "By", GIB as f64, region.current_memory_usage, region.total_memory_quota),
-                (ResourceKind::Disk, "By", GIB as f64, region.current_disk_usage, region.total_disk_quota),
-            ] {
-                resources.push(ResourceQuota {
-                    key: QuotaKey { region: Some(region.region_id.to_string()), class: Some(region.sandbox_class.to_string()), resource },
-                    unit: unit.into(),
-                    in_use: in_use.get() * factor,
-                    limit: Some(limit.get() * factor),
-                });
-            }
+        for r in &v.region_usage {
+            resources.push(row(Some(r), ResourceKind::Cpu, "{vCPU}", 1.0, r.current_cpu_usage, r.total_cpu_quota));
+            resources.push(row(Some(r), ResourceKind::Memory, "By", gib, r.current_memory_usage, r.total_memory_quota));
+            resources.push(row(Some(r), ResourceKind::Disk, "By", gib, r.current_disk_usage, r.total_disk_quota));
         }
-        for (resource, in_use, limit) in [
-            (ResourceKind::SnapshotStorage, v.current_snapshot_usage, v.total_snapshot_quota),
-            (ResourceKind::VolumeStorage, v.current_volume_usage, v.total_volume_quota),
-        ] {
-            resources.push(ResourceQuota {
-                key: QuotaKey { region: None, class: None, resource },
-                unit: "By".into(),
-                in_use: in_use.get() * GIB as f64,
-                limit: Some(limit.get() * GIB as f64),
-            });
-        }
-        Ok(Quota { resources, credits_remaining: None, credit_unit: None, concurrency_in_use: None, concurrency_limit: None })
+        resources.push(row(None, ResourceKind::SnapshotStorage, "By", gib, v.current_snapshot_usage, v.total_snapshot_quota));
+        resources.push(row(None, ResourceKind::VolumeStorage, "By", gib, v.current_volume_usage, v.total_volume_quota));
+        Ok(Quota { resources, ..Quota::default() })
     }
 }
+/// The organization's aggregate for the period, as Daytona's analytics
+/// reports it, in one call. No per-size hours: Daytona reports none.
 #[async_trait]
 impl UsageOperation for Daytona {
     async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
-        let bad = || DAYTONA.bad_response();
-        let from_text = String::from(period.start().clone());
-        let to_text = String::from(period.end().clone());
-        let from = from_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period start"))?;
-        let to = to_text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| refused("invalid usage period end"))?;
-        // Sample once before the reads; ongoing usage conservatively excludes time spent querying analytics.
-        let ongoing_end = to.min(chrono::Utc::now());
-        let v: AggregatedUsage = self.analytics(&["usage", "aggregated"], &from_text, &to_text, c).await?;
+        let (from, to) = (String::from(period.start().clone()), String::from(period.end().clone()));
+        let v: AggregatedUsage = self.analytics(&["usage", "aggregated"], &from, &to, c).await?;
         // Daytona's reserved memory/disk quantities are GiB:
         // https://www.daytona.io/docs/en/sandboxes/#resources
-        // Interpret analytics' GBSeconds as the integral of those same reserved
-        // quantities. This naming assumption is part of live metering acceptance.
         let resources = [
             (ResourceKind::Cpu, "{vCPU}.s", v.cpu, 1.0),
             (ResourceKind::Memory, "By.s", v.memory, GIB as f64),
@@ -942,84 +678,17 @@ impl UsageOperation for Daytona {
         .into_iter()
         .map(|(resource, unit, amount, factor)| (resource, Quantity { amount: amount.get() * factor, unit: unit.into() }))
         .collect();
-        let price = price(&v.price)?;
-        // Analytics prices are denominated in USD; there is no currency field.
-        let mut environment_hours = Vec::new();
-        let totals: Vec<SandboxUsage> = self.analytics(&["usage", "sandbox"], &from_text, &to_text, c).await?;
-        let mut seen = BTreeSet::new();
-        for sandbox in &totals {
-            if !seen.insert(&sandbox.sandbox_id) {
-                continue;
-            }
-            let periods: Vec<UsagePeriod> = self.analytics(&["sandbox", &sandbox.sandbox_id, "usage"], &from_text, &to_text, c).await?;
-            for row in periods {
-                let cpus = row.cpu.get();
-                // Zero-CPU records contribute no size-hours, even with
-                // their other fields absent.
-                if cpus == 0.0 {
-                    continue;
-                }
-                let start = row.start.ok_or_else(bad)?;
-                let end = match row.end {
-                    None => ongoing_end,
-                    Some(end) if end < start => return Err(bad()),
-                    Some(end) => end,
-                };
-                let start = start.max(from);
-                let end = end.min(to);
-                if end <= start {
-                    continue;
-                }
-                let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
-                let bytes = |n: Option<u64>| n.and_then(|v| v.checked_mul(GIB)).ok_or_else(bad);
-                environment_hours.push(SizeUsage {
-                    size: Size { cpus, memory_bytes: bytes(row.memory)?, disk_bytes: bytes(row.disk)? },
-                    hours: seconds / 3600.0,
-                });
-            }
-        }
         Ok(Usage {
             period,
-            environment_hours,
+            environment_hours: vec![],
             measurements: Some(UsageMeasurements {
                 scope: UsageScope::Organization { id: self.settings.organization_id.clone() },
                 resources,
-                cost: Some(Cost { amount: price, currency: "USD".into() }),
+                // Analytics prices are denominated in USD; there is no currency field.
+                cost: Some(Cost { amount: v.price.get().to_owned(), currency: "USD".into() }),
             }),
         })
     }
-}
-
-/// The analytics price as a decimal lexeme, never through f64.
-fn price(raw: &RawValue) -> Result<String> {
-    decimal_lexeme(raw.get())
-        .ok_or_else(|| ProtocolError::Internal { reason: "invalid Daytona price".into(), provider_error: raw.get().to_owned() })
-}
-
-// JSON permits scientific notation. Expand it using decimal digits alone,
-// bounding the output so a malformed vendor response cannot allocate unboundedly.
-fn decimal_lexeme(raw: &str) -> Option<String> {
-    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
-    if !valid_decimal(mantissa) {
-        return None;
-    }
-    let exponent: i32 = exponent.parse().ok()?;
-    if exponent.unsigned_abs() > 1024 {
-        return None;
-    }
-    let point = mantissa.find('.').unwrap_or(mantissa.len()) as i32 + exponent;
-    let digits = mantissa.replace('.', "");
-    let expanded = if point <= 0 {
-        format!("0.{}{}", "0".repeat((-point) as usize), digits)
-    } else if point as usize >= digits.len() {
-        format!("{}{}", digits, "0".repeat(point as usize - digits.len()))
-    } else {
-        format!("{}.{}", &digits[..point as usize], &digits[point as usize..])
-    };
-    let (integer, fraction) = expanded.split_once('.').unwrap_or((&expanded, ""));
-    let integer = integer.trim_start_matches('0');
-    let integer = if integer.is_empty() { "0" } else { integer };
-    Some(if fraction.is_empty() { integer.into() } else { format!("{integer}.{fraction}") })
 }
 
 // Prefer the exceeded throttler's documented delay; otherwise use an exhausted
@@ -1041,12 +710,10 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
                 .max()
         })
 }
-// The provider records the prepared form under this deterministic resource key.
-// Call only after validate_size: whole positive CPUs make the integer cast lossless.
-/// The prepared form's key. "base-only" sets apart snapshots of the base
-/// alone, made since upload bootstrap, from those carrying a baked agent
-/// (keyed "frozen-agent"): each image is prepared again, once, and a build
-/// that still bakes never finds a snapshot without its agent.
+/// The prepared form's key: the base image, the platform and the size, which
+/// a Daytona snapshot fixes. "base-only" sets apart snapshots of the base
+/// alone from older ones carrying a baked agent. Call after the size check:
+/// whole positive CPUs make the integer cast lossless.
 fn snapshot_name(image: &str, platform: &Platform, size: &Size) -> String {
     name("snapshot", &format!("base-only\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
 }
@@ -1059,24 +726,6 @@ fn platform() -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Vendor decimal lexemes retain all digits, beyond binary64's exact range.
-    #[test]
-    fn exact_vendor_money_and_complete_errors() {
-        let v: AggregatedUsage = serde_json::from_slice(
-            br#"{"totalPrice":9007199254740993.00000001,"sandboxCount":1,"totalCPUSeconds":0,"totalRAMGBSeconds":0,"totalDiskGBSeconds":0,"totalGPUSeconds":0}"#,
-        )
-        .unwrap();
-        assert_eq!(price(&v.price).unwrap(), "9007199254740993.00000001");
-        assert_eq!(decimal_lexeme("1.23e-7").as_deref(), Some("0.000000123"));
-        assert_eq!(decimal_lexeme("1.23e+5").as_deref(), Some("123000"));
-        assert_eq!(decimal_lexeme("0.5e1").as_deref(), Some("5"));
-        assert_eq!(decimal_lexeme("0.001e2").as_deref(), Some("0.1"));
-        assert_eq!(decimal_lexeme("0e3").as_deref(), Some("0"));
-        assert!(decimal_lexeme("1e99999").is_none());
-        for invalid in ["-1e2", ".5e1", "1.e2", "1ee2", "1e", "NaN", "", "1e-99999"] {
-            assert!(decimal_lexeme(invalid).is_none(), "{invalid}");
-        }
-    }
     // The snapshot is built for one platform, so the platform is part of its name.
     #[test]
     fn snapshot_name_includes_platform() {
@@ -1085,19 +734,15 @@ mod tests {
         assert_eq!(amd, snapshot_name("image", &platform(), &size));
         assert_ne!(amd, snapshot_name("image", &Platform::new("linux", "arm64"), &size));
     }
-    // Vendor normalization must not break an exact label retry.
+    // One Daytona control per request: domains, addresses, or block-all.
     #[test]
-    fn normalized_policy_identity() {
-        let policy = |v: serde_json::Value| serde_json::from_value::<Policy>(v).unwrap();
-        assert!(policy_matches(
-            &policy(json!({"domainAllowList":"EXAMPLE.COM.,other.test"})),
-            &policy(json!({"domainAllowList":"other.test,example.com"}))
-        ));
-        assert!(policy_matches(
-            &policy(json!({"networkAllowList":"192.0.2.5,10.0.0.12/24"})),
-            &policy(json!({"networkAllowList":"10.0.0.0/24,192.0.2.5/32"}))
-        ));
-        assert!(!policy_matches(&policy(json!({"networkAllowList":"192.0.2.5"})), &policy(json!({"networkAllowList":"192.0.2.6/32"}))));
+    fn egress_translation() {
+        let host = |h: &str| Destination::Host { host: serde_json::from_value(json!(h)).unwrap() };
+        let deny = |direct| allowlist(EgressRequest::DenyAll { direct }).unwrap();
+        assert_eq!(deny(vec![]), Policy { network_block_all: Some(true), ..Policy::default() });
+        assert_eq!(deny(vec![host("Example.COM."), host("a.test")]).domain_allow_list.as_deref(), Some("a.test,example.com"));
+        assert_eq!(deny(vec![host("192.0.2.5")]).network_allow_list.as_deref(), Some("192.0.2.5/32"));
+        assert!(allowlist(EgressRequest::DenyAll { direct: vec![host("a.test"), host("192.0.2.5")] }).is_err());
     }
     // Retry headers use named throttlers; reset fallback applies only to an
     // exhausted bucket. Reset is a duration, not a Unix epoch.

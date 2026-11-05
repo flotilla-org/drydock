@@ -203,7 +203,7 @@ async fn transport_drop_mid_provision_is_unknown_and_not_retried() {
     let reference = drydock_host::reference::ReferenceModule
         .configure(
             "p",
-            &ProviderConfiguration { module: "fake".into(), settings: Default::default(), credential: None },
+            &ProviderConfiguration { module: "fake".into(), settings: Default::default(), credential: None, ..Default::default() },
             Arc::new(rigging_http_client::ReqwestHttpClient::restricted(None, None).unwrap()),
         )
         .await

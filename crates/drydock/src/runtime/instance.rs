@@ -31,6 +31,8 @@ pub(super) struct Instance {
     pub(super) observation_generation: Mutex<u64>,
     pub(super) egress_measured_at: Mutex<BTreeMap<String, tokio::time::Instant>>,
     pub(super) request_timeout: std::time::Duration,
+    /// The observer's view of this provider, as drydockd's waits read it.
+    pub(super) observed: Arc<Observed>,
 }
 #[derive(Default)]
 pub(super) struct DestroyState {

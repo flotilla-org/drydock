@@ -612,7 +612,8 @@ impl Daemon {
             // provision below is adopted without drydock's key: labels are the
             // client's, and drydock does not arbitrate between two clients of one.
             let existing = self.runtime(provider)?.list(provider).await?;
-            if existing.iter().any(|environment| environment.label.as_deref() == Some(request.label.as_str())) {
+            let named = |e: &Environment| e.live() && e.label.as_deref() == Some(request.label.as_str());
+            if existing.iter().any(named) {
                 return Err(Error::Protocol(ProtocolError::Refused {
                     reason: "drydock holds no SSH key for the environment this label names".into(),
                 }));
@@ -1006,5 +1007,6 @@ fn conservative_capabilities() -> Capabilities {
         exclusive_label: false,
         agent_tcp_port: None,
         reach_ways: vec![],
+        semantics: Default::default(),
     }
 }

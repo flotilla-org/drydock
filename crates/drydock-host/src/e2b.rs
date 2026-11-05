@@ -453,6 +453,7 @@ impl E2b {
             egress_measured: false,
             egress_policy: v.network.as_ref().map(|n| Policy::read(n).fingerprint()),
             timestamp: None,
+            vendor: None,
         })
     }
     fn gone(&self, id: &str) -> Environment {
@@ -467,6 +468,7 @@ impl E2b {
             egress_measured: false,
             egress_policy: None,
             timestamp: None,
+            vendor: None,
         }
     }
     async fn wait_state(&self, id: &str, wanted: &str, c: &Credentials) -> Result<()> {
@@ -767,6 +769,7 @@ impl Provider for E2b {
             exclusive_label: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     fn observation(&self) -> ObservationMode {

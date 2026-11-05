@@ -28,6 +28,7 @@ pub(super) fn poll_interval(mode: ObservationMode, limits: &[RateLimit]) -> Resu
 pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     let interval = instance.poll_interval;
     let mut credentials = instance.credential_changes.subscribe();
+    let observed = instance.observed.clone();
     let weak: Weak<Instance> = Arc::downgrade(&instance);
     drop(instance);
     tokio::spawn(async move {
@@ -41,6 +42,8 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             tokio::select! {
                 _ = clock.tick() => {},
                 result = credentials.changed() => { if result.is_err() { break; } clock.reset(); },
+                // A wait asks for a poll now; the next one is an interval later.
+                _ = observed.poll_now.notified() => clock.reset(),
                 _ = stopping.changed() => break,
             }
             let Some(instance) = weak.upgrade() else {
@@ -56,6 +59,7 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 result = instance.call_with_budget(Gate::List, true, None, |p,c| async move { p.list(&c).await }) => match result {
                     Ok(rows) => rows,
                     Err(error) => {
+                        let error_for_waits = error.clone();
                         tracing::warn!(provider = %instance.name, route = "poll", error_class = error.class(), error = %error, "poll failed; retaining inventory");
                         let auth = instance.auth.recover();
                         if auth.generation == generation && !auth.rejected {
@@ -63,12 +67,16 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                         }
                         drop(auth);
                         instance.events.shared.changed.send_modify(|_| {});
+                        observed.polls.send_replace(Some(error_for_waits));
                         continue;
                     },
                 },
                 _ = stopping.changed() => break,
             };
             reconcile(&instance, &mut seen, rows, observation_generation);
+            // Sent on every poll, changed or not: each send is the tick a
+            // settling wait counts.
+            observed.polls.send_replace(None);
         }
     })
 }
@@ -86,6 +94,7 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
             }
         }
     }
+    let confirmed: BTreeSet<String> = instance.destroyed.recover().iter().filter(|(_, s)| s.confirmed).map(|(id, _)| id.clone()).collect();
     for (id, row) in &current {
         let s = row;
         let mut kinds = vec![];
@@ -114,7 +123,13 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
                 });
             }
             Observation::Gone { cause } if old.is_none_or(|old| old.state != s.state) => {
-                kinds.push(EventKind::Gone { cause: cause.clone() })
+                // A vendor that keeps listing what it destroyed reports the
+                // destruction drydock asked for as its own.
+                let cause = match cause {
+                    GoneCause::DestroyedAtProvider if confirmed.contains(id) => GoneCause::DestroyedByRequest,
+                    cause => cause.clone(),
+                };
+                kinds.push(EventKind::Gone { cause })
             }
             _ => {}
         }

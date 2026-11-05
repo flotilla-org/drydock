@@ -180,6 +180,7 @@ impl Local {
             egress_measured: false,
             egress_policy: None,
             timestamp: None,
+            vendor: None,
         }
     }
     /// Environments found on disk, with the label each was created for.
@@ -477,6 +478,7 @@ impl Provider for Local {
             agent_tcp_port: None,
             // Vessels are processes on this machine: its network is theirs.
             reach_ways: vec![ReachWay::HostNetwork, ReachWay::OutwardExposure],
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     fn observation(&self) -> ObservationMode {

@@ -34,7 +34,7 @@ pub(super) async fn host_fixtures(
             let mut invalid = configuration.clone();
             invalid.providers.insert(
                 "invalid".into(),
-                ProviderConfiguration { module: "unknown".into(), settings: Default::default(), credential: None },
+                ProviderConfiguration { module: "unknown".into(), settings: Default::default(), credential: None, ..Default::default() },
             );
             let (status, _) = client
                 .wire(Method::PUT, &["v1", "config"], &[], Some(&serde_json::to_value(invalid).map_err(SafeError::category)?))
@@ -134,9 +134,10 @@ pub async fn error_contract(client: &Client, base: &Configuration, report: &mut 
                 return;
             }
         };
-        configuration
-            .providers
-            .insert(format!("error-{}", error.class()), ProviderConfiguration { module: module.clone(), settings, credential: None });
+        configuration.providers.insert(
+            format!("error-{}", error.class()),
+            ProviderConfiguration { module: module.clone(), settings, credential: None, ..Default::default() },
+        );
     }
     let configured = client.configure(ConfigUpdate::Replace(configuration)).await.map_err(SafeError::category);
     if report.capture("host_configuration", configured).is_none() {

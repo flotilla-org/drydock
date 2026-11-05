@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "11";
+pub const PROTOCOL_VERSION: &str = "12";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -53,7 +53,7 @@ pub struct Configuration {
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfiguration>,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfiguration {
     pub module: String,
@@ -63,6 +63,58 @@ pub struct ProviderConfiguration {
     /// Server only: where the server gets this provider's credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<CredentialLocation>,
+    /// Whether drydock owns the vendor account or shares it.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ownership: Ownership,
+    /// Server only: the guarantees drydockd adds for this instance where the
+    /// module's operations do not give them by themselves ([`Semantics`]).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub semantics: SemanticOptions,
+}
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+/// The vendor-side tag naming the drydock instance that made a resource, on
+/// a shared account.
+pub const OWNER_TAG: &str = "drydock.provider";
+/// Who else uses the vendor account an instance works in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Ownership {
+    /// Others use the account too: what the instance makes carries
+    /// [`OWNER_TAG`], and the instance lists, destroys, suspends and resumes
+    /// only what does.
+    #[default]
+    SharedAccount,
+    /// Drydock owns the whole account: nothing is tagged, filtered or refused.
+    OwnedAccount,
+}
+/// What drydockd adds to a module's operations, for one instance. Each applies
+/// only where the module's [`Semantics`] do not already give it; with both
+/// off, a module's verbs are its own operations.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct SemanticOptions {
+    /// Provision and resume answer once drydockd observes the environment
+    /// running, and suspend once it observes it stopped. drydockd waits on
+    /// its own observation of the provider, so a wait can take up to one
+    /// observation interval after the vendor got there. A provision whose
+    /// wait fails has still made its environment, which `list` shows under
+    /// the client's label.
+    pub settle: bool,
+    /// Resume of a running or starting environment succeeds without a vendor
+    /// call, as does suspend of a stopped or stopping one when the module's
+    /// resume token is the environment id; without `settle`, such a call can
+    /// answer while the transition is still under way. Destroy of an absent
+    /// environment, or one already being destroyed, succeeds.
+    pub idempotent: bool,
+    /// The longest provision, suspend or resume waits.
+    pub wait_seconds: u64,
+}
+impl Default for SemanticOptions {
+    fn default() -> Self {
+        Self { settle: true, idempotent: true, wait_seconds: 120 }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(untagged, deny_unknown_fields)]
@@ -212,10 +264,10 @@ pub struct Capabilities {
     /// not a sandbox, and nothing may treat it as one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_processes: bool,
-    /// Concurrent provisions of one label return one environment: the provider
-    /// refuses a second sandbox for a label. Without it, a retry after a
-    /// provision has returned still returns that environment, but concurrent
-    /// provisions may each create one.
+    /// Provision of a label that names an environment returns it, concurrent
+    /// provisions included: the module refuses a second sandbox for a label.
+    /// Without it a label is only the client's name for what it made, and
+    /// every provision may create an environment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_label: bool,
     /// The ways, beyond the guest's own egress, that a vessel can reach a
@@ -224,6 +276,61 @@ pub struct Capabilities {
     /// egress policy) stays described by `egress`.
     #[serde(default)]
     pub reach_ways: Vec<ReachWay>,
+    /// What the module's operations guarantee by themselves.
+    #[serde(default)]
+    pub semantics: Semantics,
+}
+/// Nothing: no material, checkout, image route or optional port; open egress,
+/// unfiltered; Bake bootstrap. Modules state what differs.
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            material_modes: vec![],
+            checkout_strategies: vec![],
+            workspace_root: String::new(),
+            suspend_resume: false,
+            suspend_preserves_memory: None,
+            export: false,
+            egress: EgressCapability { routes: vec![EgressRoute::Open], model: EgressModel::unfiltered() },
+            fallback_runner: false,
+            bootstrap: BootstrapRoute::Bake,
+            agent: false,
+            agent_tcp_port: None,
+            platforms: vec![],
+            image_routes: vec![],
+            usage: false,
+            quota: false,
+            host_filesystem: false,
+            host_processes: false,
+            exclusive_label: false,
+            reach_ways: vec![],
+            semantics: Semantics::default(),
+        }
+    }
+}
+/// What a module's operations guarantee by themselves. Each defaults to
+/// false: no guarantee. A module states what its own operations do, and
+/// drydockd adds what the instance's [`SemanticOptions`] ask for; the
+/// declaration a client reads says what the operations guarantee with
+/// drydockd's additions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct Semantics {
+    /// Provision and resume answer once the environment runs, suspend once it
+    /// has stopped, and prepare once the prepared form can be used. Otherwise
+    /// each answers when the request was accepted, and prepare answers
+    /// unavailable while the form is being built.
+    pub settles: bool,
+    /// Suspend, resume or destroy of an environment already in that state (or
+    /// gone) succeeds.
+    pub idempotent: bool,
+    /// List and destroy reach only what this instance made: the module checks
+    /// its own ownership. Otherwise the module tags what it makes with
+    /// [`OWNER_TAG`] on a shared account and reports the tags in
+    /// [`VendorState`], and drydockd applies the instance's [`Ownership`].
+    pub owner_scoped: bool,
+    /// The resume token is the environment id and resume ignores it.
+    pub token_is_id: bool,
 }
 /// One way, beyond the guest's own egress, that a vessel can reach a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -624,11 +731,32 @@ pub struct Environment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(format = DateTime)]
     pub timestamp: Option<Timestamp>,
+    /// What the vendor itself reports, beside the coarse `state`, from
+    /// modules that report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<VendorState>,
+}
+/// An environment in the vendor's own words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct VendorState {
+    /// The vendor's state name, as it gives it.
+    pub state: String,
+    /// The vendor's explanation of that state, when it gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The vendor-side tags, as read back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
 }
 impl Environment {
     /// The observation without its evidence fields, for comparing states.
     pub fn without_evidence(&self) -> Self {
         Self { egress_measured: false, egress_policy: None, timestamp: None, ..self.clone() }
+    }
+    /// Neither gone nor being destroyed. A vendor may keep listing an
+    /// environment in either state for a while.
+    pub fn live(&self) -> bool {
+        !matches!(self.state, Observation::Gone { .. } | Observation::Transitioning { phase: TransitionPhase::Destroying })
     }
 }
 /// An OCI platform: `os` and `architecture` by OCI names (`linux`, `amd64`,
@@ -894,6 +1022,8 @@ pub struct Quantity {
 
 /// Currency is explicit, e.g. USD or EUR; the field name fixes no currency.
 /// A missing cost is unknown, whereas an amount of zero is a known zero cost.
+/// The amount is the vendor's own number text, which may carry an exponent
+/// (`1.5e-7`); it never passes through binary floating point.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Cost {
     #[serde(deserialize_with = "decimal_amount")]
@@ -952,11 +1082,14 @@ pub struct ResourceQuota {
     pub limit: Option<f64>,
 }
 
-/// Nonnegative exact decimal money: no exponent, binary float, or NaN.
+/// Nonnegative decimal money, as a JSON number's text: digits, an optional
+/// fraction and an optional exponent. Never NaN or a binary float.
 fn decimal_amount<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let value = String::deserialize(d)?;
-    if !valid_decimal(&value) {
-        return Err(serde::de::Error::custom("expected nonnegative exact decimal"));
+    let (mantissa, exponent) = value.split_once(['e', 'E']).unwrap_or((&value, "0"));
+    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if !valid_decimal(mantissa) || exponent.is_empty() || !exponent.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(serde::de::Error::custom("expected a nonnegative decimal number"));
     }
     Ok(value)
 }
@@ -974,7 +1107,7 @@ pub struct SizeUsage {
     pub size: Size,
     pub hours: f64,
 }
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Quota {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceQuota>,

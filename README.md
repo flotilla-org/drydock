@@ -663,7 +663,63 @@ report the exact upstream operation and message; they do not invalidate the key.
 The main server owns common admission, credential state, budgets, polling,
 inventory/lifecycle reconciliation, billing, snapshots, replay and public diagnostic
 sanitisation. Embedded `Daemon` and standalone `drydockd` use the same
-[`runtime`](crates/drydock/src/runtime) implementation. The
+[`runtime`](crates/drydock/src/runtime) implementation.
+
+### Semantics drydockd adds
+
+A module declares in `capabilities.semantics` what its own operations
+guarantee; each flag defaults to false. Where they do not, drydockd adds what
+the instance asks for, in [one place](crates/drydock/src/runtime/semantics.rs),
+and the declaration clients read says what the operations guarantee with
+those additions. Each instance takes `ownership` and `semantics` beside
+`module`:
+
+```toml
+[providers.daytona]
+module = "daytona"
+ownership = "shared_account"   # or "owned_account"
+semantics = { settle = true, idempotent = true, wait_seconds = 120 }
+```
+
+The values shown are the defaults.
+
+- `settle`: provision and resume return once drydockd observes the
+  environment running, and suspend once it observes it stopped. The wait reads
+  drydockd's own observer: it asks for one poll at once, then follows the
+  observer's polls, so it can take up to one observation interval after the
+  vendor got there, and it makes no vendor calls of its own. It needs the
+  credential drydockd holds for the instance, since that is what the observer
+  polls with. A wait ends early, refused, when the environment is gone or its
+  state unknown, and unavailable at its deadline, naming the last poll's
+  error if the observer's polls were failing. A provision whose wait fails has
+  still made its environment: the error names its id, and `list` shows it
+  under the client's label for the client to use or destroy. Prepare is not
+  waited on: a module may answer unavailable while a form is built, and the
+  client asks again.
+- `idempotent`: resume of a running or starting environment makes no vendor
+  call, nor does suspend of a stopped or stopping one when the module's resume
+  token is the environment id (`token_is_id`); otherwise suspend asks the
+  vendor for the token. Without `settle`, a skipped call can answer while the
+  transition is still under way. Destroy of an absent environment, or of one
+  already being destroyed, succeeds.
+- `ownership`: on a `shared_account`, what the instance makes carries
+  `drydock.provider=<instance>`, and drydockd lists only what carries it and
+  refuses to destroy, suspend or resume anything else, or anything whose tag
+  the vendor cannot report at the time. The check and the operation are two
+  vendor calls, not one atomic step. Inspect, reach and relay are not checked,
+  so a client can open a path into another tool's environment by its id
+  ([#276](https://github.com/flotilla-org/drydock/issues/276)). On an
+  `owned_account` nothing is tagged, filtered or refused. Only a module that leaves ownership to drydockd (does
+  not declare `owner_scoped`) takes `owned_account`.
+
+A label is the client's name for what it made, not a handle: drydockd does
+not adopt environments by label. Only a module that declares
+`exclusive_label` returns the environment a label names.
+
+With `settle` and `idempotent` false, each verb is the module's own
+operation, answered as the vendor answers it. `semantics` is server-only:
+hosts never receive it. Lists report what the vendor lists, so a row may be
+`gone` or `destroying`; `Environment::live` says whether it is neither. The
 [Rust host](crates/drydock-host/README.md) is a compiled module loader serving
 the public API over [`drydock-provider`](crates/drydock-provider); the server
 reaches it through the same routes a client uses against the server. Earlier

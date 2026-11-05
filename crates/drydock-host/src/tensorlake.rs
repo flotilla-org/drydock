@@ -351,6 +351,7 @@ impl Tensorlake {
             egress_measured: false,
             egress_policy: Some(Policy::read(v.network_policy.as_ref()).fingerprint()),
             timestamp: None,
+            vendor: None,
         })
     }
     async fn token(&self, id: &str, c: &Credentials) -> Result<Token> {
@@ -702,6 +703,7 @@ impl Provider for Tensorlake {
             host_processes: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     fn observation(&self) -> ObservationMode {

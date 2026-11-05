@@ -166,7 +166,6 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
       "module": "daytona",
       "settings": {
         "organization_id":"YOUR_ORGANIZATION_ID",
-        "region":"eu", "tier":1,
         "ssh_host_key":"ssh-ed25519 YOUR_VERIFIED_GATEWAY_PUBLIC_KEY"
       }
     }
@@ -174,216 +173,84 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
 }
 ```
 
+The module translates: each verb is Daytona's own operation, and each answer
+is what Daytona said. Rows carry Daytona's own state name, its `errorReason`
+and its labels in `vendor`, beside the coarse `state`. It declares no
+guarantee beyond `token_is_id`: drydockd adds waiting, idempotence and
+ownership as the instance's `semantics` and `ownership` ask (see the
+top-level README). Sandboxes are named by Daytona; a label is a tag, and
+provisioning a label twice makes two sandboxes.
+
+| Verb | Daytona calls |
+|---|---|
+| prepare | `GET /snapshots/{name}`, then `POST /snapshots` when absent (or `POST .../activate` when inactive); unavailable until `active` |
+| provision | `POST /sandbox` |
+| list | `GET /sandbox`, every page, every state (including `destroying`) |
+| inspect | `GET /sandbox/{id}` |
+| destroy | `DELETE /sandbox/{id}` |
+| suspend / resume | `POST /sandbox/{id}/stop` / `start`; the resume token is the id |
+| reach | `POST /sandbox/{id}/ssh-access` |
+| exec | toolbox `POST /process/execute` |
+| files | toolbox `POST /files/upload-v2`, then `POST /files/permissions` |
+| quota | `GET /organizations/{id}/usage` |
+| usage | analytics `GET /organization/{id}/usage/aggregated` |
+| push access | `GET /docker-registry/registry-push-access` |
+
+Daytona answers 409 while a sandbox's state change is in progress (unavailable,
+retryable) and 400 when the request does not fit the sandbox's state, for
+example a stop of a stopped sandbox (refused, in Daytona's words).
+
 The organisation API key arrives in each call's `Drydock-Credential` header and
-is sent as the bearer token on REST, toolbox and analytics calls, using the
-host's injected HTTP client. There are no module retries or ambient credentials.
-The key needs sandbox creation/modification/deletion, snapshot creation and billing
-read access. API-key scope is the organisation; this is not isolation between
+is sent as the bearer token on REST, toolbox and analytics calls. The key needs
+sandbox creation/modification/deletion, snapshot creation and billing read
+access. API-key scope is the organisation; this is not isolation between
 sandboxes in that organisation.
+
+Settings, with their defaults: `api_url` (`https://app.daytona.io/api/`),
+`analytics_url` (`https://analytics.app.daytona.io/`), `toolbox_url`
+(`https://proxy.app-eu.daytona.io/toolbox/`, the `eu` region's proxy, which
+Daytona also reports on each sandbox), `region` (`eu`; set `toolbox_url` to
+match), `ssh_endpoint` (`ssh.app.daytona.io:22`), `max_cpus` (4),
+`max_memory_gib` (8), `max_disk_gib` (10), `rate_limits` (Tier 1: 10,000
+requests and 300 creates a minute), `max_image_gib` (20), `push_chunk_bytes`
+(16 MiB), `push_credential_seconds` (3600), `ssh_token_minutes` (5),
+`upload_seconds` (300), `exec_seconds` (20), `poll_seconds` (30) and
+`page_size` (200). Bases must be HTTPS and end in `/`.
 
 Daytona takes upload bootstrap (`BootstrapRoute::Upload`): a snapshot is the
 base image alone, and drydockd puts its own agent build in each sandbox through
-the files port. The port writes a file whole with the toolbox's
-`POST /files/upload-v2?path=` (a raw `application/octet-stream` body; parents
-are made) and then sets its mode with `POST /files/permissions`. The upload is
-one request with a five-minute deadline (others keep the host's 30 seconds),
-so a 12 MB agent needs about 330 kbit/s up to Daytona. Daytona's module starts
-no agent itself: a caller that provisions or resumes without drydockd gets a
-sandbox without one.
+the files port, then runs
+`/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`. The
+upload is one request with `upload_seconds` as its deadline. The module starts
+no agent itself.
 
 Daytona declares two image routes, both `tools_layer: upload`. The default is
-`provider_push`, for images in registries Daytona cannot reach: Daytona's
-registry is a drydockd staging target. The push-access port mints a robot with
-`GET /docker-registry/registry-push-access` and names
-`<registry>/<project>/drydock-vessel`; the route declares `max_image_bytes`
-(from `max_image_gib`, default 20, Daytona's default snapshot maximum) and
-`chunk_bytes` (from `push_chunk_bytes`, default 16 MiB). drydockd copies the
-base's `linux/amd64` image there and waits until Daytona's registry serves it
-(see staging in the top-level README), and the module creates the snapshot
-from that `imageName` with no `buildInfo`. The module itself reads no
-registry. Images over the limit, platforms other than amd64 and push access
-that expires mid-copy are typed refusals.
-
-The fallback, `registry_pull`, creates the snapshot from `imageName` set to the
-base reference itself; Daytona pulls it, so a private registry must first be
-registered for the organisation through `POST /docker-registry` (`name`, `url`,
-`username`, `password`; needs `write:registries`). Request it with
-`--image-route registry_pull` or `route` on the prepare request.
-
-Neither route sets entrypoint, command or init, and neither reads the tools
-image: the prepare request must still name one pinned by digest, but it is not
-part of the snapshot or its name. The base must be an immutable SHA-256 image
-reference.
-
+`provider_push`: drydockd copies the base's `linux/amd64` image into Daytona's
+registry with access the push-access port mints, and the module creates the
+snapshot from that `imageName`. The fallback, `registry_pull`, has Daytona build
+the snapshot from a one-line Dockerfile pinning the base to the platform; a
+private registry must first be registered through `POST /docker-registry`.
 The snapshot name includes the image digest, platform and size, not the route
-(both make the same filesystem) and not the tools pin, so a pin bump makes no
-new snapshot. It is marked `base-only`, apart from the snapshots made before
-upload bootstrap with a baked agent: each image is prepared again, once, and a
-build that still bakes never finds a snapshot without its agent.
-Prepare reuses a snapshot and waits for `active`, for up to four minutes per
-call. Provision inherits the snapshot's resources and refuses a size that
-differs from the prepared key. Requests must use whole vCPU and GiB within the
-default 4 vCPU, 8 GiB RAM and 10 GiB disk cap.
+and not the tools pin, so a pin bump makes no new snapshot. A sandbox gets the
+snapshot's resources; `granted_size` reports them.
 
-Provision writes `flotilla.label`, uses a deterministic unique sandbox name,
-disables auto-stop/auto-pause and auto-delete, and waits for started; it runs no
-guest command. drydockd then uploads its build for the prepared platform to
-`/opt/drydock/drydock-agent` (on re-adoption and resume, only when none is
-there) and runs
-`/opt/drydock/drydock-agent --supervise --socket /run/drydock/agent.sock`. The
-agent detaches a supervisor, uses an OS file lock to make concurrent bootstraps
-converge, and restarts the agent after a crash. It requires neither Python nor
-util-linux `flock`. PID 1 remains Daytona's daemon. Resume starts the sandbox,
-and drydockd starts the agent again the same way.
-
-Toolbox commands get a 20-second budget. Starting supervision does not claim
-agent readiness: `drydockd` waits up to 60 seconds for the agent's
-`Client::connect_current` handshake over the SSH gateway before returning
-launch success. An agent found in an older snapshot is upgraded to the build
-for the platform recorded in the prepared form, then the current hello is
-verified. Daytona declares only `linux/amd64`: its sandboxes run on x86_64,
-and its snapshot API takes no platform, so the push route copies the amd64
-manifest and the snapshot name includes the platform. Lookup order for
-platform `<os>/<arch>`:
-
-1. `DRYDOCK_AGENT_BIN_<OS>_<ARCH>` (for example `DRYDOCK_AGENT_BIN_LINUX_ARM64`);
-2. `DRYDOCK_AGENT_BIN`, only when the guest's platform is the host's own;
-3. `drydock-agent-<os>-<arch>` installed beside `drydockd`;
-4. the sibling `drydock-agent`, only when the guest's platform is the host's own.
-
-Each variable holds one path. With no build for the prepared platform, launch is
-refused before provisioning with the platform and the file or variable that
-would supply it. A hello reporting a different platform is refused naming both;
-a hello without a platform (an agent older than platform reporting) is not
-checked, and the prepared platform's build is pushed.
-The gateway refuses remote Unix-socket forwards; drydock needs only a local
-forward to the agent socket, and one HTTP/2 connection through it carries
-requests, byte streams and the vessel's outward connections. If
-the handshake never succeeds, launch fails with the last attempt's error (SSH
-user redacted), and `drydockd` logs each failed attempt to stderr. A failed bootstrap leaves a labelled
-resource discoverable for retry or cleanup. Duplicate labels re-adopt the existing
-resource; size or egress mismatches (including missing policy evidence) are refused
-with guidance to use a new label. They never change the existing resource's policy.
-Vendor name uniqueness arbitrates concurrent creates, so one slow startup does not
-hold a provider-wide creation mutex.
-
-Suspend is stop, resume is start plus bootstrap. The whole filesystem persists;
-memory and resident processes do not. `suspend_preserves_memory: false` declares
-this explicitly. There is no pause operation on the container class. Resume
-starts supervision again; the agent removes its stale socket. Repeated resume of
-an already running sandbox keeps the existing singleton supervisor.
-The deterministic resume token is an id-bound continuation marker, not an access
-credential; every call still requires the organisation API key. It uses `Secret`
-because that is the protocol's resume-token representation.
-
-Every reach call requests a fresh five-minute SSH token. Daytona authenticates it
-as the gateway username, so `Reach::Ssh.user` now uses the redacting `Secret` type
-(the JSON is still a string). Supply the SSH gateway's host public key verified
-out of band: the mint route does not supply one. `ssh_endpoint` defaults to
-`ssh.app.daytona.io:22`; no host key is discovered through unauthenticated scanning.
-Never log or record a mint response or the serialized reach recipe.
+Provision labels the sandbox `flotilla.label=<label>`, and, on a shared
+account only, `drydock.provider=<instance>`. Daytona names the sandbox; no name
+derives from the label. It disables auto-stop, auto-pause and auto-delete.
 
 Egress always supplies exactly one networking control, avoiding Daytona's default
 allowlist: `networkBlockAll: true` for deny-all, `networkAllowList` for IPv4 CIDRs
-(or `0.0.0.0/0` for Open), and `domainAllowList` for host-only requests. Native
-domain rules follow Daytona's DNS updates; the module does no DNS pinning or
-AAAA rejection of dual-stack names. IPv6 literals/CIDRs, port-specific entries
-and mixed domain/CIDR requests are refused. Label retries compare normalized
-requested policies, not the results of a new DNS lookup.
+(or `0.0.0.0/0` for Open), and `domainAllowList` for host-only requests. IPv6,
+port-specific entries and mixed domain/CIDR requests are refused. The capability
+declares Daytona's documented egress model; every row is Advisory, unmeasured,
+with an opaque policy fingerprint.
 
-The capability declares Daytona's documented egress model (`egress_model`):
-firewall enforcement outside the guest, the tier 1–2 rule that organization
-restrictions take precedence, and no running-sandbox update (tier 3–4 only).
-It claims nothing verified. Every row is the vendor's claim
-alone: Advisory, unmeasured, carrying an opaque effective-policy fingerprint.
-This module runs no guest probe; measuring whether the vendor's enforcement
-holds is drydockd's, not the module's. Transport outages return Unavailable,
-not adaptor-bug Internal.
+Usage is the organization's aggregate for the period, as Daytona's analytics
+reports it, in one call: GBSeconds converted to By.s with 2^30, and the price
+passed through as Daytona's own number text, in USD. Daytona reports no
+per-size hours, so `environment_hours` is empty.
 
-Observation polls every 30 seconds, with complete cursor pagination, provider
-`updatedAt` timestamps and actual granted sizes (GiB converted to bytes). The main server
-owns all state diffs and event emission. Error reasons map OOM/eviction to loss
-causes, unreachable to host-unreachable, and other provider errors to API-error;
-known progress maps to `Transitioning` phases; unestablished states alone are
-Unknown. The main server keeps stable billing state across progress samples. No webhooks.
-
-The module declares per-organization Tier 1–4 general/create/lifecycle limits
-(10k/300/10k through 50k/600/50k per minute). Optional `rate_limits` overrides
-accept explicit provider `RateLimit` rows for Enterprise contracts. A 429 reads
-`Retry-After-{throttler}`, falling back to the exhausted bucket's
-`X-RateLimit-Reset-{throttler}` remaining seconds (or plain Retry-After). It never retries.
-Unused cached rate-window state was removed: the server does not yet dynamically
-adjust its admission budget using successful responses' observed limit/remaining
-counters. That is an explicit gap, not global quota coordination. Completion
-waits, pagination, toolbox routing lookups and probes consume additional calls
-outside route admission; sharing an organization also shares these limits.
-
-Quota reports structured region/class/resource keys with UCUM capacity units.
-Analytics reports organization-scoped neutral resource measurements, integrated
-UCUM units and exact decimal cost with currency code. Analytics GBSeconds are
-interpreted as reserved GiB integrated over time, using Daytona's documented
-[resource units](https://www.daytona.io/docs/en/sandboxes/#resources), and converted
-to By.s with 2^30. This interpretation of the analytics field naming remains a
-live metering acceptance assumption. Money is parsed from the
-original decimal lexeme before numeric conversion and uses the documented USD
-denomination, without inventing a vendor currency field. `environment_hours` is
-filled from the documented per-sandbox usage totals and usage-period routes,
-clipping each size period to the requested window. Missing `endAt` denotes an
-ongoing period clipped to the earlier of the window end and the current time;
-zero-CPU periods are skipped. Scope IDs are opaque.
-Conformance uses size-hours when measurements are aggregate and isolated CPU
-measurements when explicitly environment-scoped. Size-hours are still grouped
-by size across the organization: use an otherwise idle organization or a unique
-size for live transition attribution; aggregation cannot distinguish unrelated
-sandboxes with the same size. Empty usage windows yield zero size-hours. Aggregate measurements and per-sandbox
-periods are separate sequential reads, not an atomic provider snapshot; eventual
-updates or ongoing state changes can make them disagree. Compare settled windows
-with conformance options `billing_sample_millis` (default 25, range 1..60000)
-and `billing_settle_millis` (default 0, range 0..86400000).
-For both running and suspended checks,
-conformance records the start, waits the sample duration, records the end, then
-waits the settle duration before querying that exact period. This wait is separate
-from the request/event deadlines in `timeouts`, including host-fixture billing
-checks, and adds that duration to each billing check. It keeps the sandbox
-in the sampled lifecycle state while waiting. For example,
-`"billing_sample_millis": 60000, "billing_settle_millis": 120000` reads a roughly
-60-second window that ended at least two minutes before the usage request.
-Choose the settle duration to cover vendor accounting delay during live acceptance.
-The CLI announces a nonzero per-sample settle delay on stderr; stdout remains the
-JSON conformance report.
-Usage currently fans out sequentially across all IDs returned for the organization/window;
-individual-call budgeting and bounded fan-out are tracked in drydock#35.
-
-For operator acceptance, configure a real baked agent image, pinned gateway key,
-matching root/network/reach probes, and run conformance including egress. Retain
-`usage.measurements.cost` from the JSON report as spend evidence. This crew's
-stand-in spend is **$0**; live conformance and live spend are operator acceptance.
-
-Optional HTTPS base URLs `api_url`, `toolbox_url`, `analytics_url` must end in `/`
-and contain no URL credentials, query or fragment. REST and analytics default to Daytona's public endpoints. Toolbox routing uses
-each sandbox's required `toolboxProxyUrl` plus sandbox ID; `toolbox_url` is an
-explicit override only. Deployments requiring a fixed toolbox destination can
-set that override instead of following the API-supplied proxy route.
-
-Daytona toolbox `/process/execute` returns a buffered, merged `result` and an
-`exitCode`; it supplies neither separate stderr nor a live stdin/output stream.
-Fallback exec preserves that contract: successful merged output is exposed through
-the Drydock byte stream after completion; nonzero exits return `CommandFailed`
-(HTTP 424) with a typed `exit_code` and sensitive `output` wrapped in `Secret`.
-This is a diagnostic runner, not an interactive terminal. Empty output is valid.
-Snapshot activation is submitted once and then observed by paced reads. Terminal
-sandbox start failures are returned immediately. A provider-reported `destroyed`
-without eviction metadata is `DestroyedAtProvider`, rather than claiming that the
-guest powered itself off; confirmed Drydock deletion still uses the server's
-`DestroyedByRequest` event cause.
-
-The module's bounded completion waits are distinct from the server's observation
-poller: prepare permits up to 120 successful state reads at two-second intervals,
-and start/stop permit up to 60. A failed GET exits immediately; the caller owns
-failure retries. These internal reads do not currently consume separate server
-route-budget slots. That is a known limitation under the required rate-window
-review work, not an additional module observation/reconciliation loop.
-
-Transport loss during mutation
-reports unavailability with an uncertain-outcome reason and never proves rollback;
-malformed host responses are internal adapter errors rather than transient outages.
+Toolbox `/process/execute` returns a buffered, merged `result` and an
+`exitCode`; nonzero exits return `CommandFailed` with the output in `Secret`.
+Every reach call requests a fresh SSH gateway token; supply the gateway's host
+public key verified out of band.

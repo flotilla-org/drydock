@@ -49,7 +49,7 @@ impl Module for RemoteModule {
         self.module.smallest_size.clone()
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        let config = ProviderConfiguration { credential: None, ..config.clone() };
+        let config = ProviderConfiguration { credential: None, semantics: Default::default(), ..config.clone() };
         let patch = serde_json::json!({ "providers": { name: config } });
         self.client.configure(crate::api::ConfigUpdate::MergePatch(patch)).await.map_err(error)?;
         let declaration = self.client.provider(name).await.map_err(error)?;

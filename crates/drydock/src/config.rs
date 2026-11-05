@@ -1,7 +1,7 @@
 //! Provider-only user configuration. Module settings are passed through unchanged.
 use crate::credentials::CredentialReference;
 use drydock_agent::Target;
-use drydock_protocol::{Configuration, CredentialLocation, EgressRequest, ProviderConfiguration, Size};
+use drydock_protocol::{Configuration, CredentialLocation, EgressRequest, Ownership, ProviderConfiguration, SemanticOptions, Size};
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -64,6 +64,10 @@ pub struct Provider {
     /// image in none of them is first staged in the first one listed.
     #[serde(default)]
     pub pull_from: Vec<String>,
+    #[serde(default)]
+    pub ownership: Ownership,
+    #[serde(default)]
+    pub semantics: SemanticOptions,
 }
 /// A registry drydock can copy images into and providers can pull them from.
 #[derive(Clone, Deserialize)]
@@ -105,7 +109,13 @@ impl Config {
 }
 impl Provider {
     pub fn configuration(&self) -> ProviderConfiguration {
-        ProviderConfiguration { module: self.module.clone(), settings: self.settings.clone(), credential: self.credential.clone() }
+        ProviderConfiguration {
+            module: self.module.clone(),
+            settings: self.settings.clone(),
+            credential: self.credential.clone(),
+            ownership: self.ownership,
+            semantics: self.semantics.clone(),
+        }
     }
 }
 #[derive(Clone, Default, Deserialize, Serialize)]

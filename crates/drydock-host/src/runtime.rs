@@ -377,6 +377,7 @@ impl Runtime {
             egress_measured: false,
             egress_policy: v.labels.get(POLICY_LABEL).cloned(),
             timestamp: None,
+            vendor: None,
         })
     }
     async fn wait_running(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
@@ -642,6 +643,7 @@ impl Provider for Runtime {
             exclusive_label: true,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     fn observation(&self) -> ObservationMode {

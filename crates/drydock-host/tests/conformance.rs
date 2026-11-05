@@ -329,7 +329,9 @@ async fn declared_reach_recipes_and_faults() {
             let settings =
                 serde_json::from_value(serde_json::json!({"fixture":true,"fixture_bad_relay":kind == "relay" && broken,"reach":recipe}))
                     .unwrap();
-            configuration.providers.insert(name, ProviderConfiguration { module: "reference".into(), settings, credential: None });
+            configuration
+                .providers
+                .insert(name, ProviderConfiguration { module: "reference".into(), settings, credential: None, ..Default::default() });
         }
     }
     let (runtime, mut binary, host) = start_binary(configuration).await;

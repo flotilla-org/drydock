@@ -356,6 +356,7 @@ impl Provider for PullingProvider {
             exclusive_label: false,
             agent_tcp_port: None,
             reach_ways: vec![],
+            semantics: Default::default(),
         }
     }
     fn observation(&self) -> ObservationMode {
