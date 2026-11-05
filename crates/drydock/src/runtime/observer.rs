@@ -74,6 +74,8 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 _ = stopping.changed() => break,
             };
             reconcile(&instance, &mut seen, rows, observation_generation);
+            // Sent on every poll, changed or not: each send is the tick a
+            // settling wait counts.
             observed.polls.send_replace(None);
         }
     })
