@@ -2399,6 +2399,10 @@
             "type": "boolean",
             "description": "Vessels run on the host's own filesystem, shared with the host and with\none another: a guest path is a host path. A client lays each vessel out\nbelow paths it can write, never at fixed guest locations."
           },
+          "host_processes": {
+            "type": "boolean",
+            "description": "Vessels are processes on the host's own machine: the host's user and PID\nnamespace, with nothing between a vessel and the host. The provider is\nnot a sandbox, and nothing may treat it as one."
+          },
           "image_routes": {
             "type": "array",
             "items": {

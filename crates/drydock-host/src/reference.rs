@@ -155,6 +155,7 @@ impl Provider for Reference {
             usage: true,
             quota: true,
             host_filesystem: self.settings.host_filesystem,
+            host_processes: false,
             exclusive_label: true,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },

@@ -139,6 +139,7 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     assert!(!c.usage && !c.quota && !c.export && !c.fallback_runner);
     assert_eq!(c.workspace_root, root.path().to_str().unwrap());
     assert!(c.host_filesystem, "vessels share this machine's filesystem");
+    assert!(c.host_processes, "vessels are processes of this machine: no isolation");
     // The network is the host's, and the agent carries exposures all the same.
     assert_eq!(c.reach_ways, [ReachWay::HostNetwork, ReachWay::OutwardExposure]);
     let ports = Ports::from(p.operations());
@@ -299,6 +300,146 @@ async fn destroy_kills_the_agent_and_its_process_group() {
     assert!(!root.path().join(&environment.id).exists());
     assert!(p.list(&credentials()).await.unwrap().is_empty());
     assert!(matches!(p.inspect(&environment.id, &credentials()).await, Err(ProtocolError::NotFound { .. })));
+}
+
+/// A session of someone else's, with a member besides its leader: what a wrong kill would reach.
+struct Bystander {
+    leader: std::process::Child,
+    member: i32,
+}
+impl Bystander {
+    fn new(dir: &std::path::Path) -> Self {
+        use std::os::unix::process::CommandExt;
+        let marker = dir.join("bystander.pid");
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &format!("sleep 300 & echo $! > {}; wait", marker.display())]);
+        // SAFETY: setsid is async-signal-safe.
+        unsafe { command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }) };
+        let leader = command.spawn().unwrap();
+        let member = loop {
+            if let Some(pid) = std::fs::read_to_string(&marker).ok().and_then(|pid| pid.trim().parse().ok()) {
+                break pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Self { leader, member }
+    }
+    fn pid(&self) -> i32 {
+        self.leader.id() as i32
+    }
+    fn untouched(&self) -> bool {
+        alive(self.pid()) && alive(self.member)
+    }
+}
+impl Drop for Bystander {
+    fn drop(&mut self) {
+        unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
+        let _ = self.leader.wait();
+    }
+}
+
+// Destroy ends the vessel's processes and nobody else's, whatever its files say. A
+// vessel directory outlives the machine's processes (a restart of the host, of its
+// container, of the machine), so the PID it names can belong to another process by
+// now, or lead a session that is not the agent's. Signalling that session's members
+// is how destroy reached drydock-host itself (flotilla-org/drydock#269).
+#[tokio::test]
+async fn destroy_never_signals_a_process_outside_the_vessel() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let bystander = Bystander::new(root.0.path());
+    let namespace = std::fs::read_link("/proc/self/ns/pid").unwrap();
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", bystander.pid())).unwrap();
+    let start = stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap().to_owned();
+    let stale = [
+        // Written before scopes were recorded: a PID that is not an agent for this vessel.
+        None,
+        // The PID was recycled: the process under it started at another time.
+        Some(format!("session {} {} {}", bystander.pid(), namespace.display(), start.parse::<u64>().unwrap() + 1)),
+        // The directory is from another PID namespace, where the PID meant another process.
+        Some(format!("session {} pid:[1] {start}", bystander.pid())),
+    ];
+    for (n, scope) in stale.into_iter().enumerate() {
+        let environment = provision(&*p, &format!("stale-{n}")).await;
+        let dir = root.path().join(&environment.id);
+        let agent = pid(&root, &environment.id);
+        // The agent is gone but for its record, which now names the bystander.
+        unsafe { libc::kill(-agent, libc::SIGKILL) };
+        eventually("the agent stopped", || !alive(agent)).await;
+        std::fs::write(dir.join("agent.pid"), bystander.pid().to_string()).unwrap();
+        match scope {
+            Some(scope) => std::fs::write(dir.join("agent.scope"), scope).unwrap(),
+            None => std::fs::remove_file(dir.join("agent.scope")).unwrap(),
+        }
+        p.destroy(&environment.id, &credentials()).await.unwrap();
+        assert!(!dir.exists());
+        assert!(bystander.untouched(), "case {n}: destroy signalled a process outside the vessel");
+    }
+}
+
+// A vessel's own processes are found by the identity of its agent, so destroy
+// ends them even once the agent is gone, and still leaves a neighbour alone.
+#[tokio::test]
+async fn destroy_ends_what_a_dead_agent_left_and_only_that() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let bystander = Bystander::new(root.0.path());
+    let environment = provision(&*p, "orphaned").await;
+    let agent = pid(&root, &environment.id);
+    let marker = root.path().join(&environment.id).join("orphan.pid");
+    // A grandchild in the agent's session that outlives the agent.
+    let script = format!("sleep 300 & echo $! > {}", marker.display());
+    let build = std::fs::read(agent::agent_binary()).unwrap();
+    let open = || async {
+        let stream = p.relay(&environment.id, &credentials()).await.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(Box::new(stream) as _)
+    };
+    let client = drydock_agent::Client::connect_current(open, &Platform::current(), &build, Duration::from_secs(10)).await.unwrap();
+    let _command = client.spawn(drydock_agent::Exec::new("sh", ["-c", &script])).await.unwrap();
+    eventually("the command started", || std::fs::read_to_string(&marker).is_ok_and(|pid| !pid.trim().is_empty())).await;
+    let orphan: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    unsafe { libc::kill(agent, libc::SIGKILL) };
+    eventually("the agent died", || !alive(agent)).await;
+    assert!(alive(orphan));
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    eventually("the orphan ended", || !alive(orphan)).await;
+    assert!(bystander.untouched());
+}
+
+// Where the host may make cgroups, a process that leaves the agent's session and
+// process group is still in the vessel, and destroy ends it.
+#[tokio::test]
+async fn destroy_ends_a_process_that_escaped_the_session_when_cgroups_are_available() {
+    let probe = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let own =
+        std::path::Path::new("/sys/fs/cgroup").join(probe.lines().find_map(|l| l.strip_prefix("0::")).unwrap().trim_start_matches('/'));
+    let trial = own.join("drydock-trial");
+    if std::fs::create_dir(&trial).is_err() {
+        eprintln!("skipped: no writable cgroup v2 tree here");
+        return;
+    }
+    let usable = trial.join("cgroup.kill").exists();
+    let _ = std::fs::remove_dir(&trial);
+    if !usable {
+        eprintln!("skipped: no cgroup.kill here");
+        return;
+    }
+    let root = Root::new();
+    let p = provider(&root).await;
+    let environment = provision(&*p, "escapee").await;
+    let marker = root.path().join(&environment.id).join("escapee.pid");
+    let build = std::fs::read(agent::agent_binary()).unwrap();
+    let open = || async {
+        let stream = p.relay(&environment.id, &credentials()).await.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Ok(Box::new(stream) as _)
+    };
+    let client = drydock_agent::Client::connect_current(open, &Platform::current(), &build, Duration::from_secs(10)).await.unwrap();
+    let script = format!("setsid sh -c 'echo $$ > {}; exec sleep 300' </dev/null >/dev/null 2>&1 &", marker.display());
+    let _command = client.spawn(drydock_agent::Exec::new("sh", ["-c", &script])).await.unwrap();
+    eventually("the command started", || std::fs::read_to_string(&marker).is_ok_and(|pid| !pid.trim().is_empty())).await;
+    let escapee: i32 = std::fs::read_to_string(&marker).unwrap().trim().parse().unwrap();
+    p.destroy(&environment.id, &credentials()).await.unwrap();
+    eventually("the escapee ended", || !alive(escapee)).await;
 }
 
 // Destroy removes what the vessel left read-only, as the agent's artifact

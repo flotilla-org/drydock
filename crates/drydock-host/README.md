@@ -123,12 +123,20 @@ no build reports `missing_tool`.
   through the agent like on any provider.
 - **Suspend** kills the agent and everything in its session and keeps the
   directory; **resume** starts the agent again. Memory and processes are not kept.
-- **Destroy** kills the agent and its session, then removes the directory, read-only
-  contents (such as the agent's artifact store) included. Anything
-  that started its own session escapes.
+- **Destroy** kills the agent and everything it started, then removes the directory,
+  read-only contents (such as the agent's artifact store) included. Where the host
+  may create cgroups (cgroup v2, writable, kernel 5.14 or later; often not inside a
+  container) each vessel gets one and `cgroup.kill` ends it whole, so nothing
+  escapes. Elsewhere the vessel is the session its agent leads, and anything that
+  started its own session escapes. Either way only what is known to be the vessel's
+  is signalled: the agent is identified by its start time and PID namespace, not by
+  a PID read from a file, so a recycled PID, or a directory left by an earlier life of
+  the machine, signals nothing. The scope is recorded in `agent.scope`.
 - **Egress** is declared open and unfiltered. A deny-all request is refused with a
   reason, because the host's network cannot be restricted per vessel.
-- **Capabilities** declare `host_filesystem`: a guest path is a host path, so a
+- **Capabilities** declare `host_processes`: the vessels are processes of the host's
+  machine, with its user and PID namespace and no isolation, so the module is not a
+  sandbox and nothing may treat it as one. They declare `host_filesystem`: a guest path is a host path, so a
   client lays each vessel out below paths it can write, never at fixed guest
   locations such as `/opt`. They declare `exclusive_label`, since the id comes
   from the label and creation is serialized. They declare no usage, quota or

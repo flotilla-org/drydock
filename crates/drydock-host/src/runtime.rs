@@ -638,6 +638,7 @@ impl Provider for Runtime {
             usage: true,
             quota: true,
             host_filesystem: false,
+            host_processes: false,
             exclusive_label: true,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
