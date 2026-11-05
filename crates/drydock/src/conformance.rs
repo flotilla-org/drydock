@@ -765,9 +765,16 @@ impl Target<'_> {
         report.record(
             "list_readoption",
             async {
-                let rows = client.list(provider).await.map_err(SafeError::category)?;
-                let matches: Vec<_> = rows.iter().filter(|e| e.label == environment.label).collect();
-                require(matches.len() == 1 && matches[0].id == environment.id, "list did not uniquely re-adopt label")
+                // A vendor's list may lag a creation: wait until it shows the label.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(options.timeouts.transition_seconds);
+                loop {
+                    let rows = client.list(provider).await.map_err(SafeError::category)?;
+                    let matches: Vec<_> = rows.iter().filter(|e| e.label == environment.label).collect();
+                    if !matches.is_empty() || tokio::time::Instant::now() >= deadline {
+                        break require(matches.len() == 1 && matches[0].id == environment.id, "list did not uniquely re-adopt label");
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
             .await,
         );
