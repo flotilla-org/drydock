@@ -41,7 +41,6 @@ const EVENT_PAGES: usize = 100;
 const SANDBOX_PAGES: Paging = Paging { rows: None, cursor: "nextToken", next: Next::Header("x-next-token") };
 const EVENT_PAGES_BY_OFFSET: Paging = Paging { rows: None, cursor: "offset", next: Next::Offset(EVENT_PAGE) };
 const BUILD_PAGES: Paging = Paging { rows: Some("builds"), cursor: "nextToken", next: Next::Header("x-next-token") };
-const RESUME_PREFIX: &str = "e2b-resume-";
 
 #[derive(Serialize)]
 struct NewTemplate<'a> {
@@ -896,10 +895,10 @@ impl SuspendResume for E2b {
         self.wait_state(id, "paused", c).await?;
         self.agents.forget(id);
         self.suspended.record(id);
-        Ok(E2B.resume_marker(RESUME_PREFIX, &self.name, id))
+        Ok(E2B.resume_marker(&self.name, id))
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        E2B.check_resume(RESUME_PREFIX, &self.name, id, &token)?;
+        E2B.check_resume(&self.name, id, &token)?;
         self.agents.forget(id);
         self.connect(id, c).await?;
         self.wait_state(id, "running", c).await?;

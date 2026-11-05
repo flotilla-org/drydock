@@ -741,14 +741,14 @@ impl SuspendResume for Runtime {
         let read = async || Ok(self.sandbox(id, c).await?.state);
         STATE_WAIT
             .until("Runtime sandbox has not paused", read, |state| match &*state {
-                "paused" | "stopped" => Verdict::Done(RUNTIME.resume_marker("runtime-resume-", &self.name, id)),
+                "paused" | "stopped" => Verdict::Done(RUNTIME.resume_marker(&self.name, id)),
                 "pausing" | "running" => Verdict::Pending,
                 other => Verdict::Failed(refused(format!("Runtime sandbox {id} is {other}, not pausing"))),
             })
             .await
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        RUNTIME.check_resume("runtime-resume-", &self.name, id, &token)?;
+        RUNTIME.check_resume(&self.name, id, &token)?;
         let action = match &*self.ours(id, c).await?.state {
             "paused" | "pausing" => Some("wake"),
             "stopped" => Some("restart"),

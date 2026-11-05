@@ -556,7 +556,7 @@ async fn a_dead_agent_is_reported_stopped_and_restarted_on_resume() {
     assert_eq!(p.inspect(&environment.id, &credentials()).await.unwrap().state, Observation::Stopped { cause: StopCause::GuestHalted });
     assert_eq!(p.list(&credentials()).await.unwrap()[0].state, Observation::Stopped { cause: StopCause::GuestHalted });
     // The marker depends only on provider and environment, so it can be had without a suspend.
-    let token = drydock_host::kit::Vendor("Local").resume_marker("local-resume-", "local", &environment.id);
+    let token = drydock_host::kit::Vendor("Local").resume_marker("local", &environment.id);
     suspend.resume(&environment.id, token, &credentials()).await.unwrap();
     assert_eq!(p.inspect(&environment.id, &credentials()).await.unwrap().state, Observation::Running);
     assert!(hello(&*p, &environment.id).await.unwrap().starts_with("HTTP/1.1 200"));

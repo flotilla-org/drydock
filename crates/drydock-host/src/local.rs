@@ -140,7 +140,7 @@ fn prepared_id(image_digest: &str, platform: &Platform) -> String {
 }
 const LOCAL: Vendor = Vendor("Local");
 fn resume_token(provider: &str, id: &str) -> ResumeToken {
-    LOCAL.resume_marker("local-resume-", provider, id)
+    LOCAL.resume_marker(provider, id)
 }
 
 impl Local {

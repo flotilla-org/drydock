@@ -59,12 +59,13 @@ impl Vendor {
     }
     /// A deterministic continuation marker binding instance and environment.
     /// It is not a credential: every resume still needs the key.
-    pub fn resume_marker(self, prefix: &str, instance: &str, id: &str) -> ResumeToken {
-        ResumeToken { token: Secret::new(format!("{prefix}{}", &digest(&format!("{instance}\0{id}"))[..40])) }
+    pub fn resume_marker(self, instance: &str, id: &str) -> ResumeToken {
+        let prefix = self.0.to_ascii_lowercase();
+        ResumeToken { token: Secret::new(format!("{prefix}-resume-{}", &digest(&format!("{instance}\0{id}"))[..40])) }
     }
     /// Refuses a resume token minted for another environment.
-    pub fn check_resume(self, prefix: &str, instance: &str, id: &str, token: &ResumeToken) -> Result<()> {
-        if token.token.expose() != self.resume_marker(prefix, instance, id).token.expose() {
+    pub fn check_resume(self, instance: &str, id: &str, token: &ResumeToken) -> Result<()> {
+        if token.token.expose() != self.resume_marker(instance, id).token.expose() {
             return Err(refused("resume token belongs to another environment"));
         }
         Ok(())
@@ -329,8 +330,8 @@ mod tests {
         ] {
             assert!(limits.check(v, &bad).is_err(), "{bad:?}");
         }
-        let marker = v.resume_marker("t-", "a", "x");
-        assert!(v.check_resume("t-", "a", "x", &marker).is_ok());
-        assert!(v.check_resume("t-", "a", "y", &marker).is_err());
+        let marker = v.resume_marker("a", "x");
+        assert!(v.check_resume("a", "x", &marker).is_ok());
+        assert!(v.check_resume("a", "y", &marker).is_err());
     }
 }

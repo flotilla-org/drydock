@@ -41,7 +41,6 @@ const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
 const BUILD_WAIT: Wait = Wait { attempts: 150, interval: Duration::from_secs(3), retry_after: 30 };
 const STATE_WAIT: Wait = Wait { attempts: 120, interval: Duration::from_secs(1), retry_after: 5 };
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
-const RESUME: &str = "tensorlake-resume-";
 const STATES: StateTable = &[
     ("pending", kit::starting()),
     ("running", Observation::Running),
@@ -868,14 +867,14 @@ impl SuspendResume for Tensorlake {
         let status = async || self.status(id, c).await;
         STATE_WAIT
             .until("Tensorlake sandbox has not suspended", status, |status| match status.as_str() {
-                "suspended" => Verdict::Done(TENSORLAKE.resume_marker(RESUME, &self.name, id)),
+                "suspended" => Verdict::Done(TENSORLAKE.resume_marker(&self.name, id)),
                 "suspending" | "snapshotting" | "running" => Verdict::Pending,
                 other => Verdict::Failed(refused(format!("Tensorlake sandbox {id} is {other}, not suspending"))),
             })
             .await
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        TENSORLAKE.check_resume(RESUME, &self.name, id, &token)?;
+        TENSORLAKE.check_resume(&self.name, id, &token)?;
         self.agents.forget(id);
         if self.status(id, c).await? != "running" {
             let mut url = self.api.url(&["sandboxes", id, "resume"])?;
