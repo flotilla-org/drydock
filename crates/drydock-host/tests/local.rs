@@ -51,8 +51,12 @@ async fn provider(root: &Root) -> Arc<dyn Provider> {
     configured(serde_json::json!({"root": root.path(), "agent": agent::agent_binary()})).await.unwrap()
 }
 async fn configured(settings: serde_json::Value) -> Result<Arc<dyn Provider>, ProtocolError> {
-    let configuration =
-        ProviderConfiguration { module: "local".into(), settings: serde_json::from_value(settings).unwrap(), credential: None };
+    let configuration = ProviderConfiguration {
+        module: "local".into(),
+        settings: serde_json::from_value(settings).unwrap(),
+        credential: None,
+        ..Default::default()
+    };
     LocalModule.configure("local", &configuration, Arc::new(NoHttp)).await
 }
 fn credentials() -> Credentials {

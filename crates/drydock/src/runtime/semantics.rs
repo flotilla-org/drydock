@@ -54,7 +54,8 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
 
 struct Added {
     inner: Arc<dyn Provider>,
-    /// The instance whose tag marks what it may list and destroy, on a shared account.
+    /// The instance whose tag marks what it may list, destroy, suspend and
+    /// resume, on a shared account.
     owner: Option<String>,
     settle: bool,
     idempotent: bool,
@@ -108,6 +109,27 @@ impl Added {
             }
         }
     }
+    /// On a shared account, the environment as the vendor reports it, refused
+    /// unless it carries this instance's tag. Fails closed: any inspect error
+    /// is returned rather than acting on what cannot be verified. `None` on an
+    /// owned account, where nothing is checked.
+    async fn guard(&self, id: &str, c: &Credentials) -> Result<Option<Environment>> {
+        if self.owner.is_none() {
+            return Ok(None);
+        }
+        let e = self.inner.inspect(id, c).await?;
+        if !self.ours(&e) {
+            return Err(refused(format!("environment {id} does not carry this instance's {OWNER_TAG} tag")));
+        }
+        Ok(Some(e))
+    }
+    /// The vendor's state of `id`, reusing what [`Self::guard`] read.
+    async fn state(&self, id: &str, guarded: Option<Environment>, c: &Credentials) -> Result<Observation> {
+        Ok(match guarded {
+            Some(e) => e.state,
+            None => self.inner.inspect(id, c).await?.state,
+        })
+    }
     async fn running(&self, id: &str) -> Result<Environment> {
         self.until(id, "running", |s| matches!(s, Observation::Running)).await
     }
@@ -155,21 +177,19 @@ impl Provider for Added {
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         Ok(self.inner.list(c).await?.into_iter().filter(|e| self.ours(e)).collect())
     }
+    // Inspect, reach and relay are not owner-checked: they change nothing at
+    // the vendor, and the observer inspects whatever a client asks about. The
+    // guard covers the operations that change vendor state.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         self.inner.inspect(id, c).await
     }
     /// On a shared account, refuses an environment another instance or tool
-    /// made. Idempotent: absent, or already being destroyed, is destroyed.
+    /// made, or one the vendor cannot say is ours. Idempotent: absent, or already being destroyed, is destroyed.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        if self.owner.is_some() {
-            match self.inner.inspect(id, c).await {
-                Ok(e) if !self.ours(&e) => {
-                    return Err(refused(format!("environment {id} does not carry this instance's {OWNER_TAG} tag")));
-                }
-                Err(ProtocolError::NotFound { .. }) if self.idempotent => return Ok(()),
-                _ => {}
-            }
-        }
+        match self.guard(id, c).await {
+            Err(ProtocolError::NotFound { .. }) if self.idempotent => return Ok(()),
+            guarded => guarded?,
+        };
         match self.inner.destroy(id, c).await {
             Err(ProtocolError::NotFound { .. }) if self.idempotent => Ok(()),
             Err(busy @ ProtocolError::Unavailable { .. }) if self.idempotent => match self.inner.inspect(id, c).await {
@@ -192,10 +212,11 @@ impl Provider for Added {
 impl SuspendResume for Added {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
         let port = self.inner.operations().suspend_resume.ok_or_else(|| refused("suspend is not supported"))?;
+        let guarded = self.guard(id, c).await?;
         let skip = self.idempotent
             && self.token_is_id
             && matches!(
-                self.inner.inspect(id, c).await?.state,
+                self.state(id, guarded, c).await?,
                 Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping }
             );
         let token = if skip { ResumeToken { token: Secret::new(id) } } else { port.suspend(id, c).await? };
@@ -206,9 +227,10 @@ impl SuspendResume for Added {
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         let port = self.inner.operations().suspend_resume.ok_or_else(|| refused("resume is not supported"))?;
+        let guarded = self.guard(id, c).await?;
         let skip = self.idempotent
             && matches!(
-                self.inner.inspect(id, c).await?.state,
+                self.state(id, guarded, c).await?,
                 Observation::Running | Observation::Transitioning { phase: TransitionPhase::Starting }
             );
         if !skip {

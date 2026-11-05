@@ -698,7 +698,8 @@ The values shown are the defaults.
   being destroyed, succeeds.
 - `ownership`: on a `shared_account`, what the instance makes carries
   `drydock.provider=<instance>`, and drydockd lists only what carries it and
-  refuses to destroy anything else. On an `owned_account` nothing is tagged,
+  refuses to destroy, suspend or resume anything else, or anything whose tag
+  the vendor cannot report at the time. On an `owned_account` nothing is tagged,
   filtered or refused. Only a module that leaves ownership to drydockd (does
   not declare `owner_scoped`) takes `owned_account`.
 

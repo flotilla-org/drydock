@@ -652,3 +652,124 @@ mod operation_tests {
         assert!(instance.diagnostic_secrets.recover().recent.len() <= RECENT_CREDENTIAL_LIMIT);
     }
 }
+
+mod ownership_guard {
+    use super::module::*;
+    use super::*;
+
+    // A vendor that declares no guarantees of its own, so drydockd adds the
+    // shared-account owner check. Its inspect reports `inspected`, or is
+    // unavailable when that is `None`; mutations are recorded and succeed.
+    #[derive(Clone)]
+    struct Vendor {
+        inspected: Option<Environment>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+    struct Configured(Arc<dyn Provider>, Vendor);
+    #[async_trait::async_trait]
+    impl Module for Vendor {
+        fn version(&self) -> &str {
+            "test"
+        }
+        async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+            Ok(Arc::new(Configured(reference::ReferenceModule.configure(name, config, http).await?, self.clone())))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Provider for Configured {
+        fn operations(&self) -> Operations<'_> {
+            Operations { suspend_resume: Some(self), ..Default::default() }
+        }
+        fn observation(&self) -> ObservationMode {
+            self.0.observation()
+        }
+        fn capabilities(&self) -> Capabilities {
+            let mut c = self.0.capabilities();
+            c.semantics = Semantics::default();
+            c.fallback_runner = false;
+            c.suspend_resume = true;
+            c.export = false;
+            c.usage = false;
+            c.quota = false;
+            c
+        }
+        async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
+            self.0.prepare(r, c).await
+        }
+        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+            self.0.provision(r, c).await
+        }
+        async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
+            self.0.list(c).await
+        }
+        async fn inspect(&self, _: &str, _: &Credentials) -> Result<Environment> {
+            self.1.inspected.clone().ok_or_else(|| ProtocolError::unavailable("vendor rate limited", None))
+        }
+        async fn destroy(&self, _: &str, _: &Credentials) -> Result<()> {
+            self.1.calls.recover().push("destroy");
+            Ok(())
+        }
+        async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
+            self.0.reach(id, c).await
+        }
+        async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
+            self.0.relay(id, c).await
+        }
+    }
+    #[async_trait::async_trait]
+    impl SuspendResume for Configured {
+        async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
+            self.1.calls.recover().push("suspend");
+            Ok(ResumeToken { token: Secret::new(id) })
+        }
+        async fn resume(&self, _: &str, _: ResumeToken, _: &Credentials) -> Result<()> {
+            self.1.calls.recover().push("resume");
+            Ok(())
+        }
+    }
+
+    // The provider an instance on a shared account (the default) serves, with
+    // `inspected` as the vendor's inspect answer.
+    async fn shared(inspected: Option<Environment>) -> (Arc<dyn Provider>, Arc<Mutex<Vec<&'static str>>>) {
+        let vendor = Vendor { inspected, calls: Default::default() };
+        let calls = vendor.calls.clone();
+        let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(vendor) as Arc<dyn Module>)]));
+        let request = serde_json::from_value(serde_json::json!({"providers": {"a": {"module":"vendor", "settings":{}}}})).unwrap();
+        host.configure(ConfigUpdate::Replace(request)).await.unwrap();
+        for task in host.tasks.recover().drain(..) {
+            task.abort();
+        }
+        (host.instance("a").await.unwrap().provider.clone(), calls)
+    }
+    fn tagged(owner: &str) -> Environment {
+        serde_json::from_value(serde_json::json!({
+            "id": "e", "provider": "a", "state": {"state": "running"}, "egress": "enforced",
+            "vendor": {"state": "started", "tags": {OWNER_TAG: owner}}
+        }))
+        .unwrap()
+    }
+
+    // ADR 0070: on a shared account a destroy whose ownership the vendor
+    // cannot confirm fails closed, without reaching the vendor's destroy.
+    #[tokio::test]
+    async fn destroy_fails_closed_when_ownership_cannot_be_read() {
+        let (provider, calls) = shared(None).await;
+        let result = provider.destroy("e", &Credentials::default()).await;
+        assert!(matches!(result, Err(ProtocolError::Unavailable { .. })), "{result:?}");
+        assert!(calls.recover().is_empty());
+    }
+
+    // ADR 0070: on a shared account destroy, suspend and resume refuse an
+    // environment another instance made, without calling the vendor.
+    #[tokio::test]
+    async fn mutations_refuse_another_instances_environment() {
+        let (provider, calls) = shared(Some(tagged("other"))).await;
+        let c = Credentials::default();
+        let port = provider.operations().suspend_resume.unwrap();
+        assert!(matches!(provider.destroy("e", &c).await, Err(ProtocolError::Refused { .. })));
+        assert!(matches!(port.suspend("e", &c).await, Err(ProtocolError::Refused { .. })));
+        let token = ResumeToken { token: Secret::new("e") };
+        assert!(matches!(port.resume("e", token, &c).await, Err(ProtocolError::Refused { .. })));
+        assert!(calls.recover().is_empty());
+    }
+}
