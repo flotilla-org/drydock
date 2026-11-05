@@ -154,9 +154,9 @@ function policyIdentity(network: Network) {
   return `allow-${hex(JSON.stringify(network)).slice(0, 24)}`;
 }
 
-function resources(size: Types["Size"]) {
-  if (size.disk_bytes !== 0)
-    refused("Modal sandboxes have no disk size; request disk 0");
+// Modal's disk is fixed and cannot be sized, so a requested disk is accepted
+// but not applied; the granted disk stays 0 (not stated).
+export function resources(size: Types["Size"]) {
   if (size.memory_bytes % MiB !== 0 || size.memory_bytes <= 0)
     refused("Modal sandbox memory is whole MiB");
   if (size.cpus <= 0) refused("Modal sandboxes need a positive CPU count");
