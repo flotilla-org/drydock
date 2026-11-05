@@ -352,6 +352,7 @@ impl Provider for PullingProvider {
             usage: false,
             quota: false,
             host_filesystem: false,
+            host_processes: false,
             exclusive_label: false,
             agent_tcp_port: None,
             reach_ways: vec![],

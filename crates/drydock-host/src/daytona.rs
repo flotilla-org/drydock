@@ -592,6 +592,7 @@ impl Provider for Daytona {
             usage: true,
             quota: true,
             host_filesystem: false,
+            host_processes: false,
             exclusive_label: true,
             agent_tcp_port: None,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.

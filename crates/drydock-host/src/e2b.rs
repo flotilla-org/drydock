@@ -762,6 +762,7 @@ impl Provider for E2b {
             usage: true,
             quota: true,
             host_filesystem: false,
+            host_processes: false,
             agent_tcp_port: std::num::NonZeroU16::new(AGENT_PORT),
             exclusive_label: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.

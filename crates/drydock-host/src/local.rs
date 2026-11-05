@@ -4,13 +4,16 @@
 //!
 //! An environment is a directory `<root>/<id>/` holding a record of what was
 //! asked for, its own copy of `drydock-agent` and the agent's socket at
-//! `run/drydock/agent.sock`. The agent runs as a child in its own process
-//! group, so destroying or suspending kills the agent and anything it started.
+//! `run/drydock/agent.sock`. The agent runs as a child in a cgroup of its own where
+//! the kernel allows one, else in a session of its own (see `scope`), so destroying or
+//! suspending kills the agent and anything it started, and nothing else.
 //! Nothing else is remembered in memory: environments are found by their
 //! directories, so they survive a restart of the host.
+mod scope;
 use crate::module::*;
 use async_trait::async_trait;
 use drydock_protocol::*;
+use scope::Scope;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +37,7 @@ const SOCKET: &str = "run/drydock/agent.sock";
 const AGENT: &str = "opt/drydock/drydock-agent";
 const RECORD: &str = "environment.json";
 const PID: &str = "agent.pid";
+const SCOPE: &str = "agent.scope";
 const SUSPENDED: &str = "suspended";
 
 pub fn registry() -> Registry {
@@ -196,7 +200,7 @@ impl Local {
         found.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(found)
     }
-    /// Start the environment's agent as a child in its own process group, and
+    /// Start the environment's agent as a child in a scope of its own, and
     /// return once the agent answers hello.
     async fn start(&self, id: &str) -> Result<()> {
         let dir = self.dir(id);
@@ -218,18 +222,41 @@ impl Local {
             .stdout(log.try_clone().map_err(|e| unavailable(format!("open agent log: {e}")))?)
             .stderr(log)
             .kill_on_drop(false);
-        // A session of its own: the agent starts commands in process groups of their own,
-        // so only the session finds everything it started.
+        // A session of its own, so that a signal for the agent's group never reaches the host's.
         // SAFETY: setsid is async-signal-safe and touches no shared state.
         unsafe {
             command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
         }
-        let mut child = spawn_retrying_busy(&mut command).await.map_err(|e| unavailable(format!("start agent: {e}")))?;
+        // A cgroup of its own where the kernel gives one: the agent joins it before it runs
+        // anything, so what it starts cannot be outside. The scope is recorded first, so that
+        // a vessel whose start fails half way can still be ended.
+        let cgroup = Scope::new_cgroup(id).map(Scope::Cgroup);
+        if let Some(scope) = &cgroup {
+            scope.record(&dir).map_err(|e| unavailable(format!("record agent scope: {e}")))?;
+            if let Some(join) = scope.joiner() {
+                // SAFETY: `joiner` makes only async-signal-safe calls.
+                unsafe { command.pre_exec(join) };
+            }
+        }
+        let mut child = match spawn_retrying_busy(&mut command).await {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(scope) = cgroup.as_ref().filter(|scope| scope.release()) {
+                    let _ = scope;
+                    let _ = std::fs::remove_file(dir.join(SCOPE));
+                }
+                return Err(unavailable(format!("start agent: {e}")));
+            }
+        };
         let pid = child.id().ok_or_else(|| unavailable("agent exited at once"))?;
-        if let Err(e) = tokio::fs::write(dir.join(PID), pid.to_string()).await {
+        let recorded = match cgroup.or_else(|| Scope::session(pid as i32)) {
+            Some(scope) => scope.record(&dir),
+            None => Err(std::io::Error::other("cannot identify the agent process")),
+        };
+        if let Err(e) = recorded.and(std::fs::write(dir.join(PID), pid.to_string())) {
             // Unrecorded, the agent could never be stopped later.
             let _ = child.start_kill();
-            return Err(unavailable(format!("record agent pid: {e}")));
+            return Err(unavailable(format!("record agent: {e}")));
         }
         // Reaps the agent when it exits, however that happens.
         let exit = tokio::spawn(async move { child.wait().await });
@@ -328,55 +355,46 @@ fn process(pid: i32, socket: &Path) -> Process {
         Err(_) => Process::Gone,
     }
 }
-/// The processes still in the session the agent leads: the agent, the commands
-/// it started and what those started, unless one made a session of its own.
-fn session(leader: i32) -> Vec<i32> {
-    let Ok(entries) = std::fs::read_dir("/proc") else { return vec![] };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-        .filter(|pid| {
-            // The fields after the parenthesised name: state, parent, group, session.
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
-            let fields: Vec<_> = stat.rsplit_once(')').map(|(_, rest)| rest.split_whitespace().collect()).unwrap_or_default();
-            fields.get(3).and_then(|sid| sid.parse::<i32>().ok()) == Some(leader) && fields.first() != Some(&"Z")
-        })
-        .collect()
-}
-/// Kill the agent and everything in its session, and wait until they are gone.
+/// Kill the agent and everything in its scope, and wait until they are gone.
 async fn stop(dir: &Path, socket: &Path) -> Result<()> {
-    let Some(pid) = agent_pid(dir).await else { return Ok(()) };
-    // What is left of the agent's session. If its PID has been recycled, the new holder
-    // is not ours, but the rest of the session still is.
-    let members = || -> Vec<i32> {
-        let recycled = process(pid, socket) == Process::Other;
-        session(pid).into_iter().filter(|member| !(recycled && *member == pid)).collect()
-    };
-    let signal_all = |signal: i32| {
-        // The group is the agent's only while the agent is: its PID may have been recycled.
-        if process(pid, socket) == Process::Agent {
-            // SAFETY: signals the process group the agent leads.
-            unsafe { libc::kill(-pid, signal) };
+    let Some(scope) = Scope::load(dir, socket) else {
+        // Nothing the vessel can be told from other processes by: leave every process alone.
+        if dir.join(PID).exists() || dir.join(SCOPE).exists() {
+            tracing::warn!(dir = %dir.display(), "no usable record of the agent's scope: signalling nothing; its processes, if any, are left running");
         }
-        for member in members() {
-            // SAFETY: signals a process found in the agent's session; ESRCH when it has gone.
-            unsafe { libc::kill(member, signal) };
+        for file in [PID, SCOPE] {
+            let _ = tokio::fs::remove_file(dir.join(file)).await;
         }
+        return Ok(());
     };
-    let gone = |limit: Duration| async move {
-        let deadline = tokio::time::Instant::now() + limit;
-        while (process(pid, socket) == Process::Agent || !members().is_empty()) && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    let gone = |limit: Duration| {
+        let scope = &scope;
+        async move {
+            let deadline = tokio::time::Instant::now() + limit;
+            while !scope.gone() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(scope::POLL).await;
+            }
         }
     };
-    signal_all(libc::SIGTERM);
+    scope.terminate();
     gone(TERMINATION_GRACE).await;
-    signal_all(libc::SIGKILL);
+    scope.kill();
     gone(Duration::from_secs(5)).await;
-    if process(pid, socket) == Process::Agent || !members().is_empty() {
+    if !scope.gone() {
         return Err(unavailable("the agent or its processes survived SIGKILL"));
     }
-    let _ = tokio::fs::remove_file(dir.join(PID)).await;
+    // The record stays until the cgroup is removed, so that a later stop finds it.
+    let mut released = scope.release();
+    for _ in 0..50 {
+        if released {
+            break;
+        }
+        tokio::time::sleep(scope::POLL).await;
+        released = scope.release();
+    }
+    for file in [PID].into_iter().chain(released.then_some(SCOPE)) {
+        let _ = tokio::fs::remove_file(dir.join(file)).await;
+    }
     let _ = tokio::fs::remove_file(socket).await;
     Ok(())
 }
@@ -453,6 +471,8 @@ impl Provider for Local {
             quota: false,
             // Vessels are directories on this machine: guest paths are its own.
             host_filesystem: true,
+            // And the host's processes: same user, same PID namespace. Not a sandbox.
+            host_processes: true,
             exclusive_label: true,
             agent_tcp_port: None,
             // Vessels are processes on this machine: its network is theirs.
