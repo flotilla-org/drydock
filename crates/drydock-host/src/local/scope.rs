@@ -8,6 +8,9 @@
 //! only signalled once it is known to belong to that session of that agent:
 //! a PID read from a file is not evidence, since PIDs are recycled, and a
 //! file left by an earlier life of the machine names someone else's processes.
+//! Even so, a session's members are listed and then signalled, and a listed
+//! process can exit and its PID be reused in between; the cgroup's kill has no
+//! such window, which is why it is preferred.
 use super::{PID, SCOPE};
 use std::{
     ffi::CString,
@@ -56,9 +59,17 @@ impl Scope {
     /// is the agent started for `socket`, and names nothing otherwise.
     pub(super) fn load(dir: &Path, socket: &Path) -> Option<Scope> {
         if let Ok(text) = std::fs::read_to_string(dir.join(SCOPE)) {
+            if let Some(path) = text.strip_prefix("cgroup ") {
+                // A file is not evidence: only the cgroup this module makes for this vessel is
+                // ever written to or removed.
+                let path = PathBuf::from(path);
+                let ours = path.starts_with(CGROUP_ROOT)
+                    && path.components().all(|part| !matches!(part, std::path::Component::ParentDir))
+                    && path.file_name().and_then(|name| name.to_str()) == Some(&format!("drydock-{}", dir.file_name()?.to_str()?));
+                return ours.then_some(Scope::Cgroup(path));
+            }
             let fields: Vec<_> = text.split_whitespace().collect();
             return match fields[..] {
-                ["cgroup", path] => Some(Scope::Cgroup(path.into())),
                 ["session", pid, namespace, start] => {
                     Some(Scope::Session { pid: pid.parse().ok()?, namespace: namespace.into(), start: start.parse().ok()? })
                 }
@@ -91,7 +102,7 @@ impl Scope {
                     return vec![];
                 }
                 // The session id stays taken while any member lives, so with the agent gone
-                // the sessions's remaining members are still the agent's.
+                // the session's remaining members are still the agent's.
                 session_members(*pid)
             }
         }
@@ -117,12 +128,21 @@ impl Scope {
             }
         }
     }
-    /// Whether nothing is left, releasing what held the vessel together.
+    /// Whether no live process is left. A zombie awaiting a parent that never reaps it is not live.
     pub(super) fn gone(&self) -> bool {
         match self {
-            // Removing a cgroup fails while it holds a process, a zombie awaiting its parent included.
-            Scope::Cgroup(path) => matches!(std::fs::remove_dir(path), Ok(())) || !path.exists(),
+            Scope::Cgroup(path) => match std::fs::read_to_string(path.join("cgroup.events")) {
+                Ok(events) => events.lines().any(|line| line == "populated 0"),
+                Err(_) => !path.exists(),
+            },
             Scope::Session { .. } => self.members().is_empty(),
+        }
+    }
+    /// Remove what held the vessel together, once it is gone. Best effort: a cgroup still holding a
+    /// zombie cannot be removed yet, and the next start finds it again by name.
+    pub(super) fn release(&self) {
+        if let Scope::Cgroup(path) = self {
+            let _ = std::fs::remove_dir(path);
         }
     }
     /// A cgroup for the agent to join before it executes anything, so that nothing it
@@ -170,7 +190,9 @@ fn session_members(leader: i32) -> Vec<i32> {
         .flatten()
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .filter(|pid| {
-            stat(*pid).is_some_and(|fields| fields.get(3).and_then(|sid| sid.parse::<i32>().ok()) == Some(leader) && fields[0] != "Z")
+            stat(*pid).is_some_and(|fields| {
+                fields.get(3).and_then(|sid| sid.parse::<i32>().ok()) == Some(leader) && fields.first().map(String::as_str) != Some("Z")
+            })
         })
         .collect()
 }

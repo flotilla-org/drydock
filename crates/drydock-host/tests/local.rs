@@ -406,6 +406,30 @@ async fn destroy_ends_what_a_dead_agent_left_and_only_that() {
     assert!(bystander.untouched());
 }
 
+// A record naming a cgroup that is not the vessel's own, or one that is gone, makes
+// destroy write to and remove nothing.
+#[tokio::test]
+async fn destroy_distrusts_a_recorded_cgroup_that_is_not_the_vessels() {
+    let root = Root::new();
+    let p = provider(&root).await;
+    let outside = tempfile::tempdir().unwrap();
+    for (n, path) in [outside.path().join("drydock-x"), "/sys/fs/cgroup/../../tmp/drydock-x".into(), "/sys/fs/cgroup/gone".into()]
+        .into_iter()
+        .enumerate()
+    {
+        let environment = provision(&*p, &format!("cg-{n}")).await;
+        let dir = root.path().join(&environment.id);
+        let agent = pid(&root, &environment.id);
+        unsafe { libc::kill(-agent, libc::SIGKILL) };
+        eventually("the agent stopped", || !alive(agent)).await;
+        std::fs::write(dir.join("agent.scope"), format!("cgroup {}", path.display())).unwrap();
+        std::fs::write(outside.path().join("cgroup.kill"), "keep").unwrap();
+        p.destroy(&environment.id, &credentials()).await.unwrap();
+        assert!(!dir.exists());
+        assert_eq!(std::fs::read_to_string(outside.path().join("cgroup.kill")).unwrap(), "keep");
+    }
+}
+
 // Where the host may make cgroups, a process that leaves the agent's session and
 // process group is still in the vessel, and destroy ends it.
 #[tokio::test]
@@ -413,7 +437,7 @@ async fn destroy_ends_a_process_that_escaped_the_session_when_cgroups_are_availa
     let probe = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     let own =
         std::path::Path::new("/sys/fs/cgroup").join(probe.lines().find_map(|l| l.strip_prefix("0::")).unwrap().trim_start_matches('/'));
-    let trial = own.join("drydock-trial");
+    let trial = own.join(format!("drydock-trial-{}", std::process::id()));
     if std::fs::create_dir(&trial).is_err() {
         eprintln!("skipped: no writable cgroup v2 tree here");
         return;

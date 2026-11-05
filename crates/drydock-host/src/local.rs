@@ -238,7 +238,16 @@ impl Local {
                 unsafe { command.pre_exec(join) };
             }
         }
-        let mut child = spawn_retrying_busy(&mut command).await.map_err(|e| unavailable(format!("start agent: {e}")))?;
+        let mut child = match spawn_retrying_busy(&mut command).await {
+            Ok(child) => child,
+            Err(e) => {
+                if let Some(scope) = &cgroup {
+                    scope.release();
+                    let _ = std::fs::remove_file(dir.join(SCOPE));
+                }
+                return Err(unavailable(format!("start agent: {e}")));
+            }
+        };
         let pid = child.id().ok_or_else(|| unavailable("agent exited at once"))?;
         let recorded = match cgroup.or_else(|| Scope::session(pid as i32)) {
             Some(scope) => scope.record(&dir),
@@ -369,6 +378,7 @@ async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     if !scope.gone() {
         return Err(unavailable("the agent or its processes survived SIGKILL"));
     }
+    scope.release();
     for file in [PID, SCOPE] {
         let _ = tokio::fs::remove_file(dir.join(file)).await;
     }
