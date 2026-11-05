@@ -135,8 +135,13 @@ fn progress_and_neutral_resource_wire() {
         json!({"scope":{"kind":"organization","id":"opaque/eu"},"resources":{"cpu":{"amount":123.0,"unit":"{vCPU}.s"}},"cost":{"amount":"9007199254740993.000001","currency":"USD"}}),
     );
     fixture::<ResourceQuota>(json!({"key":{"region":"eu","class":"container","resource":"memory"},"unit":"By","in_use":0.0}));
-    for amount in [json!(0.12), json!("NaN"), json!("-1"), json!("1e3"), json!(""), json!("1.")] {
+    for amount in [json!(0.12), json!("NaN"), json!("-1"), json!("1e"), json!("e3"), json!(""), json!("1."), json!("1e+-3")] {
         assert!(serde_json::from_value::<Cost>(json!({"amount":amount,"currency":"USD"})).is_err());
+    }
+    // A vendor's number text passes through as given, exponent included.
+    for amount in ["1e3", "1.5E-7", "0.25e+2"] {
+        let cost: Cost = serde_json::from_value(json!({"amount":amount,"currency":"USD"})).unwrap();
+        assert_eq!(cost.amount, amount);
     }
     assert!(serde_json::from_value::<ResourceKind>(json!("vendor_magic")).is_err());
 }

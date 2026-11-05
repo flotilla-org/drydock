@@ -15,7 +15,7 @@ fn serialized_values_match_the_document() {
     let config = Configuration {
         providers: [(
             "opaque /%".into(),
-            ProviderConfiguration { module: "reference".into(), settings: Default::default(), credential: None },
+            ProviderConfiguration { module: "reference".into(), settings: Default::default(), credential: None, ..Default::default() },
         )]
         .into(),
     };
@@ -31,6 +31,7 @@ fn serialized_values_match_the_document() {
         egress_measured: true,
         egress_policy: Some("raw-policy".into()),
         timestamp: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+        vendor: None,
     };
     let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
     let prepared = Prepared {

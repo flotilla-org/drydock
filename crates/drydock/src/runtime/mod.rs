@@ -10,6 +10,7 @@ mod instance;
 mod observer;
 mod operations;
 pub(crate) mod remote;
+mod semantics;
 #[cfg(test)]
 mod tests;
 use diagnostics::*;
@@ -171,6 +172,7 @@ impl Runtime {
                     error
                 })?,
             };
+            let provider = semantics::apply(name, p, provider)?;
             let credentials = Credentials::default();
             let (credential_changes, _) = watch::channel(credentials.clone());
             let capabilities = provider.capabilities();

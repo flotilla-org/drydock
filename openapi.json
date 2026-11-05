@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "11"
+    "version": "12"
   },
   "paths": {
     "/v1/config": {
@@ -2387,7 +2387,7 @@
           },
           "exclusive_label": {
             "type": "boolean",
-            "description": "Concurrent provisions of one label return one environment: the provider\nrefuses a second sandbox for a label. Without it, a retry after a\nprovision has returned still returns that environment, but concurrent\nprovisions may each create one."
+            "description": "Concurrent provisions of one label return one environment: the provider\nrefuses a second sandbox for a label, or drydockd, adopting labels for\na module that does not ([`SemanticOptions::adopt_label`]), serves one\nprovision of a label at a time (then only among provisions through that\ndrydockd). Without it, a retry after a provision has returned still\nreturns that environment, but concurrent provisions may each create one."
           },
           "export": {
             "type": "boolean"
@@ -2432,6 +2432,10 @@
               "$ref": "#/components/schemas/ReachWay"
             },
             "description": "The ways, beyond the guest's own egress, that a vessel can reach a\ndestination, preferred first. A client chooses among them per\ndestination; the guest's own egress (public destinations, under the\negress policy) stays described by `egress`."
+          },
+          "semantics": {
+            "$ref": "#/components/schemas/Semantics",
+            "description": "What the module's operations guarantee by themselves."
           },
           "suspend_preserves_memory": {
             "type": [
@@ -2483,7 +2487,7 @@
       },
       "Cost": {
         "type": "object",
-        "description": "Currency is explicit, e.g. USD or EUR; the field name fixes no currency.\nA missing cost is unknown, whereas an amount of zero is a known zero cost.",
+        "description": "Currency is explicit, e.g. USD or EUR; the field name fixes no currency.\nA missing cost is unknown, whereas an amount of zero is a known zero cost.\nThe amount is the vendor's own number text, which may carry an exponent\n(`1.5e-7`); it never passes through binary floating point.",
         "required": [
           "amount",
           "currency"
@@ -2850,6 +2854,17 @@
               {
                 "$ref": "#/components/schemas/Timestamp",
                 "description": "When the provider observed this state, if it says."
+              }
+            ]
+          },
+          "vendor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VendorState",
+                "description": "What the vendor itself reports, beside the coarse `state`, from\nmodules that report it."
               }
             ]
           }
@@ -3885,6 +3900,14 @@
           }
         }
       },
+      "Ownership": {
+        "type": "string",
+        "description": "Who else uses the vendor account an instance works in.",
+        "enum": [
+          "shared_account",
+          "owned_account"
+        ]
+      },
       "Period": {
         "type": "object",
         "description": "RFC 3339 endpoints; start must be <= end (equal endpoints are an empty interval).",
@@ -4299,6 +4322,14 @@
           },
           "module": {
             "type": "string"
+          },
+          "ownership": {
+            "$ref": "#/components/schemas/Ownership",
+            "description": "Whether drydock owns the vendor account or shares it."
+          },
+          "semantics": {
+            "$ref": "#/components/schemas/SemanticOptions",
+            "description": "Server only: the guarantees drydockd adds for this instance where the\nmodule declares its vendor does not give them ([`Semantics`])."
           },
           "settings": {
             "type": "object",
@@ -4787,6 +4818,80 @@
         "type": "string",
         "description": "Secret wire string. Debug output is redacted; serialization deliberately exposes the value.\nPartialEq is for wire-value comparisons, NOT constant-time authentication.\nAuthentication belongs to hosts, which must use constant-time token comparison.\nThis type does not promise secure erasure of strings or serialization buffers."
       },
+      "SemanticOptions": {
+        "type": "object",
+        "description": "What drydockd adds to a module's vendor operations, for one instance. Each\napplies only where [`Semantics`] says the vendor does not do it already;\nwith all three off a module's verbs are its vendor's own operations.",
+        "properties": {
+          "adopt_label": {
+            "type": "boolean",
+            "description": "Provision returns the live environment the label already names.",
+            "default": true
+          },
+          "idempotent": {
+            "type": "boolean",
+            "description": "Suspend of a stopped environment and resume of a running one succeed\nwithout a vendor call; destroy of an absent one, or one already being\ndestroyed, succeeds.",
+            "default": true
+          },
+          "poll_millis": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How often a wait reads the environment again.",
+            "default": 2000,
+            "minimum": 0
+          },
+          "prepare_wait_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The longest prepare waits for a form still being built.",
+            "default": 300,
+            "minimum": 0
+          },
+          "settle": {
+            "type": "boolean",
+            "description": "Provision and resume wait until the environment runs and suspend until\nit has stopped; prepare asks again while the module answers unavailable.",
+            "default": true
+          },
+          "wait_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The longest provision, suspend, resume or destroy waits.",
+            "default": 120,
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "Semantics": {
+        "type": "object",
+        "description": "What a module's vendor operations guarantee without drydockd's help. The\ndefault is what every module guaranteed before modules translated plainly;\na module whose vendor does less says so, and drydockd adds what the\ninstance's [`SemanticOptions`] ask for.",
+        "properties": {
+          "adopts_label": {
+            "type": "boolean",
+            "description": "Provision of a label that names an environment returns it.",
+            "default": true
+          },
+          "idempotent": {
+            "type": "boolean",
+            "description": "Suspend, resume or destroy of an environment already there (or gone)\nsucceeds.",
+            "default": true
+          },
+          "reports_tags": {
+            "type": "boolean",
+            "description": "The module tags what it makes with [`OWNER_TAG`] only on a shared\naccount, reports the vendor's tags in [`VendorState`], and checks no\nownership itself: drydockd applies the instance's [`Ownership`].",
+            "default": false
+          },
+          "resume_token": {
+            "type": "boolean",
+            "description": "Resume needs the token suspend returned. Otherwise the token is the\nenvironment id and resume ignores it.",
+            "default": true
+          },
+          "settles": {
+            "type": "boolean",
+            "description": "Provision and resume answer once the environment runs, suspend once it\nhas stopped, and prepare once the prepared form can be used. Otherwise\neach answers when the vendor accepted the request, and prepare answers\nunavailable while the form is being built.",
+            "default": true
+          }
+        }
+      },
       "Size": {
         "type": "object",
         "required": [
@@ -5004,6 +5109,36 @@
           }
         ],
         "description": "Aggregated usage must say what population it measured. In particular,\norganisation totals cannot prove that one suspended environment stopped billing.\nOrganization and environment IDs are provider-opaque; consumers only compare them."
+      },
+      "VendorState": {
+        "type": "object",
+        "description": "An environment in the vendor's own words.",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The vendor's explanation of that state, when it gives one."
+          },
+          "state": {
+            "type": "string",
+            "description": "The vendor's state name, as it gives it."
+          },
+          "tags": {
+            "type": "object",
+            "description": "The vendor-side tags, as read back.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
       }
     },
     "responses": {

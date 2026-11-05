@@ -86,6 +86,7 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
             }
         }
     }
+    let confirmed: BTreeSet<String> = instance.destroyed.recover().iter().filter(|(_, s)| s.confirmed).map(|(id, _)| id.clone()).collect();
     for (id, row) in &current {
         let s = row;
         let mut kinds = vec![];
@@ -114,7 +115,13 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
                 });
             }
             Observation::Gone { cause } if old.is_none_or(|old| old.state != s.state) => {
-                kinds.push(EventKind::Gone { cause: cause.clone() })
+                // A vendor that keeps listing what it destroyed reports the
+                // destruction drydock asked for as its own.
+                let cause = match cause {
+                    GoneCause::DestroyedAtProvider if confirmed.contains(id) => GoneCause::DestroyedByRequest,
+                    cause => cause.clone(),
+                };
+                kinds.push(EventKind::Gone { cause })
             }
             _ => {}
         }

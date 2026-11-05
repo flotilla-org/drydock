@@ -1009,9 +1009,10 @@ impl Target<'_> {
                 }
                 client.destroy(provider, &environment.id).await.map_err(SafeError::category)?;
                 client.destroy(provider, &environment.id).await.map_err(SafeError::category)?;
+                let within = Duration::from_secs(timeouts.transition_seconds);
                 require(
-                    !client.list(provider).await.map_err(SafeError::category)?.iter().any(|row| row.id == environment.id),
-                    "destroyed environment still listed",
+                    unlisted(client, provider, |row| row.id == environment.id, within).await?,
+                    "destroyed environment still listed as live",
                 )
             }
             .await,
@@ -1102,11 +1103,28 @@ async fn cleanup(client: &Client, provider: &str, known: &Resources) -> Result<(
     if let Some(error) = failure {
         return Err(format!("cleanup: {error}"));
     }
-    let rows = match client.list(provider).await {
-        Ok(rows) => rows,
-        Err(_) => client.list(provider).await.map_err(SafeError::category)?,
-    };
-    require(!rows.iter().any(owns), "cleanup left test resources running")
+    require(unlisted(client, provider, owns, LIST_SETTLE).await?, "cleanup left test resources running")
+}
+/// How long cleanup lets a vendor's list catch up with its deletions.
+const LIST_SETTLE: Duration = Duration::from_secs(30);
+/// Whether the list stops showing a live row that `matches` within `within`.
+/// A vendor's list may lag its deletions, and may keep listing what it is
+/// destroying as such; a failed list is read again once.
+async fn unlisted(client: &Client, provider: &str, matches: impl Fn(&Environment) -> bool, within: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let rows = match client.list(provider).await {
+            Ok(rows) => rows,
+            Err(_) => client.list(provider).await.map_err(SafeError::category)?,
+        };
+        if !rows.iter().any(|row| row.live() && matches(row)) {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 async fn finish_report(
     client: &Client,

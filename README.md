@@ -663,7 +663,47 @@ report the exact upstream operation and message; they do not invalidate the key.
 The main server owns common admission, credential state, budgets, polling,
 inventory/lifecycle reconciliation, billing, snapshots, replay and public diagnostic
 sanitisation. Embedded `Daemon` and standalone `drydockd` use the same
-[`runtime`](crates/drydock/src/runtime) implementation. The
+[`runtime`](crates/drydock/src/runtime) implementation.
+
+### Semantics drydockd adds
+
+A module declares in `capabilities.semantics` what its vendor's operations
+guarantee by themselves. Where they do not, drydockd adds what the instance
+asks for, in [one place](crates/drydock/src/runtime/semantics.rs). Each
+instance takes `ownership` and `semantics` beside `module`:
+
+```toml
+[providers.daytona]
+module = "daytona"
+ownership = "shared_account"   # or "owned_account"
+semantics = { settle = true, idempotent = true, adopt_label = true, wait_seconds = 120, prepare_wait_seconds = 300, poll_millis = 2000 }
+```
+
+The values shown are the defaults.
+
+- `settle`: provision and resume return once the environment runs, suspend
+  once it has stopped, and prepare asks again while the module answers
+  unavailable (a form still being built). A wait ends early, refused, when the
+  environment is gone or its state unknown, and unavailable at its deadline.
+- `idempotent`: suspend of a stopped environment and resume of a running one
+  make no vendor call; destroy of an absent environment, or of one already
+  being destroyed, succeeds, and one the vendor refuses mid-change is asked
+  again within the wait.
+- `adopt_label`: provision returns the live environment the label already
+  names, as existing: the one this drydockd made or adopted for the label, else
+  one the list shows. drydockd serves one provision of a label at a time and
+  declares `exclusive_label`; two drydockds (or a drydockd and another tool)
+  provisioning one label at once can still each create one.
+- `ownership`: on a `shared_account`, what the instance makes carries
+  `drydock.provider=<instance>`, and drydockd lists only what carries it and
+  refuses to destroy anything else. On an `owned_account` nothing is tagged,
+  filtered or refused. Only a module that declares `reports_tags` takes
+  `owned_account`; the others still check ownership themselves.
+
+With `settle`, `idempotent` and `adopt_label` false, each verb is the vendor's
+own operation, answered as the vendor answers it. `semantics` is server-only:
+hosts never receive it. Lists report what the vendor lists, so a row may be
+`gone` or `destroying`; `Environment::live` says whether it is neither. The
 [Rust host](crates/drydock-host/README.md) is a compiled module loader serving
 the public API over [`drydock-provider`](crates/drydock-provider); the server
 reaches it through the same routes a client uses against the server. Earlier

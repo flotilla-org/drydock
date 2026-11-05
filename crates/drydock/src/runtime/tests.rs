@@ -371,6 +371,7 @@ mod operation_tests {
             egress_measured: true,
             egress_policy: None,
             timestamp: None,
+            vendor: None,
         };
         let generation = *i.observation_generation.recover();
         cache_observation(i, &row, generation);
@@ -420,6 +421,7 @@ mod operation_tests {
             timestamp: None,
             egress_measured: true,
             egress_policy: Some("policy-a".into()),
+            vendor: None,
         };
         let generation = *i.observation_generation.recover();
         cache_observation(i, &row, generation);

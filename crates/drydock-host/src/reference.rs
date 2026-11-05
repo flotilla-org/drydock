@@ -159,6 +159,7 @@ impl Provider for Reference {
             exclusive_label: true,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
+            semantics: Default::default(),
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {
@@ -203,6 +204,7 @@ impl Provider for Reference {
             egress_measured: false,
             egress_policy: None,
             timestamp: None,
+            vendor: None,
         };
         state.running_since.insert(s.id.clone(), chrono::Utc::now());
         state.environments.insert(s.id.clone(), s.clone());

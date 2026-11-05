@@ -324,6 +324,7 @@ impl Supervisor {
             let mut document = spec.configuration.clone();
             for provider in document.providers.values_mut() {
                 provider.credential = None;
+                provider.semantics = Default::default();
             }
             loop {
                 if let Some(child) = &mut child

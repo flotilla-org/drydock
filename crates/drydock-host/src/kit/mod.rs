@@ -18,7 +18,7 @@ pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
 
 /// The provider-side tag naming the drydock instance that made a resource.
-pub const PROVIDER_TAG: &str = "drydock.provider";
+pub const PROVIDER_TAG: &str = OWNER_TAG;
 /// The provider-side tag holding the environment's label.
 pub const LABEL_TAG: &str = "flotilla.label";
 

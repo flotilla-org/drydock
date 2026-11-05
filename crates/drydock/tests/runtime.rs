@@ -697,6 +697,7 @@ async fn poll_uses_matching_inspect_timestamp() {
         egress_measured: false,
         egress_policy: None,
         timestamp: None,
+        vendor: None,
     });
     tokio::time::timeout(Duration::from_secs(2), control.list_held.notified()).await.unwrap();
     h.ok(Method::GET, "/providers/a/environments/external", Value::Null, 200).await;
@@ -948,6 +949,7 @@ async fn progress_retains_billing_baseline_and_inventory() {
         egress_measured: false,
         egress_policy: None,
         timestamp: None,
+        vendor: None,
     };
     control.vendor.lock().unwrap().row = Some(environment.clone());
     // Wait for the initial stable state, then progress must appear in snapshots
@@ -994,6 +996,7 @@ async fn cheap_inventory_carries_measured_egress() {
         egress_measured: false,
         egress_policy: None,
         timestamp: None,
+        vendor: None,
     };
     control.vendor.lock().unwrap().row = Some(env);
     h.ok(Method::GET, "/providers/a/environments/measured", Value::Null, 200).await;
