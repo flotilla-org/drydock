@@ -393,6 +393,40 @@ async fn restart_resumes_from_the_stored_cursor() {
     assert_eq!(delivered, [frames[3]["delivery_id"].as_str().unwrap(), frames[4]["delivery_id"].as_str().unwrap()]);
 }
 
+// Deliveries come at least once: when drydockd stops after applying
+// deliveries but before storing their cursor, the relay sends them again. What
+// is no newer than the row drydockd holds changes nothing.
+#[tokio::test]
+async fn a_redelivered_event_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendor = Arc::new(Vendor::default());
+    host(dir.path(), &vendor).await;
+    let (relay, url) = Relay::start().await;
+    let frames = recorded();
+    let daemon = drydockd(dir.path(), &url, "owned_account").await;
+    caught_up(&relay, dir.path()).await;
+    let mut stream = subscribe(&daemon).await;
+    relay.publish(3);
+    events(&mut stream, |e| delivery(e) == frames[2]["delivery_id"].as_str()).await;
+    drop((stream, daemon));
+    // The cursors after the first delivery were never stored; the vendor
+    // lists the sandbox stopped, as of the stopped delivery.
+    std::fs::write(dir.path().join("run/events/daytona.cursor"), cursor(&frames[0]).to_string()).unwrap();
+    let mut stopped = sandbox("daytona", Observation::Stopped { cause: StopCause::SuspendedByRequest }, "stopped");
+    stopped.timestamp = Some(frames[2]["body"]["updatedAt"].as_str().unwrap().parse().unwrap());
+    *vendor.rows.lock().unwrap() = vec![stopped];
+    relay.publish(4);
+
+    relay.hold.send_replace(true);
+    let daemon = drydockd(dir.path(), &url, "owned_account").await;
+    let mut stream = subscribe(&daemon).await;
+    relay.hold.send_replace(false);
+    let events = events(&mut stream, |e| matches!(e.event, EventKind::Transitioning { phase: TransitionPhase::Destroying })).await;
+    assert_eq!(relay.connections.lock().unwrap().last().unwrap().0, cursor(&frames[0]));
+    let delivered: Vec<_> = events.iter().filter_map(delivery).collect();
+    assert_eq!(delivered, [frames[3]["delivery_id"].as_str().unwrap()]);
+}
+
 // A cursor older than the relay's retention gets a `gap`: deliveries may have
 // been lost, so drydockd lists the provider, and what the list shows changed
 // is marked as a reconstruction, not as a webhook.

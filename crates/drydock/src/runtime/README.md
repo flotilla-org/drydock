@@ -20,7 +20,7 @@ last-seen state and diffing, and, when the instance has a relay, the relay
 stream in the same loop. A relay makes the list a gap filler, every
 `poll_seconds` (default 300). Each delivery goes to the module's `VendorEvents`
 port, which reads it into observations; each observation becomes events marked
-`webhook` and carrying the vendor state. A `gap` frame, or a start with no
+`webhook` and carrying the vendor state. Deliveries come at least once and in no promised order: one whose vendor timestamp is no newer than the row drydockd holds is a redelivery or overtaken by a list, and is skipped. A `gap` frame, or a start with no
 stored cursor, is answered by a list whose events are marked `reconstruction`;
 the cursor is stored only once what came before it is applied. Waits wake on
 the log's change signal and ask for a poll only when the instance has no relay. It stretches the interval

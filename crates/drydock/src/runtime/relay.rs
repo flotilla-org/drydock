@@ -28,6 +28,9 @@ pub(crate) struct Stream {
 }
 /// The relay stream `events` names, if any, refused when only part of one is given.
 pub(crate) fn stream(events: &EventsConfiguration) -> std::result::Result<Option<Stream>, String> {
+    if events.poll_seconds == Some(0) {
+        return Err("events: poll_seconds must be positive".into());
+    }
     let (relay, source, token) = match (&events.relay, &events.source, &events.token) {
         (None, None, None) => return Ok(None),
         (Some(relay), Some(source), Some(token)) => (relay, source, token),
@@ -40,9 +43,6 @@ pub(crate) fn stream(events: &EventsConfiguration) -> std::result::Result<Option
     url.path_segments_mut().map_err(|_| "events: relay URL has no path".to_owned())?.pop_if_empty().push("stream");
     let websocket = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(websocket).map_err(|_| "events: relay URL".to_owned())?;
-    if events.poll_seconds == Some(0) {
-        return Err("events: poll_seconds must be positive".into());
-    }
     Ok(Some(Stream { url, source: source.clone(), token: token.clone() }))
 }
 
