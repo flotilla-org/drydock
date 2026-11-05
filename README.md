@@ -693,8 +693,10 @@ The values shown are the defaults.
   state unknown, and unavailable at its deadline. Prepare is not waited on: a
   module may answer unavailable while a form is built, and the client asks
   again.
-- `idempotent`: suspend of a stopped environment and resume of a running one
-  make no vendor call; destroy of an absent environment, or of one already
+- `idempotent`: resume of a running environment makes no vendor call, nor
+  does suspend of a stopped one when the module's resume token is the
+  environment id (`token_is_id`); otherwise suspend asks the vendor for the
+  token; destroy of an absent environment, or of one already
   being destroyed, succeeds.
 - `ownership`: on a `shared_account`, what the instance makes carries
   `drydock.provider=<instance>`, and drydockd lists only what carries it and
