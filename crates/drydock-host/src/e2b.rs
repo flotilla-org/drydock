@@ -769,7 +769,7 @@ impl Provider for E2b {
             exclusive_label: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
-            semantics: Default::default(),
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     fn observation(&self) -> ObservationMode {

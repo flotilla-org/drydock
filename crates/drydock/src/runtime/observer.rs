@@ -28,6 +28,7 @@ pub(super) fn poll_interval(mode: ObservationMode, limits: &[RateLimit]) -> Resu
 pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     let interval = instance.poll_interval;
     let mut credentials = instance.credential_changes.subscribe();
+    let observed = instance.observed.clone();
     let weak: Weak<Instance> = Arc::downgrade(&instance);
     drop(instance);
     tokio::spawn(async move {
@@ -41,6 +42,8 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
             tokio::select! {
                 _ = clock.tick() => {},
                 result = credentials.changed() => { if result.is_err() { break; } clock.reset(); },
+                // A wait asks for a poll now; the next one is an interval later.
+                _ = observed.poll_now.notified() => clock.reset(),
                 _ = stopping.changed() => break,
             }
             let Some(instance) = weak.upgrade() else {
@@ -69,6 +72,7 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 _ = stopping.changed() => break,
             };
             reconcile(&instance, &mut seen, rows, observation_generation);
+            observed.polls.send_modify(|polls| *polls += 1);
         }
     })
 }

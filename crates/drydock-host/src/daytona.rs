@@ -1,6 +1,6 @@
 //! Daytona REST translator: each verb is Daytona's own operation, and each
-//! answer is what Daytona said. Waiting, adoption, idempotence and ownership
-//! are drydockd's, as the declared [`Semantics`] ask (see `capabilities`).
+//! answer is what Daytona said. Waiting, idempotence and ownership are
+//! drydockd's, as the declared [`Semantics`] leave them (see `capabilities`).
 //! API contract: https://www.daytona.io/docs/openapi.json (2026-10-20).
 use crate::{
     kit::{
@@ -455,9 +455,9 @@ impl Provider for Daytona {
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
             // Create, start and stop answer once Daytona accepted them; a second
-            // stop is refused (400), a delete mid-change conflicts (409), a
-            // name is not a label, and start needs no token.
-            semantics: Semantics { settles: false, idempotent: false, adopts_label: false, resume_token: false, reports_tags: true },
+            // stop is refused (400), a delete mid-change conflicts (409), list
+            // and delete reach the whole account, and start needs no token.
+            semantics: Semantics { token_is_id: true, ..Semantics::default() },
             ..Capabilities::default()
         }
     }

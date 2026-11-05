@@ -159,7 +159,7 @@ impl Provider for Reference {
             exclusive_label: true,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
-            semantics: Default::default(),
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

@@ -175,11 +175,11 @@ It uses the published [REST](https://www.daytona.io/docs/openapi.json),
 
 The module translates: each verb is Daytona's own operation, and each answer
 is what Daytona said. Rows carry Daytona's own state name, its `errorReason`
-and its labels in `vendor`, beside the coarse `state`. It declares
-`Semantics { settles: false, idempotent: false, adopts_label: false,
-resume_token: false, reports_tags: true }`: drydockd adds waiting, idempotence,
-adoption by label and ownership as the instance's `semantics` and `ownership`
-ask (see the top-level README).
+and its labels in `vendor`, beside the coarse `state`. It declares no
+guarantee beyond `token_is_id`: drydockd adds waiting, idempotence and
+ownership as the instance's `semantics` and `ownership` ask (see the
+top-level README). Sandboxes are named by Daytona; a label is a tag, and
+provisioning a label twice makes two sandboxes.
 
 | Verb | Daytona calls |
 |---|---|

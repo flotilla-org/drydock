@@ -49,6 +49,13 @@ class Memory implements Provider {
     workspace_root: "/workspace",
     suspend_resume: false,
     exclusive_label: true,
+    // Its own operations wait, are idempotent and check ownership.
+    semantics: {
+      settles: true,
+      idempotent: true,
+      owner_scoped: true,
+      token_is_id: false,
+    },
     suspend_preserves_memory: false,
     export: false,
     fallback_runner: false,

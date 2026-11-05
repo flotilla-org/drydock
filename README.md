@@ -667,41 +667,47 @@ sanitisation. Embedded `Daemon` and standalone `drydockd` use the same
 
 ### Semantics drydockd adds
 
-A module declares in `capabilities.semantics` what its vendor's operations
-guarantee by themselves. Where they do not, drydockd adds what the instance
-asks for, in [one place](crates/drydock/src/runtime/semantics.rs). Each
-instance takes `ownership` and `semantics` beside `module`:
+A module declares in `capabilities.semantics` what its own operations
+guarantee; each flag defaults to false. Where they do not, drydockd adds what
+the instance asks for, in [one place](crates/drydock/src/runtime/semantics.rs),
+and the declaration clients read says what the operations guarantee with
+those additions. Each instance takes `ownership` and `semantics` beside
+`module`:
 
 ```toml
 [providers.daytona]
 module = "daytona"
 ownership = "shared_account"   # or "owned_account"
-semantics = { settle = true, idempotent = true, adopt_label = true, wait_seconds = 120, prepare_wait_seconds = 300, poll_millis = 2000 }
+semantics = { settle = true, idempotent = true, wait_seconds = 120 }
 ```
 
 The values shown are the defaults.
 
-- `settle`: provision and resume return once the environment runs, suspend
-  once it has stopped, and prepare asks again while the module answers
-  unavailable (a form still being built). A wait ends early, refused, when the
-  environment is gone or its state unknown, and unavailable at its deadline.
+- `settle`: provision and resume return once drydockd observes the
+  environment running, and suspend once it observes it stopped. The wait reads
+  drydockd's own observer: it asks for one poll at once, then follows the
+  observer's polls, so it can take up to one observation interval after the
+  vendor got there, and it makes no vendor calls of its own. It needs the
+  credential drydockd holds for the instance, since that is what the observer
+  polls with. A wait ends early, refused, when the environment is gone or its
+  state unknown, and unavailable at its deadline. Prepare is not waited on: a
+  module may answer unavailable while a form is built, and the client asks
+  again.
 - `idempotent`: suspend of a stopped environment and resume of a running one
   make no vendor call; destroy of an absent environment, or of one already
-  being destroyed, succeeds, and one the vendor refuses mid-change is asked
-  again within the wait.
-- `adopt_label`: provision returns the live environment the label already
-  names, as existing: the one this drydockd made or adopted for the label, else
-  one the list shows. drydockd serves one provision of a label at a time and
-  declares `exclusive_label`; two drydockds (or a drydockd and another tool)
-  provisioning one label at once can still each create one.
+  being destroyed, succeeds.
 - `ownership`: on a `shared_account`, what the instance makes carries
   `drydock.provider=<instance>`, and drydockd lists only what carries it and
   refuses to destroy anything else. On an `owned_account` nothing is tagged,
-  filtered or refused. Only a module that declares `reports_tags` takes
-  `owned_account`; the others still check ownership themselves.
+  filtered or refused. Only a module that leaves ownership to drydockd (does
+  not declare `owner_scoped`) takes `owned_account`.
 
-With `settle`, `idempotent` and `adopt_label` false, each verb is the vendor's
-own operation, answered as the vendor answers it. `semantics` is server-only:
+A label is the client's name for what it made, not a handle: drydockd does
+not adopt environments by label. Only a module that declares
+`exclusive_label` returns the environment a label names.
+
+With `settle` and `idempotent` false, each verb is the module's own
+operation, answered as the vendor answers it. `semantics` is server-only:
 hosts never receive it. Lists report what the vendor lists, so a row may be
 `gone` or `destroying`; `Environment::live` says whether it is neither. The
 [Rust host](crates/drydock-host/README.md) is a compiled module loader serving

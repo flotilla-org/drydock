@@ -88,6 +88,8 @@ pub struct Timeouts {
     pub record_seconds: u64,
     pub transition_seconds: u64,
     pub probe_seconds: u64,
+    /// How long prepare may answer unavailable while the form is built.
+    pub prepare_seconds: u64,
 }
 impl Default for Timeouts {
     fn default() -> Self {
@@ -98,6 +100,7 @@ impl Default for Timeouts {
             record_seconds: 20,
             transition_seconds: 30,
             probe_seconds: 30,
+            prepare_seconds: 300,
         }
     }
 }
@@ -111,6 +114,7 @@ impl Timeouts {
                 self.record_seconds,
                 self.transition_seconds,
                 self.probe_seconds,
+                self.prepare_seconds,
             ]
             .into_iter()
             .all(|seconds| (1..=86400).contains(&seconds)),
@@ -372,7 +376,8 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
     .any(|scenario| options.selected(scenario));
     let mut options = options.clone();
     if options.selected(Scenario::Prepare) || needs_environment || options.selected(Scenario::Semantics) {
-        if let Some(prepared) = report.capture("prepare", prepare(client, provider, &options.request).await) {
+        let within = Duration::from_secs(options.timeouts.prepare_seconds);
+        if let Some(prepared) = report.capture("prepare", prepare(client, provider, &options.request, within).await) {
             options.request.prepared = prepared;
         } else {
             return report;
@@ -392,7 +397,9 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         }
         let mut resumed =
             if options.selected(Scenario::Observation) { target.observation(environment, &mut report, &mut records).await } else { None };
-        if options.selected(Scenario::Reach) {
+        if options.selected(Scenario::Reach) && caps.bootstrap == BootstrapRoute::Upload && !caps.semantics.settles {
+            report.not_applicable("reach_byte_stream", "provision answers before the environment runs, so drydockd uploads no agent");
+        } else if options.selected(Scenario::Reach) {
             report.record("reach_byte_stream", reach(client, provider, &environment.id, &options, caps.agent).await);
         }
         if options.selected(Scenario::Refusal) {
@@ -460,7 +467,20 @@ async fn billing_window(
     let hours: f64 = usage.environment_hours.iter().filter(|row| &row.size == size).map(|row| row.hours).sum();
     require(if running { hours > 0.0 } else { hours == 0.0 }, "vendor usage disagrees with billing transition")
 }
-async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) -> Result<Prepared> {
+/// Prepare, asked again while it answers unavailable: a module may answer
+/// before the form is built.
+async fn prepare_once_built(client: &Client, provider: &str, request: &PrepareRequest, within: Duration) -> Result<Prepared> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match client.prepare(provider, request).await {
+            Err(Error::Protocol(ProtocolError::Unavailable { retry_after, .. })) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(retry_after.unwrap_or(5).clamp(1, 30))).await
+            }
+            result => return result.map_err(SafeError::category),
+        }
+    }
+}
+async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest, within: Duration) -> Result<Prepared> {
     let prepared = &provision.prepared;
     let request = PrepareRequest {
         size: provision.size.clone(),
@@ -470,8 +490,8 @@ async fn prepare(client: &Client, provider: &str, provision: &ProvisionRequest) 
         image_digest: prepared.image_digest.clone(),
         tools_digest: prepared.tools_digest.clone(),
     };
-    let first = client.prepare(provider, &request).await.map_err(SafeError::category)?;
-    let second = client.prepare(provider, &request).await.map_err(SafeError::category)?;
+    let first = prepare_once_built(client, provider, &request, within).await?;
+    let second = prepare_once_built(client, provider, &request, within).await?;
     // The image_digest comparison is removed until prepare reports the copy
     // and the build it caused (drydock#259): drydockd's staged copy is
     // truthfully not the requested digest.
@@ -727,16 +747,21 @@ impl Target<'_> {
         let provider = self.provider;
         let options = self.options;
 
-        report.record(
-            "idempotent_label",
-            async {
-                let again = client.provision(provider, &options.request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
-                let same = again.id == environment.id && again.label == environment.label;
-                owned_ids.insert(again.id.clone());
-                require(same, "duplicate label created another environment")
-            }
-            .await,
-        );
+        if self.caps.exclusive_label {
+            report.record(
+                "idempotent_label",
+                async {
+                    let again =
+                        client.provision(provider, &options.request).await.map(Provisioned::into_inner).map_err(SafeError::category)?;
+                    let same = again.id == environment.id && again.label == environment.label;
+                    owned_ids.insert(again.id.clone());
+                    require(same, "duplicate label created another environment")
+                }
+                .await,
+            );
+        } else {
+            report.not_applicable("idempotent_label", "the provider declares no exclusive label");
+        }
         report.record(
             "list_readoption",
             async {
@@ -852,11 +877,14 @@ impl Target<'_> {
                 "suspend",
                 async {
                     let token = client.suspend(provider, &environment.id).await.map_err(SafeError::category)?;
-                    require(
-                        !token.token.expose().is_empty()
-                            && client.suspend(provider, &environment.id).await.map_err(SafeError::category)? == token,
-                        "suspend returned an empty or unstable token",
-                    )?;
+                    require(!token.token.expose().is_empty(), "suspend returned an empty token")?;
+                    // A second suspend is the module's own call unless it declares idempotence.
+                    if caps.semantics.idempotent {
+                        require(
+                            client.suspend(provider, &environment.id).await.map_err(SafeError::category)? == token,
+                            "suspend returned an unstable token",
+                        )?;
+                    }
                     Ok(token)
                 }
                 .await,
@@ -921,13 +949,8 @@ impl Target<'_> {
                     "resume",
                     async {
                         client.resume(provider, &environment.id, &token).await.map_err(SafeError::category)?;
-                        require(
-                            matches!(
-                                client.inspect(provider, &environment.id).await.map_err(SafeError::category)?.state,
-                                Observation::Running
-                            ),
-                            "resume did not restore running state",
-                        )
+                        // A module that does not settle answers before the environment runs.
+                        if caps.semantics.settles { running_state(client, provider, &environment.id).await } else { Ok(()) }
                     }
                     .await,
                 )
@@ -944,7 +967,7 @@ impl Target<'_> {
                             timeouts,
                         )
                         .await?;
-                        Ok(())
+                        if caps.semantics.settles { Ok(()) } else { running_state(client, provider, &environment.id).await }
                     }
                     .await,
                 );
@@ -1008,7 +1031,13 @@ impl Target<'_> {
                     .await?;
                 }
                 client.destroy(provider, &environment.id).await.map_err(SafeError::category)?;
-                client.destroy(provider, &environment.id).await.map_err(SafeError::category)?;
+                // Without declared idempotence, the second destroy answers as the vendor does.
+                match client.destroy(provider, &environment.id).await {
+                    Ok(()) => {}
+                    Err(Error::Protocol(ProtocolError::NotFound { .. } | ProtocolError::Unavailable { .. }))
+                        if !self.caps.semantics.idempotent => {}
+                    Err(error) => return Err(error.category()),
+                }
                 let within = Duration::from_secs(timeouts.transition_seconds);
                 require(
                     unlisted(client, provider, |row| row.id == environment.id, within).await?,
@@ -1091,11 +1120,18 @@ async fn cleanup(client: &Client, provider: &str, known: &Resources) -> Result<(
     if let Ok(rows) = &inventory {
         ids = rows.iter().filter(|row| owns(row)).map(|row| row.id.clone()).collect();
     }
+    // An environment already gone is cleaned up, whatever the module declares.
+    let destroy = |id: String| async move {
+        match client.destroy(provider, &id).await {
+            Err(Error::Protocol(ProtocolError::NotFound { .. })) => Ok(()),
+            result => result,
+        }
+    };
     let mut failure = None;
     for id in ids {
-        if client.destroy(provider, &id).await.is_err() {
+        if destroy(id.clone()).await.is_err() {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Err(error) = client.destroy(provider, &id).await {
+            if let Err(error) = destroy(id).await {
                 failure = Some(error.category());
             }
         }
@@ -1104,6 +1140,12 @@ async fn cleanup(client: &Client, provider: &str, known: &Resources) -> Result<(
         return Err(format!("cleanup: {error}"));
     }
     require(unlisted(client, provider, owns, LIST_SETTLE).await?, "cleanup left test resources running")
+}
+async fn running_state(client: &Client, provider: &str, id: &str) -> Result<()> {
+    require(
+        matches!(client.inspect(provider, id).await.map_err(SafeError::category)?.state, Observation::Running),
+        "resume did not restore running state",
+    )
 }
 /// How long cleanup lets a vendor's list catch up with its deletions.
 const LIST_SETTLE: Duration = Duration::from_secs(30);

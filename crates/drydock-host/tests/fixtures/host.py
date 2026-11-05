@@ -28,7 +28,8 @@ capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clon
                 "workspace_root": "/workspace", "suspend_resume": True, "export": True, "exclusive_label": True,
                 "egress": {"routes": ["none"], "model": {"shapes": ["open"], "enforced": "none", "mutable_while_running": False}},
                 "fallback_runner": True, "bootstrap": "bake", "usage": True, "quota": True,
-                "platforms": [{"os": "linux", "architecture": "amd64"}]}
+                "platforms": [{"os": "linux", "architecture": "amd64"}],
+                "semantics": {"settles": True, "idempotent": True, "owner_scoped": True}}
 if fault.startswith("egress-"):
     capabilities["egress"]["model"] = {"shapes": ["deny_all", "allow_addresses"], "enforced": "outside_guest", "mutable_while_running": False}
 if fault == "capabilities":

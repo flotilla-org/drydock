@@ -67,7 +67,7 @@ pub struct ProviderConfiguration {
     #[serde(default, skip_serializing_if = "is_default")]
     pub ownership: Ownership,
     /// Server only: the guarantees drydockd adds for this instance where the
-    /// module declares its vendor does not give them ([`Semantics`]).
+    /// module's operations do not give them by themselves ([`Semantics`]).
     #[serde(default, skip_serializing_if = "is_default")]
     pub semantics: SemanticOptions,
 }
@@ -88,31 +88,27 @@ pub enum Ownership {
     /// Drydock owns the whole account: nothing is tagged, filtered or refused.
     OwnedAccount,
 }
-/// What drydockd adds to a module's vendor operations, for one instance. Each
-/// applies only where [`Semantics`] says the vendor does not do it already;
-/// with all three off a module's verbs are its vendor's own operations.
+/// What drydockd adds to a module's operations, for one instance. Each applies
+/// only where the module's [`Semantics`] do not already give it; with both
+/// off, a module's verbs are its own operations.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct SemanticOptions {
-    /// Provision and resume wait until the environment runs and suspend until
-    /// it has stopped; prepare asks again while the module answers unavailable.
+    /// Provision and resume answer once drydockd observes the environment
+    /// running, and suspend once it observes it stopped. drydockd waits on
+    /// its own observation of the provider, so a wait can take up to one
+    /// observation interval after the vendor got there.
     pub settle: bool,
     /// Suspend of a stopped environment and resume of a running one succeed
     /// without a vendor call; destroy of an absent one, or one already being
     /// destroyed, succeeds.
     pub idempotent: bool,
-    /// Provision returns the live environment the label already names.
-    pub adopt_label: bool,
-    /// The longest provision, suspend, resume or destroy waits.
+    /// The longest provision, suspend or resume waits.
     pub wait_seconds: u64,
-    /// The longest prepare waits for a form still being built.
-    pub prepare_wait_seconds: u64,
-    /// How often a wait reads the environment again.
-    pub poll_millis: u64,
 }
 impl Default for SemanticOptions {
     fn default() -> Self {
-        Self { settle: true, idempotent: true, adopt_label: true, wait_seconds: 120, prepare_wait_seconds: 300, poll_millis: 2000 }
+        Self { settle: true, idempotent: true, wait_seconds: 120 }
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -263,12 +259,10 @@ pub struct Capabilities {
     /// not a sandbox, and nothing may treat it as one.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_processes: bool,
-    /// Concurrent provisions of one label return one environment: the provider
-    /// refuses a second sandbox for a label, or drydockd, adopting labels for
-    /// a module that does not ([`SemanticOptions::adopt_label`]), serves one
-    /// provision of a label at a time (then only among provisions through that
-    /// drydockd). Without it, a retry after a provision has returned still
-    /// returns that environment, but concurrent provisions may each create one.
+    /// Provision of a label that names an environment returns it, concurrent
+    /// provisions included: the module refuses a second sandbox for a label.
+    /// Without it a label is only the client's name for what it made, and
+    /// every provision may create an environment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_label: bool,
     /// The ways, beyond the guest's own egress, that a vessel can reach a
@@ -309,35 +303,29 @@ impl Default for Capabilities {
         }
     }
 }
-/// What a module's vendor operations guarantee without drydockd's help. The
-/// default is what every module guaranteed before modules translated plainly;
-/// a module whose vendor does less says so, and drydockd adds what the
-/// instance's [`SemanticOptions`] ask for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// What a module's operations guarantee by themselves. Each defaults to
+/// false: no guarantee. A module states what its own operations do, and
+/// drydockd adds what the instance's [`SemanticOptions`] ask for; the
+/// declaration a client reads says what the operations guarantee with
+/// drydockd's additions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Semantics {
     /// Provision and resume answer once the environment runs, suspend once it
     /// has stopped, and prepare once the prepared form can be used. Otherwise
-    /// each answers when the vendor accepted the request, and prepare answers
+    /// each answers when the request was accepted, and prepare answers
     /// unavailable while the form is being built.
     pub settles: bool,
-    /// Suspend, resume or destroy of an environment already there (or gone)
-    /// succeeds.
+    /// Suspend, resume or destroy of an environment already in that state (or
+    /// gone) succeeds.
     pub idempotent: bool,
-    /// Provision of a label that names an environment returns it.
-    pub adopts_label: bool,
-    /// Resume needs the token suspend returned. Otherwise the token is the
-    /// environment id and resume ignores it.
-    pub resume_token: bool,
-    /// The module tags what it makes with [`OWNER_TAG`] only on a shared
-    /// account, reports the vendor's tags in [`VendorState`], and checks no
-    /// ownership itself: drydockd applies the instance's [`Ownership`].
-    pub reports_tags: bool,
-}
-impl Default for Semantics {
-    fn default() -> Self {
-        Self { settles: true, idempotent: true, adopts_label: true, resume_token: true, reports_tags: false }
-    }
+    /// List and destroy reach only what this instance made: the module checks
+    /// its own ownership. Otherwise the module tags what it makes with
+    /// [`OWNER_TAG`] on a shared account and reports the tags in
+    /// [`VendorState`], and drydockd applies the instance's [`Ownership`].
+    pub owner_scoped: bool,
+    /// The resume token is the environment id and resume ignores it.
+    pub token_is_id: bool,
 }
 /// One way, beyond the guest's own egress, that a vessel can reach a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

@@ -20,6 +20,7 @@ use events::*;
 use evidence::*;
 use instance::*;
 use module::{Credentials, Provider, Registry, Result, refused};
+use semantics::Observed;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Mutex},
@@ -172,7 +173,8 @@ impl Runtime {
                     error
                 })?,
             };
-            let provider = semantics::apply(name, p, provider)?;
+            let observed = Observed::new(&self.events, name);
+            let provider = semantics::apply(p, observed.clone(), provider)?;
             let credentials = Credentials::default();
             let (credential_changes, _) = watch::channel(credentials.clone());
             let capabilities = provider.capabilities();
@@ -214,6 +216,7 @@ impl Runtime {
                     observation_generation: Mutex::new(0),
                     egress_measured_at: Mutex::new(BTreeMap::new()),
                     request_timeout: self.request_timeout,
+                    observed,
                 }),
             );
         }

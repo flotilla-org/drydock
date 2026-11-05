@@ -1,38 +1,52 @@
 //! What drydockd adds to a module's operations, in one place: waiting for a
-//! state, idempotent lifecycle calls, adoption by label and the ownership of
-//! a shared account. A module declares what its vendor already guarantees
-//! ([`Semantics`]); an instance's [`SemanticOptions`] and [`Ownership`] ask
-//! for the rest. A module that declares the default gets nothing added.
+//! state, idempotent lifecycle calls and the ownership of a shared account. A
+//! module declares what its own operations guarantee ([`Semantics`]); an
+//! instance's [`SemanticOptions`] and [`Ownership`] ask for the rest.
+//!
+//! A wait reads what drydockd's observer already sees of the provider: it
+//! asks the observer to poll once, then follows its polls. It makes no vendor
+//! calls of its own.
 use super::*;
 use module::{ByteStream, Operations, Provisioned, SuspendResume};
 use std::time::Duration;
-use tokio::time::Instant;
+use tokio::{sync::Notify, time::Instant};
+
+/// The observer's view of one provider, as waits read it.
+pub(super) struct Observed {
+    log: Arc<Mutex<Log>>,
+    provider: String,
+    /// Counts the observer's committed polls.
+    pub(super) polls: watch::Sender<u64>,
+    /// Asks the observer to poll now rather than at its next interval.
+    pub(super) poll_now: Notify,
+}
+impl Observed {
+    pub(super) fn new(log: &EventLog, provider: &str) -> Arc<Self> {
+        Arc::new(Self { log: log.log.clone(), provider: provider.to_owned(), polls: watch::channel(0).0, poll_now: Notify::new() })
+    }
+    fn row(&self, id: &str) -> Option<Environment> {
+        self.log.recover().inventories.get(&self.provider)?.iter().find(|row| row.id == id).cloned()
+    }
+}
 
 /// `provider`, with what `config` asks for and its module does not declare.
-pub(super) fn apply(name: &str, config: &ProviderConfiguration, provider: Arc<dyn Provider>) -> Result<Arc<dyn Provider>> {
+pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, provider: Arc<dyn Provider>) -> Result<Arc<dyn Provider>> {
     let declared = provider.capabilities().semantics;
     let shared = config.ownership == Ownership::SharedAccount;
-    if !shared && !declared.reports_tags {
+    if !shared && declared.owner_scoped {
         return Err(refused("an owned account needs a module that leaves ownership to drydockd; this one checks its own"));
     }
     let o = &config.semantics;
-    if o.poll_millis == 0 {
-        return Err(refused("semantics.poll_millis must be positive"));
-    }
     let added = Added {
-        owner: (shared && declared.reports_tags).then(|| name.to_owned()),
+        owner: (shared && !declared.owner_scoped).then(|| observed.provider.clone()),
         settle: o.settle && !declared.settles,
         idempotent: o.idempotent && !declared.idempotent,
-        adopt: o.adopt_label && !declared.adopts_label,
-        token_is_id: !declared.resume_token,
+        token_is_id: declared.token_is_id,
         wait: Duration::from_secs(o.wait_seconds),
-        prepare_wait: Duration::from_secs(o.prepare_wait_seconds),
-        poll: Duration::from_millis(o.poll_millis),
-        labels: Mutex::default(),
-        provisions: Mutex::default(),
+        observed,
         inner: provider,
     };
-    if added.owner.is_none() && !added.settle && !added.idempotent && !added.adopt {
+    if added.owner.is_none() && !added.settle && !added.idempotent {
         return Ok(added.inner);
     }
     Ok(Arc::new(added))
@@ -44,17 +58,9 @@ struct Added {
     owner: Option<String>,
     settle: bool,
     idempotent: bool,
-    adopt: bool,
-    /// The module's resume ignores its token, which is the environment id.
     token_is_id: bool,
     wait: Duration,
-    prepare_wait: Duration,
-    poll: Duration,
-    /// The environment each label names, as this drydockd made or adopted
-    /// it: a vendor's list can lag a creation by seconds.
-    labels: Mutex<BTreeMap<String, String>>,
-    /// One provision of a label at a time.
-    provisions: Mutex<BTreeMap<String, std::sync::Weak<AsyncMutex<()>>>>,
+    observed: Arc<Observed>,
 }
 
 fn described(e: &Environment) -> String {
@@ -66,43 +72,44 @@ fn described(e: &Environment) -> String {
 }
 
 impl Added {
-    /// The live environment `label` names: the one this drydockd knows, else
-    /// the first the list shows.
-    async fn named(&self, label: &str, c: &Credentials) -> Result<Option<Environment>> {
-        let known = self.labels.recover().get(label).cloned();
-        if let Some(id) = known {
-            match self.inner.inspect(&id, c).await {
-                Ok(e) if e.live() => return Ok(Some(e)),
-                Ok(_) | Err(ProtocolError::NotFound { .. }) => drop(self.labels.recover().remove(label)),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(self.list(c).await?.into_iter().find(|e| e.live() && e.label.as_deref() == Some(label)))
-    }
     fn ours(&self, e: &Environment) -> bool {
         self.owner.as_ref().is_none_or(|owner| e.vendor.as_ref().and_then(|v| v.tags.get(OWNER_TAG)) == Some(owner))
     }
-    /// Reads the environment until `done` holds. A wait ends early when it
-    /// is gone or its state is unknown, and as unavailable at the deadline.
-    async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool, c: &Credentials) -> Result<Environment> {
+    /// The environment once the observer sees it `what`. A wait ends early
+    /// when the observer sees it gone or in an unknown state, and as
+    /// unavailable at the deadline.
+    async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool) -> Result<Environment> {
+        let mut polls = self.observed.polls.subscribe();
+        polls.mark_unchanged();
+        self.observed.poll_now.notify_one();
         let deadline = Instant::now() + self.wait;
+        let mut last = None;
         loop {
-            let e = self.inner.inspect(id, c).await?;
-            if done(&e.state) {
-                return Ok(e);
+            tokio::select! {
+                changed = polls.changed() => if changed.is_err() {
+                    return Err(ProtocolError::unavailable("provider observation stopped", None));
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let seen = last.as_ref().map_or_else(|| "not yet observed".to_owned(), |e| format!("still {}", described(e)));
+                    return Err(ProtocolError::unavailable(
+                        format!("environment {id} is {seen} after {}s waiting to be {what}", self.wait.as_secs()),
+                        None,
+                    ));
+                },
             }
-            if matches!(e.state, Observation::Gone { .. } | Observation::Unknown { .. }) {
-                return Err(refused(format!("environment {id} is {} while waiting for it to be {what}", described(&e))));
+            if let Some(e) = self.observed.row(id) {
+                if done(&e.state) {
+                    return Ok(e);
+                }
+                if matches!(e.state, Observation::Gone { .. } | Observation::Unknown { .. }) {
+                    return Err(refused(format!("environment {id} is {} while waiting for it to be {what}", described(&e))));
+                }
+                last = Some(e);
             }
-            if Instant::now() + self.poll > deadline {
-                let reason = format!("environment {id} is still {} after {}s waiting to be {what}", described(&e), self.wait.as_secs());
-                return Err(ProtocolError::unavailable(reason, Some(self.poll.as_secs().max(1))));
-            }
-            tokio::time::sleep(self.poll).await;
         }
     }
-    async fn running(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        self.until(id, "running", |s| matches!(s, Observation::Running), c).await
+    async fn running(&self, id: &str) -> Result<Environment> {
+        self.until(id, "running", |s| matches!(s, Observation::Running)).await
     }
 }
 
@@ -115,11 +122,14 @@ impl Provider for Added {
         }
         ops
     }
-    /// With adoption, drydockd makes one environment per label for the
-    /// provisions it serves, and declares so.
+    /// What the operations guarantee with drydockd's additions.
     fn capabilities(&self) -> Capabilities {
-        let capabilities = self.inner.capabilities();
-        Capabilities { exclusive_label: capabilities.exclusive_label || self.adopt, ..capabilities }
+        let mut capabilities = self.inner.capabilities();
+        let s = &mut capabilities.semantics;
+        s.settles |= self.settle;
+        s.idempotent |= self.idempotent;
+        s.owner_scoped |= self.owner.is_some();
+        capabilities
     }
     fn observation(&self) -> ObservationMode {
         self.inner.observation()
@@ -133,55 +143,14 @@ impl Provider for Added {
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.inner.rate_limits()
     }
-    /// Asks again while the module answers unavailable: the form is still
-    /// being built.
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
-        let deadline = Instant::now() + self.prepare_wait;
-        loop {
-            match self.inner.prepare(r.clone(), c).await {
-                Err(ProtocolError::Unavailable { retry_after, .. }) if self.settle && Instant::now() + self.poll < deadline => {
-                    tokio::time::sleep(self.poll.max(Duration::from_secs(retry_after.unwrap_or(0)))).await
-                }
-                result => return result,
-            }
-        }
+        self.inner.prepare(r, c).await
     }
-    /// With adoption, one provision of a label at a time, so concurrent
-    /// provisions through this drydockd return one environment.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        let lock = self.adopt.then(|| {
-            let mut locks = self.provisions.recover();
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            let lock = locks.get(&r.label).and_then(std::sync::Weak::upgrade).unwrap_or_default();
-            locks.insert(r.label.clone(), Arc::downgrade(&lock));
-            lock
-        });
-        let _one = match &lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
-        if self.adopt
-            && let Some(e) = self.named(&r.label, c).await?
-        {
-            self.labels.recover().insert(r.label.clone(), e.id.clone());
-            // An adopted environment is returned as it is, unless it is on its
-            // way to running: provision never resumes a stopped one.
-            let starting = matches!(e.state, Observation::Transitioning { phase: TransitionPhase::Preparing | TransitionPhase::Starting });
-            return Ok(Provisioned::Existing(if self.settle && starting { self.running(&e.id, c).await? } else { e }));
+        match self.inner.provision(r, c).await? {
+            Provisioned::Created(e) if self.settle => Ok(Provisioned::Created(self.running(&e.id).await?)),
+            provisioned => Ok(provisioned),
         }
-        let label = r.label.clone();
-        let provisioned = self.inner.provision(r, c).await?;
-        if self.adopt {
-            let (Provisioned::Created(e) | Provisioned::Existing(e)) = &provisioned;
-            self.labels.recover().insert(label, e.id.clone());
-        }
-        if !self.settle {
-            return Ok(provisioned);
-        }
-        Ok(match provisioned {
-            Provisioned::Created(e) => Provisioned::Created(self.running(&e.id, c).await?),
-            Provisioned::Existing(e) => Provisioned::Existing(e),
-        })
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         Ok(self.inner.list(c).await?.into_iter().filter(|e| self.ours(e)).collect())
@@ -190,8 +159,7 @@ impl Provider for Added {
         self.inner.inspect(id, c).await
     }
     /// On a shared account, refuses an environment another instance or tool
-    /// made. Idempotent: absent, or already being destroyed, is destroyed;
-    /// a vendor busy with another change is asked again within the wait.
+    /// made. Idempotent: absent, or already being destroyed, is destroyed.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         if self.owner.is_some() {
             match self.inner.inspect(id, c).await {
@@ -202,18 +170,14 @@ impl Provider for Added {
                 _ => {}
             }
         }
-        let deadline = Instant::now() + self.wait;
-        loop {
-            match self.inner.destroy(id, c).await {
-                Err(ProtocolError::NotFound { .. }) if self.idempotent => return Ok(()),
-                Err(busy @ ProtocolError::Unavailable { .. }) if self.idempotent => match self.inner.inspect(id, c).await {
-                    Err(ProtocolError::NotFound { .. }) => return Ok(()),
-                    Ok(e) if !e.live() => return Ok(()),
-                    _ if self.settle && Instant::now() + self.poll < deadline => tokio::time::sleep(self.poll).await,
-                    _ => return Err(busy),
-                },
-                result => return result,
-            }
+        match self.inner.destroy(id, c).await {
+            Err(ProtocolError::NotFound { .. }) if self.idempotent => Ok(()),
+            Err(busy @ ProtocolError::Unavailable { .. }) if self.idempotent => match self.inner.inspect(id, c).await {
+                Err(ProtocolError::NotFound { .. }) => Ok(()),
+                Ok(e) if !e.live() => Ok(()),
+                _ => Err(busy),
+            },
+            result => result,
         }
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
@@ -236,7 +200,7 @@ impl SuspendResume for Added {
             );
         let token = if skip { ResumeToken { token: Secret::new(id) } } else { port.suspend(id, c).await? };
         if self.settle {
-            self.until(id, "stopped", |s| matches!(s, Observation::Stopped { .. }), c).await?;
+            self.until(id, "stopped", |s| matches!(s, Observation::Stopped { .. })).await?;
         }
         Ok(token)
     }
@@ -251,7 +215,7 @@ impl SuspendResume for Added {
             port.resume(id, token, c).await?;
         }
         if self.settle {
-            self.running(id, c).await?;
+            self.running(id).await?;
         }
         Ok(())
     }

@@ -2387,7 +2387,7 @@
           },
           "exclusive_label": {
             "type": "boolean",
-            "description": "Concurrent provisions of one label return one environment: the provider\nrefuses a second sandbox for a label, or drydockd, adopting labels for\na module that does not ([`SemanticOptions::adopt_label`]), serves one\nprovision of a label at a time (then only among provisions through that\ndrydockd). Without it, a retry after a provision has returned still\nreturns that environment, but concurrent provisions may each create one."
+            "description": "Provision of a label that names an environment returns it, concurrent\nprovisions included: the module refuses a second sandbox for a label.\nWithout it a label is only the client's name for what it made, and\nevery provision may create an environment."
           },
           "export": {
             "type": "boolean"
@@ -4329,7 +4329,7 @@
           },
           "semantics": {
             "$ref": "#/components/schemas/SemanticOptions",
-            "description": "Server only: the guarantees drydockd adds for this instance where the\nmodule declares its vendor does not give them ([`Semantics`])."
+            "description": "Server only: the guarantees drydockd adds for this instance where the\nmodule's operations do not give them by themselves ([`Semantics`])."
           },
           "settings": {
             "type": "object",
@@ -4820,41 +4820,22 @@
       },
       "SemanticOptions": {
         "type": "object",
-        "description": "What drydockd adds to a module's vendor operations, for one instance. Each\napplies only where [`Semantics`] says the vendor does not do it already;\nwith all three off a module's verbs are its vendor's own operations.",
+        "description": "What drydockd adds to a module's operations, for one instance. Each applies\nonly where the module's [`Semantics`] do not already give it; with both\noff, a module's verbs are its own operations.",
         "properties": {
-          "adopt_label": {
-            "type": "boolean",
-            "description": "Provision returns the live environment the label already names.",
-            "default": true
-          },
           "idempotent": {
             "type": "boolean",
             "description": "Suspend of a stopped environment and resume of a running one succeed\nwithout a vendor call; destroy of an absent one, or one already being\ndestroyed, succeeds.",
             "default": true
           },
-          "poll_millis": {
-            "type": "integer",
-            "format": "int64",
-            "description": "How often a wait reads the environment again.",
-            "default": 2000,
-            "minimum": 0
-          },
-          "prepare_wait_seconds": {
-            "type": "integer",
-            "format": "int64",
-            "description": "The longest prepare waits for a form still being built.",
-            "default": 300,
-            "minimum": 0
-          },
           "settle": {
             "type": "boolean",
-            "description": "Provision and resume wait until the environment runs and suspend until\nit has stopped; prepare asks again while the module answers unavailable.",
+            "description": "Provision and resume answer once drydockd observes the environment\nrunning, and suspend once it observes it stopped. drydockd waits on\nits own observation of the provider, so a wait can take up to one\nobservation interval after the vendor got there.",
             "default": true
           },
           "wait_seconds": {
             "type": "integer",
             "format": "int64",
-            "description": "The longest provision, suspend, resume or destroy waits.",
+            "description": "The longest provision, suspend or resume waits.",
             "default": 120,
             "minimum": 0
           }
@@ -4863,32 +4844,27 @@
       },
       "Semantics": {
         "type": "object",
-        "description": "What a module's vendor operations guarantee without drydockd's help. The\ndefault is what every module guaranteed before modules translated plainly;\na module whose vendor does less says so, and drydockd adds what the\ninstance's [`SemanticOptions`] ask for.",
+        "description": "What a module's operations guarantee by themselves. Each defaults to\nfalse: no guarantee. A module states what its own operations do, and\ndrydockd adds what the instance's [`SemanticOptions`] ask for; the\ndeclaration a client reads says what the operations guarantee with\ndrydockd's additions.",
         "properties": {
-          "adopts_label": {
-            "type": "boolean",
-            "description": "Provision of a label that names an environment returns it.",
-            "default": true
-          },
           "idempotent": {
             "type": "boolean",
-            "description": "Suspend, resume or destroy of an environment already there (or gone)\nsucceeds.",
-            "default": true
-          },
-          "reports_tags": {
-            "type": "boolean",
-            "description": "The module tags what it makes with [`OWNER_TAG`] only on a shared\naccount, reports the vendor's tags in [`VendorState`], and checks no\nownership itself: drydockd applies the instance's [`Ownership`].",
+            "description": "Suspend, resume or destroy of an environment already in that state (or\ngone) succeeds.",
             "default": false
           },
-          "resume_token": {
+          "owner_scoped": {
             "type": "boolean",
-            "description": "Resume needs the token suspend returned. Otherwise the token is the\nenvironment id and resume ignores it.",
-            "default": true
+            "description": "List and destroy reach only what this instance made: the module checks\nits own ownership. Otherwise the module tags what it makes with\n[`OWNER_TAG`] on a shared account and reports the tags in\n[`VendorState`], and drydockd applies the instance's [`Ownership`].",
+            "default": false
           },
           "settles": {
             "type": "boolean",
-            "description": "Provision and resume answer once the environment runs, suspend once it\nhas stopped, and prepare once the prepared form can be used. Otherwise\neach answers when the vendor accepted the request, and prepare answers\nunavailable while the form is being built.",
-            "default": true
+            "description": "Provision and resume answer once the environment runs, suspend once it\nhas stopped, and prepare once the prepared form can be used. Otherwise\neach answers when the request was accepted, and prepare answers\nunavailable while the form is being built.",
+            "default": false
+          },
+          "token_is_id": {
+            "type": "boolean",
+            "description": "The resume token is the environment id and resume ignores it.",
+            "default": false
           }
         }
       },

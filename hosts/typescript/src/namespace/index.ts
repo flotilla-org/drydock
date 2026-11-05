@@ -213,6 +213,13 @@ class Namespace implements Provider {
     workspace_root: "/workspace",
     suspend_resume: true,
     exclusive_label: true,
+    // Its own operations wait, are idempotent and check ownership.
+    semantics: {
+      settles: true,
+      idempotent: true,
+      owner_scoped: true,
+      token_is_id: false,
+    },
     // Devbox stop keeps the filesystem; memory and processes are lost.
     suspend_preserves_memory: false,
     export: false,
