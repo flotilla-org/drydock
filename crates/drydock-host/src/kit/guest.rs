@@ -90,7 +90,7 @@ pub async fn read_token(guest: &(impl Guest + ?Sized), id: &str, c: &Credentials
         .ok_or_else(|| ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", guest.vendor()), Some(2)))
 }
 
-/// Tokens read once, until the module drops them (suspend, resume, destroy).
+/// Tokens read once, until the module drops them (suspend, resume, destroy). A restarted agent's new token, or a drop during a read, is not seen until the next drop.
 #[derive(Default)]
 pub struct AgentTokens(Mutex<HashMap<String, Token>>);
 impl AgentTokens {
