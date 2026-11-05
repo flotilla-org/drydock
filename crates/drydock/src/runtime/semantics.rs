@@ -194,7 +194,9 @@ impl Provider for Added {
     }
     // Inspect, reach and relay are not owner-checked: they change nothing at
     // the vendor, and the observer inspects whatever a client asks about. The
-    // guard covers the operations that change vendor state.
+    // guard covers the operations that change vendor state. Reach and relay
+    // do open the guest to the client; whether they take the guard too is
+    // flotilla-org/drydock#276.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         self.inner.inspect(id, c).await
     }
