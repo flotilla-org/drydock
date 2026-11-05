@@ -62,7 +62,7 @@ impl Scope {
             if let Some(path) = text.strip_prefix("cgroup ") {
                 // A file is not evidence: only the cgroup this module makes for this vessel is
                 // ever written to or removed.
-                let path = PathBuf::from(path);
+                let path = PathBuf::from(path.trim_end());
                 let ours = path.starts_with(CGROUP_ROOT)
                     && path.components().all(|part| !matches!(part, std::path::Component::ParentDir))
                     && path.file_name().and_then(|name| name.to_str()) == Some(&format!("drydock-{}", dir.file_name()?.to_str()?));
@@ -110,7 +110,8 @@ impl Scope {
             }
         }
     }
-    /// Ask the vessel's processes to exit.
+    /// Ask the vessel's processes to exit. A cgroup's own processes only: those moved into a
+    /// child cgroup get no graceful stop, only the kill.
     pub(super) fn terminate(&self) {
         for member in self.members() {
             // SAFETY: signals a process found in the vessel; ESRCH when it has gone.
