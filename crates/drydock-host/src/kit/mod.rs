@@ -304,6 +304,7 @@ mod tests {
             platform: None,
             egress_measured: false,
             egress_policy: Some(policy.into()),
+            vendor: None,
             timestamp: None,
         };
         assert!(check_readopt(v, &held(size.clone(), &id), &size, &id).is_ok());

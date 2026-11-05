@@ -248,8 +248,12 @@ impl Module for DaytonaModule {
                 return Err(refused("Daytona's configured bases must end in /"));
             }
         }
-        let api = Api::new(DAYTONA, &settings.api_url, Auth::Bearer, http.clone())?.classify(classify).retry_after(retry_delay);
-        let analytics = Api::new(DAYTONA, &settings.analytics_url, Auth::Bearer, http)?.classify(classify).retry_after(retry_delay);
+        let api = Api::new(DAYTONA, &settings.api_url, Auth::Bearer, http.clone())?
+            .classify(classify)
+            .retry_after(|headers, _| retry_delay(headers));
+        let analytics = Api::new(DAYTONA, &settings.analytics_url, Auth::Bearer, http)?
+            .classify(classify)
+            .retry_after(|headers, _| retry_delay(headers));
         Ok(Arc::new(Daytona { name: name.to_owned(), ownership: config.ownership, settings, api, analytics }))
     }
 }
