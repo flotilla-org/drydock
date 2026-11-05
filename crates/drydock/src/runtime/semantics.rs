@@ -15,14 +15,15 @@ use tokio::{sync::Notify, time::Instant};
 pub(super) struct Observed {
     log: Arc<Mutex<Log>>,
     provider: String,
-    /// Counts the observer's committed polls.
-    pub(super) polls: watch::Sender<u64>,
+    /// The outcome of the observer's latest poll: `None` once it committed
+    /// what the vendor listed, or the error the vendor answered.
+    pub(super) polls: watch::Sender<Option<ProtocolError>>,
     /// Asks the observer to poll now rather than at its next interval.
     pub(super) poll_now: Notify,
 }
 impl Observed {
     pub(super) fn new(log: &EventLog, provider: &str) -> Arc<Self> {
-        Arc::new(Self { log: log.log.clone(), provider: provider.to_owned(), polls: watch::channel(0).0, poll_now: Notify::new() })
+        Arc::new(Self { log: log.log.clone(), provider: provider.to_owned(), polls: watch::channel(None).0, poll_now: Notify::new() })
     }
     fn row(&self, id: &str) -> Option<Environment> {
         self.log.recover().inventories.get(&self.provider)?.iter().find(|row| row.id == id).cloned()
@@ -34,7 +35,10 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
     let declared = provider.capabilities().semantics;
     let shared = config.ownership == Ownership::SharedAccount;
     if !shared && declared.owner_scoped {
-        return Err(refused("an owned account needs a module that leaves ownership to drydockd; this one checks its own"));
+        return Err(refused(format!(
+            "provider {}: an owned account needs a module that leaves ownership to drydockd; this one checks its own",
+            observed.provider
+        )));
     }
     let o = &config.semantics;
     let added = Added {
@@ -78,13 +82,17 @@ impl Added {
     }
     /// The environment once the observer sees it `what`. A wait ends early
     /// when the observer sees it gone or in an unknown state, and as
-    /// unavailable at the deadline.
+    /// unavailable at the deadline, naming the last poll's error if the
+    /// observer's polls were failing.
     async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool) -> Result<Environment> {
         let mut polls = self.observed.polls.subscribe();
         polls.mark_unchanged();
+        // When the observer is mid-poll this stores a permit, so it polls
+        // again straight after: the poll in flight may predate the change.
         self.observed.poll_now.notify_one();
         let deadline = Instant::now() + self.wait;
         let mut last = None;
+        let mut failed = None;
         loop {
             tokio::select! {
                 changed = polls.changed() => if changed.is_err() {
@@ -92,11 +100,16 @@ impl Added {
                 },
                 _ = tokio::time::sleep_until(deadline) => {
                     let seen = last.as_ref().map_or_else(|| "not yet observed".to_owned(), |e| format!("still {}", described(e)));
+                    let polling = failed.map_or_else(String::new, |e: ProtocolError| format!("; the last poll failed: {e}"));
                     return Err(ProtocolError::unavailable(
-                        format!("environment {id} is {seen} after {}s waiting to be {what}", self.wait.as_secs()),
+                        format!("environment {id} is {seen} after {}s waiting to be {what}{polling}", self.wait.as_secs()),
                         None,
                     ));
                 },
+            }
+            failed = polls.borrow_and_update().clone();
+            if failed.is_some() {
+                continue;
             }
             if let Some(e) = self.observed.row(id) {
                 if done(&e.state) {
@@ -112,7 +125,9 @@ impl Added {
     /// On a shared account, the environment as the vendor reports it, refused
     /// unless it carries this instance's tag. Fails closed: any inspect error
     /// is returned rather than acting on what cannot be verified. `None` on an
-    /// owned account, where nothing is checked.
+    /// owned account, where nothing is checked. The check and the operation
+    /// that follows are two vendor calls, not one atomic step; drydockd does
+    /// not lock through the vendor to close that gap.
     async fn guard(&self, id: &str, c: &Credentials) -> Result<Option<Environment>> {
         if self.owner.is_none() {
             return Ok(None);
@@ -184,7 +199,8 @@ impl Provider for Added {
         self.inner.inspect(id, c).await
     }
     /// On a shared account, refuses an environment another instance or tool
-    /// made, or one the vendor cannot say is ours. Idempotent: absent, or already being destroyed, is destroyed.
+    /// made, or one the vendor cannot say is ours. Idempotent: absent, or
+    /// already being destroyed, is destroyed.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         match self.guard(id, c).await {
             Err(ProtocolError::NotFound { .. }) if self.idempotent => return Ok(()),

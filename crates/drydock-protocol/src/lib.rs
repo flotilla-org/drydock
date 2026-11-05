@@ -98,11 +98,15 @@ pub struct SemanticOptions {
     /// Provision and resume answer once drydockd observes the environment
     /// running, and suspend once it observes it stopped. drydockd waits on
     /// its own observation of the provider, so a wait can take up to one
-    /// observation interval after the vendor got there.
+    /// observation interval after the vendor got there. A provision whose
+    /// wait fails has still made its environment, which `list` shows under
+    /// the client's label.
     pub settle: bool,
-    /// Suspend of a stopped environment and resume of a running one succeed
-    /// without a vendor call; destroy of an absent one, or one already being
-    /// destroyed, succeeds.
+    /// Resume of a running or starting environment succeeds without a vendor
+    /// call, as does suspend of a stopped or stopping one when the module's
+    /// resume token is the environment id; without `settle`, such a call can
+    /// answer while the transition is still under way. Destroy of an absent
+    /// environment, or one already being destroyed, succeeds.
     pub idempotent: bool,
     /// The longest provision, suspend or resume waits.
     pub wait_seconds: u64,

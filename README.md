@@ -690,14 +690,18 @@ The values shown are the defaults.
   vendor got there, and it makes no vendor calls of its own. It needs the
   credential drydockd holds for the instance, since that is what the observer
   polls with. A wait ends early, refused, when the environment is gone or its
-  state unknown, and unavailable at its deadline. Prepare is not waited on: a
-  module may answer unavailable while a form is built, and the client asks
-  again.
-- `idempotent`: resume of a running environment makes no vendor call, nor
-  does suspend of a stopped one when the module's resume token is the
-  environment id (`token_is_id`); otherwise suspend asks the vendor for the
-  token; destroy of an absent environment, or of one already
-  being destroyed, succeeds.
+  state unknown, and unavailable at its deadline, naming the last poll's
+  error if the observer's polls were failing. A provision whose wait fails has
+  still made its environment: the error names its id, and `list` shows it
+  under the client's label for the client to use or destroy. Prepare is not
+  waited on: a module may answer unavailable while a form is built, and the
+  client asks again.
+- `idempotent`: resume of a running or starting environment makes no vendor
+  call, nor does suspend of a stopped or stopping one when the module's resume
+  token is the environment id (`token_is_id`); otherwise suspend asks the
+  vendor for the token. Without `settle`, a skipped call can answer while the
+  transition is still under way. Destroy of an absent environment, or of one
+  already being destroyed, succeeds.
 - `ownership`: on a `shared_account`, what the instance makes carries
   `drydock.provider=<instance>`, and drydockd lists only what carries it and
   refuses to destroy, suspend or resume anything else, or anything whose tag

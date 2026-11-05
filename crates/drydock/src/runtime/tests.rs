@@ -653,16 +653,17 @@ mod operation_tests {
     }
 }
 
-mod ownership_guard {
+mod semantics_layer {
     use super::module::*;
     use super::*;
 
-    // A vendor that declares no guarantees of its own, so drydockd adds the
-    // shared-account owner check. Its inspect reports `inspected`, or is
-    // unavailable when that is `None`; mutations are recorded and succeed.
-    #[derive(Clone)]
+    // A vendor that declares no guarantees of its own, so drydockd adds them.
+    // Its inspect reports `inspected` and its list `listed`, each unavailable
+    // when `None`; mutations are recorded and succeed.
+    #[derive(Clone, Default)]
     struct Vendor {
         inspected: Option<Environment>,
+        listed: Option<Vec<Environment>>,
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
     struct Configured(Arc<dyn Provider>, Vendor);
@@ -699,8 +700,8 @@ mod ownership_guard {
         async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
             self.0.provision(r, c).await
         }
-        async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
-            self.0.list(c).await
+        async fn list(&self, _: &Credentials) -> Result<Vec<Environment>> {
+            self.1.listed.clone().ok_or_else(|| ProtocolError::unavailable("vendor list rate limited", None))
         }
         async fn inspect(&self, _: &str, _: &Credentials) -> Result<Environment> {
             self.1.inspected.clone().ok_or_else(|| ProtocolError::unavailable("vendor rate limited", None))
@@ -728,25 +729,39 @@ mod ownership_guard {
         }
     }
 
+    // The provider instance "a" serves for `vendor`, configured with
+    // `instance` beside its module, and the host keeping its observer
+    // running when `observe`.
+    async fn serve(vendor: Vendor, instance: serde_json::Value, observe: bool) -> (Arc<dyn Provider>, Runtime) {
+        let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(vendor) as Arc<dyn Module>)]));
+        let mut a = serde_json::json!({"module": "vendor", "settings": {}});
+        a.as_object_mut().unwrap().extend(instance.as_object().unwrap().clone());
+        let request = serde_json::from_value(serde_json::json!({"providers": {"a": a}})).unwrap();
+        host.configure(ConfigUpdate::Replace(request)).await.unwrap();
+        if !observe {
+            for task in host.tasks.recover().drain(..) {
+                task.abort();
+            }
+        }
+        host.credential("a", Secret::new("token")).await.unwrap();
+        (host.instance("a").await.unwrap().provider.clone(), host)
+    }
     // The provider an instance on a shared account (the default) serves, with
     // `inspected` as the vendor's inspect answer.
     async fn shared(inspected: Option<Environment>) -> (Arc<dyn Provider>, Arc<Mutex<Vec<&'static str>>>) {
-        let vendor = Vendor { inspected, calls: Default::default() };
+        let vendor = Vendor { inspected, listed: Some(vec![]), ..Default::default() };
         let calls = vendor.calls.clone();
-        let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(vendor) as Arc<dyn Module>)]));
-        let request = serde_json::from_value(serde_json::json!({"providers": {"a": {"module":"vendor", "settings":{}}}})).unwrap();
-        host.configure(ConfigUpdate::Replace(request)).await.unwrap();
-        for task in host.tasks.recover().drain(..) {
-            task.abort();
-        }
-        (host.instance("a").await.unwrap().provider.clone(), calls)
+        (serve(vendor, serde_json::json!({}), false).await.0, calls)
     }
-    fn tagged(owner: &str) -> Environment {
+    fn environment(owner: &str, state: serde_json::Value) -> Environment {
         serde_json::from_value(serde_json::json!({
-            "id": "e", "provider": "a", "state": {"state": "running"}, "egress": "enforced",
-            "vendor": {"state": "started", "tags": {OWNER_TAG: owner}}
+            "id": "e", "provider": "a", "state": state, "egress": "enforced",
+            "vendor": {"state": "vendor words", "tags": {OWNER_TAG: owner}}
         }))
         .unwrap()
+    }
+    fn tagged(owner: &str) -> Environment {
+        environment(owner, serde_json::json!({"state": "running"}))
     }
 
     // ADR 0070: on a shared account a destroy whose ownership the vendor
@@ -771,5 +786,61 @@ mod ownership_guard {
         let token = ResumeToken { token: Secret::new("e") };
         assert!(matches!(port.resume("e", token, &c).await, Err(ProtocolError::Refused { .. })));
         assert!(calls.recover().is_empty());
+    }
+
+    // An idempotent suspend of a stopped environment still asks the vendor
+    // when the module's resume token is not the id: only the vendor can give
+    // the token resume needs.
+    #[tokio::test]
+    async fn idempotent_suspend_asks_vendor_for_a_token_that_is_not_the_id() {
+        let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
+        let vendor = Vendor { inspected: Some(stopped), listed: Some(vec![]), ..Default::default() };
+        let calls = vendor.calls.clone();
+        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"settle": false}}), false).await;
+        provider.operations().suspend_resume.unwrap().suspend("e", &Credentials::default()).await.unwrap();
+        assert_eq!(*calls.recover(), vec!["suspend"]);
+    }
+
+    // A settling wait whose observer polls keep failing answers unavailable
+    // at its deadline, naming the poll's error.
+    #[tokio::test]
+    async fn settle_timeout_names_the_failing_poll() {
+        let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
+        let vendor = Vendor { inspected: Some(stopped), listed: None, ..Default::default() };
+        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"wait_seconds": 1}}), true).await;
+        let token = ResumeToken { token: Secret::new("e") };
+        let result = provider.operations().suspend_resume.unwrap().resume("e", token, &Credentials::default()).await;
+        let Err(ProtocolError::Unavailable { reason, .. }) = result else { panic!("{result:?}") };
+        assert!(reason.contains("the last poll failed") && reason.contains("vendor list rate limited"), "{reason}");
+    }
+
+    // A settling wait ends at once, refused, when the observer sees the
+    // environment gone, rather than waiting out its deadline.
+    #[tokio::test]
+    async fn settle_ends_early_on_gone() {
+        let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
+        let gone = environment("a", serde_json::json!({"state": "gone", "cause": {"kind": "destroyed_at_provider"}}));
+        let vendor = Vendor { inspected: Some(stopped), listed: Some(vec![gone]), ..Default::default() };
+        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"wait_seconds": 60}}), true).await;
+        let token = ResumeToken { token: Secret::new("e") };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.operations().suspend_resume.unwrap().resume("e", token, &Credentials::default()),
+        )
+        .await
+        .expect("the wait ends before its deadline");
+        assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{result:?}");
+    }
+
+    // An owned account is refused for a module that checks ownership itself.
+    #[tokio::test]
+    async fn owned_account_refuses_an_owner_scoped_module() {
+        let host = Runtime::new(reference::registry());
+        let request = serde_json::from_value(serde_json::json!({
+            "providers": {"a": {"module": "reference", "settings": {}, "ownership": "owned_account"}}
+        }))
+        .unwrap();
+        let result = host.configure(ConfigUpdate::Replace(request)).await;
+        assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{result:?}");
     }
 }

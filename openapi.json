@@ -4824,12 +4824,12 @@
         "properties": {
           "idempotent": {
             "type": "boolean",
-            "description": "Suspend of a stopped environment and resume of a running one succeed\nwithout a vendor call; destroy of an absent one, or one already being\ndestroyed, succeeds.",
+            "description": "Resume of a running or starting environment succeeds without a vendor\ncall, as does suspend of a stopped or stopping one when the module's\nresume token is the environment id; without `settle`, such a call can\nanswer while the transition is still under way. Destroy of an absent\nenvironment, or one already being destroyed, succeeds.",
             "default": true
           },
           "settle": {
             "type": "boolean",
-            "description": "Provision and resume answer once drydockd observes the environment\nrunning, and suspend once it observes it stopped. drydockd waits on\nits own observation of the provider, so a wait can take up to one\nobservation interval after the vendor got there.",
+            "description": "Provision and resume answer once drydockd observes the environment\nrunning, and suspend once it observes it stopped. drydockd waits on\nits own observation of the provider, so a wait can take up to one\nobservation interval after the vendor got there. A provision whose\nwait fails has still made its environment, which `list` shows under\nthe client's label.",
             "default": true
           },
           "wait_seconds": {

@@ -59,6 +59,7 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                 result = instance.call_with_budget(Gate::List, true, None, |p,c| async move { p.list(&c).await }) => match result {
                     Ok(rows) => rows,
                     Err(error) => {
+                        let error_for_waits = error.clone();
                         tracing::warn!(provider = %instance.name, route = "poll", error_class = error.class(), error = %error, "poll failed; retaining inventory");
                         let auth = instance.auth.recover();
                         if auth.generation == generation && !auth.rejected {
@@ -66,13 +67,14 @@ pub(super) fn spawn(instance: Arc<Instance>, mut stopping: watch::Receiver<bool>
                         }
                         drop(auth);
                         instance.events.shared.changed.send_modify(|_| {});
+                        observed.polls.send_replace(Some(error_for_waits));
                         continue;
                     },
                 },
                 _ = stopping.changed() => break,
             };
             reconcile(&instance, &mut seen, rows, observation_generation);
-            observed.polls.send_modify(|polls| *polls += 1);
+            observed.polls.send_replace(None);
         }
     })
 }
