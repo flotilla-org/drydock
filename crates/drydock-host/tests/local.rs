@@ -413,9 +413,14 @@ async fn destroy_distrusts_a_recorded_cgroup_that_is_not_the_vessels() {
     let root = Root::new();
     let p = provider(&root).await;
     let outside = tempfile::tempdir().unwrap();
-    for (n, path) in [outside.path().join("drydock-x"), "/sys/fs/cgroup/../../tmp/drydock-x".into(), "/sys/fs/cgroup/gone".into()]
-        .into_iter()
-        .enumerate()
+    for (n, path) in [
+        outside.path().join("drydock-x"),
+        "/sys/fs/cgroup/../../tmp/drydock-x".into(),
+        "/sys/fs/cgroup/gone".into(),
+        "/sys/fs/cgroup/drydock-local-other".into(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let environment = provision(&*p, &format!("cg-{n}")).await;
         let dir = root.path().join(&environment.id);
@@ -431,7 +436,8 @@ async fn destroy_distrusts_a_recorded_cgroup_that_is_not_the_vessels() {
 }
 
 // Where the host may make cgroups, a process that leaves the agent's session and
-// process group is still in the vessel, and destroy ends it.
+// process group is still in the vessel, and destroy ends it. Set DRYDOCK_REQUIRE_CGROUP
+// to fail instead of skipping where no cgroup can be made.
 #[tokio::test]
 async fn destroy_ends_a_process_that_escaped_the_session_when_cgroups_are_available() {
     let probe = std::fs::read_to_string("/proc/self/cgroup").unwrap();
@@ -439,12 +445,14 @@ async fn destroy_ends_a_process_that_escaped_the_session_when_cgroups_are_availa
         std::path::Path::new("/sys/fs/cgroup").join(probe.lines().find_map(|l| l.strip_prefix("0::")).unwrap().trim_start_matches('/'));
     let trial = own.join(format!("drydock-trial-{}", std::process::id()));
     if std::fs::create_dir(&trial).is_err() {
+        assert!(std::env::var_os("DRYDOCK_REQUIRE_CGROUP").is_none(), "DRYDOCK_REQUIRE_CGROUP is set but no cgroup can be made");
         eprintln!("skipped: no writable cgroup v2 tree here");
         return;
     }
     let usable = trial.join("cgroup.kill").exists();
     let _ = std::fs::remove_dir(&trial);
     if !usable {
+        assert!(std::env::var_os("DRYDOCK_REQUIRE_CGROUP").is_none(), "DRYDOCK_REQUIRE_CGROUP is set but there is no cgroup.kill");
         eprintln!("skipped: no cgroup.kill here");
         return;
     }

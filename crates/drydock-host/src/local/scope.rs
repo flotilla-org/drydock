@@ -70,9 +70,11 @@ impl Scope {
             }
             let fields: Vec<_> = text.split_whitespace().collect();
             return match fields[..] {
-                ["session", pid, namespace, start] => {
-                    Some(Scope::Session { pid: pid.parse().ok()?, namespace: namespace.into(), start: start.parse().ok()? })
-                }
+                ["session", pid, namespace, start] => Some(Scope::Session {
+                    pid: pid.parse().ok().filter(|pid| *pid > 1)?,
+                    namespace: namespace.into(),
+                    start: start.parse().ok()?,
+                }),
                 _ => None,
             };
         }
@@ -102,7 +104,8 @@ impl Scope {
                     return vec![];
                 }
                 // The session id stays taken while any member lives, so with the agent gone
-                // the session's remaining members are still the agent's.
+                // the session's remaining members are still the agent's. If its PID is already
+                // taken by another process the session is empty; nothing survives to be found.
                 session_members(*pid)
             }
         }
@@ -138,11 +141,12 @@ impl Scope {
             Scope::Session { .. } => self.members().is_empty(),
         }
     }
-    /// Remove what held the vessel together, once it is gone. Best effort: a cgroup still holding a
-    /// zombie cannot be removed yet, and the next start finds it again by name.
-    pub(super) fn release(&self) {
-        if let Scope::Cgroup(path) = self {
-            let _ = std::fs::remove_dir(path);
+    /// Remove what held the vessel together, once it is gone. Whether it is removed: a cgroup
+    /// can refuse for a moment after its last process exits, until the zombie is reaped.
+    pub(super) fn release(&self) -> bool {
+        match self {
+            Scope::Cgroup(path) => std::fs::remove_dir(path).is_ok() || !path.exists(),
+            Scope::Session { .. } => true,
         }
     }
     /// A cgroup for the agent to join before it executes anything, so that nothing it

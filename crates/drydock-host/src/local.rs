@@ -241,8 +241,8 @@ impl Local {
         let mut child = match spawn_retrying_busy(&mut command).await {
             Ok(child) => child,
             Err(e) => {
-                if let Some(scope) = &cgroup {
-                    scope.release();
+                if let Some(scope) = cgroup.as_ref().filter(|scope| scope.release()) {
+                    let _ = scope;
                     let _ = std::fs::remove_file(dir.join(SCOPE));
                 }
                 return Err(unavailable(format!("start agent: {e}")));
@@ -359,7 +359,12 @@ fn process(pid: i32, socket: &Path) -> Process {
 async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     let Some(scope) = Scope::load(dir, socket) else {
         // Nothing the vessel can be told from other processes by: leave every process alone.
-        let _ = tokio::fs::remove_file(dir.join(PID)).await;
+        if dir.join(PID).exists() || dir.join(SCOPE).exists() {
+            tracing::warn!(dir = %dir.display(), "no usable record of the agent's scope: signalling nothing; its processes, if any, are left running");
+        }
+        for file in [PID, SCOPE] {
+            let _ = tokio::fs::remove_file(dir.join(file)).await;
+        }
         return Ok(());
     };
     let gone = |limit: Duration| {
@@ -378,8 +383,16 @@ async fn stop(dir: &Path, socket: &Path) -> Result<()> {
     if !scope.gone() {
         return Err(unavailable("the agent or its processes survived SIGKILL"));
     }
-    scope.release();
-    for file in [PID, SCOPE] {
+    // The record stays until the cgroup is removed, so that a later stop finds it.
+    let mut released = scope.release();
+    for _ in 0..50 {
+        if released {
+            break;
+        }
+        tokio::time::sleep(scope::POLL).await;
+        released = scope.release();
+    }
+    for file in [PID].into_iter().chain(released.then_some(SCOPE)) {
         let _ = tokio::fs::remove_file(dir.join(file)).await;
     }
     let _ = tokio::fs::remove_file(socket).await;
