@@ -5427,7 +5427,7 @@
           },
           {
             "type": "object",
-            "description": "The vendor posts these events to a receiver the installation runs;\ndrydockd reads them from a relay and the module translates each.",
+            "description": "The vendor posts these events to a receiver the installation runs;\ndrydockd reads them from a relay and the module translates each.\n`registration` lists every way the vendor offers to register the\nwebhook; drydockd registers none itself.",
             "required": [
               "registration",
               "events",
@@ -5445,7 +5445,10 @@
                 }
               },
               "registration": {
-                "$ref": "#/components/schemas/WebhookRegistration"
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WebhookRegistration"
+                }
               },
               "way": {
                 "type": "string",

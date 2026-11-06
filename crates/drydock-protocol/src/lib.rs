@@ -224,7 +224,9 @@ pub enum WayIn {
     Poll { interval_ms: u64 },
     /// The vendor posts these events to a receiver the installation runs;
     /// drydockd reads them from a relay and the module translates each.
-    Webhook { registration: WebhookRegistration, events: Vec<String>, delivery: DeliveryGuarantee },
+    /// `registration` lists every way the vendor offers to register the
+    /// webhook; drydockd registers none itself.
+    Webhook { registration: Vec<WebhookRegistration>, events: Vec<String>, delivery: DeliveryGuarantee },
 }
 /// Where a webhook is registered with the vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

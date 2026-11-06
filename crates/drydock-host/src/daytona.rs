@@ -519,7 +519,7 @@ impl Provider for Daytona {
         vec![
             WayIn::Poll { interval_ms: self.settings.poll_seconds.saturating_mul(1000) },
             WayIn::Webhook {
-                registration: WebhookRegistration::Dashboard,
+                registration: vec![WebhookRegistration::Dashboard],
                 events: vec![CREATED.into(), STATE_UPDATED.into()],
                 delivery: DeliveryGuarantee::AtLeastOnce,
             },
