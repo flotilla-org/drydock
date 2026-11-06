@@ -549,7 +549,15 @@ class Namespace implements Provider {
         }
       },
     );
-    await this.addAgent(box, signal);
+    try {
+      await this.addAgent(box, signal);
+    } catch (error) {
+      // Without its agent the devbox is no vessel, and the failed provision
+      // returns no id to destroy it by: delete it, best effort, unsignalled
+      // so an aborted provision still cleans up. The answer is the failure.
+      await vendor.devboxes.delete(box.id).catch(() => {});
+      throw error;
+    }
     return { created: true, environment: this.row(box) };
   }
 
@@ -676,13 +684,15 @@ class Namespace implements Provider {
       boxes.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor);
-    const rows: Types["Environment"][] = [];
-    const queue = [...boxes];
+    // In Namespace's list order. One failed refresh fails the list: a
+    // partial inventory would read the missing devboxes as gone.
+    const rows: (Types["Environment"] | undefined)[] = [];
+    const queue = boxes.entries();
     const worker = async () => {
-      for (let box = queue.shift(); box; box = queue.shift()) {
+      for (const [index, box] of queue) {
         try {
           await call(() => box.refresh({ signal }));
-          rows.push(this.row(box));
+          rows[index] = this.row(box);
         } catch (error) {
           // Destroyed since the list: it is not in the inventory.
           if (protocolError(error).detail.kind !== "not_found") throw error;
@@ -691,7 +701,7 @@ class Namespace implements Provider {
     };
     const workers = this.settings.list_refreshes ?? 8;
     await Promise.all(Array.from({ length: workers }, worker));
-    return rows;
+    return rows.filter((row) => row !== undefined);
   }
 
   async inspect(id: string, { credential, signal }: Context) {

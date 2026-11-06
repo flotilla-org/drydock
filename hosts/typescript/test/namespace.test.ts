@@ -290,6 +290,20 @@ test("provision is one create and the agent service", async () => {
   }
 });
 
+// A devbox whose agent service cannot be added is deleted, and provision
+// answers with the service's failure: no devbox is left without an id.
+test("provision deletes the devbox when the agent service fails", async () => {
+  const { standIn, provision } = await setup();
+  standIn.box = (box) => {
+    box.services.create = async () => {
+      throw new ConnectError("no agent", Code.Unavailable);
+    };
+  };
+  await assert.rejects(provision("vessel"), kind("unavailable"));
+  assert.equal(standIn.rows.size, 0);
+  assert.equal(standIn.count("delete"), 1);
+});
+
 // Sizes Namespace does not sell are refused before any call; a prepared form
 // Namespace does not know is Namespace's refusal.
 test("provision refuses unsold sizes; Namespace refuses unknown images", async () => {
@@ -400,7 +414,7 @@ test("list reports devboxes as Namespace states them", async () => {
     if (ownership === "owned_account")
       expected.push([foreign.id, { state: "running" }, "running"]);
     assert.deepEqual(
-      rows.map((r) => [r.id, r.state, r.vendor?.state]).sort(),
+      rows.map((r) => [r.id, r.state, r.vendor?.state]),
       expected,
     );
     assert.equal(standIn.count("refresh"), expected.length);

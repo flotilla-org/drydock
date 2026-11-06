@@ -39,6 +39,8 @@ export class StandIn implements Vendor {
   /** How often the module closed its SDK client. */
   closed = 0;
   tokens: string[] = [];
+  /** Adjusts each devbox handle before the module sees it. */
+  box: (box: Box) => void = () => {};
   private faults = new Map<string, number>();
   private next = 0;
 
@@ -108,6 +110,7 @@ export class StandIn implements Vendor {
         box.info = structuredClone(standIn.row(id).info);
       },
     };
+    this.box(box);
     return box;
   }
 
