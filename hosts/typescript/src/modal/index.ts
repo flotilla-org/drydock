@@ -634,9 +634,14 @@ class Modal implements Provider {
           }
         }
       };
-      await Promise.all(
-        Array.from({ length: this.settings.list_concurrency }, worker),
-      );
+      try {
+        await Promise.all(
+          Array.from({ length: this.settings.list_concurrency }, worker),
+        );
+      } finally {
+        // A failed read ends the list; the handles not yet read are let go.
+        for (const sandbox of queue.splice(0)) sandbox.detach();
+      }
       return rows;
     });
   }

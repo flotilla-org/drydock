@@ -286,3 +286,13 @@ test("reach dials the agent through Modal's edge with no expiry, starting the ag
     `createConnectToken ${other} 7811`,
   ]);
 });
+
+test("reach to an ended sandbox is refused in Modal's words", async () => {
+  const { standIn, provider, context } = await setup();
+  const id = standIn.add({}, 137);
+  await assert.rejects(provider.reach(id, context), (e: any) => {
+    assert.equal(e.detail.kind, "refused");
+    assert.match(e.detail.reason, /has already finished/);
+    return true;
+  });
+});

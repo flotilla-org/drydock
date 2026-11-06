@@ -1,7 +1,7 @@
 // An in-process stand-in for the Modal SDK calls the Modal module makes. It
 // answers as the SDK documents: `poll()` is null while a sandbox runs, else
 // its exit code; `list()` yields running sandboxes having the given tags.
-import { AlreadyExistsError, NotFoundError } from "modal";
+import { AlreadyExistsError, ConflictError, NotFoundError } from "modal";
 
 export const CREDENTIAL = JSON.stringify({
   token_id: "ak-test",
@@ -60,7 +60,9 @@ export class StandIn {
       },
       async exec(argv: string[]) {
         standIn.calls.push(`exec ${id}`);
-        standIn.row(id);
+        // The SDK's answer when the sandbox ended before exec found its task.
+        if (standIn.row(id).exit !== null)
+          throw new ConflictError(`Sandbox ${id} has already finished`);
         standIn.scripts.push(argv[2]);
         const output = new TextEncoder().encode(standIn.agentOutput);
         return {
