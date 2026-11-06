@@ -69,62 +69,42 @@ impl TensorlakeModule {
     }
 }
 
+/// Every key has a default.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Settings {
     /// The project whose webhooks the relay receives: a delivery for another
     /// project says nothing drydock follows.
-    #[serde(default)]
     project_id: Option<String>,
-    #[serde(default = "api_url")]
     api_url: String,
-    #[serde(default = "sandbox_domain")]
     sandbox_domain: String,
-    #[serde(default = "tunnel_port")]
     tunnel_port: NonZeroU16,
-    #[serde(default = "max_cpus")]
     max_cpus: u32,
-    #[serde(default = "max_memory")]
     max_memory: u64,
-    #[serde(default = "poll_interval_ms")]
     poll_interval_ms: u64,
     /// Prepare reads an image build's status every `build_poll_seconds`, up to
     /// `build_polls` times, then answers unavailable.
-    #[serde(default = "build_poll_seconds")]
     build_poll_seconds: u64,
-    #[serde(default = "build_polls")]
     build_polls: u32,
     /// The agent upload is one proxy request: an agent build (about 12 MB)
     /// needs longer than an ordinary call on a slow link.
-    #[serde(default = "upload_seconds")]
     upload_seconds: u64,
 }
-fn api_url() -> String {
-    "https://api.tensorlake.ai/".into()
-}
-fn sandbox_domain() -> String {
-    "sandbox.tensorlake.ai".into()
-}
-fn tunnel_port() -> NonZeroU16 {
-    const { NonZeroU16::new(7811).unwrap() }
-}
-fn max_cpus() -> u32 {
-    4
-}
-fn max_memory() -> u64 {
-    16 * GIB
-}
-fn poll_interval_ms() -> u64 {
-    30_000
-}
-fn build_poll_seconds() -> u64 {
-    3
-}
-fn build_polls() -> u32 {
-    150
-}
-fn upload_seconds() -> u64 {
-    300
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            project_id: None,
+            api_url: "https://api.tensorlake.ai/".into(),
+            sandbox_domain: "sandbox.tensorlake.ai".into(),
+            tunnel_port: const { NonZeroU16::new(7811).unwrap() },
+            max_cpus: 4,
+            max_memory: 16 * GIB,
+            poll_interval_ms: 30_000,
+            build_poll_seconds: 3,
+            build_polls: 150,
+            upload_seconds: 300,
+        }
+    }
 }
 
 // Tensorlake's wire types (see the API contract above), only the fields read.
