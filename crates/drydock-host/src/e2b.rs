@@ -23,7 +23,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned, de::IgnoredAny};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -307,7 +307,6 @@ impl Module for E2bModule {
             api,
             resolver: self.resolver.clone(),
             access: Mutex::default(),
-            suspended: Mutex::default(),
         }))
     }
 }
@@ -335,11 +334,6 @@ pub struct E2b {
     /// The tokens E2B hands out at create and connect. A detail read gives
     /// the envd token again; only connect gives the traffic token again.
     access: Mutex<HashMap<String, Access>>,
-    /// Sandboxes this host paused. E2B names both its own pause and ours
-    /// `paused` and does not say whose it was. The set is held in memory, so
-    /// after a restart a pause this host made reads as E2B's own; a stop
-    /// without a stated cause is drydock#282.
-    suspended: Mutex<HashSet<String>>,
 }
 
 trait Recover<T> {
@@ -406,8 +400,8 @@ impl E2b {
     fn environment(&self, v: Sandbox) -> Result<Environment> {
         let state = match v.state.as_deref() {
             Some("running") => Observation::Running,
-            Some("paused") if self.suspended.recover().contains(&*v.id) => kit::stopped(StopCause::SuspendedByRequest),
-            Some("paused") => kit::stopped(StopCause::PausedByProvider),
+            // E2B does not say whether its timeout or a client paused it.
+            Some("paused") => Observation::Stopped { cause: None },
             // A create answer carries no state, and no vendor row is reported.
             _ => Observation::Unknown { reason: UnknownReason::ProviderStateUnknown },
         };
@@ -754,7 +748,6 @@ impl Provider for E2b {
         let killed = self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", checked(id)?])?, Body::None, c).await;
         if killed.is_ok() {
             self.access.recover().remove(id);
-            self.suspended.recover().remove(id);
         }
         killed.map(drop)
     }
@@ -794,19 +787,11 @@ impl Provider for E2b {
 #[async_trait]
 impl SuspendResume for E2b {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        // Marked first, so an observation of the pause never reads as E2B's own.
-        let url = self.api.url(&["sandboxes", checked(id)?, "pause"])?;
-        let marked = self.suspended.recover().insert(id.to_owned());
-        let paused = self.api.call::<IgnoredAny>(Method::POST, url, Body::None, c).await;
-        if paused.is_err() && marked {
-            self.suspended.recover().remove(id);
-        }
-        paused.map(|_| ResumeToken { token: Secret::new(id) })
+        self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", checked(id)?, "pause"])?, Body::None, c).await?;
+        Ok(ResumeToken { token: Secret::new(id) })
     }
     async fn resume(&self, id: &str, _: ResumeToken, c: &Credentials) -> Result<()> {
-        self.connect(id, c).await?;
-        self.suspended.recover().remove(id);
-        Ok(())
+        self.connect(id, c).await.map(drop)
     }
 }
 
@@ -919,35 +904,41 @@ mod tests {
 
     // List is one call, and reports every row E2B lists, another owner's
     // included, with E2B's state name and metadata beside the coarse state.
+    // A pause has no cause, and a row without metadata no tags: E2B states
+    // neither.
     #[tokio::test]
     async fn list_reports_every_row_as_e2b_gives_it() {
         let rows = r#"[
             {"sandboxID":"sbx1","state":"running","cpuCount":1,"memoryMB":1024,"diskSizeMB":1024,"metadata":{"drydock.provider":"e2b-a","flotilla.label":"l"}},
-            {"sandboxID":"sbx2","state":"paused","cpuCount":2,"memoryMB":2048,"diskSizeMB":1024,"metadata":{"drydock.provider":"other"}}
+            {"sandboxID":"sbx2","state":"paused","cpuCount":2,"memoryMB":2048,"diskSizeMB":1024,"metadata":{"drydock.provider":"other"}},
+            {"sandboxID":"sbx3","state":"running","cpuCount":1,"memoryMB":1024,"diskSizeMB":1024}
         ]"#;
         let (e2b, script) = e2b(Ownership::SharedAccount, vec![(200, rows)]).await;
         let listed = e2b.list(&key()).await.unwrap();
         assert_eq!(script.asked(), [asked("GET", "/v2/sandboxes")]);
         let seen: Vec<_> = listed.iter().map(|e| (e.id.as_str(), e.label.as_deref(), e.state.clone())).collect();
-        assert_eq!(seen, [("sbx1", Some("l"), Observation::Running), ("sbx2", None, kit::stopped(StopCause::PausedByProvider))]);
+        assert_eq!(
+            seen,
+            [
+                ("sbx1", Some("l"), Observation::Running),
+                ("sbx2", None, Observation::Stopped { cause: None }),
+                ("sbx3", None, Observation::Running)
+            ]
+        );
         let vendor = listed[1].vendor.as_ref().unwrap();
         assert_eq!((vendor.state.as_str(), vendor.tags.as_ref().unwrap()[OWNER_TAG].as_str()), ("paused", "other"));
+        assert_eq!(listed[2].vendor.as_ref().unwrap().tags, None);
     }
 
-    // Suspend is one pause and answers the id as the token; the pause then
-    // reads as this host's. Resume is one connect, whatever the token.
+    // Suspend is one pause and answers the id as the token. Resume is one
+    // connect, whatever the token.
     #[tokio::test]
     async fn suspend_and_resume_are_one_call_each() {
-        let paused = r#"{"sandboxID":"sbx1","state":"paused","metadata":{}}"#;
-        let (e2b, script) = e2b(Ownership::OwnedAccount, vec![(204, ""), (200, paused), (201, CREATED)]).await;
+        let (e2b, script) = e2b(Ownership::OwnedAccount, vec![(204, ""), (201, CREATED)]).await;
         let port = e2b.operations().suspend_resume.unwrap();
         assert_eq!(port.suspend("sbx1", &key()).await.unwrap(), ResumeToken { token: Secret::new("sbx1") });
-        assert_eq!(e2b.inspect("sbx1", &key()).await.unwrap().state, kit::stopped(StopCause::SuspendedByRequest));
         port.resume("sbx1", ResumeToken { token: Secret::new("anything") }, &key()).await.unwrap();
-        assert_eq!(
-            script.asked(),
-            [asked("POST", "/sandboxes/sbx1/pause"), asked("GET", "/sandboxes/sbx1"), asked("POST", "/v2/sandboxes/sbx1/connect")]
-        );
+        assert_eq!(script.asked(), [asked("POST", "/sandboxes/sbx1/pause"), asked("POST", "/v2/sandboxes/sbx1/connect")]);
     }
 
     // A request becomes E2B's network as asked; a read network's digest keeps
