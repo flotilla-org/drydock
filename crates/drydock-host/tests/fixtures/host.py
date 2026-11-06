@@ -273,6 +273,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             row = {"id":str(len(events)+1),"label":body["label"],"provider":provider,"state":{"state":"running"},"granted_size":body["size"],"egress":"enforced" if fault.startswith("egress-") else "advisory"}
             rows[row["id"]] = row; running_since[row["id"]] = now()
             emit(row, "created")
+            if fault == "transitional": emit(row, "transitioning", phase="preparing")
             if fault == "slow": threading.Timer(1.5, lambda: emit(row,"running",granted_size=row["granted_size"])).start()
             else: emit(row,"running",granted_size=row["granted_size"])
             if fault == "partial": return self.respond(500,{"kind":"internal","reason":"SECRET","provider_error":"SECRET"})
