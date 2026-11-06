@@ -20,7 +20,6 @@ import {
   type Page,
   type RegisterImageInput,
   type Service,
-  type UpdateDevboxInput,
 } from "@namespacelabs/sdk/devbox";
 import { ProtocolFailure } from "../provider.js";
 
@@ -37,14 +36,7 @@ export interface Box {
     list(options?: OperationOptions): Promise<Service[]>;
   };
   exec(argv: readonly string[], options?: ExecOptions): Promise<ExecResult>;
-  start(options?: OperationOptions): Promise<unknown>;
-  stop(options?: OperationOptions): Promise<unknown>;
-  delete(options?: OperationOptions): Promise<void>;
   refresh(options?: OperationOptions): Promise<unknown>;
-  update(
-    input: UpdateDevboxInput,
-    options?: OperationOptions,
-  ): Promise<unknown>;
 }
 
 /** Live concurrency limits and use, from `UsageService/GetConcurrency`. */
@@ -61,6 +53,13 @@ export interface Vendor {
     create(input: CreateDevboxInput, options?: OperationOptions): Promise<Box>;
     get(ref: string, options?: OperationOptions): Promise<Box>;
     list(options?: ListDevboxesOptions): Promise<Page<Box>>;
+    /**
+     * Namespace's Stop and Expire take a devbox's name, not its id, so the
+     * SDK looks the id up before each of these; start does the same.
+     */
+    start(ref: string, options?: OperationOptions): Promise<unknown>;
+    stop(ref: string, options?: OperationOptions): Promise<unknown>;
+    delete(ref: string, options?: OperationOptions): Promise<void>;
   };
   images: {
     register(
@@ -70,17 +69,21 @@ export interface Vendor {
     get(selector: ImageSelector, options?: OperationOptions): Promise<Image>;
   };
   /**
-   * A byte channel to `command` running in the devbox: an SSH exec channel over
-   * the SDK's gateway, without a terminal, so bytes pass unchanged both ways.
-   * Opening it starts a stopped devbox.
+   * A byte channel to `command` running in devbox `id`: an SSH exec channel
+   * over the SDK's gateway, without a terminal, so bytes pass unchanged both
+   * ways. Opening it is Namespace's activate, which starts a stopped devbox.
    */
-  channel(box: Box, command: string, signal: AbortSignal): Promise<Duplex>;
+  channel(id: string, command: string, signal: AbortSignal): Promise<Duplex>;
   concurrency(signal: AbortSignal): Promise<Concurrency[]>;
   close(): void;
 }
 
 // The SDK keeps its ssh2 client private, but its gateway refuses Unix-socket
 // forwards; an exec channel is the only binary-safe way to the agent's socket.
+// Its connections are private too, and opened by id with one activate call.
+type Connections = {
+  get(id: string, options: OperationOptions): Promise<{ client?: SshClient }>;
+};
 type SshClient = {
   exec(
     command: string,
@@ -98,8 +101,16 @@ export function sdkVendor(token: string): Vendor {
   return {
     devboxes: client.devboxes,
     images: client.images,
-    async channel(box, command, signal) {
-      const connection = await (box as any).connection({ signal });
+    async channel(id, command, signal) {
+      const connections: Connections | undefined = (client.devboxes as any)
+        .connections;
+      if (typeof connections?.get !== "function")
+        throw new ProtocolFailure({
+          kind: "internal",
+          reason: "Namespace SDK no longer keeps its connections by id",
+          provider_error: "",
+        });
+      const connection = await connections.get(id, { signal });
       const ssh: SshClient | undefined = connection?.client;
       if (typeof ssh?.exec !== "function")
         throw new ProtocolFailure({
@@ -142,7 +153,9 @@ const ATTEMPTS = 3;
  * took effect anyway (returning its result) or not (undefined), and the call
  * is repeated only if not. A `settled` check that itself closes early counts
  * as not settled, so the call repeats; `ATTEMPTS` bounds both. Every other
- * failure becomes a protocol error.
+ * failure becomes a protocol error. This gets one vendor call through the
+ * SDK's transport, never makes it twice, and adds no guarantee of drydock's:
+ * a call Namespace refuses is answered with Namespace's refusal.
  */
 export async function call<T>(
   operation: () => Promise<T>,
