@@ -82,7 +82,7 @@ const settingsValid = compile({
     runtime: { enum: ["vm", "gvisor"] },
     // Modal's sandbox timeout is at most 24 hours.
     lifetime_seconds: { type: "integer", minimum: 1, maximum: 86_400 },
-    list_concurrency: { type: "integer", minimum: 1 },
+    list_concurrency: { type: "integer", minimum: 1, maximum: 64 },
     agent_wait_seconds: { type: "integer", minimum: 1, maximum: 600 },
   },
 });
@@ -659,8 +659,8 @@ class Modal implements Provider {
   async destroy(id: string, { credential }: Context) {
     return this.using(credential, (client) =>
       this.sandbox(client, id, async (sandbox) => {
-        await call(() => sandbox.terminate());
         this.tokens.delete(id);
+        await call(() => sandbox.terminate());
       }),
     );
   }

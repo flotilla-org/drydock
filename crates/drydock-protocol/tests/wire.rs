@@ -30,6 +30,9 @@ fn tagged_wire_fixtures() {
     ] {
         fixture::<Reach>(value);
     }
+    // An expiry the vendor does not state is left off the wire, not sent as null.
+    let unstated = Reach::Dial { url: "wss://h".into(), token: Secret::new("secret"), headers: Default::default(), expires_at: None };
+    assert!(serde_json::to_value(&unstated).unwrap().get("expires_at").is_none());
     // A host that says nothing about reverse forwards does not accept them.
     let reach: Reach = serde_json::from_value(json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"})).unwrap();
     assert!(matches!(reach, Reach::Ssh { reverse_forwards: false, .. }));

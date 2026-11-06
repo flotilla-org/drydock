@@ -73,6 +73,7 @@ test("settings outside their bounds are refused", async () => {
     { lifetime_seconds: 0 },
     { lifetime_seconds: 86_401 },
     { list_concurrency: 0 },
+    { list_concurrency: 65 },
     { agent_wait_seconds: 0 },
     { concurrency_limit: 4 },
   ])

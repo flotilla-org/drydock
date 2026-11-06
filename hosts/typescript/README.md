@@ -145,7 +145,7 @@ The built-in `modal` module drives Modal sandboxes through the JavaScript SDK
 `drydock`: the one app holding every sandbox of the instance, created if
 missing), `environment`, `runtime` (`vm`, the default, or `gvisor`),
 `lifetime_seconds` (Modal's timeout for each sandbox; default 86400, Modal's
-longest), `list_concurrency` (tag reads list runs at once; default 8) and
+longest), `list_concurrency` (tag reads list runs at once; default 8, at most 64) and
 `agent_wait_seconds` (how long the agent's socket is waited for; default 10). The credential is
 `{"token_id": …, "token_secret": …}`, handed to the SDK client directly, never
 through `~/.modal.toml` or `MODAL_TOKEN_*`; the SDK still reads its server URL

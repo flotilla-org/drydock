@@ -94,6 +94,9 @@ fn every_route_carries_typed_error_statuses() {
 fn instants_and_shared_constraints() {
     assert_eq!("2026-01-01T00:00:00Z".parse::<Timestamp>().unwrap(), "2026-01-01T01:00:00+01:00".parse::<Timestamp>().unwrap());
     assert!(serde_json::from_value::<Reach>(json!({"kind":"dial","url":"x","token":"x","expires_at":"bad"})).is_err());
+    // An explicit null is an unstated expiry, as the schema's null branch says.
+    let unstated = serde_json::from_value::<Reach>(json!({"kind":"dial","url":"x","token":"x","expires_at":null})).unwrap();
+    assert!(matches!(unstated, Reach::Dial { expires_at: None, .. }));
     let schemas = serde_json::to_value(openapi::openapi()).unwrap()["components"]["schemas"].clone();
     assert_eq!(schemas["Port"]["minimum"], 1);
     assert_eq!(schemas["Port"]["maximum"], 65535);
