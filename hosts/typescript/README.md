@@ -165,7 +165,10 @@ and sandbox backend from those, so run the host without them.
   what Modal said. It declares `settles`, `idempotent` and `owner_scoped`
   false, so drydockd waits, makes lifecycle calls idempotent and scopes a
   shared account to the instance (`semantics.rs`), as the instance's options
-  and `ownership` ask.
+  and `ownership` ask. That scope covers list, destroy and suspend; until
+  drydock#276, inspect and reach on a shared account are not scoped, so this
+  instance's credential can inspect, and mint a connect token for, any
+  sandbox in the app whose id it is given.
 - Provision is one create of an unnamed sandbox, tagged `flotilla.label` with
   the client's label and, on a `shared_account` (the default), `drydock.provider`
   with the instance; on an `owned_account` nothing else is tagged. A label is

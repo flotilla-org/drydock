@@ -41,7 +41,8 @@ const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 // and exec ports, which this host does not offer, and listens on loopback,
 // which Modal's connect-token edge (https://modal.com/docs/guide/sandbox-networking)
 // was seen not to reach. So the module starts it, listening on all addresses,
-// and waits up to `agent_wait_seconds` for its socket.
+// and waits up to `agent_wait_seconds` for its socket. That setting is
+// interpolated into the script, so its schema must keep it an integer.
 const ensureAgent = (waitSeconds: number) =>
   [
     "t=$(head -c 256)",
