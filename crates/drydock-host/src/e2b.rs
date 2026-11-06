@@ -798,7 +798,6 @@ impl Provider for E2b {
     }
 }
 
-/// Pause and connect. E2B resumes by id alone, so the token is the id.
 /// E2B's lifecycle events, each with the drydock state its type names, if any.
 /// A pause or a kill states no cause; an update or a checkpoint states no state.
 const LIFECYCLE: [(&str, Option<Observation>); 6] = [
@@ -813,8 +812,6 @@ const LIFECYCLE: [(&str, Option<Observation>); 6] = [
 /// fields read. `event_data.execution` is usage, left for drydock#257.
 #[derive(Deserialize)]
 struct Lifecycle {
-    #[serde(rename = "type")]
-    kind: Text,
     sandbox_id: Text,
     sandbox_team_id: String,
     timestamp: Option<DateTime<Utc>>,
@@ -826,10 +823,10 @@ struct LifecycleData {
     kill_reason: Option<String>,
     sandbox_metadata: Option<BTreeMap<String, String>>,
 }
-/// Each lifecycle event states one sandbox, E2B's event type as its state,
-/// the kill reason and the sandbox's metadata as E2B gives them, and when it
-/// happened. Any other event, or one for another team, says nothing drydock
-/// follows.
+/// Each lifecycle event states one sandbox; E2B's event type (the body's
+/// `type`, which the relay gives as the event name) as its state; the kill
+/// reason and the sandbox's metadata as E2B gives them; and when it happened.
+/// Any other event, or one for another team, says nothing drydock follows.
 #[async_trait]
 impl VendorEvents for E2b {
     async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
@@ -839,18 +836,16 @@ impl VendorEvents for E2b {
         if v.sandbox_team_id != self.settings.team_id {
             return Ok(vec![]);
         }
-        if &*v.kind != event {
-            return Err(refused(format!("E2B {event} body names type {}", &*v.kind)));
-        }
         Ok(vec![VendorObservation {
             id: v.sandbox_id.to_string(),
             state: state.clone(),
-            vendor: VendorState { state: v.kind.into(), reason: v.event_data.kill_reason, tags: v.event_data.sandbox_metadata },
+            vendor: VendorState { state: delivery.event, reason: v.event_data.kill_reason, tags: v.event_data.sandbox_metadata },
             timestamp: v.timestamp.map(Into::into),
         }])
     }
 }
 
+/// Pause and connect. E2B resumes by id alone, so the token is the id.
 #[async_trait]
 impl SuspendResume for E2b {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
