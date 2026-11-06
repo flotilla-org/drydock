@@ -336,7 +336,7 @@ impl Exec for Reference {
                 "pause" => {
                     state.stop_billing(target);
                     state.environments.get_mut(target).ok_or_else(|| refused("unknown fixture target"))?.state =
-                        Observation::Stopped { cause: StopCause::PausedByProvider };
+                        Observation::Stopped { cause: Some(StopCause::PausedByProvider) };
                     serde_json::Value::Null
                 }
                 _ => return Err(refused("unknown fixture action")),
@@ -376,7 +376,7 @@ impl SuspendResume for Reference {
             return state.tokens.get(id).cloned().ok_or_else(|| refused("missing resume token"));
         }
         state.stop_billing(id);
-        s.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+        s.state = Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) };
         let token = ResumeToken { token: Secret::new(format!("{}:{id}", self.name)) };
         state.tokens.insert(id.into(), token.clone());
         state.environments.insert(id.into(), s);

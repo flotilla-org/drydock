@@ -361,7 +361,7 @@ impl Daemon {
                         rate_limits: vec![],
                         readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
                         ports: Ports::default(),
-                        ways_in: vec![],
+                        ways_in: None,
                     });
                 if let Some(readiness) = self.unavailable.get(name) {
                     declaration.readiness = readiness.clone();

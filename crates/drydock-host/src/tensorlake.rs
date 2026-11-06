@@ -52,7 +52,7 @@ const STATES: StateTable = &[
     ("snapshotting", Observation::Transitioning { phase: TransitionPhase::Reconfiguring }),
     ("suspending", kit::stopping()),
     ("suspended", kit::stopped(StopCause::SuspendedByRequest)),
-    ("terminated", Observation::Gone { cause: GoneCause::DestroyedAtProvider }),
+    ("terminated", Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) }),
     ("resume_failed", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
 ];
 

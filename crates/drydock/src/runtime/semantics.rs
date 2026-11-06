@@ -91,7 +91,7 @@ fn described(e: &Environment) -> String {
 
 impl Added {
     fn ours(&self, e: &Environment) -> bool {
-        self.owner.as_ref().is_none_or(|owner| e.vendor.as_ref().and_then(|v| v.tags.get(OWNER_TAG)) == Some(owner))
+        self.owner.as_ref().is_none_or(|owner| e.vendor.as_ref().and_then(|v| v.tags.as_ref()?.get(OWNER_TAG)) == Some(owner))
     }
     /// The environment once the observer sees it `what`. A wait ends early
     /// when the observer sees it gone or in an unknown state, and as

@@ -44,7 +44,7 @@ impl EventSink {
             timestamp_source: if timestamp.is_some() { TimestampSource::Provider } else { TimestampSource::Adaptor },
             event: p.kind,
             // An event carries the vendor's state and reason, not its tags.
-            vendor: p.vendor.map(|v| VendorState { tags: BTreeMap::new(), ..v }),
+            vendor: p.vendor.map(|v| VendorState { tags: None, ..v }),
             observed: Some(observed.clone()),
         });
         if log.records.len() > EVENT_HISTORY_CAPACITY {
@@ -60,11 +60,11 @@ impl EventSink {
         }
         self.shared.changed.send_replace(log.serial);
     }
-    /// One environment's row and its transitions. Before the first list there
-    /// is no inventory to complete, so only the events are kept.
-    pub(super) fn update(&self, row: Environment, events: Vec<Pending>, observed: &ObservedBy) {
+    /// One environment's transitions, and its row when there is one. Before
+    /// the first list there is no inventory to complete, so only the events are kept.
+    pub(super) fn update(&self, row: Option<Environment>, events: Vec<Pending>, observed: &ObservedBy) {
         let mut log = self.shared.log.recover();
-        if let Some(rows) = log.inventories.get_mut(&self.provider) {
+        if let (Some(row), Some(rows)) = (row, log.inventories.get_mut(&self.provider)) {
             rows.retain(|old| old.id != row.id);
             rows.push(row);
         }

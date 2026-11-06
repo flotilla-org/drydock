@@ -736,7 +736,10 @@ poll_seconds = 300
 to change the listing interval. With a relay drydockd still lists, every
 `poll_seconds` (300 by default), to fill gaps. Each event says how it was
 observed (`observed.way`: `webhook` with its `delivery_id`, `poll`, or
-`reconstruction`) and carries the vendor's state verbatim (`vendor`).
+`reconstruction`) and carries the vendor's state verbatim (`vendor`, without
+tags). What a delivery does not state stays absent: Daytona's body gives no
+cause for a stop or a destruction (`cause` is then absent), and no labels or
+size.
 Transitional states arrive as `transitioning` events. drydockd stores the
 relay cursor under its run directory (`events/<instance>.cursor`) and resumes
 from it after a restart. With no stored cursor, or when the relay reports a

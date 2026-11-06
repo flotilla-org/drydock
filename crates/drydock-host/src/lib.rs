@@ -74,7 +74,7 @@ impl Host {
             readiness: p.readiness(&self.credentials),
             rate_limits: p.rate_limits(),
             ports: p.operations().into(),
-            ways_in: p.ways_in(),
+            ways_in: Some(p.ways_in()),
         }
     }
     async fn bindings(&self) -> Vec<(String, String, Arc<dyn Provider>)> {

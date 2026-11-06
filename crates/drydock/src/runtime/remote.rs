@@ -79,7 +79,8 @@ impl Provider for RemoteProvider {
         self.declaration.capabilities.clone()
     }
     fn ways_in(&self) -> Vec<WayIn> {
-        self.declaration.ways_in.clone()
+        // A host that declares none offers drydockd no way in.
+        self.declaration.ways_in.clone().unwrap_or_default()
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.declaration.rate_limits.clone()
@@ -116,7 +117,7 @@ impl Provider for RemoteProvider {
             files: ports.files.then_some(self),
             push_access: ports.push_access.then_some(self),
             // The webhook way in is the declaration of this port.
-            events: self.declaration.ways_in.iter().any(|w| matches!(w, WayIn::Webhook { .. })).then_some(self),
+            events: self.declaration.ways_in.iter().flatten().any(|w| matches!(w, WayIn::Webhook { .. })).then_some(self),
         }
     }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {

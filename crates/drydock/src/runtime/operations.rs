@@ -16,7 +16,7 @@ impl Runtime {
             readiness: mask_readiness(i.readiness(&i.auth.recover()), masker),
             rate_limits: i.rate_limits.clone(),
             ports: i.provider.operations().into(),
-            ways_in: i.ways_in.clone(),
+            ways_in: Some(i.ways_in.clone()),
         }
     }
 }

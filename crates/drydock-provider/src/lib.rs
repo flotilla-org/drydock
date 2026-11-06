@@ -123,14 +123,7 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     /// The ways the vendor offers to hear about environments. A webhook way
     /// needs the [`VendorEvents`] port.
-    fn ways_in(&self) -> Vec<WayIn> {
-        vec![self.observation().into()]
-    }
-    /// List polling alone, for a module that has not moved to [`Self::ways_in`].
-    /// Remove with [`ObservationMode`].
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 30_000 }
-    }
+    fn ways_in(&self) -> Vec<WayIn>;
     fn readiness(&self, c: &Credentials) -> Readiness {
         if c.token().is_some() { Readiness::Ready } else { Readiness::MissingCredential { reason: "credential not delivered".into() } }
     }

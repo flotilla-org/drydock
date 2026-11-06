@@ -55,6 +55,8 @@ pub(super) fn spawn(
     drop(instance);
     tokio::spawn(async move {
         let mut seen: BTreeMap<String, Environment> = BTreeMap::new();
+        // What deliveries said of environments no list has shown yet.
+        let mut announced = BTreeMap::new();
         let mut clock = tokio::time::interval_at(tokio::time::Instant::now(), interval);
         clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -82,7 +84,7 @@ pub(super) fn spawn(
                     relay::Next::Delivery(delivery) => {
                         let Some(instance) = weak.upgrade() else { break };
                         let reader = relay.as_mut().expect("a frame came from the relay");
-                        match deliver(&instance, &mut seen, &delivery).await {
+                        match deliver(&instance, &mut seen, &mut announced, &delivery).await {
                             Ok(()) => reader.commit(delivery.cursor),
                             Err(()) => reader.reconnect(),
                         }
@@ -125,7 +127,7 @@ pub(super) fn spawn(
                 },
                 _ = stopping.changed() => break,
             };
-            reconcile(&instance, &mut seen, rows, observation_generation, way);
+            reconcile(&instance, &mut seen, &mut announced, rows, observation_generation, way);
             if let (Some(cursor), Some(reader)) = (gap, relay.as_mut()) {
                 reader.commit(cursor);
             }
@@ -141,6 +143,7 @@ pub(super) fn spawn(
 async fn deliver(
     instance: &Instance,
     seen: &mut BTreeMap<String, Environment>,
+    announced: &mut BTreeMap<String, VendorObservation>,
     delivery: &rigging_relay_protocol::Delivery,
 ) -> std::result::Result<(), ()> {
     let Some(body) = delivery.body.clone() else { return Ok(()) };
@@ -171,104 +174,111 @@ async fn deliver(
     };
     let observed = ObservedBy { way: ObservedWay::Webhook, delivery_id: Some(delivery.delivery_id.clone()) };
     for observation in observations {
-        apply(instance, seen, observation, &observed);
+        apply(instance, seen, announced, observation, &observed);
     }
     Ok(())
 }
 
 /// One environment as the vendor reports it, with every transition it makes.
-fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, v: VendorObservation, observed: &ObservedBy) {
-    let current = instance.observed.row(&v.id).or_else(|| seen.get(&v.id).cloned());
+/// What the delivery states replaces what drydockd holds of the row; the rest
+/// stays. An environment drydockd holds no row of gets its events alone, and
+/// the next list makes its row.
+fn apply(
+    instance: &Instance,
+    seen: &mut BTreeMap<String, Environment>,
+    announced: &mut BTreeMap<String, VendorObservation>,
+    v: VendorObservation,
+    observed: &ObservedBy,
+) {
+    let held = instance.observed.row(&v.id).or_else(|| seen.get(&v.id).cloned());
+    let held = held.or_else(|| instance.observed.claimed.recover().remove(&v.id));
     // Deliveries come at least once and in no promised order: one older than
-    // the row drydockd holds, or as old and in the same state, is overtaken
-    // by a list or a redelivery.
-    let held = current.as_ref().and_then(|row| Some((row.timestamp.as_ref()?, row.vendor.as_ref().map(|v| &v.state))));
-    if let (Some((held, state)), Some(at)) = (held, &v.timestamp)
-        && (at.instant() < held.instant() || at.instant() == held.instant() && state == Some(&v.vendor.state))
+    // what drydockd holds, or as old and in the same state, is overtaken by a
+    // list or a redelivery.
+    let newest = match (&held, announced.get(&v.id)) {
+        (Some(row), _) => row.timestamp.as_ref().map(|at| (at, row.vendor.as_ref().map(|v| &v.state))),
+        (None, Some(a)) => a.timestamp.as_ref().map(|at| (at, Some(&a.vendor.state))),
+        (None, None) => None,
+    };
+    if let (Some((held_at, state)), Some(at)) = (newest, &v.timestamp)
+        && (at.instant() < held_at.instant() || at.instant() == held_at.instant() && state == Some(&v.vendor.state))
     {
         tracing::debug!(provider = %instance.name, environment_id = %v.id, "vendor event already held or overtaken; skipped");
         return;
     }
-    let base = match current {
-        Some(row) => row,
-        // What drydockd provisioned is known in full; anything else is new
-        // here, unless it may be another instance's on a shared account.
-        None => match instance.observed.claimed.recover().remove(&v.id) {
-            Some(row) => row,
-            None if instance.foreign_possible => {
-                tracing::debug!(provider = %instance.name, environment_id = %v.id, "vendor event for an environment not known to be this instance's; left to the next list");
-                return;
-            }
-            None => Environment {
+    let confirmed = instance.destroyed.recover().get(&v.id).is_some_and(|s| s.confirmed);
+    let pending = |label: Option<String>, kinds: Vec<EventKind>| -> Vec<Pending> {
+        kinds
+            .into_iter()
+            .map(|kind| Pending {
                 id: v.id.clone(),
-                label: None,
-                provider: instance.name.clone(),
-                state: v.state.clone(),
-                granted_size: None,
-                // The weaker claim, until a list says otherwise.
-                egress: Enforcement::Advisory,
-                platform: None,
-                egress_measured: false,
-                egress_policy: None,
-                timestamp: None,
-                vendor: None,
-            },
-        },
+                label: label.clone(),
+                timestamp: v.timestamp.clone(),
+                vendor: Some(v.vendor.clone()),
+                kind,
+            })
+            .collect()
     };
-    let row = Environment { state: v.state, vendor: Some(v.vendor), timestamp: v.timestamp, ..base };
-    let confirmed = instance.destroyed.recover().get(&row.id).is_some_and(|s| s.confirmed);
+    let Some(held) = held else {
+        if instance.foreign_possible {
+            tracing::debug!(provider = %instance.name, environment_id = %v.id, "vendor event for an environment not known to be this instance's; left to the next list");
+            return;
+        }
+        let events = pending(None, transitions(announced.get(&v.id).map(|a| (&a.state, None)), &v.state, None, confirmed, true));
+        instance.events.update(None, events, observed);
+        announced.insert(v.id.clone(), v);
+        return;
+    };
+    let tags = v.vendor.tags.clone().or_else(|| held.vendor.as_ref().and_then(|h| h.tags.clone()));
+    let vendor = VendorState { tags, ..v.vendor.clone() };
+    let row = Environment { state: v.state.clone(), vendor: Some(vendor), timestamp: v.timestamp.clone(), ..held };
     let old = seen.get(&row.id);
-    let events = transitions(old, &row, confirmed, true)
-        .into_iter()
-        .map(|kind| Pending {
-            id: row.id.clone(),
-            label: row.label.clone(),
-            timestamp: row.timestamp.clone(),
-            vendor: row.vendor.clone(),
-            kind,
-        })
-        .collect();
+    let events = pending(row.label.clone(), transitions(old.map(last), &row.state, row.granted_size.as_ref(), confirmed, true));
     // Billing keeps the last stable row across transitions, as a list does.
     if !(matches!(row.state, Observation::Transitioning { .. }) && old.is_some()) {
         seen.insert(row.id.clone(), row.clone());
     }
-    instance.events.update(row, events, observed);
+    instance.events.update(Some(row), events, observed);
 }
 
-/// What `row` is a transition to from `old`, the last stable row. A list
+/// What drydockd last held of an environment: its state, and its granted size when known.
+type Last<'a> = (&'a Observation, Option<&'a Size>);
+fn last(row: &Environment) -> Last<'_> {
+    (&row.state, row.granted_size.as_ref())
+}
+
+/// What `state` is a transition to from `old`, the last stable state. A list
 /// reports changes; a `pushed` vendor event reports its state every time,
 /// transitional states included.
-fn transitions(old: Option<&Environment>, row: &Environment, confirmed: bool, pushed: bool) -> Vec<EventKind> {
+fn transitions(old: Option<Last>, state: &Observation, size: Option<&Size>, confirmed: bool, pushed: bool) -> Vec<EventKind> {
     let mut kinds = vec![];
     if old.is_none() {
         kinds.push(EventKind::Created);
     }
-    let changed = pushed || old.is_none_or(|old| old.state != row.state);
-    match &row.state {
+    let changed = pushed || old.is_none_or(|(old, _)| old != state);
+    match state {
         Observation::Running => {
-            if old.is_some_and(|s| matches!(s.state, Observation::Stopped { .. })) {
+            if old.is_some_and(|(old, _)| matches!(old, Observation::Stopped { .. })) {
                 kinds.push(EventKind::Resumed);
             }
             // Restart emits Running even with unchanged size; a running row
             // also emits it when the granted size changes.
-            if (pushed || old.is_none_or(|old| !matches!(old.state, Observation::Running) || old.granted_size != row.granted_size))
-                && let Some(granted_size) = row.granted_size.clone()
+            if (pushed || old.is_none_or(|(old, old_size)| !matches!(old, Observation::Running) || old_size != size))
+                && let Some(granted_size) = size.cloned()
             {
                 kinds.push(EventKind::Running { granted_size });
             }
         }
         Observation::Stopped { cause } if changed => {
-            kinds.push(if matches!(cause, StopCause::PausedByProvider) {
-                EventKind::Paused { cause: cause.clone() }
-            } else {
-                EventKind::Stopped { cause: cause.clone() }
+            kinds.push(match cause {
+                Some(StopCause::PausedByProvider) => EventKind::Paused { cause: StopCause::PausedByProvider },
+                cause => EventKind::Stopped { cause: cause.clone() },
             });
         }
         Observation::Gone { cause } if changed => {
-            // A vendor that keeps listing what it destroyed reports the
-            // destruction drydock asked for as its own.
+            // A destruction drydock asked for is its own, whatever the vendor says of it.
             let cause = match cause {
-                GoneCause::DestroyedAtProvider if confirmed => GoneCause::DestroyedByRequest,
+                Some(GoneCause::DestroyedAtProvider) | None if confirmed => Some(GoneCause::DestroyedByRequest),
                 cause => cause.clone(),
             };
             kinds.push(EventKind::Gone { cause })
@@ -279,7 +289,14 @@ fn transitions(old: Option<&Environment>, row: &Environment, confirmed: bool, pu
     kinds
 }
 
-fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut rows: Vec<Environment>, generation: u64, way: ObservedWay) {
+fn reconcile(
+    instance: &Instance,
+    seen: &mut BTreeMap<String, Environment>,
+    announced: &mut BTreeMap<String, VendorObservation>,
+    mut rows: Vec<Environment>,
+    generation: u64,
+    way: ObservedWay,
+) {
     carry_egress(instance, &mut rows, generation);
     let mut pending = vec![];
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
@@ -294,7 +311,8 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
     }
     let confirmed: BTreeSet<String> = instance.destroyed.recover().iter().filter(|(_, s)| s.confirmed).map(|(id, _)| id.clone()).collect();
     for (id, row) in &current {
-        for kind in transitions(seen.get(id), row, confirmed.contains(id), false) {
+        let old = seen.get(id).map(last).or_else(|| announced.get(id).map(|a| (&a.state, None)));
+        for kind in transitions(old, &row.state, row.granted_size.as_ref(), confirmed.contains(id), false) {
             pending.push(Pending {
                 id: id.clone(),
                 label: row.label.clone(),
@@ -306,30 +324,29 @@ fn reconcile(instance: &Instance, seen: &mut BTreeMap<String, Environment>, mut 
     }
     let mut destroyed = instance.destroyed.recover();
     let mut deferred = vec![];
-    for (id, row) in seen.iter() {
-        if !current.contains_key(id) && !matches!(row.state, Observation::Gone { .. }) {
+    let held = seen.iter().map(|(id, row)| (id, &row.state, row.label.clone(), Some(row)));
+    let announced_only = announced.iter().filter(|(id, _)| !seen.contains_key(*id)).map(|(id, a)| (id, &a.state, None, None));
+    for (id, state, label, row) in held.chain(announced_only) {
+        if !current.contains_key(id) && !matches!(state, Observation::Gone { .. }) {
             if destroyed.get(id).is_some_and(|state| state.pending > 0 && !state.confirmed) {
                 // Vendor deletion may be visible before its call returns. Defer the
                 // billing cause until confirmation, failure or cancellation is known.
-                deferred.push((id.clone(), row.clone()));
-                continue;
+                if let Some(row) = row {
+                    deferred.push((id.clone(), row.clone()));
+                    continue;
+                }
             }
             let cause = if destroyed.get(id).is_some_and(|state| state.confirmed) {
                 GoneCause::DestroyedByRequest
             } else {
                 GoneCause::MissingOnList
             };
-            pending.push(Pending {
-                id: id.clone(),
-                label: row.label.clone(),
-                timestamp: None,
-                vendor: None,
-                kind: EventKind::Gone { cause },
-            });
+            pending.push(Pending { id: id.clone(), label, timestamp: None, vendor: None, kind: EventKind::Gone { cause: Some(cause) } });
         }
     }
     destroyed.retain(|id, state| state.pending > 0 || current.get(id).is_some_and(|row| !matches!(row.state, Observation::Gone { .. })));
     instance.observed.claimed.recover().retain(|id, _| !current.contains_key(id));
+    announced.clear();
     // Snapshot inventory stays authoritative while only the pending billing diff
     // retains an absent row awaiting a concurrent deletion outcome.
     instance.events.commit(current.values().cloned().collect(), pending, &ObservedBy { way, delivery_id: None });

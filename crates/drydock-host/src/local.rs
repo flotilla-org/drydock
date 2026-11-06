@@ -164,10 +164,10 @@ impl Local {
         let state = if running(&dir, &self.socket(id)).await {
             Observation::Running
         } else if dir.join(SUSPENDED).exists() {
-            Observation::Stopped { cause: StopCause::SuspendedByRequest }
+            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
         } else {
             // The agent is gone and nobody asked: reported, not restarted.
-            Observation::Stopped { cause: StopCause::GuestHalted }
+            Observation::Stopped { cause: Some(StopCause::GuestHalted) }
         };
         Environment {
             id: id.to_owned(),

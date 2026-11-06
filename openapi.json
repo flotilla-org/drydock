@@ -3057,12 +3057,18 @@
           {
             "type": "object",
             "required": [
-              "cause",
               "kind"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/StopCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StopCause"
+                  }
+                ]
               },
               "kind": {
                 "type": "string",
@@ -3108,12 +3114,18 @@
           {
             "type": "object",
             "required": [
-              "cause",
               "kind"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/GoneCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GoneCause"
+                  }
+                ]
               },
               "kind": {
                 "type": "string",
@@ -3820,13 +3832,20 @@
           },
           {
             "type": "object",
+            "description": "`cause` is absent when the vendor does not say why.",
             "required": [
-              "cause",
               "state"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/StopCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StopCause"
+                  }
+                ]
               },
               "state": {
                 "type": "string",
@@ -3838,13 +3857,20 @@
           },
           {
             "type": "object",
+            "description": "`cause` is absent when the vendor does not say why.",
             "required": [
-              "cause",
               "state"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/GoneCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GoneCause"
+                  }
+                ]
               },
               "state": {
                 "type": "string",
@@ -4537,8 +4563,7 @@
           "capabilities",
           "readiness",
           "rate_limits",
-          "ports",
-          "ways_in"
+          "ports"
         ],
         "properties": {
           "capabilities": {
@@ -4563,11 +4588,14 @@
             "$ref": "#/components/schemas/Readiness"
           },
           "ways_in": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "items": {
               "$ref": "#/components/schemas/WayIn"
             },
-            "description": "The ways the vendor offers to hear about environments."
+            "description": "The ways the vendor offers to hear about environments; absent when\nthe provider's host did not declare them."
           }
         }
       },
@@ -5353,8 +5381,11 @@
             "description": "The vendor's state name, as it gives it."
           },
           "tags": {
-            "type": "object",
-            "description": "The vendor-side tags, as read back.",
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The vendor-side tags, as read back; absent when they were not read.",
             "additionalProperties": {
               "type": "string"
             },

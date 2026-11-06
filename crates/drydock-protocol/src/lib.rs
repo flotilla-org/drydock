@@ -193,8 +193,10 @@ pub struct ProviderDeclaration {
     pub readiness: Readiness,
     pub rate_limits: Vec<RateLimit>,
     pub ports: Ports,
-    /// The ways the vendor offers to hear about environments.
-    pub ways_in: Vec<WayIn>,
+    /// The ways the vendor offers to hear about environments; absent when
+    /// the provider's host did not declare them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ways_in: Option<Vec<WayIn>>,
 }
 /// Which optional operations exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -212,19 +214,6 @@ pub struct Ports {
     /// [`ImageRoute::ProviderPush`] route.
     #[serde(default)]
     pub push_access: bool,
-}
-/// The list polling a Rust module declared before [`WayIn`]. Remove once no
-/// module implements `Provider::observation` (e2b.rs, under drydock#278).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum ObservationMode {
-    Poll { interval_ms: u64 },
-}
-impl From<ObservationMode> for WayIn {
-    fn from(mode: ObservationMode) -> Self {
-        let ObservationMode::Poll { interval_ms } = mode;
-        Self::Poll { interval_ms }
-    }
 }
 /// One way a vendor offers to hear about its environments. The installation
 /// chooses which drydockd uses.
@@ -827,9 +816,9 @@ pub struct VendorState {
     /// The vendor's explanation of that state, when it gives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The vendor-side tags, as read back.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
+    /// The vendor-side tags, as read back; absent when they were not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
 }
 impl Environment {
     /// The observation without its evidence fields, for comparing states.
@@ -941,10 +930,22 @@ impl Reach {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observation {
     Running,
-    Stopped { cause: StopCause },
-    Gone { cause: GoneCause },
-    Transitioning { phase: TransitionPhase },
-    Unknown { reason: UnknownReason },
+    /// `cause` is absent when the vendor does not say why.
+    Stopped {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StopCause>,
+    },
+    /// `cause` is absent when the vendor does not say why.
+    Gone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<GoneCause>,
+    },
+    Transitioning {
+        phase: TransitionPhase,
+    },
+    Unknown {
+        reason: UnknownReason,
+    },
 }
 /// Generic phases describe progress, not billing transitions. The host retains
 /// its last stable billing observation until another stable observation arrives.
@@ -1044,7 +1045,8 @@ pub enum EventKind {
         granted_size: Size,
     },
     Stopped {
-        cause: StopCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StopCause>,
     },
     /// Explicit pause transition, distinct from the more general stopped observation.
     Paused {
@@ -1052,7 +1054,8 @@ pub enum EventKind {
     },
     Resumed,
     Gone {
-        cause: GoneCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<GoneCause>,
     },
     /// The vendor reports a state drydock classes as on the way to another,
     /// such as stopping or destroying. Only events from the vendor carry it.

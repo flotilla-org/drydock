@@ -57,8 +57,7 @@ const STATES: StateTable = &[
 struct Sandbox {
     id: Text,
     state: Text,
-    #[serde(default)]
-    labels: BTreeMap<String, String>,
+    labels: Option<BTreeMap<String, String>>,
     cpu: Option<u64>,
     memory: Option<u64>,
     disk: Option<u64>,
@@ -286,7 +285,7 @@ impl Daytona {
         Ok(Environment {
             id: v.id.to_string(),
             provider: self.name.clone(),
-            label: v.labels.get(LABEL_TAG).cloned(),
+            label: v.labels.as_ref().and_then(|l| l.get(LABEL_TAG)).cloned(),
             state,
             granted_size: kit::granted(DAYTONA, v.cpu, v.memory, GIB, v.disk, GIB)?,
             egress: Enforcement::Advisory,
@@ -333,8 +332,8 @@ impl Guest for Daytona {
 
 fn observe(state: &str, spot_evicted: bool) -> Observation {
     match (state, spot_evicted) {
-        ("destroyed", true) => Observation::Gone { cause: GoneCause::EvictedByProvider },
-        ("destroyed", false) => Observation::Gone { cause: GoneCause::DestroyedAtProvider },
+        ("destroyed", true) => Observation::Gone { cause: Some(GoneCause::EvictedByProvider) },
+        ("destroyed", false) => Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) },
         (state, _) => kit::observe(STATES, state),
     }
 }
@@ -350,8 +349,8 @@ struct StateUpdated {
     timestamp: Option<DateTime<Utc>>,
 }
 /// A state update is the sandbox in its new state; any other event, or one
-/// for another organization, says nothing drydock follows. The body names no
-/// eviction, so a destroyed sandbox is destroyed at Daytona.
+/// for another organization, says nothing drydock follows. The body gives no
+/// cause for a stop or a destruction, and no labels.
 #[async_trait]
 impl VendorEvents for Daytona {
     async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
@@ -364,8 +363,12 @@ impl VendorEvents for Daytona {
         }
         Ok(vec![VendorObservation {
             id: v.id.to_string(),
-            state: observe(&v.new_state, false),
-            vendor: VendorState { state: v.new_state.into(), reason: None, tags: BTreeMap::new() },
+            state: match observe(&v.new_state, false) {
+                Observation::Stopped { .. } => Observation::Stopped { cause: None },
+                Observation::Gone { .. } => Observation::Gone { cause: None },
+                state => state,
+            },
+            vendor: VendorState { state: v.new_state.into(), reason: None, tags: None },
             timestamp: v.updated_at.or(v.timestamp).map(Into::into),
         }])
     }

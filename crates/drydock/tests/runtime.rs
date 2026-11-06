@@ -743,7 +743,7 @@ async fn destroy_attribution_survives_stale_poll() {
     control.list_result_release.notify_one();
     assert!(matches!(events.next().await, ObserveRecord::Event { event }
         if event.id == environment.id && matches!(event.event,
-            EventKind::Gone { cause: GoneCause::DestroyedByRequest })));
+            EventKind::Gone { cause: Some(GoneCause::DestroyedByRequest) })));
 }
 
 // Startup is complete only after HTTP responds; a socket pathname alone is insufficient.
@@ -898,7 +898,7 @@ async fn poll_during_delete_waits_for_confirmed_cause() {
         control.destroy_release.notify_one();
         assert_eq!(deletion.await.unwrap().status().as_u16(), if failed { 503 } else { 204 });
         let expected = if failed { GoneCause::MissingOnList } else { GoneCause::DestroyedByRequest };
-        assert!(matches!(stream.next().await, ObserveRecord::Event { event } if event.event == EventKind::Gone {cause: expected}));
+        assert!(matches!(stream.next().await, ObserveRecord::Event { event } if event.event == EventKind::Gone {cause: Some(expected)}));
     }
 }
 
@@ -943,7 +943,7 @@ async fn progress_retains_billing_baseline_and_inventory() {
         id: "progress".into(),
         provider: "a".into(),
         label: None,
-        state: Observation::Stopped { cause: StopCause::SuspendedByRequest },
+        state: Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) },
         granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 }),
         egress: Enforcement::Advisory,
         egress_measured: false,
@@ -1015,7 +1015,7 @@ async fn cheap_inventory_carries_measured_egress() {
     control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Enforced;
     h.ok(Method::GET, "/providers/a/environments/measured", Value::Null, 200).await;
     control.vendor.lock().unwrap().row.as_mut().unwrap().egress = Enforcement::Advisory;
-    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) };
     let rows: Vec<Environment> = h.ok(Method::GET, "/providers/a/environments", Value::Null, 200).await.json().await.unwrap();
     assert_eq!(rows[0].egress, Enforcement::Advisory);
 }

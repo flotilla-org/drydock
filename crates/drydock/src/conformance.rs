@@ -913,7 +913,7 @@ impl Target<'_> {
                         running.as_ref().is_none_or(|event| stopped.cursor != event.cursor)
                             && matches!(
                                 stopped.event,
-                                EventKind::Stopped { cause: StopCause::SuspendedByRequest }
+                                EventKind::Stopped { cause: Some(StopCause::SuspendedByRequest) }
                                     | EventKind::Paused { cause: StopCause::SuspendedByRequest }
                             ),
                         "stopped event has wrong cursor or cause",
@@ -927,7 +927,7 @@ impl Target<'_> {
                     require(
                         matches!(
                             client.inspect(provider, &environment.id).await.map_err(SafeError::category)?.state,
-                            Observation::Stopped { cause: StopCause::SuspendedByRequest }
+                            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
                         ),
                         "suspended environment has wrong state or cause",
                     )
@@ -1066,7 +1066,7 @@ impl Target<'_> {
                 )
                 .await?;
                 require(
-                    matches!(event.event, EventKind::Gone { cause: GoneCause::DestroyedByRequest }),
+                    matches!(event.event, EventKind::Gone { cause: Some(GoneCause::DestroyedByRequest) }),
                     "confirmed destroy has wrong loss cause",
                 )
             }

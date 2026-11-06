@@ -196,7 +196,7 @@ fn sandbox(provider: &str, state: Observation, vendor: &str) -> Environment {
         egress_measured: false,
         egress_policy: None,
         timestamp: None,
-        vendor: Some(VendorState { state: vendor.into(), reason: None, tags: [(OWNER_TAG.to_owned(), provider.to_owned())].into() }),
+        vendor: Some(VendorState { state: vendor.into(), reason: None, tags: Some([(OWNER_TAG.to_owned(), provider.to_owned())].into()) }),
     }
 }
 #[async_trait::async_trait]
@@ -301,6 +301,14 @@ async fn subscribe(daemon: &Daemon) -> drydock::api::ObservationStream {
     assert!(matches!(first, ObserveRecord::Snapshot { .. }), "{first:?}");
     stream
 }
+/// The row drydockd holds of the recorded sandbox, as a new stream's snapshot gives it.
+async fn held(daemon: &Daemon) -> Option<Environment> {
+    let mut stream = ProviderApi::observe(daemon, None).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(20), stream.next()).await.unwrap().unwrap().unwrap() {
+        ObserveRecord::Snapshot { environments, .. } => environments.into_iter().find(|e| e.id == SANDBOX),
+        other => panic!("{other:?}"),
+    }
+}
 /// Events about the recorded sandbox, until `until` holds of one.
 async fn events(stream: &mut drydock::api::ObservationStream, until: impl Fn(&Event) -> bool) -> Vec<Event> {
     let mut events = vec![];
@@ -328,7 +336,9 @@ fn delivery(event: &Event) -> Option<&str> {
 // Every state change Daytona reports arrives as its own event, the
 // transitional ones included, each with Daytona's own state, its timestamp,
 // and the delivery it came in. The first update for a sandbox drydockd does
-// not know is its creation.
+// not know is its creation. Daytona's body gives no cause for a stop or a
+// destruction, and no labels or size, so the events claim none and drydockd
+// makes no row until a list.
 #[tokio::test]
 async fn transitions_arrive_as_events_with_the_vendor_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -349,17 +359,43 @@ async fn transitions_arrive_as_events_with_the_vendor_state() {
         [
             (EventKind::Created, "started", id(0)),
             (EventKind::Transitioning { phase: TransitionPhase::Stopping }, "stopping", id(1)),
-            (EventKind::Stopped { cause: StopCause::SuspendedByRequest }, "stopped", id(2)),
+            (EventKind::Stopped { cause: None }, "stopped", id(2)),
             (EventKind::Transitioning { phase: TransitionPhase::Destroying }, "destroying", id(3)),
-            (EventKind::Gone { cause: GoneCause::DestroyedAtProvider }, "destroyed", id(4)),
+            (EventKind::Gone { cause: None }, "destroyed", id(4)),
         ]
     );
     for (event, frame) in events.iter().zip(&frames) {
         assert_eq!(event.observed.as_ref().unwrap().way, ObservedWay::Webhook);
         assert_eq!(event.timestamp_source, TimestampSource::Provider);
         assert_eq!(event.timestamp, frame["body"]["updatedAt"].as_str().unwrap().parse().unwrap());
+        assert_eq!((event.label.as_ref(), event.vendor.as_ref().unwrap().tags.as_ref()), (None, None));
     }
+    assert_eq!(held(&daemon).await, None);
     assert_eq!(relay.connections.lock().unwrap()[0].1, "daytona");
+}
+
+// A delivery changes only what it states of a row drydockd holds: the state,
+// Daytona's state and the time. The labels, size and egress a list read stay.
+#[tokio::test]
+async fn a_webhook_after_a_list_keeps_what_the_list_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendor = Arc::new(Vendor::default());
+    host(dir.path(), &vendor).await;
+    let listed = sandbox("daytona", Observation::Running, "started");
+    *vendor.rows.lock().unwrap() = vec![listed.clone()];
+    let (relay, url) = Relay::start().await;
+    let frames = recorded();
+    let daemon = drydockd(dir.path(), &url, "owned_account").await;
+    caught_up(&relay, dir.path()).await;
+    let mut stream = subscribe(&daemon).await;
+    relay.publish(2);
+    events(&mut stream, |e| delivery(e) == frames[1]["delivery_id"].as_str()).await;
+    let row = held(&daemon).await.unwrap();
+    let vendor_state = row.vendor.clone().unwrap();
+    assert_eq!(row.state, Observation::Transitioning { phase: TransitionPhase::Stopping });
+    assert_eq!((vendor_state.state.as_str(), vendor_state.tags), ("stopping", listed.vendor.unwrap().tags));
+    assert_eq!(row.timestamp, Some(frames[1]["body"]["updatedAt"].as_str().unwrap().parse().unwrap()));
+    assert_eq!((row.label, row.granted_size, row.egress), (listed.label, listed.granted_size, listed.egress));
 }
 
 // The relay cursor drydockd last took in is stored under its state
@@ -379,7 +415,7 @@ async fn restart_resumes_from_the_stored_cursor() {
     events(&mut stream, |e| delivery(e) == frames[2]["delivery_id"].as_str()).await;
     drop((stream, daemon));
     // While drydockd is down Daytona destroys the sandbox; until then it lists it stopped.
-    *vendor.rows.lock().unwrap() = vec![sandbox("daytona", Observation::Stopped { cause: StopCause::SuspendedByRequest }, "stopped")];
+    *vendor.rows.lock().unwrap() = vec![sandbox("daytona", Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }, "stopped")];
     relay.publish(5);
 
     relay.hold.send_replace(true);
@@ -412,7 +448,7 @@ async fn a_redelivered_event_changes_nothing() {
     // The cursors after the first delivery were never stored; the vendor
     // lists the sandbox stopped, as of the stopped delivery.
     std::fs::write(dir.path().join("run/events/daytona.cursor"), cursor(&frames[0]).to_string()).unwrap();
-    let mut stopped = sandbox("daytona", Observation::Stopped { cause: StopCause::SuspendedByRequest }, "stopped");
+    let mut stopped = sandbox("daytona", Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }, "stopped");
     stopped.timestamp = Some(frames[2]["body"]["updatedAt"].as_str().unwrap().parse().unwrap());
     *vendor.rows.lock().unwrap() = vec![stopped];
     relay.publish(4);
@@ -448,7 +484,7 @@ async fn a_gap_yields_a_marked_reconstruction() {
     // retention before drydockd reconnects. The vendor now lists the sandbox stopped.
     *relay.horizon.lock().unwrap() = cursor(&frames[2]);
     relay.kick.send_modify(|n| *n += 1);
-    *vendor.rows.lock().unwrap() = vec![sandbox("daytona", Observation::Stopped { cause: StopCause::SuspendedByRequest }, "stopped")];
+    *vendor.rows.lock().unwrap() = vec![sandbox("daytona", Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }, "stopped")];
     relay.publish(3);
     let events = events(&mut stream, |e| matches!(e.event, EventKind::Stopped { .. })).await;
     let stopped = events.last().unwrap();
@@ -494,7 +530,9 @@ async fn a_wait_completes_on_a_webhook_event_without_a_poll() {
     relay.publish(1);
     let environment = tokio::time::timeout(Duration::from_secs(20), provision).await.unwrap().unwrap().unwrap().into_inner();
     assert_eq!(environment.state, Observation::Running);
-    assert_eq!(environment.vendor.unwrap().state, "started");
+    let vendor_state = environment.vendor.unwrap();
+    assert_eq!(vendor_state.state, "started");
+    assert_eq!(vendor_state.tags.unwrap()[OWNER_TAG], "daytona");
     assert_eq!(environment.label.as_deref(), Some("vessel"));
     assert_eq!(vendor.lists.load(SeqCst), lists, "the wait asked for a poll");
 }

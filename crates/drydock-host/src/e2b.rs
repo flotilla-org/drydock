@@ -461,7 +461,7 @@ impl E2b {
             id: id.to_owned(),
             label: None,
             provider: self.name.clone(),
-            state: Observation::Gone { cause: GoneCause::DestroyedAtProvider },
+            state: Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) },
             granted_size: None,
             egress: Enforcement::Advisory,
             platform: Some(platform()),
@@ -772,8 +772,8 @@ impl Provider for E2b {
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {

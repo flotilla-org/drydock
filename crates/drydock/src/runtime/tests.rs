@@ -439,7 +439,7 @@ mod operation_tests {
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
         assert_eq!(cheap.egress, Enforcement::Advisory);
         cache_observation(i, &row, generation);
-        cheap.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+        cheap.state = Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) };
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
         cheap.state = Observation::Running;
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
