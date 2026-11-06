@@ -91,8 +91,8 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
     }
 
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 10 }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: 10 }]
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         let requests = self.control.list_limit.load(std::sync::atomic::Ordering::SeqCst);

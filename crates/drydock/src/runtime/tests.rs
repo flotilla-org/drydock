@@ -141,8 +141,8 @@ mod operation_tests {
     struct Basic(Arc<dyn Provider>, bool);
     #[async_trait::async_trait]
     impl Provider for Basic {
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             let mut c = self.0.capabilities();
@@ -183,8 +183,8 @@ mod operation_tests {
     struct Lying(Arc<dyn Provider>);
     #[async_trait::async_trait]
     impl Provider for Lying {
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             self.0.capabilities()
@@ -439,7 +439,7 @@ mod operation_tests {
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
         assert_eq!(cheap.egress, Enforcement::Advisory);
         cache_observation(i, &row, generation);
-        cheap.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+        cheap.state = Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) };
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
         cheap.state = Observation::Running;
         carry_egress(i, std::slice::from_mut(&mut cheap), generation);
@@ -681,8 +681,8 @@ mod semantics_layer {
         fn operations(&self) -> Operations<'_> {
             Operations { suspend_resume: Some(self), ..Default::default() }
         }
-        fn observation(&self) -> ObservationMode {
-            self.0.observation()
+        fn ways_in(&self) -> Vec<WayIn> {
+            self.0.ways_in()
         }
         fn capabilities(&self) -> Capabilities {
             let mut c = self.0.capabilities();

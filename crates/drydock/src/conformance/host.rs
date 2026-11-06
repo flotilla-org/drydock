@@ -85,13 +85,16 @@ pub(super) async fn host_fixtures(
                     &[
                         "state".into(),
                         row.id.clone(),
-                        serde_json::to_string(&Observation::Gone { cause: cause.clone() }).map_err(SafeError::category)?,
+                        serde_json::to_string(&Observation::Gone { cause: Some(cause.clone()) }).map_err(SafeError::category)?,
                     ],
                 )
                 .await?;
                 let event =
                     transition(&mut records, provider, &row.id, |kind| matches!(kind, EventKind::Gone { .. }), &options.timeouts).await?;
-                require(matches!(event.event, EventKind::Gone { cause: actual } if actual == cause), "loss cause changed or was untyped")
+                require(
+                    matches!(event.event, EventKind::Gone { cause: actual } if actual == Some(cause)),
+                    "loss cause changed or was untyped",
+                )
             }
             .await,
         );
@@ -278,7 +281,7 @@ pub async fn optional_contract(
     require(
         matches!(
             client.inspect(provider, &row.id).await.map_err(SafeError::category)?.state,
-            Observation::Stopped { cause: StopCause::SuspendedByRequest }
+            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
         ),
         "suspend observation cause changed",
     )?;
@@ -339,7 +342,8 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                 &[
                     "state".into(),
                     row.id.clone(),
-                    serde_json::to_string(&Observation::Stopped { cause: StopCause::PausedByProvider }).map_err(SafeError::category)?,
+                    serde_json::to_string(&Observation::Stopped { cause: Some(StopCause::PausedByProvider) })
+                        .map_err(SafeError::category)?,
                 ],
             )
             .await?;
@@ -386,7 +390,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
             let event =
                 transition(&mut records, provider, &row.id, |kind| matches!(kind, EventKind::Gone { .. }), &options.timeouts).await?;
             require(
-                matches!(event.event, EventKind::Gone { cause: GoneCause::MissingOnList })
+                matches!(event.event, EventKind::Gone { cause: Some(GoneCause::MissingOnList) })
                     && event.timestamp_source == TimestampSource::Adaptor,
                 "authoritative disappearance has wrong cause or provenance",
             )
@@ -411,7 +415,7 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                     &[
                         "state".into(),
                         row.id.clone(),
-                        serde_json::to_string(&Observation::Stopped { cause: cause.clone() }).map_err(SafeError::category)?,
+                        serde_json::to_string(&Observation::Stopped { cause: Some(cause.clone()) }).map_err(SafeError::category)?,
                     ],
                 )
                 .await?;
@@ -424,11 +428,11 @@ async fn poll_cases(client: &Client, provider: &str, options: &Options, main: &E
                 )
                 .await?;
                 require(
-                    matches!(event.event, EventKind::Stopped { cause: actual } | EventKind::Paused { cause: actual } if actual == cause),
+                    matches!(&event.event, EventKind::Stopped { cause: Some(actual) } | EventKind::Paused { cause: actual } if *actual == cause),
                     "provider stop cause changed",
                 )?;
                 require(
-                    client.inspect(provider, &row.id).await.map_err(SafeError::category)?.state == Observation::Stopped { cause },
+                    client.inspect(provider, &row.id).await.map_err(SafeError::category)?.state == Observation::Stopped { cause: Some(cause) },
                     "stopped inventory disagrees",
                 )?;
                 billing_window(

@@ -26,7 +26,10 @@ current one keeps its provider and any in-memory state. The server-only
 `credential` key is refused. `GET /v1/hello` reports the protocol and host
 versions and the loadable modules. `GET /v1/providers` and
 `GET /v1/providers/{provider}` declare each provider's module, capabilities,
-readiness, rate limits, optional `ports` and `observation` (the poll interval).
+readiness, rate limits, optional `ports` and `ways_in` (the poll interval, and
+any vendor webhooks). `POST /v1/providers/{provider}/event` reads one vendor
+delivery the server took from its relay into the observations it carries; a
+module without a webhook way in refuses it.
 Every other call is the public provider route, carrying the credential to use in
 its `Drydock-Credential` header; a call without one has no credential. Prepare
 resolves the platform and image route before the module sees them, as the server

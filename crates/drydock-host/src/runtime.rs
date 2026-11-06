@@ -646,8 +646,8 @@ impl Provider for Runtime {
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 30_000 }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: 30_000 }]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {

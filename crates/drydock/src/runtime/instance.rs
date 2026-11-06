@@ -21,7 +21,12 @@ pub(super) struct Instance {
     pub(super) poll_waiting: Mutex<BTreeSet<String>>,
     pub(super) budget: Mutex<BTreeMap<String, VecDeque<tokio::time::Instant>>>,
     pub(super) events: EventSink,
-    pub(super) observation: ObservationMode,
+    pub(super) ways_in: Vec<WayIn>,
+    /// The relay stream this instance reads, when the installation names one.
+    pub(super) relay: Option<relay::Stream>,
+    /// On a shared account, a vendor event alone cannot say whose an
+    /// environment is: the module leaves ownership to drydockd's tag check.
+    pub(super) foreign_possible: bool,
     pub(super) poll_interval: std::time::Duration,
     pub(super) poll_error: Mutex<Option<ProtocolError>>,
     pub(super) credential_changes: watch::Sender<Credentials>,

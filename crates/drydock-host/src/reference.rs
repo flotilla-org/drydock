@@ -108,8 +108,8 @@ impl Provider for Reference {
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.settings.rate_limits.clone()
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: self.settings.poll_interval_ms }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {
@@ -120,6 +120,7 @@ impl Provider for Reference {
             quota: Some(self),
             files: None,
             push_access: None,
+            events: None,
         }
     }
     fn capabilities(&self) -> Capabilities {
@@ -335,7 +336,7 @@ impl Exec for Reference {
                 "pause" => {
                     state.stop_billing(target);
                     state.environments.get_mut(target).ok_or_else(|| refused("unknown fixture target"))?.state =
-                        Observation::Stopped { cause: StopCause::PausedByProvider };
+                        Observation::Stopped { cause: Some(StopCause::PausedByProvider) };
                     serde_json::Value::Null
                 }
                 _ => return Err(refused("unknown fixture action")),
@@ -375,7 +376,7 @@ impl SuspendResume for Reference {
             return state.tokens.get(id).cloned().ok_or_else(|| refused("missing resume token"));
         }
         state.stop_billing(id);
-        s.state = Observation::Stopped { cause: StopCause::SuspendedByRequest };
+        s.state = Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) };
         let token = ResumeToken { token: Secret::new(format!("{}:{id}", self.name)) };
         state.tokens.insert(id.into(), token.clone());
         state.environments.insert(id.into(), s);

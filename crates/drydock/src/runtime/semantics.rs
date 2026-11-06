@@ -4,8 +4,9 @@
 //! instance's [`SemanticOptions`] and [`Ownership`] ask for the rest.
 //!
 //! A wait reads what drydockd's observer already sees of the provider: it
-//! asks the observer to poll once, then follows its polls. It makes no vendor
-//! calls of its own.
+//! wakes on each change to the event log. On an instance that hears of
+//! changes only by listing, it asks the observer to poll once. It makes no
+//! vendor calls of its own.
 use super::*;
 use module::{ByteStream, Operations, Provisioned, SuspendResume};
 use std::time::Duration;
@@ -13,20 +14,35 @@ use tokio::{sync::Notify, time::Instant};
 
 /// The observer's view of one provider, as waits read it.
 pub(super) struct Observed {
-    log: Arc<Mutex<Log>>,
+    log: EventLog,
     provider: String,
+    /// Whether the vendor's events reach the observer as they happen.
+    pushed: bool,
     /// The outcome of the observer's latest poll: `None` once it committed
     /// what the vendor listed, or the error the vendor answered.
     pub(super) polls: watch::Sender<Option<ProtocolError>>,
     /// Asks the observer to poll now rather than at its next interval.
     pub(super) poll_now: Notify,
+    /// Tells the observer this instance's provision returned an id.
+    pub(super) claimed_now: Notify,
+    /// What this instance provisioned and no list has shown yet: its first
+    /// vendor event starts from this row, and it is this instance's own.
+    pub(super) claimed: Mutex<BTreeMap<String, Environment>>,
 }
 impl Observed {
-    pub(super) fn new(log: &EventLog, provider: &str) -> Arc<Self> {
-        Arc::new(Self { log: log.log.clone(), provider: provider.to_owned(), polls: watch::channel(None).0, poll_now: Notify::new() })
+    pub(super) fn new(log: &EventLog, provider: &str, pushed: bool) -> Arc<Self> {
+        Arc::new(Self {
+            log: log.clone(),
+            provider: provider.to_owned(),
+            pushed,
+            polls: watch::channel(None).0,
+            poll_now: Notify::new(),
+            claimed_now: Notify::new(),
+            claimed: Mutex::default(),
+        })
     }
-    fn row(&self, id: &str) -> Option<Environment> {
-        self.log.recover().inventories.get(&self.provider)?.iter().find(|row| row.id == id).cloned()
+    pub(super) fn row(&self, id: &str) -> Option<Environment> {
+        self.log.log.recover().inventories.get(&self.provider)?.iter().find(|row| row.id == id).cloned()
     }
 }
 
@@ -78,39 +94,22 @@ fn described(e: &Environment) -> String {
 
 impl Added {
     fn ours(&self, e: &Environment) -> bool {
-        self.owner.as_ref().is_none_or(|owner| e.vendor.as_ref().and_then(|v| v.tags.get(OWNER_TAG)) == Some(owner))
+        self.owner.as_ref().is_none_or(|owner| e.vendor.as_ref().and_then(|v| v.tags.as_ref()?.get(OWNER_TAG)) == Some(owner))
     }
     /// The environment once the observer sees it `what`. A wait ends early
     /// when the observer sees it gone or in an unknown state, and as
     /// unavailable at the deadline, naming the last poll's error if the
     /// observer's polls were failing.
     async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool) -> Result<Environment> {
-        let mut polls = self.observed.polls.subscribe();
-        polls.mark_unchanged();
-        // When the observer is mid-poll this stores a permit, so it polls
-        // again straight after: the poll in flight may predate the change.
-        self.observed.poll_now.notify_one();
+        let mut changes = self.observed.log.changed.subscribe();
+        if !self.observed.pushed {
+            // When the observer is mid-poll this stores a permit, so it polls
+            // again straight after: the poll in flight may predate the change.
+            self.observed.poll_now.notify_one();
+        }
         let deadline = Instant::now() + self.wait;
         let mut last = None;
-        let mut failed = None;
         loop {
-            tokio::select! {
-                changed = polls.changed() => if changed.is_err() {
-                    return Err(ProtocolError::unavailable("provider observation stopped", None));
-                },
-                _ = tokio::time::sleep_until(deadline) => {
-                    let seen = last.as_ref().map_or_else(|| "not yet observed".to_owned(), |e| format!("still {}", described(e)));
-                    let polling = failed.map_or_else(String::new, |e: ProtocolError| format!("; the last poll failed: {e}"));
-                    return Err(ProtocolError::unavailable(
-                        format!("environment {id} is {seen} after {}s waiting to be {what}{polling}", self.wait.as_secs()),
-                        None,
-                    ));
-                },
-            }
-            failed = polls.borrow_and_update().clone();
-            if failed.is_some() {
-                continue;
-            }
             if let Some(e) = self.observed.row(id) {
                 if done(&e.state) {
                     return Ok(e);
@@ -119,6 +118,20 @@ impl Added {
                     return Err(refused(format!("environment {id} is {} while waiting for it to be {what}", described(&e))));
                 }
                 last = Some(e);
+            }
+            tokio::select! {
+                changed = changes.changed() => if changed.is_err() {
+                    return Err(ProtocolError::unavailable("provider observation stopped", None));
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    let seen = last.as_ref().map_or_else(|| "not yet observed".to_owned(), |e| format!("still {}", described(e)));
+                    let failed = self.observed.polls.borrow().clone();
+                    let polling = failed.map_or_else(String::new, |e: ProtocolError| format!("; the last poll failed: {e}"));
+                    return Err(ProtocolError::unavailable(
+                        format!("environment {id} is {seen} after {}s waiting to be {what}{polling}", self.wait.as_secs()),
+                        None,
+                    ));
+                },
             }
         }
     }
@@ -168,8 +181,8 @@ impl Provider for Added {
         s.owner_scoped |= self.owner.is_some();
         capabilities
     }
-    fn observation(&self) -> ObservationMode {
-        self.inner.observation()
+    fn ways_in(&self) -> Vec<WayIn> {
+        self.inner.ways_in()
     }
     fn readiness(&self, c: &Credentials) -> Readiness {
         self.inner.readiness(c)
@@ -185,7 +198,11 @@ impl Provider for Added {
     }
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         match self.inner.provision(r, c).await? {
-            Provisioned::Created(e) if self.settle => Ok(Provisioned::Created(self.running(&e.id).await?)),
+            Provisioned::Created(e) => {
+                self.observed.claimed.recover().insert(e.id.clone(), e.clone());
+                self.observed.claimed_now.notify_one();
+                Ok(Provisioned::Created(if self.settle { self.running(&e.id).await? } else { e }))
+            }
             provisioned => Ok(provisioned),
         }
     }

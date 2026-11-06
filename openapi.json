@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "12"
+    "version": "13"
   },
   "paths": {
     "/v1/config": {
@@ -2019,6 +2019,89 @@
         }
       }
     },
+    "/v1/providers/{provider}/event": {
+      "post": {
+        "tags": [
+          "host"
+        ],
+        "operationId": "event",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VendorDelivery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What the delivery says of each environment it is about",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/VendorObservation"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
     "/v1/providers/{provider}/prepare": {
       "post": {
         "tags": [
@@ -2557,6 +2640,12 @@
           "per_request"
         ]
       },
+      "DeliveryGuarantee": {
+        "type": "string",
+        "enum": [
+          "at_least_once"
+        ]
+      },
       "Destination": {
         "oneOf": [
           {
@@ -2897,6 +2986,17 @@
               "null"
             ]
           },
+          "observed": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ObservedBy",
+                "description": "How drydockd learnt of it. Absent on drydockd's own exposure events."
+              }
+            ]
+          },
           "provider": {
             "type": "string"
           },
@@ -2906,6 +3006,17 @@
           },
           "timestamp_source": {
             "$ref": "#/components/schemas/TimestampSource"
+          },
+          "vendor": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VendorState",
+                "description": "The vendor's own state and reason for this transition, verbatim."
+              }
+            ]
           }
         }
       },
@@ -2946,12 +3057,18 @@
           {
             "type": "object",
             "required": [
-              "cause",
               "kind"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/StopCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StopCause"
+                  }
+                ]
               },
               "kind": {
                 "type": "string",
@@ -2997,18 +3114,43 @@
           {
             "type": "object",
             "required": [
-              "cause",
               "kind"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/GoneCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GoneCause"
+                  }
+                ]
               },
               "kind": {
                 "type": "string",
                 "enum": [
                   "gone"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The vendor reports a state drydock classes as on the way to another,\nsuch as stopping or destroying. Only events from the vendor carry it.",
+            "required": [
+              "phase",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "transitioning"
+                ]
+              },
+              "phase": {
+                "$ref": "#/components/schemas/TransitionPhase"
               }
             }
           },
@@ -3053,6 +3195,47 @@
             }
           }
         ]
+      },
+      "EventsConfiguration": {
+        "type": "object",
+        "description": "How one instance hears about its environments. Without a relay drydockd\nlists them at the module's interval; with one it reads the relay's stream\nand lists every `poll_seconds` to fill gaps.",
+        "properties": {
+          "poll_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds between lists; 300 when a relay is configured, otherwise the\nmodule's own interval.",
+            "minimum": 0
+          },
+          "relay": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The relay install the vendor's webhooks are delivered to, such as\n`https://relay.flotilla.work/i/lab`."
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The install's source name for this vendor."
+          },
+          "token": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CredentialLocation",
+                "description": "The install's consumer token."
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
       },
       "ExecRequest": {
         "type": "object",
@@ -3649,13 +3832,20 @@
           },
           {
             "type": "object",
+            "description": "`cause` is absent when the vendor does not say why.",
             "required": [
-              "cause",
               "state"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/StopCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StopCause"
+                  }
+                ]
               },
               "state": {
                 "type": "string",
@@ -3667,13 +3857,20 @@
           },
           {
             "type": "object",
+            "description": "`cause` is absent when the vendor does not say why.",
             "required": [
-              "cause",
               "state"
             ],
             "properties": {
               "cause": {
-                "$ref": "#/components/schemas/GoneCause"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/GoneCause"
+                  }
+                ]
               },
               "state": {
                 "type": "string",
@@ -3720,31 +3917,6 @@
             }
           }
         ]
-      },
-      "ObservationMode": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "interval_ms",
-              "mode"
-            ],
-            "properties": {
-              "interval_ms": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "poll"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "How the server observes a provider: it polls the environment list."
       },
       "ObserveRecord": {
         "oneOf": [
@@ -3803,6 +3975,35 @@
           }
         ],
         "description": "Hosts unable to replay emit a snapshot marking the gap. Inventory is complete\nonly for providers absent from `unavailable_providers`."
+      },
+      "ObservedBy": {
+        "type": "object",
+        "required": [
+          "way"
+        ],
+        "properties": {
+          "delivery_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The vendor's delivery, for a webhook."
+          },
+          "way": {
+            "$ref": "#/components/schemas/ObservedWay"
+          }
+        }
+      },
+      "ObservedWay": {
+        "type": "string",
+        "description": "A `poll` or `reconstruction` event compares two lists: transitions\nbetween them may be missed.",
+        "enum": [
+          "webhook",
+          "vendor_log",
+          "long_poll",
+          "poll",
+          "reconstruction"
+        ]
       },
       "Outward": {
         "type": "object",
@@ -4320,6 +4521,17 @@
               }
             ]
           },
+          "events": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EventsConfiguration",
+                "description": "Server only: the ways in this installation reads the vendor's events\nthrough, beside or instead of the module's defaults."
+              }
+            ]
+          },
           "module": {
             "type": "string"
           },
@@ -4351,8 +4563,7 @@
           "capabilities",
           "readiness",
           "rate_limits",
-          "ports",
-          "observation"
+          "ports"
         ],
         "properties": {
           "capabilities": {
@@ -4360,9 +4571,6 @@
           },
           "module": {
             "type": "string"
-          },
-          "observation": {
-            "$ref": "#/components/schemas/ObservationMode"
           },
           "ports": {
             "$ref": "#/components/schemas/Ports"
@@ -4378,6 +4586,16 @@
           },
           "readiness": {
             "$ref": "#/components/schemas/Readiness"
+          },
+          "ways_in": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/WayIn"
+            },
+            "description": "The ways the vendor offers to hear about environments; absent when\nthe provider's host did not declare them."
           }
         }
       },
@@ -5086,6 +5304,71 @@
         ],
         "description": "Aggregated usage must say what population it measured. In particular,\norganisation totals cannot prove that one suspended environment stopped billing.\nOrganization and environment IDs are provider-opaque; consumers only compare them."
       },
+      "VendorDelivery": {
+        "type": "object",
+        "description": "One delivery from the vendor, as drydockd received it, for the module to read.",
+        "required": [
+          "event",
+          "delivery_id",
+          "received_at",
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "type": "object",
+            "description": "The vendor's body, unchanged."
+          },
+          "delivery_id": {
+            "type": "string"
+          },
+          "event": {
+            "type": "string",
+            "description": "The vendor's event name."
+          },
+          "received_at": {
+            "$ref": "#/components/schemas/Timestamp",
+            "description": "When the receiver got the delivery."
+          }
+        }
+      },
+      "VendorObservation": {
+        "type": "object",
+        "description": "What a delivery says of one environment.",
+        "required": [
+          "id",
+          "vendor"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Observation",
+                "description": "Absent when the delivery states no state drydock classes, such as a\ncreation that gives only the vendor's own."
+              }
+            ]
+          },
+          "timestamp": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Timestamp",
+                "description": "When the vendor says the environment got there."
+              }
+            ]
+          },
+          "vendor": {
+            "$ref": "#/components/schemas/VendorState"
+          }
+        }
+      },
       "VendorState": {
         "type": "object",
         "description": "An environment in the vendor's own words.",
@@ -5105,8 +5388,11 @@
             "description": "The vendor's state name, as it gives it."
           },
           "tags": {
-            "type": "object",
-            "description": "The vendor-side tags, as read back.",
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "The vendor-side tags, as read back; absent when they were not read.",
             "additionalProperties": {
               "type": "string"
             },
@@ -5115,6 +5401,73 @@
             }
           }
         }
+      },
+      "WayIn": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "drydockd lists every environment, every `interval_ms`.",
+            "required": [
+              "interval_ms",
+              "way"
+            ],
+            "properties": {
+              "interval_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "way": {
+                "type": "string",
+                "enum": [
+                  "poll"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The vendor posts these events to a receiver the installation runs;\ndrydockd reads them from a relay and the module translates each.\n`registration` lists every way the vendor offers to register the\nwebhook; drydockd registers none itself.",
+            "required": [
+              "registration",
+              "events",
+              "delivery",
+              "way"
+            ],
+            "properties": {
+              "delivery": {
+                "$ref": "#/components/schemas/DeliveryGuarantee"
+              },
+              "events": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "registration": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WebhookRegistration"
+                }
+              },
+              "way": {
+                "type": "string",
+                "enum": [
+                  "webhook"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One way a vendor offers to hear about its environments. The installation\nchooses which drydockd uses."
+      },
+      "WebhookRegistration": {
+        "type": "string",
+        "description": "Where a webhook is registered with the vendor.",
+        "enum": [
+          "dashboard",
+          "api"
+        ]
       }
     },
     "responses": {

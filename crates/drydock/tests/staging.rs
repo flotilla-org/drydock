@@ -359,8 +359,8 @@ impl Provider for PullingProvider {
             semantics: Default::default(),
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 60_000 }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: 60_000 }]
     }
     fn operations(&self) -> drydock_host::module::Operations<'_> {
         drydock_host::module::Operations {

@@ -146,6 +146,8 @@ pub struct Supervisor {
     pub refresh_interval: Duration,
     pub restart_delay: Duration,
     pub request_timeout: Duration,
+    /// Where each host's runtime keeps what outlives a restart, such as relay cursors.
+    pub state_directory: Option<PathBuf>,
 }
 impl Supervisor {
     pub fn new(runtime_directory: PathBuf, credentials: Arc<dyn CredentialSource>) -> Self {
@@ -157,6 +159,7 @@ impl Supervisor {
             refresh_interval: Duration::from_secs(1),
             restart_delay: Duration::from_millis(100),
             request_timeout: Duration::from_secs(30),
+            state_directory: None,
         }
     }
     pub async fn start(&self, spec: HostSpec) -> Result<HostHandle, client::Error> {
@@ -215,7 +218,10 @@ impl Supervisor {
         let mut supervisor = self.clone();
         supervisor.runtime_directory = runtime_directory;
         let host_client = client.clone();
-        let public_client = runtime::Runtime::new(Default::default()).with_request_timeout(self.request_timeout);
+        let mut public_client = runtime::Runtime::new(Default::default()).with_request_timeout(self.request_timeout);
+        if let Some(directory) = &self.state_directory {
+            public_client = public_client.with_state_directory(directory.clone());
+        }
         let policy = public_client.clone();
         let instances = spec.configuration.providers.keys().cloned().collect();
         let task = tokio::spawn(async move {
@@ -325,6 +331,7 @@ impl Supervisor {
             for provider in document.providers.values_mut() {
                 provider.credential = None;
                 provider.semantics = Default::default();
+                provider.events = None;
             }
             loop {
                 if let Some(child) = &mut child

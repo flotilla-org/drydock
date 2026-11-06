@@ -174,7 +174,8 @@ impl Daemon {
     ) -> Result<Arc<Self>, String> {
         let Seams { resolver, dialer, builds, guest, timing, registries } = seams;
         crate::local::private_dir(run)?;
-        let supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
+        let mut supervisor = Supervisor::new(run.join("hosts"), Arc::new(BuiltinCredentials::default()));
+        supervisor.state_directory = Some(run.join("events"));
         let mut discovered = Vec::new();
         let mut failed_optional = BTreeSet::new();
         for option in options {
@@ -360,7 +361,7 @@ impl Daemon {
                         rate_limits: vec![],
                         readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
                         ports: Ports::default(),
-                        observation: ObservationMode::Poll { interval_ms: 0 },
+                        ways_in: None,
                     });
                 if let Some(readiness) = self.unavailable.get(name) {
                     declaration.readiness = readiness.clone();
@@ -953,7 +954,7 @@ impl Daemon {
                         let cursor=serde_json::to_string(&cursors).expect("cursor map serializes");
                         yield Ok(ObserveRecord::Event{event:Event{
                             cursor,id:notice.id,provider:notice.provider,label:Some(notice.label),
-                            timestamp:chrono::Utc::now().into(),timestamp_source:TimestampSource::Adaptor,event:notice.kind,
+                            timestamp:chrono::Utc::now().into(),timestamp_source:TimestampSource::Adaptor,event:notice.kind,vendor:None,observed:None,
                         }});
                         continue;
                     }

@@ -19,7 +19,7 @@ export interface ProviderModule {
 /** SDK facts and operations only; Daemon owns admission, rates and observation policy. */
 export interface Provider {
   capabilities: Types["Capabilities"];
-  observation: Types["ObservationMode"];
+  waysIn: Types["WayIn"][];
   rateLimits: Types["RateLimit"][];
   readiness(context: Context): Types["Readiness"] | Promise<Types["Readiness"]>;
   prepare(

@@ -267,6 +267,14 @@ async fn configurable_transition_deadlines() {
     assert!(report.passed(), "{report:?}");
 }
 
+// A resume from a cursor returns the event that followed it, whatever its
+// kind: here a transitional event comes between created and running.
+#[tokio::test]
+async fn resume_returns_the_next_event_whatever_its_kind() {
+    let report = python_report("transitional").await;
+    assert!(report.passed(), "{report:?}");
+}
+
 // A temporary inspect failure is a state-check failure, not a missing event.
 // The retained Running event still drives replay and subsequent cursor checks.
 #[tokio::test]

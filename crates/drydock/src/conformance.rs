@@ -272,9 +272,24 @@ async fn transition(
     predicate: impl Fn(&EventKind) -> bool,
     timeouts: &Timeouts,
 ) -> Result<Event> {
+    noting_transition(records, provider, id, predicate, timeouts, &mut None).await
+}
+/// [`transition`], keeping the first record it reads in `first`.
+async fn noting_transition(
+    records: &mut Records,
+    provider: &str,
+    id: &str,
+    predicate: impl Fn(&EventKind) -> bool,
+    timeouts: &Timeouts,
+    first: &mut Option<ObserveRecord>,
+) -> Result<Event> {
     tokio::time::timeout(Duration::from_secs(timeouts.transition_seconds), async {
         loop {
-            if let ObserveRecord::Event { event } = next(records, timeouts).await?
+            let record = next(records, timeouts).await?;
+            if first.is_none() {
+                *first = Some(record.clone());
+            }
+            if let ObserveRecord::Event { event } = record
                 && event.provider == provider
                 && event.id == id
                 && predicate(&event.event)
@@ -803,15 +818,19 @@ impl Target<'_> {
             }
             .await,
         );
+        // The record after creation, whatever it is: a resume from creation's
+        // cursor must return it first.
+        let mut following = None;
         let running = report.capture(
             "running_event",
             async {
-                transition(
+                noting_transition(
                     records.as_mut().ok_or("cannot observe")?,
                     provider,
                     &environment.id,
                     |e| matches!(e, EventKind::Running { .. }),
                     timeouts,
+                    &mut following,
                 )
                 .await
             }
@@ -835,13 +854,15 @@ impl Target<'_> {
         }
         // Replay a known predecessor to check exclusive resume without depending on
         // optional suspend support. Snapshot fallback explicitly marks a metering gap.
-        if let (Some(created), Some(running)) = (&created, &running) {
+        if let (Some(created), Some(following)) = (&created, &following) {
             report.record(
                 "cursor_resume",
                 async {
                     let mut replay = observe(client, Some(&created.cursor), timeouts).await?;
                     match next(&mut replay, timeouts).await? {
-                        ObserveRecord::Event { event } => require(event == *running, "resume did not return the next event exclusively"),
+                        record @ ObserveRecord::Event { .. } => {
+                            require(record == *following, "resume did not return the next event exclusively")
+                        }
                         ObserveRecord::Snapshot { unavailable_providers, .. } => {
                             require(!unavailable_providers.contains_key(provider), "resume inventory unavailable")
                         }
@@ -913,7 +934,8 @@ impl Target<'_> {
                         running.as_ref().is_none_or(|event| stopped.cursor != event.cursor)
                             && matches!(
                                 stopped.event,
-                                EventKind::Stopped { cause: StopCause::SuspendedByRequest }
+                                // A vendor event may give no cause; a stated one must be the request.
+                                EventKind::Stopped { cause: None | Some(StopCause::SuspendedByRequest) }
                                     | EventKind::Paused { cause: StopCause::SuspendedByRequest }
                             ),
                         "stopped event has wrong cursor or cause",
@@ -927,7 +949,7 @@ impl Target<'_> {
                     require(
                         matches!(
                             client.inspect(provider, &environment.id).await.map_err(SafeError::category)?.state,
-                            Observation::Stopped { cause: StopCause::SuspendedByRequest }
+                            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
                         ),
                         "suspended environment has wrong state or cause",
                     )
@@ -1066,7 +1088,7 @@ impl Target<'_> {
                 )
                 .await?;
                 require(
-                    matches!(event.event, EventKind::Gone { cause: GoneCause::DestroyedByRequest }),
+                    matches!(event.event, EventKind::Gone { cause: Some(GoneCause::DestroyedByRequest) }),
                     "confirmed destroy has wrong loss cause",
                 )
             }

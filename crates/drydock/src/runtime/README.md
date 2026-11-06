@@ -8,14 +8,29 @@ The following detailed behaviours moved with the implementation from the Rust ho
 router and the Daemon call. `instance.rs` holds one configured provider's
 readiness, admission, credential rejection, budgets and call deadlines;
 `events.rs` the history, cursors, replay and snapshots; `evidence.rs` the
-lifecycle-inspection and egress-evidence cache; `observer.rs` polling and push
-reconciliation; `diagnostics.rs` credential masking; `remote.rs` the private
+lifecycle-inspection and egress-evidence cache; `observer.rs` polling and
+applying vendor events; `relay.rs` the webhook relay stream and its stored cursor; `diagnostics.rs` credential masking; `remote.rs` the private
 trait adapter. `mod.rs` owns configuration, credential delivery and shutdown.
 
 ## Server-owned observation
 
-A provider declares `ObservationMode::Poll { interval }` or Push. For Poll the
-server owns one list loop, last-seen state and diffing. It stretches the interval
+A provider declares its `ways_in`: `Poll { interval }`, and `Webhook` when its
+vendor sends events. The server owns one observer per instance: a list loop,
+last-seen state and diffing, and, when the instance has a relay, the relay
+stream in the same loop. A relay makes the list a gap filler, every
+`poll_seconds` (default 300). Each delivery goes to the module's `VendorEvents`
+port, which reads it into observations; each observation becomes events marked
+`webhook` and carrying the vendor state. A delivery replaces only what it
+states of a row drydockd holds (the state, the vendor's state and reason, the
+time) and keeps the rest, tags included; for an environment drydockd holds no
+row of it makes events alone, and the next list makes the row. On a shared
+account, deliveries for an id no list or provision has shown to be this
+instance's are held, and applied in order once its provision returns the id;
+the next list drops the rest. A delivery may state no drydock state (Daytona's
+`sandbox.created`): it is the environment's creation, or nothing. Deliveries come at least once and in no promised order: one whose vendor timestamp is older than the row drydockd holds, or as old with the same vendor state, is a redelivery or overtaken by a list, and is skipped. A `gap` frame, or a start with no
+stored cursor, is answered by a list whose events are marked `reconstruction`;
+the cursor is stored only once what came before it is applied. Waits wake on
+the log's change signal and ask for a poll only when the instance has no relay. It stretches the interval
 within declared list/global limits and skips missed ticks. Observation gets at
 most half the long-run list/global rate and max(1, requests/2) slots per window;
 route calls share the total budget and can use the remaining slots. An indivisible
@@ -83,7 +98,7 @@ Direct credentials still require refresh. Poll providers repair through normal p
 Retained-cursor replay does not list. Server stopping still returns an initial typed
 HTTP error or ends an existing stream. The protocol defines no terminal NDJSON error record.
 Polling cannot report transitions hidden entirely between samples; modules with
-event streams declare Push.
+vendor events declare a webhook way in.
 
 Push observers receive `Provider::run(PushContext)` only after configuration commits.
 The context carries a provider-scoped raw observation sink, an immutable credential snapshot, and a stop watch. The server cancels/reopens subscriptions on rotation.

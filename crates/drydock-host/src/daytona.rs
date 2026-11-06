@@ -57,8 +57,7 @@ const STATES: StateTable = &[
 struct Sandbox {
     id: Text,
     state: Text,
-    #[serde(default)]
-    labels: BTreeMap<String, String>,
+    labels: Option<BTreeMap<String, String>>,
     cpu: Option<u64>,
     memory: Option<u64>,
     disk: Option<u64>,
@@ -280,17 +279,13 @@ impl Daytona {
         self.api.call::<IgnoredAny>(Method::POST, url, Body::None, c).await.map(drop)
     }
     fn environment(&self, v: Sandbox) -> Result<Environment> {
-        let state = match (&*v.state, &v.spot_evicted_at) {
-            ("destroyed", Some(_)) => Observation::Gone { cause: GoneCause::EvictedByProvider },
-            ("destroyed", None) => Observation::Gone { cause: GoneCause::DestroyedAtProvider },
-            (state, _) => kit::observe(STATES, state),
-        };
+        let state = observe(&v.state, v.spot_evicted_at.is_some());
         let p = &v.policy;
         let policy = json!({"block":p.network_block_all,"cidrs":p.network_allow_list,"domains":p.domain_allow_list});
         Ok(Environment {
             id: v.id.to_string(),
             provider: self.name.clone(),
-            label: v.labels.get(LABEL_TAG).cloned(),
+            label: v.labels.as_ref().and_then(|l| l.get(LABEL_TAG)).cloned(),
             state,
             granted_size: kit::granted(DAYTONA, v.cpu, v.memory, GIB, v.disk, GIB)?,
             egress: Enforcement::Advisory,
@@ -332,6 +327,64 @@ impl Guest for Daytona {
         let body = Body::json(&json!({"command": script, "timeout": self.settings.exec_seconds}))?;
         let v: Executed = self.api.call(Method::POST, self.toolbox(id, &["process", "execute"])?, body, c).await?;
         Ok(GuestOutput::from_text(&v.result, "", Some(v.exit_code.into())))
+    }
+}
+
+fn observe(state: &str, spot_evicted: bool) -> Observation {
+    match (state, spot_evicted) {
+        ("destroyed", true) => Observation::Gone { cause: Some(GoneCause::EvictedByProvider) },
+        ("destroyed", false) => Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) },
+        (state, _) => kit::observe(STATES, state),
+    }
+}
+const CREATED: &str = "sandbox.created";
+const STATE_UPDATED: &str = "sandbox.state.updated";
+/// The bodies of `sandbox.created` and `sandbox.state.updated`, as recorded
+/// from Daytona on 2026-11-05 and 2026-11-06, only the fields read.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Delivered {
+    id: Text,
+    organization_id: String,
+    /// The state a created sandbox starts in.
+    state: Option<Text>,
+    new_state: Option<Text>,
+    created_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
+    timestamp: Option<DateTime<Utc>>,
+}
+/// A creation states the sandbox and Daytona's own state for it, which
+/// drydock does not class; an update states the sandbox in its new state.
+/// Neither gives a cause for a stop or a destruction, nor labels. Any other
+/// event, or one for another organization, says nothing drydock follows.
+#[async_trait]
+impl VendorEvents for Daytona {
+    async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
+        let event = delivery.event.as_str();
+        if event != CREATED && event != STATE_UPDATED {
+            return Ok(vec![]);
+        }
+        let v: Delivered = serde_json::from_value(delivery.body).map_err(|e| refused(format!("Daytona {event} body: {e}")))?;
+        if v.organization_id != self.settings.organization_id {
+            return Ok(vec![]);
+        }
+        let (vendor, state, timestamp) = if event == CREATED {
+            (v.state, None, v.created_at)
+        } else {
+            let state = v.new_state.as_deref().map(|s| match observe(s, false) {
+                Observation::Stopped { .. } => Observation::Stopped { cause: None },
+                Observation::Gone { .. } => Observation::Gone { cause: None },
+                state => state,
+            });
+            (v.new_state, state, v.updated_at.or(v.timestamp))
+        };
+        let vendor = vendor.ok_or_else(|| refused(format!("Daytona {event} body names no state")))?;
+        Ok(vec![VendorObservation {
+            id: v.id.to_string(),
+            state,
+            vendor: VendorState { state: vendor.into(), reason: None, tags: None },
+            timestamp: timestamp.map(Into::into),
+        }])
     }
 }
 
@@ -461,14 +514,23 @@ impl Provider for Daytona {
             ..Capabilities::default()
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: self.settings.poll_seconds.saturating_mul(1000) }
+    /// Daytona's webhooks are registered in its dashboard, through Svix.
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![
+            WayIn::Poll { interval_ms: self.settings.poll_seconds.saturating_mul(1000) },
+            WayIn::Webhook {
+                registration: vec![WebhookRegistration::Dashboard],
+                events: vec![CREATED.into(), STATE_UPDATED.into()],
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            },
+        ]
     }
     fn operations(&self) -> Operations<'_> {
         Operations {
             exec: Some(self),
             files: Some(self),
             push_access: Some(self),
+            events: Some(self),
             suspend_resume: Some(self),
             quota: Some(self),
             usage: Some(self),

@@ -241,7 +241,7 @@ export async function serve(modules: ProviderModule[], unix: string) {
       module: config.module,
       ports: ports(provider),
       capabilities: provider.capabilities,
-      observation: provider.observation,
+      ways_in: provider.waysIn,
       rate_limits: provider.rateLimits,
       readiness: await readiness(provider, ctx),
     };

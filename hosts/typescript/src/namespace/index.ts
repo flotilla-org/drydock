@@ -243,7 +243,7 @@ class Namespace implements Provider {
       },
     ],
   };
-  observation: Types["ObservationMode"] = { mode: "poll", interval_ms: 30_000 };
+  waysIn: Types["WayIn"][] = [{ way: "poll", interval_ms: 30_000 }];
   rateLimits: Types["RateLimit"][] = [];
   /**
    * Devboxes this host stopped, so their stop reads as requested. Labels are

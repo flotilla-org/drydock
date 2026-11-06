@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "12";
+pub const PROTOCOL_VERSION: &str = "13";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -70,6 +70,31 @@ pub struct ProviderConfiguration {
     /// module's operations do not give them by themselves ([`Semantics`]).
     #[serde(default, skip_serializing_if = "is_default")]
     pub semantics: SemanticOptions,
+    /// Server only: the ways in this installation reads the vendor's events
+    /// through, beside or instead of the module's defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<EventsConfiguration>,
+}
+/// How one instance hears about its environments. Without a relay drydockd
+/// lists them at the module's interval; with one it reads the relay's stream
+/// and lists every `poll_seconds` to fill gaps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EventsConfiguration {
+    /// The relay install the vendor's webhooks are delivered to, such as
+    /// `https://relay.flotilla.work/i/lab`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// The install's source name for this vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The install's consumer token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<CredentialLocation>,
+    /// Seconds between lists; 300 when a relay is configured, otherwise the
+    /// module's own interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_seconds: Option<u64>,
 }
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
@@ -168,7 +193,10 @@ pub struct ProviderDeclaration {
     pub readiness: Readiness,
     pub rate_limits: Vec<RateLimit>,
     pub ports: Ports,
-    pub observation: ObservationMode,
+    /// The ways the vendor offers to hear about environments; absent when
+    /// the provider's host did not declare them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ways_in: Option<Vec<WayIn>>,
 }
 /// Which optional operations exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -187,11 +215,60 @@ pub struct Ports {
     #[serde(default)]
     pub push_access: bool,
 }
-/// How the server observes a provider: it polls the environment list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum ObservationMode {
+/// One way a vendor offers to hear about its environments. The installation
+/// chooses which drydockd uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "way", rename_all = "snake_case")]
+pub enum WayIn {
+    /// drydockd lists every environment, every `interval_ms`.
     Poll { interval_ms: u64 },
+    /// The vendor posts these events to a receiver the installation runs;
+    /// drydockd reads them from a relay and the module translates each.
+    /// `registration` lists every way the vendor offers to register the
+    /// webhook; drydockd registers none itself.
+    Webhook { registration: Vec<WebhookRegistration>, events: Vec<String>, delivery: DeliveryGuarantee },
+}
+/// Where a webhook is registered with the vendor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookRegistration {
+    /// By hand, in the vendor's dashboard.
+    Dashboard,
+    /// Through the vendor's API.
+    Api,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryGuarantee {
+    /// Each event arrives once or more.
+    AtLeastOnce,
+}
+/// One delivery from the vendor, as drydockd received it, for the module to read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct VendorDelivery {
+    /// The vendor's event name.
+    pub event: String,
+    pub delivery_id: String,
+    /// When the receiver got the delivery.
+    #[schema(format = DateTime)]
+    pub received_at: Timestamp,
+    /// The vendor's body, unchanged.
+    #[schema(value_type = Object)]
+    pub body: serde_json::Value,
+}
+/// What a delivery says of one environment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct VendorObservation {
+    pub id: String,
+    /// Absent when the delivery states no state drydock classes, such as a
+    /// creation that gives only the vendor's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Observation>,
+    pub vendor: VendorState,
+    /// When the vendor says the environment got there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime)]
+    pub timestamp: Option<Timestamp>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct RateLimit {
@@ -744,9 +821,9 @@ pub struct VendorState {
     /// The vendor's explanation of that state, when it gives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The vendor-side tags, as read back.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub tags: BTreeMap<String, String>,
+    /// The vendor-side tags, as read back; absent when they were not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<BTreeMap<String, String>>,
 }
 impl Environment {
     /// The observation without its evidence fields, for comparing states.
@@ -858,10 +935,22 @@ impl Reach {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Observation {
     Running,
-    Stopped { cause: StopCause },
-    Gone { cause: GoneCause },
-    Transitioning { phase: TransitionPhase },
-    Unknown { reason: UnknownReason },
+    /// `cause` is absent when the vendor does not say why.
+    Stopped {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StopCause>,
+    },
+    /// `cause` is absent when the vendor does not say why.
+    Gone {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<GoneCause>,
+    },
+    Transitioning {
+        phase: TransitionPhase,
+    },
+    Unknown {
+        reason: UnknownReason,
+    },
 }
 /// Generic phases describe progress, not billing transitions. The host retains
 /// its last stable billing observation until another stable observation arrives.
@@ -927,6 +1016,31 @@ pub struct Event {
     pub timestamp: Timestamp,
     pub timestamp_source: TimestampSource,
     pub event: EventKind,
+    /// The vendor's own state and reason for this transition, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<VendorState>,
+    /// How drydockd learnt of it. Absent on drydockd's own exposure events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed: Option<ObservedBy>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ObservedBy {
+    pub way: ObservedWay,
+    /// The vendor's delivery, for a webhook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_id: Option<String>,
+}
+/// A `poll` or `reconstruction` event compares two lists: transitions
+/// between them may be missed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedWay {
+    Webhook,
+    VendorLog,
+    LongPoll,
+    Poll,
+    /// A list made because events may have been lost.
+    Reconstruction,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -936,7 +1050,8 @@ pub enum EventKind {
         granted_size: Size,
     },
     Stopped {
-        cause: StopCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StopCause>,
     },
     /// Explicit pause transition, distinct from the more general stopped observation.
     Paused {
@@ -944,7 +1059,13 @@ pub enum EventKind {
     },
     Resumed,
     Gone {
-        cause: GoneCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<GoneCause>,
+    },
+    /// The vendor reports a state drydock classes as on the way to another,
+    /// such as stopping or destroying. Only events from the vendor carry it.
+    Transitioning {
+        phase: TransitionPhase,
     },
     /// Server only: an exposure was set or removed, or its `ready` changed.
     /// Live only: a replay from `since` does not repeat it, so read the
@@ -963,6 +1084,8 @@ pub enum EventKind {
 /// only for providers absent from `unavailable_providers`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Records are read one at a time off a stream; boxing the event buys nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum ObserveRecord {
     Event {
         event: Event,

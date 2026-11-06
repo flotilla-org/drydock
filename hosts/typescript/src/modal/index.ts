@@ -333,7 +333,7 @@ class Modal implements Provider {
       },
     ],
   };
-  observation: Types["ObservationMode"] = { mode: "poll", interval_ms: 30_000 };
+  waysIn: Types["WayIn"][] = [{ way: "poll", interval_ms: 30_000 }];
   rateLimits: Types["RateLimit"][] = [];
   private clients: Clients<ModalClient>;
   private apps = new WeakMap<ModalClient, Promise<App>>();

@@ -83,7 +83,7 @@ class Memory implements Provider {
       },
     ],
   };
-  observation: Types["ObservationMode"];
+  waysIn: Types["WayIn"][];
   rateLimits: Types["RateLimit"][] = [];
   private builds = new Map<string, Types["Prepared"]>();
   private rows = new Map<string, Types["Environment"]>();
@@ -92,7 +92,7 @@ class Memory implements Provider {
     private name: string,
     settings: Record<string, unknown>,
   ) {
-    this.observation = { mode: "poll", interval_ms: 10 };
+    this.waysIn = [{ way: "poll", interval_ms: 10 }];
     if (settings.seed_unlabelled)
       this.rows.set("unlabelled", {
         provider: name,

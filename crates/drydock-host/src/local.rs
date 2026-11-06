@@ -164,10 +164,10 @@ impl Local {
         let state = if running(&dir, &self.socket(id)).await {
             Observation::Running
         } else if dir.join(SUSPENDED).exists() {
-            Observation::Stopped { cause: StopCause::SuspendedByRequest }
+            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
         } else {
             // The agent is gone and nobody asked: reported, not restarted.
-            Observation::Stopped { cause: StopCause::GuestHalted }
+            Observation::Stopped { cause: Some(StopCause::GuestHalted) }
         };
         Environment {
             id: id.to_owned(),
@@ -481,8 +481,8 @@ impl Provider for Local {
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
         }
     }
-    fn observation(&self) -> ObservationMode {
-        ObservationMode::Poll { interval_ms: 1000 }
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: 1000 }]
     }
     fn readiness(&self, _: &Credentials) -> Readiness {
         if !cfg!(target_os = "linux") {

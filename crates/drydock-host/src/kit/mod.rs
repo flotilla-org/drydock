@@ -162,7 +162,7 @@ pub const fn stopping() -> Observation {
     Observation::Transitioning { phase: TransitionPhase::Stopping }
 }
 pub const fn stopped(cause: StopCause) -> Observation {
-    Observation::Stopped { cause }
+    Observation::Stopped { cause: Some(cause) }
 }
 
 /// Whether a resource's tags name this instance, and the label they hold.

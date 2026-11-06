@@ -261,7 +261,7 @@ async fn suspend_stops_the_agent_and_resume_restarts_it() {
     assert_eq!(suspend.suspend(&environment.id, &credentials()).await.unwrap(), token);
     assert_eq!(
         p.inspect(&environment.id, &credentials()).await.unwrap().state,
-        Observation::Stopped { cause: StopCause::SuspendedByRequest }
+        Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
     );
     assert!(!alive(before));
     assert!(matches!(hello(&*p, &environment.id).await, Err(ProtocolError::Unavailable { .. })));
@@ -553,8 +553,11 @@ async fn a_dead_agent_is_reported_stopped_and_restarted_on_resume() {
     unsafe { libc::kill(-pid(&root, &environment.id), libc::SIGKILL) };
     eventually("the agent died", || !alive(pid(&root, &environment.id))).await;
 
-    assert_eq!(p.inspect(&environment.id, &credentials()).await.unwrap().state, Observation::Stopped { cause: StopCause::GuestHalted });
-    assert_eq!(p.list(&credentials()).await.unwrap()[0].state, Observation::Stopped { cause: StopCause::GuestHalted });
+    assert_eq!(
+        p.inspect(&environment.id, &credentials()).await.unwrap().state,
+        Observation::Stopped { cause: Some(StopCause::GuestHalted) }
+    );
+    assert_eq!(p.list(&credentials()).await.unwrap()[0].state, Observation::Stopped { cause: Some(StopCause::GuestHalted) });
     let token = ResumeToken { token: Secret::new(format!("local:{}", environment.id)) };
     suspend.resume(&environment.id, token, &credentials()).await.unwrap();
     assert_eq!(p.inspect(&environment.id, &credentials()).await.unwrap().state, Observation::Running);
@@ -730,7 +733,8 @@ async fn suspending_never_looks_like_a_crash() {
     });
     token.unwrap();
     assert!(
-        seen.iter().all(|state| matches!(state, Observation::Running | Observation::Stopped { cause: StopCause::SuspendedByRequest })),
+        seen.iter()
+            .all(|state| matches!(state, Observation::Running | Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) })),
         "{seen:?}"
     );
 }
