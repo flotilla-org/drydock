@@ -1008,6 +1008,33 @@ mod tests {
             assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{refused}");
         }
     }
+    // The webhook way in, and the port that reads it, need the project id:
+    // without it no delivery could be told from another project's.
+    #[tokio::test]
+    async fn webhooks_need_the_project_id() {
+        let webhook = |p: &Arc<dyn Provider>| p.ways_in().iter().any(|w| matches!(w, WayIn::Webhook { .. }));
+        let without = configure(serde_json::json!({}), Arc::default()).await.unwrap();
+        assert!(!webhook(&without) && without.operations().events.is_none());
+        let with = configure(serde_json::json!({"project_id": "project_1"}), Arc::default()).await.unwrap();
+        assert!(webhook(&with) && with.operations().events.is_some());
+    }
+    // An event the module does not read says nothing; a sandbox event whose
+    // body is not Tensorlake's envelope is refused, and drydockd skips it.
+    #[tokio::test]
+    async fn events_outside_the_sandbox_envelope() {
+        let provider = configure(serde_json::json!({"project_id": "project_1"}), Arc::default()).await.unwrap();
+        let events = provider.operations().events.unwrap();
+        let delivery = |event: &str, body: serde_json::Value| VendorDelivery {
+            event: event.into(),
+            delivery_id: "evt_1".into(),
+            received_at: "2026-11-06T17:07:15Z".parse().unwrap(),
+            body,
+        };
+        let other = events.event(delivery("tensorlake.application.created", serde_json::json!({"project_id": "project_1"}))).await;
+        assert_eq!(other.unwrap(), vec![]);
+        let malformed = events.event(delivery("tensorlake.sandbox.running", serde_json::json!({"project_id": "project_1"}))).await;
+        assert!(matches!(malformed, Err(ProtocolError::Refused { .. })), "{malformed:?}");
+    }
     // Provision is one create, answered with what Tensorlake's answer states;
     // a name Tensorlake already holds is refused in its words.
     #[tokio::test]
