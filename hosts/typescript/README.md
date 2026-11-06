@@ -115,8 +115,9 @@ wait`, `ingress access` and `containerregistry *`,
   and never `ephemeral`. PID 1 is Namespace's agent and the image's entrypoint
   never runs, so the create is followed by drydock's agent as the service
   `drydock-agent` (`/opt/drydock/drydock-agent`, on boot, always restarted,
-  keeping the devbox awake); if the service cannot be added the devbox is
-  deleted and provision fails. A label is the client's name: provisioning it
+  keeping the devbox awake); if the service cannot be added provision fails
+  and leaves the devbox, naming its id, for the client to inspect or destroy.
+  It keeps billing until destroyed, and a retry makes another devbox. A label is the client's name: provisioning it
   again makes another devbox. An unknown prepared form is Namespace's refusal.
 - Reach is this host's relay route, with no call to Namespace; the relay is an
   SSH exec channel over the SDK's gateway running `drydock-agent --bridge`,
