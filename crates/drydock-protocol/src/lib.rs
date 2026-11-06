@@ -1048,8 +1048,11 @@ pub enum ObservedWay {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
     Created,
+    /// The environment became running, or its granted size changed while
+    /// running. The size is the vendor's, absent when it states none.
     Running {
-        granted_size: Size,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_size: Option<Size>,
     },
     Stopped {
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3038,13 +3038,20 @@
           },
           {
             "type": "object",
+            "description": "The environment became running, or its granted size changed while\nrunning. The size is the vendor's, absent when it states none.",
             "required": [
-              "granted_size",
               "kind"
             ],
             "properties": {
               "granted_size": {
-                "$ref": "#/components/schemas/Size"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Size"
+                  }
+                ]
               },
               "kind": {
                 "type": "string",

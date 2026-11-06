@@ -143,9 +143,8 @@ pub trait Provider: Send + Sync {
     /// See ci/tools-image/README.md for the full prepare/start outcome contract.
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
-    /// Running observations must include granted_size to emit a billing Running
-    /// event, whose protocol payload requires that size. Without it, inventory is
-    /// still visible but no billable Running transition can be inferred.
+    /// A row becoming running emits a Running event carrying its granted_size
+    /// when stated; a row without one emits Running with no size.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>>;
     /// A failed guest probe still returns the environment, with egress_measured false.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment>;

@@ -976,6 +976,79 @@ async fn progress_retains_billing_baseline_and_inventory() {
     assert!(matches!(kinds[1], EventKind::Running { .. }));
 }
 
+// A row that becomes running emits Running even when the vendor states no
+// size; the event then carries none.
+#[tokio::test]
+async fn an_unsized_row_becoming_running_emits_running_without_a_size() {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    control.vendor.lock().unwrap().row = Some(Environment {
+        platform: None,
+        id: "unsized".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Running,
+        granted_size: None,
+        egress: Enforcement::Advisory,
+        egress_measured: false,
+        egress_policy: None,
+        timestamp: None,
+        vendor: None,
+    });
+    let mut kinds = vec![];
+    while kinds.len() < 2 {
+        if let ObserveRecord::Event { event } = events.next().await {
+            kinds.push(event.event);
+        }
+    }
+    assert_eq!(kinds, [EventKind::Created, EventKind::Running { granted_size: None }]);
+}
+
+// A running row emits Running again when its size changes between two stated
+// sizes; a size first stated on a running row is not a change.
+#[tokio::test]
+async fn a_running_row_emits_running_on_a_change_between_known_sizes() {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    let size = |cpus| Size { cpus, memory_bytes: 0, disk_bytes: 0 };
+    control.vendor.lock().unwrap().row = Some(Environment {
+        platform: None,
+        id: "resized".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Running,
+        granted_size: None,
+        egress: Enforcement::Advisory,
+        egress_measured: false,
+        egress_policy: None,
+        timestamp: None,
+        vendor: None,
+    });
+    let mut next = async || loop {
+        if let ObserveRecord::Event { event } = events.next().await {
+            break event.event;
+        }
+    };
+    assert_eq!(next().await, EventKind::Created);
+    assert_eq!(next().await, EventKind::Running { granted_size: None });
+    control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = Some(size(1.));
+    loop {
+        let ObserveRecord::Snapshot { environments, .. } = h.stream(None).await.next().await else { panic!("snapshot") };
+        if environments[0].granted_size == Some(size(1.)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = Some(size(2.));
+    assert_eq!(next().await, EventKind::Running { granted_size: Some(size(2.)) });
+}
+
 // Cheap polling retains explicit inspect's measured claim while running, and
 // clears it when stopped. No network probe is needed for each inventory sample.
 #[tokio::test]

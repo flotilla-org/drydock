@@ -55,6 +55,7 @@ fn tagged_wire_fixtures() {
     for event in [
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
+        json!({"kind":"running"}),
         json!({"kind":"stopped","cause":"guest_halted"}),
         json!({"kind":"paused","cause":"paused_by_provider"}),
         json!({"kind":"resumed"}),

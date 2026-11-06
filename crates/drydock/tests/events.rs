@@ -376,8 +376,8 @@ fn delivery(event: &Event) -> Option<&str> {
 // transitional ones included, each with Daytona's own state, its timestamp,
 // and the delivery it came in. The first update for a sandbox drydockd does
 // not know is its creation. Daytona's body gives no cause for a stop or a
-// destruction, and no labels or size, so the events claim none and drydockd
-// makes no row until a list.
+// destruction, and no labels or size, so the events claim none (its start
+// is Running with no size) and drydockd makes no row until a list.
 #[tokio::test]
 async fn transitions_arrive_as_events_with_the_vendor_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -397,13 +397,15 @@ async fn transitions_arrive_as_events_with_the_vendor_state() {
         kinds,
         [
             (EventKind::Created, "started", id(0)),
+            (EventKind::Running { granted_size: None }, "started", id(0)),
             (EventKind::Transitioning { phase: TransitionPhase::Stopping }, "stopping", id(1)),
             (EventKind::Stopped { cause: None }, "stopped", id(2)),
             (EventKind::Transitioning { phase: TransitionPhase::Destroying }, "destroying", id(3)),
             (EventKind::Gone { cause: None }, "destroyed", id(4)),
         ]
     );
-    for (event, frame) in events.iter().zip(&frames) {
+    for event in &events {
+        let frame = frames.iter().find(|f| f["delivery_id"].as_str() == delivery(event)).unwrap();
         assert_eq!(event.observed.as_ref().unwrap().way, ObservedWay::Webhook);
         assert_eq!(event.timestamp_source, TimestampSource::Provider);
         assert_eq!(event.timestamp, frame["body"]["updatedAt"].as_str().unwrap().parse().unwrap());
@@ -600,7 +602,7 @@ async fn deliveries_before_a_provision_returns_count_once_it_does() {
         [
             (EventKind::Created, id(0)),
             (EventKind::Transitioning { phase: TransitionPhase::Preparing }, id(0)),
-            (EventKind::Running { granted_size: size }, id(2)),
+            (EventKind::Running { granted_size: Some(size) }, id(2)),
         ]
     );
     assert!(events.iter().all(|e| e.label.as_deref() == Some("vessel")));
