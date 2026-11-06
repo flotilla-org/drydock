@@ -76,7 +76,7 @@ Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Run
 
 ## Tensorlake (`tensorlake`, Rust host)
 
-Credential: a project API key (`tl_apiKey_…`), as a plain token file. Usage also needs `organization_id` in the settings; without it the provider declares no usage.
+Credential: a project API key (`tl_apiKey_…`), as a plain token file. Usage also needs `organization_id` in the settings; without it the provider declares no usage. Reading Tensorlake's webhooks needs `project_id`, the project's public id, which every delivery names.
 
 Create the key in the Tensorlake dashboard (project → API Keys). Use a project that holds only drydock's sandboxes. The key sees and controls every sandbox, snapshot and image in its project, and sandboxes carry no labels, so drydock finds its own by name (`dd-<instance>-…`).
 

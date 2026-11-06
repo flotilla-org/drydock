@@ -73,6 +73,10 @@ impl TensorlakeModule {
 struct Settings {
     #[serde(default)]
     organization_id: Option<String>,
+    /// The project whose webhooks the relay receives: a delivery for another
+    /// project says nothing drydock follows.
+    #[serde(default)]
+    project_id: Option<String>,
     #[serde(default = "api_url")]
     api_url: String,
     #[serde(default = "sandbox_domain")]
@@ -246,6 +250,7 @@ impl Module for TensorlakeModule {
             serde_json::from_value(serde_json::json!(config.settings)).map_err(|e| refused(format!("invalid Tensorlake settings: {e}")))?;
         let api = Api::new(TENSORLAKE, &settings.api_url, Auth::Bearer, http)?.classify(classify);
         if settings.organization_id.as_deref().is_some_and(str::is_empty)
+            || settings.project_id.as_deref().is_some_and(str::is_empty)
             || settings.max_cpus == 0
             || settings.max_memory < GIB
             || settings.poll_interval_ms == 0
