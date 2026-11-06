@@ -32,10 +32,17 @@ use tokio::sync::watch;
 const ORGANIZATION: &str = "9f88ac62-7a81-4056-8477-a477ab86f0f2";
 /// The first recorded run's sandbox: created, stopped, deleted.
 const SANDBOX: &str = "0b9b3414-e719-4784-b96d-bb7decdaba51";
+/// The second recording's sandbox: Daytona sends its `creating` update, then
+/// `sandbox.created`, while the create call is still answering.
+const CREATING: &str = "b285d7a4-f0d2-4325-9c15-7389b3b66d61";
 const TOKEN: &str = "consumer-token";
 
 fn recorded() -> Vec<Value> {
     serde_json::from_str(include_str!("fixtures/daytona-frames-2026-11-05.json")).unwrap()
+}
+/// Relay frames recorded on 2026-11-06, each with Daytona's body.
+fn created() -> Vec<Value> {
+    serde_json::from_str(include_str!("fixtures/daytona-frames-2026-11-06.json")).unwrap()
 }
 fn cursor(frame: &Value) -> u64 {
     frame["cursor"].as_u64().unwrap()
@@ -62,8 +69,11 @@ struct Relay {
 }
 impl Relay {
     async fn start() -> (Self, String) {
+        Self::serving(recorded()).await
+    }
+    async fn serving(frames: Vec<Value>) -> (Self, String) {
         let relay = Self {
-            frames: Arc::new(recorded()),
+            frames: Arc::new(frames),
             published: watch::channel(0).0,
             horizon: Arc::default(),
             connections: Arc::default(),
@@ -160,6 +170,11 @@ impl Relay {
 struct Vendor {
     rows: Mutex<Vec<Environment>>,
     lists: AtomicUsize,
+    /// The id a provision answers with, when not the first recording's.
+    made: Mutex<Option<String>>,
+    /// While set, a provision waits for `release` before answering.
+    held: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
 }
 /// Daytona's own module reads the deliveries and declares Daytona's ways in;
 /// everything that would call Daytona answers from the vendor stand-in.
@@ -218,8 +233,13 @@ impl Provider for RecordedProvider {
     }
     /// Daytona answers a create while the sandbox is still being made.
     async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ModuleResult<Provisioned> {
+        if self.vendor.held.load(SeqCst) {
+            self.vendor.release.notified().await;
+        }
         let preparing = Observation::Transitioning { phase: TransitionPhase::Preparing };
-        Ok(Provisioned::Created(sandbox(&self.name, preparing, "creating")))
+        let mut made = sandbox(&self.name, preparing, "creating");
+        made.id = self.vendor.made.lock().unwrap().clone().unwrap_or(made.id);
+        Ok(Provisioned::Created(made))
     }
     async fn list(&self, _: &Credentials) -> ModuleResult<Vec<Environment>> {
         self.vendor.lists.fetch_add(1, SeqCst);
@@ -309,13 +329,32 @@ async fn held(daemon: &Daemon) -> Option<Environment> {
         other => panic!("{other:?}"),
     }
 }
-/// Events about the recorded sandbox, until `until` holds of one.
+/// A provision of the `vessel` label, answered once the settling wait ends.
+fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned, drydock::client::Error>> {
+    let prepared = Prepared {
+        provider: "daytona".into(),
+        id: "snapshot".into(),
+        platform: Platform::new("linux", "amd64"),
+        image_digest: "image".into(),
+        tools_digest: "tools".into(),
+    };
+    let request = ProvisionRequest {
+        label: "vessel".into(),
+        prepared,
+        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 },
+        egress: EgressRequest::Open,
+        ssh_public_key: Some("ssh-ed25519 AAAA".into()),
+    };
+    let daemon = daemon.clone();
+    tokio::spawn(async move { ProviderApi::provision(&*daemon, "daytona", &request).await })
+}
+/// Events about the recorded sandboxes, until `until` holds of one.
 async fn events(stream: &mut drydock::api::ObservationStream, until: impl Fn(&Event) -> bool) -> Vec<Event> {
     let mut events = vec![];
     tokio::time::timeout(Duration::from_secs(20), async {
         while let Some(record) = stream.next().await {
             if let ObserveRecord::Event { event } = record.unwrap()
-                && event.id == SANDBOX
+                && [SANDBOX, CREATING].contains(&event.id.as_str())
             {
                 let done = until(&event);
                 events.push(event);
@@ -494,6 +533,80 @@ async fn a_gap_yields_a_marked_reconstruction() {
     assert_eq!(relay.connections.lock().unwrap().last().unwrap().0, cursor(&frames[0]));
 }
 
+// `sandbox.created` is a sandbox's creation: it states Daytona's own state
+// (`unknown`) and when the sandbox was made, and nothing drydock classes.
+#[tokio::test]
+async fn a_created_delivery_is_the_sandbox_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendor = Arc::new(Vendor::default());
+    host(dir.path(), &vendor).await;
+    let frames = created();
+    let (relay, url) = Relay::serving(frames.clone()).await;
+    // drydockd had read the stream up to the `creating` update.
+    let events_dir = dir.path().join("run/events");
+    std::fs::create_dir_all(&events_dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for d in [dir.path().join("run"), events_dir.clone()] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(events_dir.join("daytona.cursor"), cursor(&frames[0]).to_string()).unwrap();
+    relay.publish(3);
+    relay.hold.send_replace(true);
+    let daemon = drydockd(dir.path(), &url, "owned_account").await;
+    let mut stream = subscribe(&daemon).await;
+    relay.hold.send_replace(false);
+    let events = events(&mut stream, |e| e.event == EventKind::Created).await;
+    let created = events.last().unwrap();
+    assert_eq!(delivery(created), frames[1]["delivery_id"].as_str());
+    assert_eq!(created.id, CREATING);
+    assert_eq!((created.vendor.as_ref().unwrap().state.as_str(), created.label.as_ref()), ("unknown", None));
+    assert_eq!(created.timestamp, frames[1]["body"]["createdAt"].as_str().unwrap().parse().unwrap());
+}
+
+// On a shared account, what Daytona sends of a sandbox before the create call
+// answers counts once this instance's provision returns its id, in order: its
+// `creating` update is its creation. The older `sandbox.created` adds nothing.
+#[tokio::test]
+async fn deliveries_before_a_provision_returns_count_once_it_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let vendor = Arc::new(Vendor::default());
+    *vendor.made.lock().unwrap() = Some(CREATING.into());
+    vendor.held.store(true, SeqCst);
+    host(dir.path(), &vendor).await;
+    let frames = created();
+    let (relay, url) = Relay::serving(frames.clone()).await;
+    let daemon = drydockd(dir.path(), &url, "shared_account").await;
+    caught_up(&relay, dir.path()).await;
+    let mut stream = subscribe(&daemon).await;
+    let provision = provision(&daemon);
+    relay.publish(2);
+    let cursor_file = dir.path().join("run/events/daytona.cursor");
+    let taken = cursor(&frames[1]).to_string();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while std::fs::read_to_string(&cursor_file).unwrap() != taken {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    vendor.release.notify_one();
+    relay.publish(3);
+    let events = events(&mut stream, |e| matches!(e.event, EventKind::Running { .. })).await;
+    let kinds: Vec<_> = events.iter().map(|e| (e.event.clone(), delivery(e))).collect();
+    let id = |i: usize| frames[i]["delivery_id"].as_str();
+    let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 };
+    assert_eq!(
+        kinds,
+        [
+            (EventKind::Created, id(0)),
+            (EventKind::Transitioning { phase: TransitionPhase::Preparing }, id(0)),
+            (EventKind::Running { granted_size: size }, id(2)),
+        ]
+    );
+    assert!(events.iter().all(|e| e.label.as_deref() == Some("vessel")));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(20), provision).await.unwrap().unwrap().unwrap().into_inner().id, CREATING);
+}
+
 // A provision that settles completes when Daytona's own event says the
 // sandbox started, without asking the vendor's list: drydockd hears of the
 // change through the relay.
@@ -507,24 +620,7 @@ async fn a_wait_completes_on_a_webhook_event_without_a_poll() {
     let daemon = drydockd(dir.path(), &url, "shared_account").await;
     caught_up(&relay, dir.path()).await;
     let lists = vendor.lists.load(SeqCst);
-    let prepared = Prepared {
-        provider: "daytona".into(),
-        id: "snapshot".into(),
-        platform: Platform::new("linux", "amd64"),
-        image_digest: "image".into(),
-        tools_digest: "tools".into(),
-    };
-    let request = ProvisionRequest {
-        label: "vessel".into(),
-        prepared,
-        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 },
-        egress: EgressRequest::Open,
-        ssh_public_key: Some("ssh-ed25519 AAAA".into()),
-    };
-    let provision = tokio::spawn({
-        let daemon = daemon.clone();
-        async move { ProviderApi::provision(&*daemon, "daytona", &request).await }
-    });
+    let provision = provision(&daemon);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!provision.is_finished(), "provision answered before the sandbox started");
     relay.publish(1);

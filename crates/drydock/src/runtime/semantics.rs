@@ -23,6 +23,8 @@ pub(super) struct Observed {
     pub(super) polls: watch::Sender<Option<ProtocolError>>,
     /// Asks the observer to poll now rather than at its next interval.
     pub(super) poll_now: Notify,
+    /// Tells the observer this instance's provision returned an id.
+    pub(super) claimed_now: Notify,
     /// What this instance provisioned and no list has shown yet: its first
     /// vendor event starts from this row, and it is this instance's own.
     pub(super) claimed: Mutex<BTreeMap<String, Environment>>,
@@ -35,6 +37,7 @@ impl Observed {
             pushed,
             polls: watch::channel(None).0,
             poll_now: Notify::new(),
+            claimed_now: Notify::new(),
             claimed: Mutex::default(),
         })
     }
@@ -197,6 +200,7 @@ impl Provider for Added {
         match self.inner.provision(r, c).await? {
             Provisioned::Created(e) => {
                 self.observed.claimed.recover().insert(e.id.clone(), e.clone());
+                self.observed.claimed_now.notify_one();
                 Ok(Provisioned::Created(if self.settle { self.running(&e.id).await? } else { e }))
             }
             provisioned => Ok(provisioned),

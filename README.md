@@ -720,9 +720,10 @@ The values shown are the defaults.
 
 A module declares its `ways_in`: how drydockd can hear of a change. Every
 module has `poll` (list at an interval); Daytona also declares `webhook`, its
-`sandbox.state.updated` deliveries. The installation chooses: an instance
-reads its vendor's webhooks from a [webhook relay](https://github.com/flotilla-org/rigging)
-stream when given one:
+`sandbox.created` and `sandbox.state.updated` deliveries. The installation
+chooses: an instance reads its vendor's webhooks from a
+[webhook relay](https://github.com/flotilla-org/flotilla.work) stream when
+given one:
 
 ```toml
 [providers.daytona.events]
@@ -744,10 +745,11 @@ Transitional states arrive as `transitioning` events. drydockd stores the
 relay cursor under its run directory (`events/<instance>.cursor`) and resumes
 from it after a restart. With no stored cursor, or when the relay reports a
 `gap` (deliveries lost to its retention), drydockd lists the provider and
-marks what changed as a `reconstruction`. Daytona sends no
-`sandbox.created`: the first update for an unknown id is its creation. On a
-`shared_account` an update for an id this instance neither listed nor made is
-ignored. Several drydockd instances reading one account's events are not
+marks what changed as a `reconstruction`. The first delivery for an id
+drydockd does not hold is its creation; `sandbox.created` states no drydock
+state, only Daytona's own (`unknown`). On a `shared_account` deliveries for an
+id this instance neither listed nor made are held until its own provision
+returns that id, then applied in order; the next list drops any still held. Several drydockd instances reading one account's events are not
 designed for. Without `events`, observation is polling alone, as before.
 
 A label is the client's name for what it made, not a handle: drydockd does

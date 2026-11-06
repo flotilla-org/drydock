@@ -337,39 +337,53 @@ fn observe(state: &str, spot_evicted: bool) -> Observation {
         (state, _) => kit::observe(STATES, state),
     }
 }
+const CREATED: &str = "sandbox.created";
 const STATE_UPDATED: &str = "sandbox.state.updated";
-/// A `sandbox.state.updated` body, as recorded from Daytona on 2026-11-05.
+/// The bodies of `sandbox.created` and `sandbox.state.updated`, as recorded
+/// from Daytona on 2026-11-05 and 2026-11-06, only the fields read.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StateUpdated {
+struct Delivered {
     id: Text,
-    new_state: Text,
     organization_id: String,
+    /// The state a created sandbox starts in.
+    state: Option<Text>,
+    new_state: Option<Text>,
+    created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     timestamp: Option<DateTime<Utc>>,
 }
-/// A state update is the sandbox in its new state; any other event, or one
-/// for another organization, says nothing drydock follows. The body gives no
-/// cause for a stop or a destruction, and no labels.
+/// A creation states the sandbox and Daytona's own state for it, which
+/// drydock does not class; an update states the sandbox in its new state.
+/// Neither gives a cause for a stop or a destruction, nor labels. Any other
+/// event, or one for another organization, says nothing drydock follows.
 #[async_trait]
 impl VendorEvents for Daytona {
     async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
-        if delivery.event != STATE_UPDATED {
+        let event = delivery.event.as_str();
+        if event != CREATED && event != STATE_UPDATED {
             return Ok(vec![]);
         }
-        let v: StateUpdated = serde_json::from_value(delivery.body).map_err(|e| refused(format!("Daytona {STATE_UPDATED} body: {e}")))?;
+        let v: Delivered = serde_json::from_value(delivery.body).map_err(|e| refused(format!("Daytona {event} body: {e}")))?;
         if v.organization_id != self.settings.organization_id {
             return Ok(vec![]);
         }
-        Ok(vec![VendorObservation {
-            id: v.id.to_string(),
-            state: match observe(&v.new_state, false) {
+        let (vendor, state, timestamp) = if event == CREATED {
+            (v.state, None, v.created_at)
+        } else {
+            let state = v.new_state.as_deref().map(|s| match observe(s, false) {
                 Observation::Stopped { .. } => Observation::Stopped { cause: None },
                 Observation::Gone { .. } => Observation::Gone { cause: None },
                 state => state,
-            },
-            vendor: VendorState { state: v.new_state.into(), reason: None, tags: None },
-            timestamp: v.updated_at.or(v.timestamp).map(Into::into),
+            });
+            (v.new_state, state, v.updated_at.or(v.timestamp))
+        };
+        let vendor = vendor.ok_or_else(|| refused(format!("Daytona {event} body names no state")))?;
+        Ok(vec![VendorObservation {
+            id: v.id.to_string(),
+            state,
+            vendor: VendorState { state: vendor.into(), reason: None, tags: None },
+            timestamp: timestamp.map(Into::into),
         }])
     }
 }
@@ -500,15 +514,13 @@ impl Provider for Daytona {
             ..Capabilities::default()
         }
     }
-    /// Daytona's webhooks are registered in its dashboard, through Svix. It
-    /// sends no `sandbox.created` in practice: a sandbox's first state update
-    /// is its creation.
+    /// Daytona's webhooks are registered in its dashboard, through Svix.
     fn ways_in(&self) -> Vec<WayIn> {
         vec![
             WayIn::Poll { interval_ms: self.settings.poll_seconds.saturating_mul(1000) },
             WayIn::Webhook {
                 registration: WebhookRegistration::Dashboard,
-                events: vec![STATE_UPDATED.into()],
+                events: vec![CREATED.into(), STATE_UPDATED.into()],
                 delivery: DeliveryGuarantee::AtLeastOnce,
             },
         ]

@@ -913,7 +913,8 @@ impl Target<'_> {
                         running.as_ref().is_none_or(|event| stopped.cursor != event.cursor)
                             && matches!(
                                 stopped.event,
-                                EventKind::Stopped { cause: Some(StopCause::SuspendedByRequest) }
+                                // A vendor event may give no cause; a stated one must be the request.
+                                EventKind::Stopped { cause: None | Some(StopCause::SuspendedByRequest) }
                                     | EventKind::Paused { cause: StopCause::SuspendedByRequest }
                             ),
                         "stopped event has wrong cursor or cause",

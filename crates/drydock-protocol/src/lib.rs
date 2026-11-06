@@ -258,7 +258,10 @@ pub struct VendorDelivery {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct VendorObservation {
     pub id: String,
-    pub state: Observation,
+    /// Absent when the delivery states no state drydock classes, such as a
+    /// creation that gives only the vendor's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Observation>,
     pub vendor: VendorState,
     /// When the vendor says the environment got there.
     #[serde(default, skip_serializing_if = "Option::is_none")]

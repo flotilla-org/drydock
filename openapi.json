@@ -5336,7 +5336,6 @@
         "description": "What a delivery says of one environment.",
         "required": [
           "id",
-          "state",
           "vendor"
         ],
         "properties": {
@@ -5344,7 +5343,15 @@
             "type": "string"
           },
           "state": {
-            "$ref": "#/components/schemas/Observation"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Observation",
+                "description": "Absent when the delivery states no state drydock classes, such as a\ncreation that gives only the vendor's own."
+              }
+            ]
           },
           "timestamp": {
             "oneOf": [
