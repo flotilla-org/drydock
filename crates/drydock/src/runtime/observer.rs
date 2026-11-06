@@ -179,13 +179,14 @@ async fn deliver(
 /// One environment as the vendor reports it, with every transition it makes.
 fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, v: VendorObservation, observed: &ObservedBy) {
     let current = instance.observed.row(&v.id).or_else(|| seen.get(&v.id).cloned());
-    // Deliveries come at least once and in no promised order: one no newer
-    // than the row drydockd holds is a redelivery, or overtaken by a list.
-    let held = current.as_ref().and_then(|row| row.timestamp.as_ref());
-    if let (Some(held), Some(at)) = (held, &v.timestamp)
-        && at.instant() <= held.instant()
+    // Deliveries come at least once and in no promised order: one older than
+    // the row drydockd holds, or as old and in the same state, is overtaken
+    // by a list or a redelivery.
+    let held = current.as_ref().and_then(|row| Some((row.timestamp.as_ref()?, row.vendor.as_ref().map(|v| &v.state))));
+    if let (Some((held, state)), Some(at)) = (held, &v.timestamp)
+        && (at.instant() < held.instant() || at.instant() == held.instant() && state == Some(&v.vendor.state))
     {
-        tracing::debug!(provider = %instance.name, environment_id = %v.id, "vendor event no newer than what drydockd holds; skipped");
+        tracing::debug!(provider = %instance.name, environment_id = %v.id, "vendor event already held or overtaken; skipped");
         return;
     }
     let base = match current {
