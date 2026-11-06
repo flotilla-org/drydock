@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { createDevboxClient } from "@namespacelabs/sdk/devbox";
 import {
   AGENT,
   LABEL,
@@ -302,6 +303,23 @@ test("provision deletes the devbox when the agent service fails", async () => {
   await assert.rejects(provision("vessel"), kind("unavailable"));
   assert.equal(standIn.rows.size, 0);
   assert.equal(standIn.count("delete"), 1);
+  // A delete that fails too is named in the answer.
+  standIn.devboxes.delete = async () => {
+    throw new ConnectError("busy", Code.Unavailable);
+  };
+  await assert.rejects(provision("again"), (e: any) =>
+    /devbox devbox-\d+ was left behind: unavailable/.test(e.detail?.reason),
+  );
+});
+
+// The relay reaches the SDK's private connection manager; this pins the
+// shape of the real SDK client so an upgrade that moves it fails here.
+test("the SDK keeps its connections where the relay looks", () => {
+  const client = createDevboxClient({
+    tokenSource: { issueToken: async () => "t" },
+  });
+  assert.equal(typeof (client.devboxes as any).connections?.get, "function");
+  client.close();
 });
 
 // Sizes Namespace does not sell are refused before any call; a prepared form
@@ -411,8 +429,11 @@ test("list reports devboxes as Namespace states them", async () => {
       [ids[1], { state: "stopped" }, "stopped"],
       [ids[2], { state: "running" }, "running"],
     ];
-    if (ownership === "owned_account")
+    if (ownership === "owned_account") {
       expected.push([foreign.id, { state: "running" }, "running"]);
+      // A devbox drydock did not make is listed, with no label.
+      assert.ok(!("label" in rows.find((r) => r.id === foreign.id)!));
+    }
     assert.deepEqual(
       rows.map((r) => [r.id, r.state, r.vendor?.state]),
       expected,
