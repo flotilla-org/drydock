@@ -92,7 +92,7 @@ Sandboxes carry no labels or metadata, so the sandbox's name holds them: `dd-<di
 | Images: CAS build (`/images/v4/builds`) and lookup by name | prepare |
 | Sandbox proxy: files, processes, TCP tunnel | agent upload, exec, reach |
 
-- Sandboxes are created with `auto_resume` off: a relay or a command to a suspended sandbox fails with Tensorlake's answer instead of waking it.
+- Sandboxes are created with `auto_resume` off: a relay or a command to a suspended sandbox fails with Tensorlake's answer instead of waking it. Sandboxes made before drydock#287 have it on, and a relay or command still wakes them.
 - Tensorlake states no platform for a sandbox, and its rows give no time for their state, so rows carry neither. drydockd chooses the agent build from the module's only declared platform (`linux/amd64`).
 - The module declares no usage. Tensorlake's per-sandbox usage export is its source when usage is collected as each vendor gives it (drydock#257).
 - Prepare waits for an image build by reading its status every `build_poll_seconds` (default 3), up to `build_polls` times (default 150), then answers unavailable; Tensorlake offers no other way to learn a build finished. The agent upload may take `upload_seconds` (default 300).

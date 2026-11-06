@@ -225,7 +225,7 @@ impl Module for TensorlakeModule {
         let settings: Settings =
             serde_json::from_value(serde_json::json!(config.settings)).map_err(|e| refused(format!("invalid Tensorlake settings: {e}")))?;
         let api = Api::new(TENSORLAKE, &settings.api_url, Auth::Bearer, http)?.classify(classify);
-        if settings.project_id.as_deref().is_some_and(str::is_empty)
+        if settings.project_id.as_deref().is_some_and(|p| p.is_empty() || p.trim() != p)
             || settings.max_cpus == 0
             || settings.max_memory < GIB
             || [settings.poll_interval_ms, settings.build_poll_seconds, settings.upload_seconds].contains(&0)
@@ -234,7 +234,7 @@ impl Module for TensorlakeModule {
             || !settings.sandbox_domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         {
             return Err(refused(
-                "Tensorlake requires a sandbox_domain host name, a tunnel port, a nonempty project_id when set, and positive \
+                "Tensorlake requires a sandbox_domain host name, a tunnel port, a project_id without surrounding spaces when set, and positive \
                  max_cpus, max_memory, poll_interval_ms, build_poll_seconds, build_polls and upload_seconds",
             ));
         }
@@ -786,9 +786,12 @@ impl Provider for Tensorlake {
     }
     /// The delete, then the snapshot sweep: a Tensorlake sandbox leaves
     /// snapshots (one per suspend) that its delete does not remove and that
-    /// bill until deleted, so destroy needs this second call.
+    /// bill until deleted, so destroy needs this second call. A sandbox
+    /// Tensorlake no longer knows is not found, after the sweep: a retry
+    /// after a sweep that failed still finishes it.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await?;
+        let deleted = self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await;
+        let deleted = absent_on_not_found(deleted)?;
         locked(&self.tokens).remove(id);
         for snapshot in self.snapshots(id, c).await? {
             if snapshot.status.as_deref() == Some("deleting") {
@@ -800,7 +803,7 @@ impl Provider for Tensorlake {
                 self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["snapshots", &snapshot_id])?, Body::None, c).await,
             )?;
         }
-        Ok(())
+        deleted.map(drop).ok_or_else(|| ProtocolError::NotFound { reason: format!("Tensorlake has no sandbox {id}") })
     }
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
         Ok(Reach::relay(&self.name, id))
@@ -951,6 +954,104 @@ impl GuestFiles for Tensorlake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rigging_http_client::ChannelLabel;
+
+    /// Answers each request with the next scripted (status, body), keeping
+    /// each request's method and path.
+    #[derive(Default)]
+    struct Script {
+        answers: Mutex<Vec<(u16, &'static str)>>,
+        asked: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl HttpClient for Script {
+        async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+            locked(&self.asked).push((request.method().to_string(), request.url().path().to_owned()));
+            let (status, body) = {
+                let mut answers = locked(&self.answers);
+                assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
+                answers.remove(0)
+            };
+            Ok(http::Response::builder().status(status).body(Bytes::from_static(body.as_bytes())).unwrap())
+        }
+    }
+    fn script(answers: &[(u16, &'static str)]) -> Arc<Script> {
+        Arc::new(Script { answers: Mutex::new(answers.to_vec()), ..Script::default() })
+    }
+    async fn configure(settings: serde_json::Value, script: Arc<Script>) -> Result<Arc<dyn Provider>> {
+        let config = ProviderConfiguration {
+            module: "tensorlake".into(),
+            settings: serde_json::from_value(settings).unwrap(),
+            ..Default::default()
+        };
+        TensorlakeModule::with_dialer(Arc::new(TlsDialer::new().unwrap())).configure("lab", &config, script).await
+    }
+    fn credentials() -> Credentials {
+        Credentials::new(Some(Secret::new("tl_apiKey_test")))
+    }
+
+    // Every setting has a default; zeroes, a project id with spaces around
+    // it and keys the module no longer reads are refused.
+    #[tokio::test]
+    async fn settings_refuse_zeroes_and_unknown_keys() {
+        assert!(configure(serde_json::json!({}), Arc::default()).await.is_ok());
+        for refused in [
+            serde_json::json!({"project_id": ""}),
+            serde_json::json!({"project_id": " project_123"}),
+            serde_json::json!({"build_polls": 0}),
+            serde_json::json!({"build_poll_seconds": 0}),
+            serde_json::json!({"upload_seconds": 0}),
+            serde_json::json!({"poll_interval_ms": 0}),
+            serde_json::json!({"organization_id": "org"}),
+        ] {
+            let result = configure(refused.clone(), Arc::default()).await;
+            assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{refused}");
+        }
+    }
+    // Provision is one create, answered with what Tensorlake's answer states;
+    // a name Tensorlake already holds is refused in its words.
+    #[tokio::test]
+    async fn provision_is_one_create() {
+        let script = script(&[(202, r#"{"sandbox_id":"sbx1","name":"n","state":"pending"}"#), (409, "sandbox name already exists")]);
+        let provider = configure(serde_json::json!({}), script.clone()).await.unwrap();
+        let prepared = Prepared {
+            provider: "lab".into(),
+            id: image_name("image@sha256:aa", &platform()),
+            platform: platform(),
+            image_digest: "image@sha256:aa".into(),
+            tools_digest: "tools".into(),
+        };
+        let request = ProvisionRequest {
+            label: "crew-1".into(),
+            prepared,
+            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 10 * GIB },
+            egress: EgressRequest::Open,
+            ssh_public_key: None,
+        };
+        let made = provider.provision(request.clone(), &credentials()).await.unwrap().into_inner();
+        assert_eq!((made.id.as_str(), made.label.as_deref(), &made.state), ("sbx1", Some("crew-1"), &kit::starting()));
+        let vendor = made.vendor.unwrap();
+        assert_eq!((vendor.state.as_str(), vendor.tags), ("pending", tags("lab", &sandbox_name("lab", "crew-1"))));
+        let refused = provider.provision(request, &credentials()).await;
+        assert!(matches!(&refused, Err(ProtocolError::Refused { reason }) if reason.contains("already exists")), "{refused:?}");
+        assert_eq!(*locked(&script.asked), [("POST".into(), "/sandboxes".into()), ("POST".into(), "/sandboxes".into())]);
+    }
+    // Destroy deletes, then sweeps the snapshots the delete leaves. A retry
+    // once Tensorlake has forgotten the sandbox still sweeps, then answers not found.
+    #[tokio::test]
+    async fn destroy_sweeps_snapshots_even_when_the_sandbox_is_gone() {
+        let snapshots = r#"{"snapshots":[{"snapshot_id":"snap1","sandbox_id":"sbx1"},{"snapshot_id":"snap2","sandbox_id":"sbx1","status":"deleting"}]}"#;
+        let script = script(&[(200, ""), (200, snapshots), (200, "{}"), (404, "Sandbox not found"), (200, snapshots), (404, "gone")]);
+        let provider = configure(serde_json::json!({}), script.clone()).await.unwrap();
+        provider.destroy("sbx1", &credentials()).await.unwrap();
+        assert!(matches!(provider.destroy("sbx1", &credentials()).await, Err(ProtocolError::NotFound { .. })));
+        let sweep = [
+            ("DELETE".to_owned(), "/sandboxes/sbx1".to_owned()),
+            ("GET".into(), "/sandboxes/sbx1/snapshots".into()),
+            ("DELETE".into(), "/snapshots/snap1".into()),
+        ];
+        assert_eq!(*locked(&script.asked), [sweep.clone(), sweep].concat());
+    }
 
     // Output lines keep their stream; a signal is 128 plus its number, and an
     // exit status outside what a process can have is a bad response.
@@ -961,6 +1062,7 @@ mod tests {
         assert_eq!((output.stdout(), output.bytes(None), output.exit_code()), (b"out\n".to_vec(), b"out\nerr\n".to_vec(), 137));
         assert!(guest_output(b"data: {\"exit_code\":4294967296}\n").is_err());
         assert!(guest_output(b"data: {\"signal\":-1}\n").is_err());
+        assert!(guest_output(b"data: {\"signal\":0}\n").is_err());
     }
     // A name this instance made carries its owner tag and the label it holds,
     // even one only a digest keeps; another instance's names carry none.
