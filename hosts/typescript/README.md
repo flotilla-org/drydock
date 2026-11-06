@@ -144,7 +144,9 @@ The built-in `modal` module drives Modal sandboxes through the JavaScript SDK
 (`modal`, gRPC to `api.modal.com`; `src/modal/`). Settings: `app` (default
 `drydock`: the one app holding every sandbox of the instance, created if
 missing), `environment`, `runtime` (`vm`, the default, or `gvisor`),
-and `concurrency_limit`. The credential is
+`lifetime_seconds` (Modal's timeout for each sandbox; default 86400, Modal's
+longest), `list_concurrency` (tag reads list runs at once; default 8) and
+`agent_wait_seconds` (how long the agent's socket is waited for; default 10). The credential is
 `{"token_id": …, "token_secret": …}`, handed to the SDK client directly, never
 through `~/.modal.toml` or `MODAL_TOKEN_*`; the SDK still reads its server URL
 and sandbox backend from those, so run the host without them.
@@ -157,24 +159,33 @@ and sandbox backend from those, so run the host without them.
   must pull anonymously. A registry that resolves here to a private address is
   refused before building, since Modal pulls only from the public internet;
   that is a best-effort check, as Modal resolves the name again itself.
-- Provision creates a sandbox named from the label (unique per app), tagged
-  with the instance, the label, its egress policy, size and expiry, with a
-  timeout of 86400 s (Modal's longest), CPUs and whole MiB of memory, and
+- The module translates: each verb is Modal's own operation, and each row is
+  what Modal said. It declares `settles`, `idempotent` and `owner_scoped`
+  false, so drydockd waits, makes lifecycle calls idempotent and scopes a
+  shared account to the instance (`semantics.rs`), as the instance's options
+  and `ownership` ask.
+- Provision is one create of an unnamed sandbox, tagged `flotilla.label` with
+  the client's label and, on a `shared_account` (the default), `drydock.provider`
+  with the instance; on an `owned_account` nothing else is tagged. A label is
+  the client's, so provisioning it twice makes two sandboxes. The sandbox has a
+  timeout of `lifetime_seconds`, CPUs and whole MiB of memory, and
   `sleep infinity` as its command, which only keeps it alive. Modal's disk is
-  fixed and cannot be sized, so a requested disk is accepted and not applied,
-  and the granted disk is reported as 0. A label whose name is taken
-  re-adopts that sandbox when its tags say it is this instance's, with the
-  same size and policy, and refuses it otherwise.
-  Either way the module then starts the agent by a root exec that gets a
+  fixed and cannot be sized, so a requested disk is accepted and not applied.
+  Modal answers a create with the sandbox's id alone, so the row's state is
+  unknown. A refused create is refused in Modal's words.
+  The module then starts the agent by a root exec that gets a
   fresh TCP token on stdin: it keeps the token already in
   `/run/drydock/tcp.token` (0600) or writes this one, runs
   `--supervise --tcp 0.0.0.0:7811 --tcp-token-file … --socket …`
-  (idempotent; all addresses, since Modal's edge cannot reach loopback), waits for the socket and prints the token in use, which the
+  (idempotent; all addresses, since Modal's edge cannot reach loopback), waits up
+  to `agent_wait_seconds` for the socket and prints the token in use, which the
   module remembers. The token is never on an argv, in the environment or in
-  Modal's configuration. A sandbox it just created and cannot hand over is
-  terminated (if that terminate fails too, the sandbox stays listed: `destroy`
-  it). The SDK takes no abort signal, so a cancelled call stops between SDK
-  calls, never during one.
+  Modal's configuration. drydockd cannot start the agent itself: its upload
+  bootstrap needs the files and exec ports this host does not offer, and
+  listens on loopback. A sandbox whose agent does not start is left as it is:
+  provision fails, and the sandbox stays listed under its label until it is
+  destroyed. The SDK takes no abort signal, so a cancelled call stops between
+  SDK calls, never during one.
 - Reach is `dial`: the agent's TCP listener behind Modal's connect-token edge,
   which drydock dials itself. Each reach mints a connect token for port 7811
   and returns its URL at `/v1/connect` with the token in the
@@ -183,8 +194,9 @@ and sandbox backend from those, so run the host without them.
   splices, and both ends carry raw bytes after the agent's 101. TLS ends at
   the edge, so Modal sees both tokens and the agent's traffic in transit. A host that lost
   the token (a restart) reads it back by the same exec. Exec carries no agent
-  traffic: each stdin write is one round trip, too slow for agent uploads. A
-  reach to a terminated sandbox is refused, not retried.
+  traffic: each stdin write is one round trip, too slow for agent uploads.
+  Modal states no lifetime for a connect token, so the reach has no
+  `expires_at`.
 - Egress: open sets nothing; deny all is an empty CIDR allowlist (Modal
   refuses a connect token to a sandbox with `blockNetwork`); IPv4 CIDRs and
   literals become the CIDR allowlist and names the domain allowlist; ports and
@@ -193,16 +205,24 @@ and sandbox backend from those, so run the host without them.
   at TLS or HTTP). The egress model declares that (`outside_guest`, shapes
   open, deny all, addresses and domains, the allowlists changeable while
   running) with DNS as a side effect: resolution is never filtered. The
-  module measures nothing, so each vessel reports egress advisory.
-- There is no suspend: snapshots restore under a new id. A sandbox that
-  reached its timeout reads as gone at its lifetime cap; one terminated
-  elsewhere as destroyed at the provider.
-- List is the app's running sandboxes tagged with the instance (Modal lists no
-  terminated ones); inspect and destroy find a sandbox by id, and refuse one
-  without the instance's tag. Destroy terminates and waits; an absent sandbox
-  is already destroyed.
-- Quota is the count of listed sandboxes against `concurrency_limit`; Modal has
-  no quota API. Usage is undeclared: the JavaScript SDK has no billing report.
+  module measures nothing, so each vessel reports egress advisory, and Modal
+  reports no policy back, so a row has no `egress_policy`.
+- There is no suspend: snapshots restore under a new id.
+- Rows report what Modal states. Inspect is Modal's `poll()` and the sandbox's
+  tags (Modal has no one read of both): null is `running`, and an exit code is
+  `gone` with no cause, the code in `vendor.reason` (`exit code 137`); the
+  module does not guess whether Modal's timeout, a terminate or the guest ended
+  it. The vendor state is `running` or `finished`, Modal's SDK words, with the
+  tags as read. No row states a size, platform or time: Modal's SDK gives none.
+- List is the app's running sandboxes (Modal lists no ended ones), filtered by
+  the instance's tag on a shared account only, then each one's tags,
+  `list_concurrency` at a time: the SDK's list yields ids alone. Its wire
+  answer has a tags field that no Modal client reads, so the module does not
+  rely on it. A sandbox gone between the two calls is left out.
+- Inspect, reach and destroy take a sandbox by id and check no tag. Destroy is
+  one terminate that does not wait; Modal's not found is its answer.
+- Quota is undeclared: Modal has no quota API. Usage is undeclared: the
+  JavaScript SDK has no billing report.
 - A role lacking a right is a refusal; only an unauthenticated token is a
   rejected credential. One SDK client is kept per credential; one a newer
   credential replaced closes once its last call ends.
