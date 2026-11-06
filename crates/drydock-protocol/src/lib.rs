@@ -1049,7 +1049,9 @@ pub enum ObservedWay {
 pub enum EventKind {
     Created,
     /// The environment became running, or its granted size changed while
-    /// running. The size is the vendor's, absent when it states none.
+    /// running. The size is the vendor's, absent when it states none. A size
+    /// first stated on a running row is not a change and emits nothing, so a
+    /// consumer reads the current size from the row, not from this event.
     Running {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         granted_size: Option<Size>,

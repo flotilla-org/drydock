@@ -3038,7 +3038,7 @@
           },
           {
             "type": "object",
-            "description": "The environment became running, or its granted size changed while\nrunning. The size is the vendor's, absent when it states none.",
+            "description": "The environment became running, or its granted size changed while\nrunning. The size is the vendor's, absent when it states none. A size\nfirst stated on a running row is not a change and emits nothing, so a\nconsumer reads the current size from the row, not from this event.",
             "required": [
               "kind"
             ],

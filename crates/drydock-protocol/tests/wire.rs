@@ -33,6 +33,8 @@ fn tagged_wire_fixtures() {
     // An expiry the vendor does not state is left off the wire, not sent as null.
     let unstated = Reach::Dial { url: "wss://h".into(), token: Secret::new("secret"), headers: Default::default(), expires_at: None };
     assert!(serde_json::to_value(&unstated).unwrap().get("expires_at").is_none());
+    // So is a size the vendor does not state on a running event.
+    assert_eq!(serde_json::to_value(EventKind::Running { granted_size: None }).unwrap(), json!({"kind":"running"}));
     // A host that says nothing about reverse forwards does not accept them.
     let reach: Reach = serde_json::from_value(json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"})).unwrap();
     assert!(matches!(reach, Reach::Ssh { reverse_forwards: false, .. }));

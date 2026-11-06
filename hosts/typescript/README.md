@@ -189,7 +189,8 @@ and sandbox backend from those, so run the host without them.
   bootstrap needs the files and exec ports this host does not offer, and
   listens on loopback. A sandbox whose agent does not start is left as it is:
   provision fails, and the sandbox stays listed under its label until it is
-  destroyed. The SDK takes no abort signal, so a cancelled call stops between
+  destroyed. Until then it runs, and is billed, for up to `lifetime_seconds`
+  (default 24 hours), the only bound until drydock#292. The SDK takes no abort signal, so a cancelled call stops between
   SDK calls, never during one.
 - Reach is `dial`: the agent's TCP listener behind Modal's connect-token edge,
   which drydock dials itself. Each reach mints a connect token for port 7811
