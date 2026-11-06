@@ -800,7 +800,8 @@ impl Provider for E2b {
 
 /// E2B's lifecycle events, each with the drydock state its type names, if any.
 /// A pause or a kill states no cause; an update or a checkpoint states no state.
-const LIFECYCLE: [(&str, Option<Observation>); 6] = [
+/// The 2026-11-06 recording has no update or checkpoint, so neither is tested.
+const LIFECYCLE: &[(&str, Option<Observation>)] = &[
     ("sandbox.lifecycle.created", Some(Observation::Running)),
     ("sandbox.lifecycle.updated", None),
     ("sandbox.lifecycle.paused", Some(Observation::Stopped { cause: None })),
@@ -813,7 +814,6 @@ const LIFECYCLE: [(&str, Option<Observation>); 6] = [
 #[derive(Deserialize)]
 struct Lifecycle {
     sandbox_id: Text,
-    sandbox_team_id: String,
     timestamp: Option<DateTime<Utc>>,
     #[serde(default)]
     event_data: LifecycleData,
@@ -831,11 +831,12 @@ struct LifecycleData {
 impl VendorEvents for E2b {
     async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
         let Some((_, state)) = LIFECYCLE.iter().find(|(event, _)| *event == delivery.event) else { return Ok(vec![]) };
-        let event = delivery.event.as_str();
-        let v: Lifecycle = serde_json::from_value(delivery.body).map_err(|e| refused(format!("E2B {event} body: {e}")))?;
-        if v.sandbox_team_id != self.settings.team_id {
+        // Another team's body, or one naming no team, is not read further.
+        if delivery.body.get("sandbox_team_id").and_then(serde_json::Value::as_str) != Some(self.settings.team_id.as_str()) {
             return Ok(vec![]);
         }
+        let event = delivery.event.as_str();
+        let v: Lifecycle = serde_json::from_value(delivery.body).map_err(|e| refused(format!("E2B {event} body: {e}")))?;
         Ok(vec![VendorObservation {
             id: v.sandbox_id.to_string(),
             state: state.clone(),
