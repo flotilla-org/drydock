@@ -323,15 +323,8 @@ impl Tensorlake {
         };
         Ok(rows.into_iter().filter(|s: &Snapshot| s.sandbox_id.as_deref() == Some(sandbox_id)).collect())
     }
-    /// Sandboxes carry no labels or metadata: the name this instance gave a
-    /// sandbox is the only mark that it is this instance's, and holds its
-    /// label. Tags are reported only for a name this instance's prefix starts.
     fn tags(&self, name: Option<&str>) -> Option<BTreeMap<String, String>> {
-        let name = name?;
-        name.starts_with(&sandbox_prefix(&self.name)).then(|| {
-            let label = label_of(&sandbox_prefix(&self.name), name).map(|label| (LABEL_TAG.to_owned(), label));
-            [(OWNER_TAG.to_owned(), self.name.clone())].into_iter().chain(label).collect()
-        })
+        tags(&self.name, name?)
     }
     fn environment(&self, v: Sandbox) -> Result<Environment> {
         let whole = |n: Amount| (n.get().fract() == 0.0 && n.get() <= u32::MAX as f64).then_some(n.get() as u64);
@@ -609,6 +602,16 @@ fn sandbox_name(instance: &str, label: &str) -> String {
         return format!("{prefix}b-{encoded}");
     }
     format!("{prefix}h-{}", &kit::digest(&format!("{instance}\0{label}"))[..40])
+}
+/// Sandboxes carry no labels or metadata: the name an instance gave a sandbox
+/// is the only mark that it is that instance's, and holds its label. Tags are
+/// reported only for a name `instance`'s prefix starts.
+fn tags(instance: &str, name: &str) -> Option<BTreeMap<String, String>> {
+    let prefix = sandbox_prefix(instance);
+    name.starts_with(&prefix).then(|| {
+        let label = label_of(&prefix, name).map(|label| (LABEL_TAG.to_owned(), label));
+        [(OWNER_TAG.to_owned(), instance.to_owned())].into_iter().chain(label).collect()
+    })
 }
 fn label_of(prefix: &str, name: &str) -> Option<String> {
     let rest = name.strip_prefix(prefix)?;
@@ -978,6 +981,21 @@ mod tests {
         assert_eq!((output.stdout(), output.bytes(None), output.exit_code()), (b"out\n".to_vec(), b"out\nerr\n".to_vec(), 137));
         assert!(guest_output(b"data: {\"exit_code\":4294967296}\n").is_err());
         assert!(guest_output(b"data: {\"signal\":-1}\n").is_err());
+    }
+    // A name this instance made carries its owner tag and the label it holds,
+    // even one only a digest keeps; another instance's names carry none.
+    #[test]
+    fn names_carry_their_instance_and_label() {
+        let tagged = |instance: &str, label: &str| tags(instance, &sandbox_name(instance, label));
+        let expect = |label: Option<&str>| {
+            let label = label.map(|l| (LABEL_TAG.to_owned(), l.to_owned()));
+            Some([(OWNER_TAG.to_owned(), "lab".to_owned())].into_iter().chain(label).collect())
+        };
+        assert_eq!(tagged("lab", "crew-1"), expect(Some("crew-1")));
+        assert_eq!(tagged("lab", "Crew/1"), expect(Some("Crew/1")));
+        assert_eq!(tagged("lab", &"x".repeat(80)), expect(None));
+        assert_eq!(tags("lab", &sandbox_name("other", "crew-1")), None);
+        assert_eq!(tags("lab", "build-runner"), None);
     }
     // A policy leaving allow_internet_access out is not the one stating it,
     // and none at all is open.
