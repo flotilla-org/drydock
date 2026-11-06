@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "13"
+    "version": "14"
   },
   "paths": {
     "/v1/config": {
@@ -4805,13 +4805,19 @@
             "required": [
               "url",
               "token",
-              "expires_at",
               "kind"
             ],
             "properties": {
               "expires_at": {
-                "$ref": "#/components/schemas/Timestamp",
-                "description": "When `url`'s credential stops working; drydock asks for a fresh\nreach for each connection."
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Timestamp",
+                    "description": "When `url`'s credential stops working, when the vendor says;\nabsent when it does not. drydock asks for a fresh reach for each\nconnection."
+                  }
+                ]
               },
               "headers": {
                 "type": "object",

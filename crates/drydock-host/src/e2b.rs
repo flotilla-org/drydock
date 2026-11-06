@@ -884,7 +884,7 @@ impl Provider for E2b {
             url: self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string(),
             token: Secret::new(token),
             headers,
-            expires_at: expires_at.into(),
+            expires_at: Some(expires_at.into()),
         })
     }
     async fn relay(&self, _: &str, _: &Credentials) -> Result<ByteStream> {

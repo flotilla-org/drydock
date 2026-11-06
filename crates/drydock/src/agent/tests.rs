@@ -130,8 +130,12 @@ async fn connects_through_a_dial_reach_and_reports_it() {
     for (presented, refused) in
         [(token.secret().to_owned(), false), (drydock_transport::tcp::Token::generate().unwrap().secret().into(), true)]
     {
-        let dial =
-            Reach::Dial { url: url.clone(), token: Secret::new(presented), headers: Default::default(), expires_at: expires_at.clone() };
+        let dial = Reach::Dial {
+            url: url.clone(),
+            token: Secret::new(presented),
+            headers: Default::default(),
+            expires_at: Some(expires_at.clone()),
+        };
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(true, dial).await;
         let gateway = Gateway::start(directory.path(), BUILD).unwrap();
@@ -185,7 +189,7 @@ async fn a_dial_reach_masks_an_echoed_edge_credential() {
         url,
         token: Secret::new(token.secret()),
         headers: Default::default(),
-        expires_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+        expires_at: Some("2030-01-01T00:00:00Z".parse().unwrap()),
     };
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let (api, environment) = provider(true, dial).await;
@@ -311,8 +315,12 @@ async fn reaches_the_agent_through_an_edge_that_wants_its_own_credential() {
     ];
     for (edge, query, headers, refused) in cases {
         let base = format!("http://{edge}/v1/connect");
-        let dial =
-            Reach::Dial { url: format!("{base}{query}"), token: Secret::new(token.secret()), headers, expires_at: expires_at.clone() };
+        let dial = Reach::Dial {
+            url: format!("{base}{query}"),
+            token: Secret::new(token.secret()),
+            headers,
+            expires_at: Some(expires_at.clone()),
+        };
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(true, dial).await;
         let gateway = Gateway::start(directory.path(), BUILD).unwrap();
@@ -367,7 +375,8 @@ async fn an_unfollowable_dial_reach_is_refused_at_once() {
         ("http://192.0.2.1/v1/connect?_edge=hunter2".into(), Default::default(), "cleartext only to a loopback"),
     ];
     for (url, headers, refusal) in cases {
-        let dial = Reach::Dial { url, token: Secret::new(token.secret()), headers, expires_at: "2030-01-01T00:00:00Z".parse().unwrap() };
+        let dial =
+            Reach::Dial { url, token: Secret::new(token.secret()), headers, expires_at: Some("2030-01-01T00:00:00Z".parse().unwrap()) };
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let (api, environment) = provider(true, dial).await;
         let gateway = Gateway::start(directory.path(), BUILD).unwrap();
@@ -407,7 +416,7 @@ async fn an_agent_the_client_cannot_reach_is_refused_without_dialling() {
         url: "https://dial.test".into(),
         token: Secret::new("minted"),
         headers: Default::default(),
-        expires_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+        expires_at: Some("2030-01-01T00:00:00Z".parse().unwrap()),
     };
     for (agent, reach, refusal) in [(false, ssh_reach(true), "declares no vessel agent"), (true, dial, "dial reach token")] {
         let directory = tempfile::tempdir_in("/tmp").unwrap();

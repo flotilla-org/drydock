@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "13";
+pub const PROTOCOL_VERSION: &str = "14";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -915,10 +915,12 @@ pub enum Reach {
         /// `Sec-WebSocket-Key`, `Sec-WebSocket-Version`).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, Secret>,
-        /// When `url`'s credential stops working; drydock asks for a fresh
-        /// reach for each connection.
+        /// When `url`'s credential stops working, when the vendor says;
+        /// absent when it does not. drydock asks for a fresh reach for each
+        /// connection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         #[schema(format = DateTime)]
-        expires_at: Timestamp,
+        expires_at: Option<Timestamp>,
     },
     Relay {
         path: String,

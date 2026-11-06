@@ -24,6 +24,7 @@ fn tagged_wire_fixtures() {
         json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":true}),
         json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":false}),
         json!({"kind":"dial","url":"wss://h","token":"secret","expires_at":"2026-10-19T00:00:00Z"}),
+        json!({"kind":"dial","url":"wss://h","token":"secret"}),
         json!({"kind":"dial","url":"https://h","token":"secret","headers":{"x-edge-token":"edge"},"expires_at":"2026-10-19T00:00:00Z"}),
         json!({"kind":"relay","path":"/relay"}),
     ] {
@@ -92,7 +93,8 @@ fn secret_debug_redacts_without_changing_wire() {
     let secret = Secret::new(value);
     let refresh = CredentialRefresh { value: secret.clone() };
     let headers = [("x-edge-token".to_owned(), secret.clone())].into();
-    let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), headers, expires_at: "2026-10-19T00:00:00Z".parse().unwrap() };
+    let reach =
+        Reach::Dial { url: "tcp://h".into(), token: secret.clone(), headers, expires_at: Some("2026-10-19T00:00:00Z".parse().unwrap()) };
     let pull = RegistryCredential { username: "u".into(), secret: secret.clone() };
     let resume = ResumeToken { token: secret };
     for debug in [format!("{refresh:?}"), format!("{reach:?}"), format!("{resume:?}"), format!("{pull:?}")] {
