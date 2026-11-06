@@ -835,18 +835,25 @@ mod tests {
     use rigging_http_client::ChannelLabel;
 
     /// Answers each request with the next scripted (status, body), keeping
-    /// each request's method, path and body.
+    /// each request's method, path, body and envd token.
     #[derive(Default)]
     struct Script {
         answers: Mutex<Vec<(u16, &'static str)>>,
         asked: Mutex<Vec<(String, String, serde_json::Value)>>,
+        envd_tokens: Mutex<Vec<Option<String>>>,
     }
     #[async_trait]
     impl HttpClient for Script {
         async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
             let body = request.body().and_then(|b| b.as_bytes()).and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
             self.asked.lock().unwrap().push((request.method().to_string(), request.url().path().to_owned(), body));
-            let (status, body) = self.answers.lock().unwrap().remove(0);
+            let token = request.headers().get("x-access-token").map(|t| t.to_str().unwrap().to_owned());
+            self.envd_tokens.lock().unwrap().push(token);
+            let (status, body) = {
+                let mut answers = self.answers.lock().unwrap();
+                assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
+                answers.remove(0)
+            };
             Ok(http::Response::builder().status(status).body(Bytes::from_static(body.as_bytes())).unwrap())
         }
     }
@@ -855,11 +862,14 @@ mod tests {
             self.asked.lock().unwrap().iter().map(|(m, p, _)| (m.clone(), p.clone())).collect()
         }
     }
+    async fn configure(ownership: Ownership, settings: serde_json::Value, script: Arc<Script>) -> Result<Arc<dyn Provider>> {
+        let settings = serde_json::from_value(settings).unwrap();
+        let config = ProviderConfiguration { module: "e2b".into(), settings, ownership, ..Default::default() };
+        E2bModule::new().configure("e2b-a", &config, script).await
+    }
     async fn e2b(ownership: Ownership, answers: Vec<(u16, &'static str)>) -> (Arc<dyn Provider>, Arc<Script>) {
         let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
-        let settings = BTreeMap::from([("team_id".to_owned(), serde_json::json!("team"))]);
-        let config = ProviderConfiguration { module: "e2b".into(), settings, ownership, ..Default::default() };
-        (E2bModule::new().configure("e2b-a", &config, script.clone()).await.unwrap(), script)
+        (configure(ownership, serde_json::json!({"team_id": "team"}), script.clone()).await.unwrap(), script)
     }
     fn key() -> Credentials {
         Credentials::new(Some(Secret::new("k")))
@@ -968,6 +978,46 @@ mod tests {
         let port = e2b.operations().quota.unwrap();
         assert_eq!(port.quota(&key()).await.unwrap().concurrency_in_use, Some(3));
         assert_eq!(port.quota(&key()).await.unwrap().concurrency_in_use, None);
+    }
+
+    // Settings take the old constants as defaults; a zero or an unknown key
+    // is refused.
+    #[tokio::test]
+    async fn settings_refuse_zeroes_and_unknown_keys() {
+        let settings = |extra: serde_json::Value| {
+            let mut settings = serde_json::json!({"team_id": "team"});
+            settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            settings
+        };
+        assert!(configure(Ownership::SharedAccount, settings(serde_json::json!({})), Arc::default()).await.is_ok());
+        for refused in [
+            serde_json::json!({"team_id": ""}),
+            serde_json::json!({"build_polls": 0}),
+            serde_json::json!({"build_poll_seconds": 0}),
+            serde_json::json!({"exec_timeout_ms": 0}),
+            serde_json::json!({"poll_interval_ms": 0}),
+            serde_json::json!({"poll_every": 5}),
+        ] {
+            let result = configure(Ownership::SharedAccount, settings(refused.clone()), Arc::default()).await;
+            assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{refused}");
+        }
+    }
+
+    // An envd request E2B answers 401 is sent once more, with the envd token
+    // read back from the sandbox's detail; the next request uses that token.
+    #[tokio::test]
+    async fn envd_refreshes_its_token_on_401() {
+        let ended: &'static str = String::from_utf8(envelope(2, br#"{"event":{"end":{}}}"#)).unwrap().leak();
+        let detail = r#"{"sandboxID":"sbx1","state":"running","envdAccessToken":"fresh"}"#;
+        let (e2b, script) = e2b(Ownership::OwnedAccount, vec![(401, ""), (200, detail), (200, ""), (200, ended)]).await;
+        let file = GuestFile { path: "/opt/tool".into(), mode: 0o755 };
+        e2b.operations().files.unwrap().put("sbx1", file, Bytes::from_static(b"x"), &key()).await.unwrap();
+        assert_eq!(
+            script.asked(),
+            [asked("POST", "/files"), asked("GET", "/sandboxes/sbx1"), asked("POST", "/files"), asked("POST", "/process.Process/Start")]
+        );
+        let tokens = script.envd_tokens.lock().unwrap().clone();
+        assert_eq!(tokens, [None, None, Some("fresh".into()), Some("fresh".into())]);
     }
 
     // Destroy is one kill; E2B's answers pass through, not found included.
