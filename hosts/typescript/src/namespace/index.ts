@@ -48,8 +48,6 @@ export const SERVICE = "drydock-agent";
 export const AGENT = "/opt/drydock/drydock-agent";
 const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 const REGISTRY = "nscr.io";
-/** How long provision waits to delete a devbox whose agent failed. */
-const CLEANUP_MS = 30_000;
 /**
  * Linux machine sizes, as the SDK resolves them client-side. Namespace sells
  * these fixed shapes; the SDK keeps its table private and offers no call that
@@ -554,19 +552,11 @@ class Namespace implements Provider {
     try {
       await this.addAgent(box, signal);
     } catch (error) {
-      // Without its agent the devbox is no vessel, and the failed provision
-      // returns no id to destroy it by: delete it, best effort, on its own
-      // deadline so an aborted provision still cleans up. The answer is the
-      // failure, naming the devbox if the delete failed too.
+      // The devbox stays for the client to inspect or destroy; the failure
+      // names it, since a failed provision returns no environment.
       const failure = protocolError(error);
-      try {
-        await vendor.devboxes.delete(box.id, {
-          signal: AbortSignal.timeout(CLEANUP_MS),
-        });
-      } catch (cleanup) {
-        const detail = failure.detail as { reason?: string };
-        detail.reason = `${detail.reason ?? failure.detail.kind}; devbox ${box.id} was left behind: ${protocolError(cleanup).detail.kind}`;
-      }
+      const detail = failure.detail as { reason?: string };
+      detail.reason = `${detail.reason ?? failure.detail.kind}; devbox ${box.id} was left for inspection`;
       throw failure;
     }
     return { created: true, environment: this.row(box) };

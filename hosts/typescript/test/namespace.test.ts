@@ -291,25 +291,23 @@ test("provision is one create and the agent service", async () => {
   }
 });
 
-// A devbox whose agent service cannot be added is deleted, and provision
-// answers with the service's failure: no devbox is left without an id.
-test("provision deletes the devbox when the agent service fails", async () => {
+// A devbox whose agent service cannot be added is left in place, and
+// provision answers with the service's failure, naming the devbox.
+test("provision leaves the devbox and names it when the agent service fails", async () => {
   const { standIn, provision } = await setup();
   standIn.box = (box) => {
     box.services.create = async () => {
       throw new ConnectError("no agent", Code.Unavailable);
     };
   };
-  await assert.rejects(provision("vessel"), kind("unavailable"));
-  assert.equal(standIn.rows.size, 0);
-  assert.equal(standIn.count("delete"), 1);
-  // A delete that fails too is named in the answer.
-  standIn.devboxes.delete = async () => {
-    throw new ConnectError("busy", Code.Unavailable);
-  };
-  await assert.rejects(provision("again"), (e: any) =>
-    /devbox devbox-\d+ was left behind: unavailable/.test(e.detail?.reason),
+  await assert.rejects(
+    provision("vessel"),
+    (e: any) =>
+      e.detail?.kind === "unavailable" &&
+      /devbox devbox-\d+ was left for inspection$/.test(e.detail?.reason),
   );
+  assert.equal(standIn.rows.size, 1);
+  assert.equal(standIn.count("delete"), 0);
 });
 
 // The relay reaches the SDK's private connection manager; this pins the
