@@ -98,26 +98,30 @@ API keys have no scopes; every key has project-member rights:
 
 Credential: a team API key (`e2b_…`), as a plain token file, sent as `X-API-Key`. Configuration also needs `team_id`.
 
-Create it in the E2B dashboard (Team → API Keys). Keys have no scopes: a key can build and delete every template and kill every sandbox in the team. Use a team that holds only drydock's sandboxes; drydock finds its own by their `drydock.provider` and `flotilla.label` metadata, and refuses to adopt or destroy a sandbox without both.
+Create it in the E2B dashboard (Team → API Keys). Keys have no scopes: a key can build and delete every template and kill every sandbox in the team. The module translates: provision, list, inspect, destroy, suspend and resume are one E2B call each, and rows carry E2B's state name and the sandbox's metadata in `vendor`. On a `shared_account` (the default) it tags what it makes with `drydock.provider` metadata, and drydockd lists, destroys, suspends and resumes only sandboxes that carry the tag. On an `owned_account` nothing is tagged or filtered, so use a team that holds only drydock's sandboxes. The label is `flotilla.label` metadata; provisioning a label twice makes two sandboxes.
 
 | Call | Used for |
 |---|---|
 | `/templates/aliases/{name}`, `/v3/templates`, `/templates/{id}/files/{hash}`, `/v2/templates/{id}/builds/{build}`, `/templates/{id}/builds/{build}/status` | prepare |
-| `/v2/sandboxes`, `/sandboxes/{id}`, `/sandboxes/{id}/pause`, `/v2/sandboxes/{id}/connect` | provision, list, inspect, suspend, resume, destroy |
+| `POST /v2/sandboxes` | provision |
+| `GET /v2/sandboxes` (every page) | list |
+| `GET /sandboxes/{id}` | inspect, reach (whether the sandbox runs and needs the traffic token) |
+| `DELETE /sandboxes/{id}` | destroy |
+| `POST /sandboxes/{id}/pause`, `POST /v2/sandboxes/{id}/connect` | suspend, resume (the resume token is the sandbox id) |
 | envd's `process.Process/Start` and `/files` at `49983-<sandbox>.e2b.app` | exec, the agent's upload |
 | the proxy at `7811-<sandbox>.e2b.app`, dialled by drydockd | reach |
-| `/events/sandboxes`, `/templates/{id}` (builds) | usage |
 | `/teams/{teamID}/metrics` | quota (in use) |
 
 - drydockd uploads the agent to each sandbox (upload bootstrap) through envd's `/files`; templates are the base image alone.
 - The module declares `agent_tcp_port` 7811, so drydockd starts the agent listening on loopback there. envd forwards loopback ports to the proxy ([`envd/internal/port`](https://github.com/e2b-dev/infra/blob/main/packages/envd/internal/port/forward.go)), so the agent's token is what gates that port at E2B's edge. The module reads the token back with `drydock-agent --print-token`.
 - Reach is a dial reach: drydockd opens the WebSocket upgrade to the agent's port itself, with the agent's token as its Bearer and the sandbox's traffic token in E2B's `e2b-traffic-access-token` header. Set `sandbox_url` (default `https://{port}-{id}.e2b.app`) for a self-hosted E2B.
 - Each sandbox returns `envdAccessToken` and `trafficAccessToken` at create and connect. The host holds them in memory; they are never written to a record or a log, and the traffic token leaves the host only in a reach. After a host restart it reads the envd token back from `GET /sandboxes/{id}` and the traffic token from a running sandbox's connect, which extends its timeout to `lifetime_seconds`.
-- The key can't read the team's limits, credit or spend; set `concurrency_limit` in settings. Usage reports no cost.
-- Usage counts each execution, clipped to the period, at the size E2B granted: an ended one from E2B's pause and kill events, which carry its start, vCPUs and memory, with its disk from its template's build (`GET /templates/{id}`), and a running one from its listed start, size and disk until now. A period with a sandbox whose template has since been deleted is refused, since that disk is no longer known. A period holding more than 10,000 of E2B's sandbox events is refused rather than undercounted; ask for a shorter one.
+- The key can't read the team's limits, credit or spend; set `concurrency_limit` in settings.
+- The module declares no usage. E2B reports execution records in its lifecycle events and concurrency samples in its team metrics, and drydock's usage shape cannot carry either as given (drydock#257).
+- Prepare waits for a template build by reading its status every `build_poll_seconds` (default 3), up to `build_polls` times (default 150), then answers unavailable; E2B offers no other way to learn a build finished. envd ends a command after `exec_timeout_ms` (default 25000).
 - drydockd observes the team's sandboxes by listing them every `poll_interval_ms` (default 30000).
 - Private registries are given per prepare, not stored at E2B. E2B pulls over the public internet, so drydock refuses a base whose registry is or resolves to a private address, or is a bare host name without a dot, `localhost`, or a name under `.local`, `.localhost`, `.internal`, `.lan`, `.home.arpa`, `.test` or `.invalid`; a staging registry (`pull_from`) is the way to such images. The check is best effort: E2B resolves the name again at build, and a name drydock's host cannot resolve is left to E2B.
-- Hobby caps a sandbox at one hour of running: a longer timeout is refused at create and silently clamped on extend. Sandboxes are created with `autoPause`, so the cap pauses rather than kills; drydock reads that pause as `paused_by_provider` and resumes on demand. A paused sandbox keeps its snapshot, which E2B may bill as storage, until drydock destroys it. Set `lifetime_seconds` (default 3600) to 86400 on Pro, and `disk_mb` (default 10240) to the plan's sandbox disk.
+- Hobby caps a sandbox at one hour of running: a longer timeout is refused at create and silently clamped on extend. Sandboxes are created with `autoPause`, so the cap pauses rather than kills; E2B does not say whether a pause was its own or a client's, so drydock reports a paused sandbox as stopped with no cause (drydock#283), and resumes it on demand. A paused sandbox keeps its snapshot, which E2B may bill as storage, until drydock destroys it. Set `lifetime_seconds` (default 3600) to 86400 on Pro, and `disk_mb` (default 10240) to the plan's sandbox disk.
 - Egress is the vendor's claim, not a measurement: the module declares E2B's documented model (a firewall outside the guest; listing a domain also opens 8.8.8.8 for DNS, and domains filter only HTTP on 80 and TLS on 443) and runs no guest probe, so every row is advisory and unmeasured until drydockd's conformance verdict says otherwise (drydock#214).
 - Templates stay at teardown, one per base image and size, so each new image or size adds one until a retention decision retires them (drydock#61). A new tools pin adds none.
 - E2B's terms ask for written consent before a third-party app interacts with the Services. This module is our own use of our own account; confirm with E2B before offering it to anyone else.

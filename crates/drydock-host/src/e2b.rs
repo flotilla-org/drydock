@@ -1,11 +1,14 @@
-//! E2B: https://github.com/e2b-dev/infra (spec/openapi.yml; packages/envd/spec).
+//! E2B translator: each verb is E2B's own operation, and each answer is what
+//! E2B said. Waiting, idempotence and ownership are drydockd's, as the
+//! declared [`Semantics`] leave them (see `capabilities`).
+//! API contract: https://github.com/e2b-dev/infra (spec/openapi.yml; packages/envd/spec).
 use crate::{
     kit::{
         self, LABEL_TAG, MIB, PROVIDER_TAG, SizeLimits, Vendor,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         egress::{Resolver, SystemResolver, ipv6, normal_cidr, normal_host, private_registry},
         guest::{Guest, GuestOutput},
-        image::{check_prepare, check_prepared, content_name},
+        image::{check_prepare, content_name},
     },
     module::*,
     oci::{ImageRef, Registry},
@@ -14,14 +17,13 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use drydock_protocol::*;
 use drydock_transport::tcp::CONNECT_PATH;
-use futures::{StreamExt, TryStreamExt};
 use reqwest::{
     Method, Url,
     header::{AUTHORIZATION, HeaderName, HeaderValue},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned, de::IgnoredAny};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -33,17 +35,9 @@ const AGENT_PORT: u16 = 7811;
 const PRINT_TOKEN: &str = "/opt/drydock/drydock-agent --print-token --tcp-token-file /run/drydock/tcp-token";
 const TOKEN_LINE: &str = "drydock-tcp-token ";
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
-const RUN_TIMEOUT_MS: u64 = 25_000;
-const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 150;
-const STATE_POLL: Duration = Duration::from_secs(1);
-const STATE_POLLS: u32 = 60;
-const DETAIL_READS: usize = 8;
-const EVENT_PAGE: usize = 100;
-const EVENT_PAGES: usize = 100;
+/// E2B's largest page of sandboxes.
+const SANDBOX_PAGE_LIMIT: &str = "100";
 const SANDBOX_PAGES: Paging = Paging { rows: None, cursor: "nextToken", next: Next::Header("x-next-token") };
-const BUILD_PAGES: Paging = Paging { rows: Some("builds"), cursor: "nextToken", next: Next::Header("x-next-token") };
-const RESUME_PREFIX: &str = "e2b-resume-";
 
 #[derive(Serialize)]
 struct NewTemplate<'a> {
@@ -69,12 +63,6 @@ struct Alias {
 struct Template {
     #[serde(rename = "templateID")]
     id: Text,
-    #[serde(rename = "cpuCount")]
-    cpus: u64,
-    #[serde(rename = "memoryMB")]
-    memory_mb: u64,
-    #[serde(rename = "diskSizeMB")]
-    disk_mb: Option<u64>,
     #[serde(default)]
     builds: Vec<TemplateBuild>,
 }
@@ -83,8 +71,6 @@ struct TemplateBuild {
     #[serde(rename = "buildID")]
     id: Text,
     status: Text,
-    #[serde(rename = "diskSizeMB")]
-    disk_mb: Option<u64>,
 }
 #[derive(Serialize)]
 struct BuildStart<'a> {
@@ -134,25 +120,25 @@ struct NewSandbox<'a> {
     timeout: u32,
     #[serde(rename = "autoPause")]
     auto_pause: bool,
-    metadata: BTreeMap<&'static str, &'a str>,
+    metadata: &'a BTreeMap<String, String>,
     network: Network,
 }
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize)]
 struct Network {
     #[serde(rename = "allowPublicTraffic", skip_serializing_if = "Option::is_none")]
     public_traffic: Option<bool>,
-    #[serde(rename = "denyOut", default, skip_serializing_if = "Vec::is_empty")]
-    deny_out: Vec<String>,
-    #[serde(rename = "allowOut", default, skip_serializing_if = "Vec::is_empty")]
-    allow_out: Vec<String>,
+    #[serde(rename = "denyOut", skip_serializing_if = "Option::is_none")]
+    deny_out: Option<Vec<String>>,
+    #[serde(rename = "allowOut", skip_serializing_if = "Option::is_none")]
+    allow_out: Option<Vec<String>>,
 }
-#[derive(Deserialize, Clone)]
+/// A sandbox as E2B answers it: its detail, a listed row, or a create or
+/// connect answer, which carries the tokens and no state.
+#[derive(Deserialize)]
 struct Sandbox {
     #[serde(rename = "sandboxID")]
     id: Text,
     state: Option<Text>,
-    #[serde(rename = "startedAt")]
-    started_at: Option<DateTime<Utc>>,
     #[serde(rename = "endAt")]
     end_at: Option<DateTime<Utc>>,
     #[serde(rename = "cpuCount")]
@@ -161,8 +147,7 @@ struct Sandbox {
     memory_mb: Option<u64>,
     #[serde(rename = "diskSizeMB")]
     disk_mb: Option<u64>,
-    #[serde(default)]
-    metadata: BTreeMap<String, String>,
+    metadata: Option<BTreeMap<String, String>>,
     network: Option<Network>,
     #[serde(rename = "envdAccessToken")]
     envd_token: Option<String>,
@@ -172,36 +157,6 @@ struct Sandbox {
 #[derive(Serialize)]
 struct Connect {
     timeout: u32,
-}
-#[derive(Deserialize)]
-struct Event {
-    id: Text,
-    timestamp: DateTime<Utc>,
-    #[serde(rename = "sandboxId")]
-    sandbox: Text,
-    #[serde(rename = "sandboxTemplateId")]
-    template: Text,
-    #[serde(rename = "sandboxBuildId")]
-    build: Text,
-    #[serde(rename = "eventData")]
-    data: EventData,
-}
-#[derive(Deserialize)]
-struct EventData {
-    #[serde(default)]
-    sandbox_metadata: BTreeMap<String, String>,
-    execution: Option<Execution>,
-}
-#[derive(Deserialize)]
-struct Execution {
-    started_at: DateTime<Utc>,
-    vcpu_count: u64,
-    memory_mb: u64,
-}
-#[derive(Clone)]
-enum Disk {
-    Granted(u64),
-    Build(String, String),
 }
 #[derive(Deserialize)]
 struct Metric {
@@ -239,6 +194,7 @@ struct ProcessData {
 }
 #[derive(Deserialize)]
 struct ProcessEnd {
+    /// Proto3 JSON leaves a zero field out, so an absent exit code is 0.
     #[serde(rename = "exitCode", default)]
     exit_code: i64,
     error: Option<String>,
@@ -266,39 +222,42 @@ impl Default for E2bModule {
     }
 }
 
+/// Every key but `team_id` has a default.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Settings {
     team_id: String,
-    #[serde(default = "api_url")]
     api_url: String,
-    #[serde(default = "sandbox_url")]
     sandbox_url: String,
-    #[serde(default = "lifetime_seconds")]
     lifetime_seconds: u32,
-    #[serde(default = "disk_mb")]
     disk_mb: u64,
-    #[serde(default)]
     concurrency_limit: Option<u64>,
-    #[serde(default)]
     rate_limits: Option<Vec<RateLimit>>,
-    #[serde(default = "poll_interval_ms")]
+    /// How often drydockd lists sandboxes.
     poll_interval_ms: u64,
+    /// How often prepare reads a template build's status, and how many times
+    /// before it answers unavailable.
+    build_poll_seconds: u64,
+    build_polls: u32,
+    /// envd's limit on one command (`connect-timeout-ms`).
+    exec_timeout_ms: u64,
 }
-fn api_url() -> String {
-    "https://api.e2b.app/".into()
-}
-fn sandbox_url() -> String {
-    "https://{port}-{id}.e2b.app".into()
-}
-fn lifetime_seconds() -> u32 {
-    3600
-}
-fn disk_mb() -> u64 {
-    10_240
-}
-fn poll_interval_ms() -> u64 {
-    30_000
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            team_id: String::new(),
+            api_url: "https://api.e2b.app/".into(),
+            sandbox_url: "https://{port}-{id}.e2b.app".into(),
+            lifetime_seconds: 3600,
+            disk_mb: 10_240,
+            concurrency_limit: None,
+            rate_limits: None,
+            poll_interval_ms: 30_000,
+            build_poll_seconds: 3,
+            build_polls: 150,
+            exec_timeout_ms: 25_000,
+        }
+    }
 }
 fn sandbox_url_valid(template: &str) -> bool {
     if !template.contains("{port}") || !template.contains("{id}") {
@@ -327,25 +286,27 @@ impl Module for E2bModule {
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
             serde_json::from_value(serde_json::json!(config.settings)).map_err(|e| refused(format!("invalid E2B settings: {e}")))?;
+        let positive = [settings.disk_mb, settings.poll_interval_ms, settings.build_poll_seconds, settings.exec_timeout_ms];
         if settings.team_id.is_empty()
             || !(1..=86_400).contains(&settings.lifetime_seconds)
-            || settings.disk_mb == 0
-            || settings.poll_interval_ms == 0
+            || positive.contains(&0)
+            || settings.build_polls == 0
             || !sandbox_url_valid(&settings.sandbox_url)
         {
             return Err(refused(
                 "E2B requires team_id, a sandbox_url holding {port} and {id} (HTTPS, or HTTP to a loopback address), \
-                 lifetime_seconds 1..86400, a positive disk_mb and a positive poll_interval_ms",
+                 lifetime_seconds 1..86400, and positive disk_mb, poll_interval_ms, build_poll_seconds, build_polls \
+                 and exec_timeout_ms",
             ));
         }
         let api = Api::new(E2B, &settings.api_url, Auth::Header(HeaderName::from_static("x-api-key")), http)?.classify(classify);
         Ok(Arc::new(E2b {
             name: name.to_owned(),
+            ownership: config.ownership,
             settings,
             api,
             resolver: self.resolver.clone(),
             access: Mutex::default(),
-            suspended: Mutex::default(),
         }))
     }
 }
@@ -366,11 +327,13 @@ struct Access {
 
 pub struct E2b {
     name: String,
+    ownership: Ownership,
     settings: Settings,
     api: Api,
     resolver: Arc<dyn Resolver>,
+    /// The tokens E2B hands out at create and connect. A detail read gives
+    /// the envd token again; only connect gives the traffic token again.
     access: Mutex<HashMap<String, Access>>,
-    suspended: Mutex<HashSet<String>>,
 }
 
 trait Recover<T> {
@@ -393,11 +356,17 @@ fn template_name(image: &str, platform: &Platform, size: &Size) -> String {
     content_name("drydock-", 40, &["e2b-template", image, &platform, &cpus, &memory])
 }
 
+/// `id`, refused as not found unless it has the shape of E2B's sandbox ids.
+fn checked(id: &str) -> Result<&str> {
+    if !sandbox_id_valid(id) {
+        return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
+    }
+    Ok(id)
+}
+
 impl E2b {
     fn port_url(&self, id: &str, port: u16, path: &str) -> Result<Url> {
-        if !sandbox_id_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
-        }
+        let id = checked(id)?;
         let base = self.settings.sandbox_url.replace("{port}", &port.to_string()).replace("{id}", id);
         Url::parse(&format!("{}{path}", base.trim_end_matches('/'))).map_err(|_| E2B.bad_response())
     }
@@ -417,33 +386,27 @@ impl E2b {
         self.access.recover().get(id).cloned().unwrap_or_default()
     }
     async fn sandbox(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
-        if !sandbox_id_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
-        }
-        let v: Sandbox = self.get(&["sandboxes", id], c).await?;
+        let v: Sandbox = self.get(&["sandboxes", checked(id)?], c).await?;
         self.keep_tokens(&v);
         Ok(v)
     }
+    /// E2B's connect: resumes a paused sandbox, and answers with its tokens.
     async fn connect(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
-        let v: Sandbox = self.post(&["v2", "sandboxes", id, "connect"], &Connect { timeout: self.settings.lifetime_seconds }, c).await?;
+        let body = Connect { timeout: self.settings.lifetime_seconds };
+        let v: Sandbox = self.post(&["v2", "sandboxes", checked(id)?, "connect"], &body, c).await?;
         self.keep_tokens(&v);
         Ok(v)
     }
-    fn label(&self, v: &Sandbox) -> Option<String> {
-        kit::ours(&v.metadata, &self.name)
-    }
-    fn state<'a>(&self, v: &'a Sandbox) -> &'a str {
-        v.state.as_deref().unwrap_or("")
-    }
-    fn environment(&self, v: &Sandbox) -> Result<Environment> {
-        let state = match self.state(v) {
-            "running" => Observation::Running,
-            "paused" if self.suspended.recover().contains(&*v.id) => kit::stopped(StopCause::SuspendedByRequest),
-            "paused" => kit::stopped(StopCause::PausedByProvider),
+    fn environment(&self, v: Sandbox) -> Result<Environment> {
+        let state = match v.state.as_deref() {
+            Some("running") => Observation::Running,
+            // E2B does not say whether its timeout or a client paused it.
+            Some("paused") => Observation::Stopped { cause: None },
+            // A create answer carries no state, and no vendor row is reported.
             _ => Observation::Unknown { reason: UnknownReason::ProviderStateUnknown },
         };
         Ok(Environment {
-            label: self.label(v),
+            label: v.metadata.as_ref().and_then(|m| m.get(LABEL_TAG).cloned()),
             id: v.id.to_string(),
             provider: self.name.clone(),
             state,
@@ -451,56 +414,11 @@ impl E2b {
             egress: Enforcement::Advisory,
             platform: Some(platform()),
             egress_measured: false,
-            egress_policy: v.network.as_ref().map(|n| Policy::read(n).fingerprint()),
+            // Only a detail read carries the network.
+            egress_policy: v.network.as_ref().map(fingerprint),
             timestamp: None,
-            vendor: None,
+            vendor: v.state.map(|state| VendorState { state: state.into(), reason: None, tags: v.metadata }),
         })
-    }
-    fn gone(&self, id: &str) -> Environment {
-        Environment {
-            id: id.to_owned(),
-            label: None,
-            provider: self.name.clone(),
-            state: Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) },
-            granted_size: None,
-            egress: Enforcement::Advisory,
-            platform: Some(platform()),
-            egress_measured: false,
-            egress_policy: None,
-            timestamp: None,
-            vendor: None,
-        }
-    }
-    async fn wait_state(&self, id: &str, wanted: &str, c: &Credentials) -> Result<()> {
-        kit::poll(STATE_POLLS, STATE_POLL, async || Ok((self.state(&self.sandbox(id, c).await?) == wanted).then_some(())))
-            .await?
-            .ok_or_else(|| ProtocolError::unavailable(format!("E2B sandbox {id} is not {wanted} yet"), Some(5)))
-    }
-    async fn listed(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Sandbox>> {
-        let filter = {
-            let mut filter = url::form_urlencoded::Serializer::new(String::new());
-            filter.append_pair(PROVIDER_TAG, &self.name);
-            if let Some(label) = label {
-                filter.append_pair(LABEL_TAG, label);
-            }
-            filter.finish()
-        };
-        let mut url = self.api.url(&["v2", "sandboxes"])?;
-        url.query_pairs_mut().append_pair("metadata", &filter).append_pair("state", "running,paused").append_pair("limit", "100");
-        let rows: Vec<Sandbox> = self.api.paged(url, &SANDBOX_PAGES, c).await?;
-        Ok(rows.into_iter().filter(|v| self.label(v).is_some_and(|held| label.is_none_or(|l| held == l))).collect())
-    }
-    async fn ours_listed(&self, label: Option<&str>, c: &Credentials) -> Result<Vec<Sandbox>> {
-        let reads = self.listed(label, c).await?.into_iter().map(|v| async move { absent_on_not_found(self.sandbox(&v.id, c).await) });
-        let details: Vec<Option<Sandbox>> = futures::stream::iter(reads).buffered(DETAIL_READS).try_collect().await?;
-        Ok(details.into_iter().flatten().collect())
-    }
-    async fn builds(&self, template: &str, c: &Credentials) -> Result<BTreeMap<String, u64>> {
-        let mut url = self.api.url(&["templates", template])?;
-        url.query_pairs_mut().append_pair("limit", "100");
-        let builds: Vec<TemplateBuild> = absent_on_not_found(self.api.paged(url, &BUILD_PAGES, c).await)?
-            .ok_or_else(|| refused(format!("E2B template {template} is gone, so its sandboxes' disk is unknown")))?;
-        Ok(builds.into_iter().filter_map(|b| Some((b.id.to_string(), b.disk_mb?))).collect())
     }
     async fn template(&self, name: &str, c: &Credentials) -> Result<Option<Template>> {
         let Some(alias) = absent_on_not_found(self.get::<Alias>(&["templates", "aliases", name], c).await)? else { return Ok(None) };
@@ -533,8 +451,12 @@ impl E2b {
         self.post::<IgnoredAny>(&["v2", "templates", &created.template, "builds", &created.build], &start, c).await?;
         self.await_build(&created.template, &created.build, c).await
     }
+    /// The one wait this module keeps: E2B offers no other way to learn that
+    /// a template build finished than reading its status, and nothing of
+    /// drydockd's observes prepared forms.
     async fn await_build(&self, template: &str, build: &str, c: &Credentials) -> Result<()> {
-        kit::poll(BUILD_POLLS, BUILD_POLL, async || {
+        let interval = Duration::from_secs(self.settings.build_poll_seconds);
+        kit::poll(self.settings.build_polls, interval, async || {
             let status: BuildStatus = self.get(&["templates", template, "builds", build, "status"], c).await?;
             match &*status.status {
                 "ready" => Ok(Some(())),
@@ -559,35 +481,36 @@ impl E2b {
             disk_step: 1,
         }
     }
+    /// One envd request with the cached envd token, sent again with a token
+    /// read back from E2B when envd answers 401.
     async fn envd(&self, id: &str, url: &Url, body: impl Fn() -> Body, c: &Credentials) -> Result<http::Response<bytes::Bytes>> {
-        let operation = kit::api::operation(&Method::POST, url);
-        for refreshed in [false, true] {
-            let envd = match self.cached(id).envd {
-                Some(token) if !refreshed => Some(token),
-                _ => self.sandbox(id, c).await?.envd_token,
-            };
+        let send = async |envd: Option<String>| {
             let mut headers = vec![
                 (AUTHORIZATION, HeaderValue::from_static("Basic cm9vdDo=")),
-                (HeaderName::from_static("connect-timeout-ms"), HeaderValue::from(RUN_TIMEOUT_MS)),
+                (HeaderName::from_static("connect-timeout-ms"), HeaderValue::from(self.settings.exec_timeout_ms)),
             ];
             if let Some(token) = envd {
                 headers.push((HeaderName::from_static("x-access-token"), sensitive(&token).map_err(|_| E2B.bad_response())?));
             }
-            let response = self.api.send(Method::POST, url.clone(), body(), c, false, &headers).await?;
-            if response.status().is_success() {
-                return Ok(response);
-            }
-            if response.status() != 401 || refreshed {
-                return Err(self.api.failure(&operation, &response));
-            }
+            self.api.send(Method::POST, url.clone(), body(), c, false, &headers).await
+        };
+        let mut response = send(self.cached(id).envd).await?;
+        if response.status() == 401 {
+            response = send(self.sandbox(id, c).await?.envd_token).await?;
         }
-        unreachable!()
+        if !response.status().is_success() {
+            return Err(self.api.failure(&kit::api::operation(&Method::POST, url), &response));
+        }
+        Ok(response)
     }
     async fn agent_token(&self, id: &str, c: &Credentials) -> Result<String> {
         let run = self.run(id, PRINT_TOKEN, BTreeMap::new(), c).await?.success(E2B)?;
         let stdout = String::from_utf8_lossy(&run.stdout()).into_owned();
         stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).filter(|t| !t.is_empty()).map(str::to_owned).ok_or_else(|| {
-            ProtocolError::Internal { reason: "the agent's TCP token was not read back".into(), provider_error: String::new() }
+            ProtocolError::Internal {
+                reason: "the agent's TCP token was not read back".into(),
+                provider_error: format!("no {TOKEN_LINE:?} line in the agent's output"),
+            }
         })
     }
 }
@@ -631,7 +554,8 @@ fn parse_run(mut body: &[u8]) -> Result<GuestOutput> {
         body = &rest[length..];
         ended |= flags & 2 != 0;
         if let Some(e) = message.error {
-            error = Some(format!("{}: {}", e.code.unwrap_or_default(), e.message.unwrap_or_default()));
+            let text = [e.code, e.message].into_iter().flatten().collect::<Vec<_>>().join(": ");
+            error = Some(if text.is_empty() { "an error with no code or message".into() } else { text });
         }
         let Some(event) = message.event else { continue };
         if let Some(data) = event.data {
@@ -642,7 +566,7 @@ fn parse_run(mut body: &[u8]) -> Result<GuestOutput> {
             }
         }
         if let Some(end) = event.end {
-            run.exit = Some(i32::try_from(end.exit_code).unwrap_or(-1));
+            run.exit = Some(i32::try_from(end.exit_code).map_err(|_| E2B.bad_response())?);
             error = error.or(end.error.filter(|e| !e.is_empty()));
         }
     }
@@ -653,41 +577,35 @@ fn parse_run(mut body: &[u8]) -> Result<GuestOutput> {
     Ok(run)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Policy {
-    deny_out: BTreeSet<String>,
-    allow_out: BTreeSet<String>,
-    public_traffic: bool,
-}
-impl Policy {
-    fn request(request: &EgressRequest) -> Result<Self> {
-        let mut policy = Self { deny_out: BTreeSet::new(), allow_out: BTreeSet::new(), public_traffic: false };
-        let EgressRequest::DenyAll { direct } = request else { return Ok(policy) };
-        policy.deny_out.insert("0.0.0.0/0".into());
-        for destination in direct {
-            match destination {
-                Destination::HostPort { .. } => return Err(refused("E2B egress rules cannot restrict ports")),
-                Destination::Cidr { cidr } => {
-                    policy.allow_out.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?);
-                }
-                Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("E2B egress takes no IPv6 destinations")),
-                Destination::Host { host } => {
-                    let host = normal_host(host.as_str());
-                    policy.allow_out.insert(normal_cidr(&host).unwrap_or(host));
-                }
+/// The network a request asks E2B for. Every sandbox is closed to public
+/// traffic, so its URLs need the traffic token.
+fn network(request: &EgressRequest) -> Result<Network> {
+    let mut network = Network { public_traffic: Some(false), deny_out: None, allow_out: None };
+    let EgressRequest::DenyAll { direct } = request else { return Ok(network) };
+    let mut allow = BTreeSet::new();
+    for destination in direct {
+        match destination {
+            Destination::HostPort { .. } => return Err(refused("E2B egress rules cannot restrict ports")),
+            Destination::Cidr { cidr } => {
+                allow.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?);
+            }
+            Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("E2B egress takes no IPv6 destinations")),
+            Destination::Host { host } => {
+                let host = normal_host(host.as_str());
+                allow.insert(normal_cidr(&host).unwrap_or(host));
             }
         }
-        Ok(policy)
     }
-    fn network(&self) -> Network {
-        Network {
-            public_traffic: Some(self.public_traffic),
-            deny_out: self.deny_out.iter().cloned().collect(),
-            allow_out: self.allow_out.iter().cloned().collect(),
-        }
-    }
-    fn read(network: &Network) -> Self {
-        let normal = |entries: &[String]| -> BTreeSet<String> {
+    network.deny_out = Some(vec!["0.0.0.0/0".into()]);
+    network.allow_out = (!allow.is_empty()).then(|| allow.into_iter().collect());
+    Ok(network)
+}
+/// A digest of the network as E2B reported it. A field E2B leaves out stays
+/// absent: an omitted `allowPublicTraffic` is the project's default, which
+/// E2B does not say.
+fn fingerprint(network: &Network) -> String {
+    let normal = |entries: &Option<Vec<String>>| -> Option<BTreeSet<String>> {
+        entries.as_ref().map(|entries| {
             entries
                 .iter()
                 .map(|e| {
@@ -695,16 +613,9 @@ impl Policy {
                     normal_cidr(&e).unwrap_or(e)
                 })
                 .collect()
-        };
-        Self {
-            deny_out: normal(&network.deny_out),
-            allow_out: normal(&network.allow_out),
-            public_traffic: network.public_traffic.unwrap_or(true),
-        }
-    }
-    fn fingerprint(&self) -> String {
-        kit::digest(&format!("{:?}", (&self.deny_out, &self.allow_out, self.public_traffic)))
-    }
+        })
+    };
+    kit::digest(&format!("{:?}", (normal(&network.deny_out), normal(&network.allow_out), network.public_traffic)))
 }
 
 fn egress_model() -> EgressModel {
@@ -761,7 +672,9 @@ impl Provider for E2b {
                 digest_references: true,
                 tools_layer: ToolsLayer::Upload,
             }],
-            usage: true,
+            // E2B reports execution records and concurrency samples, which
+            // Usage cannot carry as given (drydock#257); no figure is derived.
+            usage: false,
             quota: true,
             host_filesystem: false,
             host_processes: false,
@@ -769,21 +682,17 @@ impl Provider for E2b {
             exclusive_label: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
-            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
+            // Create and pause answer once E2B accepted them, a second pause
+            // is E2B's conflict, list and kill reach the whole team, and
+            // connect resumes by id alone.
+            semantics: Semantics { token_is_id: true, ..Semantics::default() },
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {
         vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
     }
     fn operations(&self) -> Operations<'_> {
-        Operations {
-            exec: Some(self),
-            suspend_resume: Some(self),
-            quota: Some(self),
-            usage: Some(self),
-            files: Some(self),
-            ..Operations::default()
-        }
+        Operations { exec: Some(self), suspend_resume: Some(self), quota: Some(self), files: Some(self), ..Operations::default() }
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.settings.rate_limits.clone().unwrap_or_default()
@@ -804,74 +713,56 @@ impl Provider for E2b {
         if !template.as_ref().is_some_and(|t| t.builds.iter().any(|b| &*b.status == "ready")) {
             self.build(&r, &base, &name, template.as_ref(), c).await?;
         }
-        let template = self.template(&name, c).await?.ok_or_else(|| E2B.bad_response())?;
-        if template.cpus != r.size.cpus as u64 || template.memory_mb != r.size.memory_bytes / MIB {
-            return Err(refused(format!("E2B template {name} has another size than its name holds")));
-        }
-        if let Some(disk) = template.disk_mb.filter(|disk| r.size.disk_bytes > disk * MIB) {
-            return Err(refused(format!("E2B template {name} has {disk} MiB of disk, less than requested")));
-        }
         Ok(Prepared { provider: self.name.clone(), id: name, platform, image_digest: r.image_digest, tools_digest: r.tools_digest })
     }
+    /// One create, answered with the row E2B returns: its id and tokens, and
+    /// no state. The label is the client's, as the request gave it.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        self.sizes().check(E2B, &r.size)?;
-        let p = &r.prepared;
-        check_prepared(E2B, &self.name, p, &template_name(&p.image_digest, &p.platform, &r.size))?;
-        let policy = Policy::request(&r.egress)?;
-        if let Some(v) = self.ours_listed(Some(&r.label), c).await?.into_iter().next() {
-            let existing = self.environment(&v)?;
-            let same_size = existing
-                .granted_size
-                .as_ref()
-                .is_some_and(|g| g.cpus == r.size.cpus && g.memory_bytes == r.size.memory_bytes && r.size.disk_bytes <= g.disk_bytes);
-            if !same_size || v.network.as_ref().map(Policy::read) != Some(policy) {
-                return Err(refused(
-                    "an existing E2B sandbox holds this label with a different size or egress policy; provision a new label",
-                ));
-            }
-            return Ok(Provisioned::Existing(existing));
+        let mut metadata = BTreeMap::from([(LABEL_TAG.to_owned(), r.label.clone())]);
+        if self.ownership == Ownership::SharedAccount {
+            metadata.insert(PROVIDER_TAG.to_owned(), self.name.clone());
         }
         let body = NewSandbox {
-            template: &p.id,
+            template: &r.prepared.id,
             timeout: self.settings.lifetime_seconds,
             auto_pause: true,
-            metadata: BTreeMap::from([(PROVIDER_TAG, self.name.as_str()), (LABEL_TAG, r.label.as_str())]),
-            network: policy.network(),
+            metadata: &metadata,
+            network: network(&r.egress)?,
         };
         let created: Sandbox = self.post(&["v2", "sandboxes"], &body, c).await?;
         self.keep_tokens(&created);
-        Ok(Provisioned::Created(self.inspect(&created.id, c).await?))
+        let mut environment = self.environment(created)?;
+        environment.label = Some(r.label);
+        Ok(Provisioned::Created(environment))
     }
+    /// Every sandbox E2B lists for the team, in one paged list.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
-        self.ours_listed(None, c).await?.iter().map(|v| self.environment(v)).collect()
+        let mut url = self.api.url(&["v2", "sandboxes"])?;
+        url.query_pairs_mut().append_pair("state", "running,paused").append_pair("limit", SANDBOX_PAGE_LIMIT);
+        self.api.paged::<Sandbox>(url, &SANDBOX_PAGES, c).await?.into_iter().map(|v| self.environment(v)).collect()
     }
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
-        match absent_on_not_found(self.sandbox(id, c).await)? {
-            Some(v) => self.environment(&v),
-            None => Ok(self.gone(id)),
-        }
+        self.environment(self.sandbox(id, c).await?)
     }
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        if let Some(v) = absent_on_not_found(self.sandbox(id, c).await)? {
-            if self.label(&v).is_none() {
-                return Err(refused(format!("E2B sandbox {id} is not this provider's")));
-            }
-            absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
+        let killed = self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", checked(id)?])?, Body::None, c).await;
+        if killed.is_ok() {
+            self.access.recover().remove(id);
         }
-        self.access.recover().remove(id);
-        self.suspended.recover().remove(id);
-        Ok(())
+        killed.map(drop)
     }
+    /// The dial address of the agent's port at E2B's proxy. The detail read
+    /// stays because the proxy needs the traffic token unless E2B says the
+    /// sandbox takes public traffic, and only connect gives that token again,
+    /// which would resume a paused sandbox: the read says whether the token
+    /// may be needed and that the sandbox runs.
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
         let v = self.sandbox(id, c).await?;
-        if self.state(&v) != "running" {
+        if v.state.as_deref() != Some("running") {
             return Err(refused(format!("E2B sandbox {id} is not running; resume it first")));
         }
-        if self.label(&v).is_none() {
-            return Err(refused(format!("E2B sandbox {id} is not this provider's")));
-        }
         let mut headers = BTreeMap::new();
-        if !v.network.as_ref().is_some_and(|n| n.public_traffic.unwrap_or(true)) {
+        if v.network.as_ref().and_then(|n| n.public_traffic) != Some(true) {
             let traffic = match self.cached(id).traffic {
                 Some(token) => token,
                 None => self.connect(id, c).await?.traffic_token.ok_or_else(|| E2B.bad_response())?,
@@ -879,7 +770,7 @@ impl Provider for E2b {
             headers.insert(TRAFFIC_HEADER.to_owned(), Secret::new(traffic));
         }
         let token = self.agent_token(id, c).await?;
-        let expires_at = v.end_at.unwrap_or_else(|| Utc::now() + chrono::TimeDelta::seconds(self.settings.lifetime_seconds.into()));
+        let expires_at = v.end_at.ok_or_else(|| E2B.bad_response())?;
         Ok(Reach::Dial {
             url: self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string(),
             token: Secret::new(token),
@@ -892,27 +783,15 @@ impl Provider for E2b {
     }
 }
 
+/// Pause and connect. E2B resumes by id alone, so the token is the id.
 #[async_trait]
 impl SuspendResume for E2b {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        if self.state(&self.sandbox(id, c).await?) == "running" {
-            let url = self.api.url(&["sandboxes", id, "pause"])?;
-            let operation = kit::api::operation(&Method::POST, &url);
-            let response = self.api.send(Method::POST, url, Body::None, c, true, &[]).await?;
-            if !response.status().is_success() && response.status() != 409 {
-                return Err(self.api.failure(&operation, &response));
-            }
-        }
-        self.wait_state(id, "paused", c).await?;
-        self.suspended.recover().insert(id.to_owned());
-        Ok(E2B.resume_marker(RESUME_PREFIX, &self.name, id))
+        self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", checked(id)?, "pause"])?, Body::None, c).await?;
+        Ok(ResumeToken { token: Secret::new(id) })
     }
-    async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        E2B.check_resume(RESUME_PREFIX, &self.name, id, &token)?;
-        self.connect(id, c).await?;
-        self.wait_state(id, "running", c).await?;
-        self.suspended.recover().remove(id);
-        Ok(())
+    async fn resume(&self, id: &str, _: ResumeToken, c: &Credentials) -> Result<()> {
+        self.connect(id, c).await.map(drop)
     }
 }
 
@@ -943,106 +822,9 @@ impl QuotaOperation for E2b {
             resources: vec![],
             credits_remaining: None,
             credit_unit: None,
-            concurrency_in_use: Some(metrics.iter().max_by_key(|m| m.at).map_or(0, |m| m.concurrent)),
+            // The latest sample; none when E2B gives none.
+            concurrency_in_use: metrics.iter().max_by_key(|m| m.at).map(|m| m.concurrent),
             concurrency_limit: self.settings.concurrency_limit,
-        })
-    }
-}
-
-#[async_trait]
-impl UsageOperation for E2b {
-    async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
-        let (from, to) = (period.start().instant(), period.end().instant());
-        let mut executions: BTreeMap<(String, DateTime<Utc>), (DateTime<Utc>, u64, u64, Disk)> = BTreeMap::new();
-        let mut seen = BTreeSet::new();
-        let mut complete = false;
-        'pages: for page in 0..EVENT_PAGES {
-            let mut url = self.api.url(&["events", "sandboxes"])?;
-            url.query_pairs_mut()
-                .append_pair("offset", &(page * EVENT_PAGE).to_string())
-                .append_pair("limit", &EVENT_PAGE.to_string())
-                .append_pair("orderAsc", "false")
-                .append_pair("types", "sandbox.lifecycle.paused")
-                .append_pair("types", "sandbox.lifecycle.killed");
-            let events: Vec<Event> = self.api.get(url, c).await?;
-            for event in &events {
-                if event.timestamp < from {
-                    complete = true;
-                    break 'pages;
-                }
-                if !seen.insert(event.id.to_string()) || event.data.sandbox_metadata.get(PROVIDER_TAG) != Some(&self.name) {
-                    continue;
-                }
-                let Some(x) = &event.data.execution else { continue };
-                let row = (event.timestamp, x.vcpu_count, x.memory_mb, Disk::Build(event.template.to_string(), event.build.to_string()));
-                let entry = executions.entry((event.sandbox.to_string(), x.started_at)).or_insert_with(|| row.clone());
-                if event.timestamp < entry.0 {
-                    *entry = row;
-                }
-            }
-            if events.len() < EVENT_PAGE {
-                complete = true;
-                break;
-            }
-        }
-        if !complete {
-            return Err(refused(format!(
-                "the period holds more than {} of E2B's sandbox events; ask for a shorter one",
-                EVENT_PAGES * EVENT_PAGE
-            )));
-        }
-        let now = Utc::now();
-        for v in self.listed(None, c).await? {
-            if let (Some(started), Some(cpus), Some(memory), Some(disk), "running") =
-                (v.started_at, v.cpus, v.memory_mb, v.disk_mb, self.state(&v))
-            {
-                executions.entry((v.id.to_string(), started)).or_insert((now, cpus, memory, Disk::Granted(disk)));
-            }
-        }
-        executions.retain(|(_, started), (ended, ..)| (*ended).min(to) > (*started).max(from));
-        let mut builds = BTreeMap::new();
-        for (_, _, _, disk) in executions.values() {
-            if let Disk::Build(template, _) = disk
-                && !builds.contains_key(template)
-            {
-                builds.insert(template.clone(), self.builds(template, c).await?);
-            }
-        }
-        let mut sizes: BTreeMap<(u64, u64, u64), f64> = BTreeMap::new();
-        let (mut cpu_seconds, mut memory_byte_seconds) = (0.0, 0.0);
-        let mut sandboxes = BTreeSet::new();
-        for ((sandbox, started), (ended, cpus, memory, disk)) in executions {
-            let disk = match disk {
-                Disk::Granted(disk) => disk,
-                Disk::Build(template, build) => builds[&template].get(&build).copied().ok_or_else(|| {
-                    refused(format!("E2B reports no disk for build {build} of template {template}, which sandbox {sandbox} ran"))
-                })?,
-            };
-            let (start, end) = (started.max(from), ended.min(to));
-            let seconds = (end - start).num_milliseconds() as f64 / 1000.0;
-            *sizes.entry((cpus, memory, disk)).or_default() += seconds / 3600.0;
-            cpu_seconds += cpus as f64 * seconds;
-            memory_byte_seconds += (memory * MIB) as f64 * seconds;
-            sandboxes.insert(sandbox);
-        }
-        Ok(Usage {
-            period,
-            environment_hours: sizes
-                .into_iter()
-                .map(|((cpus, memory, disk), hours)| SizeUsage {
-                    size: Size { cpus: cpus as f64, memory_bytes: memory * MIB, disk_bytes: disk * MIB },
-                    hours,
-                })
-                .collect(),
-            measurements: Some(UsageMeasurements {
-                scope: UsageScope::Organization { id: self.settings.team_id.clone() },
-                resources: BTreeMap::from([
-                    (ResourceKind::Cpu, Quantity { amount: cpu_seconds, unit: "{vCPU}.s".into() }),
-                    (ResourceKind::Memory, Quantity { amount: memory_byte_seconds, unit: "By.s".into() }),
-                    (ResourceKind::Environments, Quantity { amount: sandboxes.len() as f64, unit: "1".into() }),
-                ]),
-                cost: None,
-            }),
         })
     }
 }
@@ -1050,6 +832,202 @@ impl UsageOperation for E2b {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rigging_http_client::ChannelLabel;
+
+    /// Answers each request with the next scripted (status, body), keeping
+    /// each request's method, path, body and envd token.
+    #[derive(Default)]
+    struct Script {
+        answers: Mutex<Vec<(u16, &'static str)>>,
+        asked: Mutex<Vec<(String, String, serde_json::Value)>>,
+        envd_tokens: Mutex<Vec<Option<String>>>,
+    }
+    #[async_trait]
+    impl HttpClient for Script {
+        async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+            let body = request.body().and_then(|b| b.as_bytes()).and_then(|b| serde_json::from_slice(b).ok()).unwrap_or_default();
+            self.asked.lock().unwrap().push((request.method().to_string(), request.url().path().to_owned(), body));
+            let token = request.headers().get("x-access-token").map(|t| t.to_str().unwrap().to_owned());
+            self.envd_tokens.lock().unwrap().push(token);
+            let (status, body) = {
+                let mut answers = self.answers.lock().unwrap();
+                assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
+                answers.remove(0)
+            };
+            Ok(http::Response::builder().status(status).body(Bytes::from_static(body.as_bytes())).unwrap())
+        }
+    }
+    impl Script {
+        fn asked(&self) -> Vec<(String, String)> {
+            self.asked.lock().unwrap().iter().map(|(m, p, _)| (m.clone(), p.clone())).collect()
+        }
+    }
+    async fn configure(ownership: Ownership, settings: serde_json::Value, script: Arc<Script>) -> Result<Arc<dyn Provider>> {
+        let settings = serde_json::from_value(settings).unwrap();
+        let config = ProviderConfiguration { module: "e2b".into(), settings, ownership, ..Default::default() };
+        E2bModule::new().configure("e2b-a", &config, script).await
+    }
+    async fn e2b(ownership: Ownership, answers: Vec<(u16, &'static str)>) -> (Arc<dyn Provider>, Arc<Script>) {
+        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        (configure(ownership, serde_json::json!({"team_id": "team"}), script.clone()).await.unwrap(), script)
+    }
+    fn key() -> Credentials {
+        Credentials::new(Some(Secret::new("k")))
+    }
+    fn asked(method: &str, path: &str) -> (String, String) {
+        (method.to_owned(), path.to_owned())
+    }
+    const CREATED: &str =
+        r#"{"templateID":"t","sandboxID":"sbx1","clientID":"c","envdVersion":"0.2","envdAccessToken":"e","trafficAccessToken":"x"}"#;
+
+    // Provision is one create. The owner tag goes on only on a shared
+    // account; the answer is E2B's create row, which carries no state.
+    #[tokio::test]
+    async fn provision_is_one_create_tagged_by_ownership() {
+        for (ownership, tags) in [(Ownership::SharedAccount, 2), (Ownership::OwnedAccount, 1)] {
+            let (e2b, script) = e2b(ownership, vec![(201, CREATED)]).await;
+            let prepared = Prepared {
+                provider: "e2b-a".into(),
+                id: "drydock-tmpl".into(),
+                platform: platform(),
+                image_digest: "img".into(),
+                tools_digest: "tools".into(),
+            };
+            let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 };
+            let request = ProvisionRequest { label: "crew-1".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None };
+            let Provisioned::Created(e) = e2b.provision(request, &key()).await.unwrap() else { panic!("not created") };
+            assert_eq!(
+                (e.id.as_str(), e.label.as_deref(), &e.state),
+                ("sbx1", Some("crew-1"), &Observation::Unknown { reason: UnknownReason::ProviderStateUnknown })
+            );
+            let asked = script.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1);
+            let (method, path, body) = &asked[0];
+            assert_eq!((method.as_str(), path.as_str()), ("POST", "/v2/sandboxes"));
+            let metadata = body["metadata"].as_object().unwrap();
+            assert_eq!(metadata.len(), tags);
+            assert_eq!(metadata[LABEL_TAG], "crew-1");
+            assert_eq!(metadata.get(OWNER_TAG).is_some(), ownership == Ownership::SharedAccount);
+            assert_eq!(e.vendor, None);
+        }
+    }
+
+    // List is one call, and reports every row E2B lists, another owner's
+    // included, with E2B's state name and metadata beside the coarse state.
+    // A pause has no cause, and a row without metadata no tags: E2B states
+    // neither.
+    #[tokio::test]
+    async fn list_reports_every_row_as_e2b_gives_it() {
+        let rows = r#"[
+            {"sandboxID":"sbx1","state":"running","cpuCount":1,"memoryMB":1024,"diskSizeMB":1024,"metadata":{"drydock.provider":"e2b-a","flotilla.label":"l"}},
+            {"sandboxID":"sbx2","state":"paused","cpuCount":2,"memoryMB":2048,"diskSizeMB":1024,"metadata":{"drydock.provider":"other"}},
+            {"sandboxID":"sbx3","state":"running","cpuCount":1,"memoryMB":1024,"diskSizeMB":1024}
+        ]"#;
+        let (e2b, script) = e2b(Ownership::SharedAccount, vec![(200, rows)]).await;
+        let listed = e2b.list(&key()).await.unwrap();
+        assert_eq!(script.asked(), [asked("GET", "/v2/sandboxes")]);
+        let seen: Vec<_> = listed.iter().map(|e| (e.id.as_str(), e.label.as_deref(), e.state.clone())).collect();
+        assert_eq!(
+            seen,
+            [
+                ("sbx1", Some("l"), Observation::Running),
+                ("sbx2", None, Observation::Stopped { cause: None }),
+                ("sbx3", None, Observation::Running)
+            ]
+        );
+        let vendor = listed[1].vendor.as_ref().unwrap();
+        assert_eq!((vendor.state.as_str(), vendor.tags.as_ref().unwrap()[OWNER_TAG].as_str()), ("paused", "other"));
+        assert_eq!(listed[2].vendor.as_ref().unwrap().tags, None);
+    }
+
+    // Suspend is one pause and answers the id as the token. Resume is one
+    // connect, whatever the token.
+    #[tokio::test]
+    async fn suspend_and_resume_are_one_call_each() {
+        let (e2b, script) = e2b(Ownership::OwnedAccount, vec![(204, ""), (201, CREATED)]).await;
+        let port = e2b.operations().suspend_resume.unwrap();
+        assert_eq!(port.suspend("sbx1", &key()).await.unwrap(), ResumeToken { token: Secret::new("sbx1") });
+        port.resume("sbx1", ResumeToken { token: Secret::new("anything") }, &key()).await.unwrap();
+        assert_eq!(script.asked(), [asked("POST", "/sandboxes/sbx1/pause"), asked("POST", "/v2/sandboxes/sbx1/connect")]);
+    }
+
+    // A request becomes E2B's network as asked; a read network's digest keeps
+    // a field E2B left out apart from one it stated.
+    #[test]
+    fn egress_translation_and_fingerprint() {
+        let host = |h: &str| Destination::Host { host: serde_json::from_value(serde_json::json!(h)).unwrap() };
+        let open = network(&EgressRequest::Open).unwrap();
+        assert_eq!(serde_json::to_value(&open).unwrap(), serde_json::json!({"allowPublicTraffic": false}));
+        let deny = network(&EgressRequest::DenyAll { direct: vec![host("Example.COM."), host("192.0.2.5")] }).unwrap();
+        assert_eq!(
+            serde_json::to_value(&deny).unwrap(),
+            serde_json::json!({"allowPublicTraffic": false, "denyOut": ["0.0.0.0/0"], "allowOut": ["192.0.2.5/32", "example.com"]})
+        );
+        assert!(network(&EgressRequest::DenyAll { direct: vec![host("::1")] }).is_err());
+        let read = |v: serde_json::Value| fingerprint(&serde_json::from_value(v).unwrap());
+        assert_ne!(read(serde_json::json!({})), read(serde_json::json!({"allowPublicTraffic": true})));
+        assert_ne!(read(serde_json::json!({})), read(serde_json::json!({"denyOut": []})));
+        assert_eq!(read(serde_json::json!({"allowOut": ["EXAMPLE.com"]})), read(serde_json::json!({"allowOut": ["example.com"]})));
+    }
+
+    // Concurrency in use is E2B's latest sample, and unknown without one.
+    #[tokio::test]
+    async fn quota_is_the_latest_sample() {
+        let samples = r#"[{"timestampUnix":2,"concurrentSandboxes":3},{"timestampUnix":1,"concurrentSandboxes":9}]"#;
+        let (e2b, _) = e2b(Ownership::SharedAccount, vec![(200, samples), (200, "[]")]).await;
+        let port = e2b.operations().quota.unwrap();
+        assert_eq!(port.quota(&key()).await.unwrap().concurrency_in_use, Some(3));
+        assert_eq!(port.quota(&key()).await.unwrap().concurrency_in_use, None);
+    }
+
+    // Settings take the old constants as defaults; a zero or an unknown key
+    // is refused.
+    #[tokio::test]
+    async fn settings_refuse_zeroes_and_unknown_keys() {
+        let settings = |extra: serde_json::Value| {
+            let mut settings = serde_json::json!({"team_id": "team"});
+            settings.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            settings
+        };
+        assert!(configure(Ownership::SharedAccount, settings(serde_json::json!({})), Arc::default()).await.is_ok());
+        for refused in [
+            serde_json::json!({"team_id": ""}),
+            serde_json::json!({"build_polls": 0}),
+            serde_json::json!({"build_poll_seconds": 0}),
+            serde_json::json!({"exec_timeout_ms": 0}),
+            serde_json::json!({"poll_interval_ms": 0}),
+            serde_json::json!({"poll_every": 5}),
+        ] {
+            let result = configure(Ownership::SharedAccount, settings(refused.clone()), Arc::default()).await;
+            assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{refused}");
+        }
+    }
+
+    // An envd request E2B answers 401 is sent once more, with the envd token
+    // read back from the sandbox's detail; the next request uses that token.
+    #[tokio::test]
+    async fn envd_refreshes_its_token_on_401() {
+        let ended: &'static str = String::from_utf8(envelope(2, br#"{"event":{"end":{}}}"#)).unwrap().leak();
+        let detail = r#"{"sandboxID":"sbx1","state":"running","envdAccessToken":"fresh"}"#;
+        let (e2b, script) = e2b(Ownership::OwnedAccount, vec![(401, ""), (200, detail), (200, ""), (200, ended)]).await;
+        let file = GuestFile { path: "/opt/tool".into(), mode: 0o755 };
+        e2b.operations().files.unwrap().put("sbx1", file, Bytes::from_static(b"x"), &key()).await.unwrap();
+        assert_eq!(
+            script.asked(),
+            [asked("POST", "/files"), asked("GET", "/sandboxes/sbx1"), asked("POST", "/files"), asked("POST", "/process.Process/Start")]
+        );
+        let tokens = script.envd_tokens.lock().unwrap().clone();
+        assert_eq!(tokens, [None, None, Some("fresh".into()), Some("fresh".into())]);
+    }
+
+    // Destroy is one kill; E2B's answers pass through, not found included.
+    #[tokio::test]
+    async fn destroy_is_one_kill() {
+        let (e2b, script) = e2b(Ownership::SharedAccount, vec![(204, ""), (404, r#"{"message":"sandbox not found"}"#)]).await;
+        e2b.destroy("sbx1", &key()).await.unwrap();
+        assert!(matches!(e2b.destroy("sbx1", &key()).await, Err(ProtocolError::NotFound { .. })));
+        assert_eq!(script.asked(), [asked("DELETE", "/sandboxes/sbx1"), asked("DELETE", "/sandboxes/sbx1")]);
+    }
 
     #[test]
     fn connect_streams_parse() {

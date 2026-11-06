@@ -949,7 +949,8 @@ impl Target<'_> {
                     require(
                         matches!(
                             client.inspect(provider, &environment.id).await.map_err(SafeError::category)?.state,
-                            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
+                            // A vendor may give no cause; a stated one must be the request.
+                            Observation::Stopped { cause: None | Some(StopCause::SuspendedByRequest) }
                         ),
                         "suspended environment has wrong state or cause",
                     )
