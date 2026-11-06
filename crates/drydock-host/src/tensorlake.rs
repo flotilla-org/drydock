@@ -585,7 +585,9 @@ fn sandbox_name(instance: &str, label: &str) -> String {
 }
 /// Sandboxes carry no labels or metadata: the name an instance gave a sandbox
 /// is the only mark that it is that instance's, and holds its label. Tags are
-/// reported only for a name `instance`'s prefix starts.
+/// reported only for a name `instance`'s prefix starts (the owner's decision
+/// on drydock#287). drydock#296, snapshots left on a shared account, is about
+/// drydockd's guard, not these tags.
 fn tags(instance: &str, name: &str) -> Option<BTreeMap<String, String>> {
     let prefix = sandbox_prefix(instance);
     name.starts_with(&prefix).then(|| {
