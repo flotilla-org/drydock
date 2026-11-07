@@ -204,10 +204,11 @@ fn delivery(event: &Event) -> Option<&str> {
     event.observed.as_ref().and_then(|o| o.delivery_id.as_deref())
 }
 
-// Each lifecycle type arrives as its own event: created is the sandbox's
-// creation, paused a stop with no cause, resumed a resume, killed a gone with
-// no cause. Each carries E2B's type as its state, E2B's timestamp, and the
-// body's id as its delivery.
+// Each lifecycle type arrives as an event: created is the sandbox's creation
+// and running, paused a stop with no cause, resumed a resume and running,
+// killed a gone with no cause. E2B states no size, so running carries none.
+// Each carries E2B's type as its state, E2B's timestamp, and the body's id as
+// its delivery.
 #[tokio::test]
 async fn each_lifecycle_type_arrives_as_an_event_with_the_vendor_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -222,12 +223,15 @@ async fn each_lifecycle_type_arrives_as_an_event_with_the_vendor_state() {
         kinds,
         [
             (EventKind::Created, "sandbox.lifecycle.created", body_id(&frames[0])),
+            (EventKind::Running { granted_size: None }, "sandbox.lifecycle.created", body_id(&frames[0])),
             (EventKind::Stopped { cause: None }, "sandbox.lifecycle.paused", body_id(&frames[1])),
             (EventKind::Resumed, "sandbox.lifecycle.resumed", body_id(&frames[2])),
+            (EventKind::Running { granted_size: None }, "sandbox.lifecycle.resumed", body_id(&frames[2])),
             (EventKind::Gone { cause: None }, "sandbox.lifecycle.killed", body_id(&frames[3])),
         ]
     );
-    for (event, frame) in events.iter().zip(&frames) {
+    for event in &events {
+        let frame = frames.iter().find(|f| body_id(f) == delivery(event)).unwrap();
         assert_eq!((event.id.as_str(), event.observed.as_ref().unwrap().way), (SANDBOX, ObservedWay::Webhook));
         assert_eq!(event.timestamp_source, TimestampSource::Provider);
         assert_eq!(event.timestamp, frame["body"]["timestamp"].as_str().unwrap().parse().unwrap());
