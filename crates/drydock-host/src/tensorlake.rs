@@ -551,7 +551,7 @@ fn sandbox_name(instance: &str, label: &str) -> String {
     {
         return format!("{prefix}r-{label}");
     }
-    let encoded = base32(label.as_bytes());
+    let encoded = base32().encode(label.as_bytes());
     if !label.is_empty() && encoded.len() <= room {
         return format!("{prefix}b-{encoded}");
     }
@@ -574,7 +574,7 @@ fn label_of(prefix: &str, name: &str) -> Option<String> {
     if let Some(label) = rest.strip_prefix("r-") {
         return Some(label.to_owned());
     }
-    String::from_utf8(unbase32(rest.strip_prefix("b-")?)?).ok()
+    String::from_utf8(base32().decode(rest.strip_prefix("b-")?.as_bytes()).ok()?).ok()
 }
 fn name_valid(name: &str) -> bool {
     !name.is_empty()
@@ -582,35 +582,14 @@ fn name_valid(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.ends_with('-')
 }
-const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-fn base32(bytes: &[u8]) -> String {
-    let mut text = String::new();
-    let (mut buffer, mut bits) = (0u32, 0);
-    for byte in bytes {
-        buffer = buffer << 8 | u32::from(*byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            text.push(BASE32[(buffer >> bits & 31) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        text.push(BASE32[(buffer << (5 - bits) & 31) as usize] as char);
-    }
-    text
-}
-fn unbase32(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let (mut buffer, mut bits) = (0u32, 0);
-    for c in text.bytes() {
-        buffer = buffer << 5 | BASE32.iter().position(|b| *b == c)? as u32;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((buffer >> bits & 0xff) as u8);
-        }
-    }
-    (buffer & ((1 << bits) - 1) == 0).then_some(bytes)
+/// RFC 4648 base32 in lowercase, unpadded: sandbox names allow no capitals.
+fn base32() -> &'static data_encoding::Encoding {
+    static BASE32: std::sync::LazyLock<data_encoding::Encoding> = std::sync::LazyLock::new(|| {
+        let mut spec = data_encoding::Specification::new();
+        spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
+        spec.encoding().expect("a base32 alphabet")
+    });
+    &BASE32
 }
 fn image_name(image: &str, platform: &Platform) -> String {
     content_name("dd-", 40, &[image, &platform.to_string()])
