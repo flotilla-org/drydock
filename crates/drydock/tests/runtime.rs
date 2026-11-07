@@ -976,6 +976,90 @@ async fn progress_retains_billing_baseline_and_inventory() {
     assert!(matches!(kinds[1], EventKind::Running { .. }));
 }
 
+// A row that becomes running emits Running even when the vendor states no
+// size; the event then carries none.
+#[tokio::test]
+async fn an_unsized_row_becoming_running_emits_running_without_a_size() {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    control.vendor.lock().unwrap().row = Some(Environment {
+        platform: None,
+        id: "unsized".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Running,
+        granted_size: None,
+        egress: Enforcement::Advisory,
+        egress_measured: false,
+        egress_policy: None,
+        timestamp: None,
+        vendor: None,
+    });
+    let mut kinds = vec![];
+    while kinds.len() < 2 {
+        if let ObserveRecord::Event { event } = events.next().await {
+            kinds.push(event.event);
+        }
+    }
+    assert_eq!(kinds, [EventKind::Created, EventKind::Running { granted_size: None }]);
+}
+
+// A running row whose stated size changes reports the new size as its own
+// observation and no Running, since it did not become running.
+#[tokio::test]
+async fn a_running_row_whose_size_changes_reports_the_size_and_not_running() {
+    let size = |cpus| Size { cpus, memory_bytes: 0, disk_bytes: 0 };
+    let (_h, control, mut next) = running_row(Some(size(1.))).await;
+    assert_eq!(next().await, EventKind::Created);
+    assert_eq!(next().await, EventKind::Running { granted_size: Some(size(1.)) });
+    control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = Some(size(2.));
+    assert_eq!(next().await, EventKind::SizeChanged { granted_size: size(2.) });
+}
+
+// A size first stated while the environment runs is reported as a size
+// change with that size, and no Running.
+#[tokio::test]
+async fn a_size_first_stated_on_a_running_row_reports_the_size_and_not_running() {
+    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
+    let (_h, control, mut next) = running_row(None).await;
+    assert_eq!(next().await, EventKind::Created);
+    assert_eq!(next().await, EventKind::Running { granted_size: None });
+    control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = Some(size.clone());
+    assert_eq!(next().await, EventKind::SizeChanged { granted_size: size });
+}
+
+/// A provider whose vendor lists one running row of `granted_size`, and a
+/// reader of the events that follow.
+async fn running_row(granted_size: Option<Size>) -> (Harness, std::sync::Arc<Control>, impl AsyncFnMut() -> EventKind) {
+    let (h, control) = controlled().await;
+    h.configure(vec![provider("a", json!({}))]).await;
+    h.credential("a", "ready").await;
+    let mut events = h.stream(None).await;
+    events.next().await;
+    control.vendor.lock().unwrap().row = Some(Environment {
+        platform: None,
+        id: "sized".into(),
+        provider: "a".into(),
+        label: None,
+        state: Observation::Running,
+        granted_size,
+        egress: Enforcement::Advisory,
+        egress_measured: false,
+        egress_policy: None,
+        timestamp: None,
+        vendor: None,
+    });
+    let next = async move || loop {
+        if let ObserveRecord::Event { event } = events.next().await {
+            break event.event;
+        }
+    };
+    (h, control, next)
+}
+
 // Cheap polling retains explicit inspect's measured claim while running, and
 // clears it when stopped. No network probe is needed for each inventory sample.
 #[tokio::test]

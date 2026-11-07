@@ -745,7 +745,7 @@ impl Provider for Runtime {
             url: format!("{}{}", preview.url.trim_end_matches('/'), drydock_transport::tcp::CONNECT_PATH),
             token,
             headers: BTreeMap::from([(PREVIEW_TOKEN_HEADER.to_owned(), Secret::new(preview_token))]),
-            expires_at: expires_at.into(),
+            expires_at: Some(expires_at.into()),
         })
     }
     async fn relay(&self, _: &str, _: &Credentials) -> Result<ByteStream> {

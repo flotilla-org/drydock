@@ -24,11 +24,17 @@ fn tagged_wire_fixtures() {
         json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":true}),
         json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k","reverse_forwards":false}),
         json!({"kind":"dial","url":"wss://h","token":"secret","expires_at":"2026-10-19T00:00:00Z"}),
+        json!({"kind":"dial","url":"wss://h","token":"secret"}),
         json!({"kind":"dial","url":"https://h","token":"secret","headers":{"x-edge-token":"edge"},"expires_at":"2026-10-19T00:00:00Z"}),
         json!({"kind":"relay","path":"/relay"}),
     ] {
         fixture::<Reach>(value);
     }
+    // An expiry the vendor does not state is left off the wire, not sent as null.
+    let unstated = Reach::Dial { url: "wss://h".into(), token: Secret::new("secret"), headers: Default::default(), expires_at: None };
+    assert!(serde_json::to_value(&unstated).unwrap().get("expires_at").is_none());
+    // So is a size the vendor does not state on a running event.
+    assert_eq!(serde_json::to_value(EventKind::Running { granted_size: None }).unwrap(), json!({"kind":"running"}));
     // A host that says nothing about reverse forwards does not accept them.
     let reach: Reach = serde_json::from_value(json!({"kind":"ssh","endpoint":"h:22","user":"u","host_key":"k"})).unwrap();
     assert!(matches!(reach, Reach::Ssh { reverse_forwards: false, .. }));
@@ -51,6 +57,8 @@ fn tagged_wire_fixtures() {
     for event in [
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
+        json!({"kind":"running"}),
+        json!({"kind":"size_changed","granted_size":{"cpus":2.0,"memory_bytes":0,"disk_bytes":0}}),
         json!({"kind":"stopped","cause":"guest_halted"}),
         json!({"kind":"paused","cause":"paused_by_provider"}),
         json!({"kind":"resumed"}),
@@ -92,7 +100,8 @@ fn secret_debug_redacts_without_changing_wire() {
     let secret = Secret::new(value);
     let refresh = CredentialRefresh { value: secret.clone() };
     let headers = [("x-edge-token".to_owned(), secret.clone())].into();
-    let reach = Reach::Dial { url: "tcp://h".into(), token: secret.clone(), headers, expires_at: "2026-10-19T00:00:00Z".parse().unwrap() };
+    let reach =
+        Reach::Dial { url: "tcp://h".into(), token: secret.clone(), headers, expires_at: Some("2026-10-19T00:00:00Z".parse().unwrap()) };
     let pull = RegistryCredential { username: "u".into(), secret: secret.clone() };
     let resume = ResumeToken { token: secret };
     for debug in [format!("{refresh:?}"), format!("{reach:?}"), format!("{resume:?}"), format!("{pull:?}")] {

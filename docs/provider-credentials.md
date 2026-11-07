@@ -50,7 +50,8 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 - The module never deletes built images; Modal keeps them in its cache.
 - A token that can't see the app lists nothing rather than failing.
 - DNS resolution is never filtered, whatever the egress policy, so it remains a covert channel.
-- Quota has no API; it is the count of live sandboxes in the app.
+- The module declares no quota: Modal has none to report.
+- On a `shared_account` (the default) the module tags each sandbox `drydock.provider` with the instance, and drydockd lists and destroys only sandboxes that carry it. On an `owned_account` nothing is tagged or filtered, so the environment must hold only drydock's app. The label is the `flotilla.label` tag; provisioning a label twice makes two sandboxes.
 - The agent is reached through Modal's connect-token edge, where TLS ends: Modal sees the connect token and the agent's TCP token (`Authorization`) in transit, and every byte to and from the agent. The agent listens on all addresses in the sandbox, since the edge cannot reach loopback, so its token is the only gate on that port. drydockd masks both credentials in its errors and log.
 
 ## Runtime (`runtime`, Rust host)
