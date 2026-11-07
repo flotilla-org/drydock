@@ -3063,7 +3063,7 @@
           },
           {
             "type": "object",
-            "description": "The vendor stated a different granted size for a running environment\nthan the one it stated before. Not a state change. A size first\nstated, or no longer stated, is not a change and emits nothing, so a\nconsumer reads the current size from the row.",
+            "description": "The vendor stated a granted size for a running environment that it had\nnot stated before, or that differs from the one it stated before. Not a\nstate change. A size no longer stated is not a change and emits nothing.",
             "required": [
               "granted_size",
               "kind"

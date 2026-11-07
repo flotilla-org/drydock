@@ -294,12 +294,13 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
                 kinds.push(EventKind::Resumed);
             }
             // Becoming running emits Running, with the size only when stated.
-            // A running row whose stated size differs from the one stated
-            // before reports that size, not a transition.
+            // A running row whose size is stated for the first time, or
+            // differs from the one stated before, reports that size, not a
+            // transition; a size no longer stated reports nothing.
             if pushed || old.is_none_or(|(old, _)| !matches!(old, Some(Observation::Running))) {
                 kinds.push(EventKind::Running { granted_size: size.cloned() });
-            } else if let (Some((_, Some(old_size))), Some(size)) = (old, size)
-                && old_size != size
+            } else if let (Some((_, old_size)), Some(size)) = (old, size)
+                && old_size != Some(size)
             {
                 kinds.push(EventKind::SizeChanged { granted_size: size.clone() });
             }

@@ -1054,10 +1054,9 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         granted_size: Option<Size>,
     },
-    /// The vendor stated a different granted size for a running environment
-    /// than the one it stated before. Not a state change. A size first
-    /// stated, or no longer stated, is not a change and emits nothing, so a
-    /// consumer reads the current size from the row.
+    /// The vendor stated a granted size for a running environment that it had
+    /// not stated before, or that differs from the one it stated before. Not a
+    /// state change. A size no longer stated is not a change and emits nothing.
     SizeChanged {
         granted_size: Size,
     },
