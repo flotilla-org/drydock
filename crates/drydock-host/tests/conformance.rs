@@ -275,6 +275,14 @@ async fn resume_returns_the_next_event_whatever_its_kind() {
     assert!(report.passed(), "{report:?}");
 }
 
+// A Running event that states no size, beside a row that states one, passes:
+// the two are separate reports and are not compared.
+#[tokio::test]
+async fn running_event_without_a_size_beside_a_sized_row_passes() {
+    let report = python_report("unsized_running").await;
+    assert!(report.passed(), "{report:?}");
+}
+
 // A temporary inspect failure is a state-check failure, not a missing event.
 // The retained Running event still drives replay and subsequent cursor checks.
 #[tokio::test]

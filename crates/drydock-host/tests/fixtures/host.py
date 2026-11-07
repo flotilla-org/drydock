@@ -71,6 +71,8 @@ def emit(row, kind, **fields):
             event["timestamp"] = "2026-99-99T00:00:00Z"
         if fault == "poll_timestamp":
             event["timestamp_source"] = "adaptor"
+        if fault == "unsized_running" and kind == "running":
+            event["event"].pop("granted_size", None)
         if fault == "size" and kind == "running":
             event["event"]["granted_size"] = {**size, "cpus": 99}
         if kind == "gone":
