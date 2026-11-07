@@ -442,8 +442,9 @@ test("list reports devboxes as Namespace states them", async () => {
 });
 
 // A row carries what Namespace states and nothing else: no size without a
-// stated volume, no platform without a stated shape, and Namespace's own
-// state word beside an unknown state.
+// stated volume, no platform without a stated shape, a running devbox is
+// running with or without a size, and Namespace's own state word beside an
+// unknown state.
 test("a row reports only what Namespace states", async () => {
   const { standIn, provider, context, provision } = await setup();
   const { environment } = await provision("vessel");
@@ -461,6 +462,9 @@ test("a row reports only what Namespace states", async () => {
   delete info.shape;
   delete info.labels[LABEL];
   delete info.labels[POLICY];
+  const sizeless = await provider.inspect(environment.id, context);
+  assert.deepEqual(sizeless.state, { state: "running" });
+  assert.ok(!("granted_size" in sizeless));
   info.state = "unknown";
   const row = await provider.inspect(environment.id, context);
   for (const key of [
