@@ -1007,10 +1007,11 @@ async fn an_unsized_row_becoming_running_emits_running_without_a_size() {
     assert_eq!(kinds, [EventKind::Created, EventKind::Running { granted_size: None }]);
 }
 
-// A running row emits Running again when its size changes between two stated
-// sizes; a size first stated on a running row is not a change.
+// A running row whose stated size changes reports the new size as its own
+// observation and no Running, since it did not become running; a size first
+// stated on a running row is not a change.
 #[tokio::test]
-async fn a_running_row_emits_running_on_a_change_between_known_sizes() {
+async fn a_running_row_whose_size_changes_reports_the_size_and_not_running() {
     let (h, control) = controlled().await;
     h.configure(vec![provider("a", json!({}))]).await;
     h.credential("a", "ready").await;
@@ -1046,7 +1047,7 @@ async fn a_running_row_emits_running_on_a_change_between_known_sizes() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = Some(size(2.));
-    assert_eq!(next().await, EventKind::Running { granted_size: Some(size(2.)) });
+    assert_eq!(next().await, EventKind::SizeChanged { granted_size: size(2.) });
 }
 
 // Cheap polling retains explicit inspect's measured claim while running, and

@@ -3038,7 +3038,7 @@
           },
           {
             "type": "object",
-            "description": "The environment became running, or its granted size changed while\nrunning. The size is the vendor's, absent when it states none. A size\nfirst stated on a running row is not a change and emits nothing, so a\nconsumer reads the current size from the row, not from this event.",
+            "description": "The environment became running. The size is the vendor's, absent\nwhen it states none.",
             "required": [
               "kind"
             ],
@@ -3057,6 +3057,25 @@
                 "type": "string",
                 "enum": [
                   "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The vendor stated a different granted size for a running environment\nthan the one it stated before. Not a state change. A size first\nstated, or no longer stated, is not a change and emits nothing, so a\nconsumer reads the current size from the row.",
+            "required": [
+              "granted_size",
+              "kind"
+            ],
+            "properties": {
+              "granted_size": {
+                "$ref": "#/components/schemas/Size"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "size_changed"
                 ]
               }
             }

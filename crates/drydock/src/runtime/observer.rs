@@ -293,12 +293,15 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
             if old.is_some_and(|(old, _)| matches!(old, Some(Observation::Stopped { .. }))) {
                 kinds.push(EventKind::Resumed);
             }
-            // Becoming running emits Running, with the size only when stated;
-            // a running row emits it again when both sizes are known and differ.
-            let becomes = pushed || old.is_none_or(|(old, _)| !matches!(old, Some(Observation::Running)));
-            let resized = old.is_some_and(|(_, old_size)| old_size.is_some() && size.is_some() && old_size != size);
-            if becomes || resized {
+            // Becoming running emits Running, with the size only when stated.
+            // A running row whose stated size differs from the one stated
+            // before reports that size, not a transition.
+            if pushed || old.is_none_or(|(old, _)| !matches!(old, Some(Observation::Running))) {
                 kinds.push(EventKind::Running { granted_size: size.cloned() });
+            } else if let (Some((_, Some(old_size))), Some(size)) = (old, size)
+                && old_size != size
+            {
+                kinds.push(EventKind::SizeChanged { granted_size: size.clone() });
             }
         }
         Observation::Stopped { cause } if changed => {

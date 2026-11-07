@@ -58,6 +58,7 @@ fn tagged_wire_fixtures() {
         json!({"kind":"created"}),
         json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
         json!({"kind":"running"}),
+        json!({"kind":"size_changed","granted_size":{"cpus":2.0,"memory_bytes":0,"disk_bytes":0}}),
         json!({"kind":"stopped","cause":"guest_halted"}),
         json!({"kind":"paused","cause":"paused_by_provider"}),
         json!({"kind":"resumed"}),

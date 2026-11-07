@@ -1048,13 +1048,18 @@ pub enum ObservedWay {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
     Created,
-    /// The environment became running, or its granted size changed while
-    /// running. The size is the vendor's, absent when it states none. A size
-    /// first stated on a running row is not a change and emits nothing, so a
-    /// consumer reads the current size from the row, not from this event.
+    /// The environment became running. The size is the vendor's, absent
+    /// when it states none.
     Running {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         granted_size: Option<Size>,
+    },
+    /// The vendor stated a different granted size for a running environment
+    /// than the one it stated before. Not a state change. A size first
+    /// stated, or no longer stated, is not a change and emits nothing, so a
+    /// consumer reads the current size from the row.
+    SizeChanged {
+        granted_size: Size,
     },
     Stopped {
         #[serde(default, skip_serializing_if = "Option::is_none")]

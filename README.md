@@ -379,8 +379,9 @@ Wire conventions chosen for this first protocol version:
   typed errors; consumers preserve their previous rows rather than infer deletion.
   Event times are RFC 3339 with explicit provider/adaptor provenance. A row
   becoming running emits a running event carrying its granted size when the
-  vendor states one and none when it does not; a running row whose stated size
-  changes emits another.
+  vendor states one and none when it does not. A running row whose stated size
+  differs from the one stated before emits `size_changed` with the new size, not
+  another running event; a size first stated, or no longer stated, emits nothing.
 - Retry hints are whole seconds. Modules do not retry. Capability flags govern
   optional suspend/resume, export, exec, usage and quota operations. A resume
   token is valid only at the same provider. Usage periods are RFC 3339 start/end;
