@@ -76,19 +76,28 @@ Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Run
 
 ## Tensorlake (`tensorlake`, Rust host)
 
-Credential: a project API key (`tl_apiKey_…`), as a plain token file. Usage also needs `organization_id` in the settings; without it the provider declares no usage.
+Credential: a project API key (`tl_apiKey_…`), as a plain token file. Reading Tensorlake's webhooks also needs `project_id`, the project's public id, which every delivery names.
 
-Create the key in the Tensorlake dashboard (project → API Keys). Use a project that holds only drydock's sandboxes. The key sees and controls every sandbox, snapshot and image in its project, and sandboxes carry no labels, so drydock finds its own by name (`dd-<instance>-…`).
+Create the key in the Tensorlake dashboard (project → API Keys). The key sees and controls every sandbox, snapshot and image in its project. The module translates: provision, list, inspect, suspend and resume are one Tensorlake call each, and destroy is the delete and the sweep of the sandbox's snapshots. Rows carry Tensorlake's `status` in `vendor`, and its `outcome`/`outcome_reason` or `termination_reason` as the reason. An environment's id is Tensorlake's sandbox id.
 
-API keys have no scopes; every key has project-member rights:
+Sandboxes carry no labels or metadata, so the sandbox's name holds them: `dd-<digest of the instance>-r-<label>` (or `-b-` with the label in base32, or `-h-` with a digest when it does not fit). The module reports `drydock.provider` and `flotilla.label`, decoded from a name with this instance's prefix, as `vendor.tags`. On a `shared_account` (the default) drydockd lists, destroys, suspends and resumes only sandboxes carrying that tag. On an `owned_account` nothing is filtered, so use a project that holds only drydock's sandboxes. Names are unique in a project: provisioning a label that already names a sandbox is refused with Tensorlake's 409.
 
-| Operation | Used for |
+| Call | Used for |
 |---|---|
-| Sandboxes: create, suspend, resume, delete; snapshots: list, delete | provision, suspend, resume, destroy and its snapshot cleanup |
+| `POST /sandboxes` (`wait: false`) | provision |
+| `GET /sandboxes` (every page) | list |
+| `GET /sandboxes/{id}`, then `GET /archived-sandboxes/{id}` when it is not found | inspect |
+| `DELETE /sandboxes/{id}`; snapshots: list, delete | destroy and its snapshot sweep |
+| `POST /sandboxes/{id}/suspend`, `POST /sandboxes/{id}/resume` | suspend, resume (the resume token is the sandbox id) |
 | Images: CAS build (`/images/v4/builds`) and lookup by name | prepare |
 | Sandbox proxy: files, processes, TCP tunnel | agent upload, exec, reach |
-| Sandbox usage (`/platform/v1/organizations/{org}/sandbox-usage`) | usage |
 
+- Sandboxes are created with `auto_resume` off: a relay or a command to a suspended sandbox fails with Tensorlake's answer instead of waking it. Sandboxes made before drydock#287 have it on, and a relay or command still wakes them.
+- Tensorlake states no platform for a sandbox, and its rows give no time for their state, so rows carry neither. drydockd chooses the agent build from the module's only declared platform (`linux/amd64`).
+- The module declares no usage, and no longer accepts `organization_id`, which only usage read: remove it from the settings. Tensorlake's per-sandbox usage export is its source when usage is collected as each vendor gives it (drydock#257).
+- Prepare waits for an image build by reading its status every `build_poll_seconds` (default 3), up to `build_polls` times (default 150), then answers unavailable; Tensorlake offers no other way to learn a build finished. The agent upload may take `upload_seconds` (default 300).
+- drydockd observes the project's sandboxes by listing them every `poll_interval_ms` (default 30000).
+- Webhooks: with `project_id` set, the module declares Tensorlake's webhook way in (`tensorlake.sandbox.created`, `.running`, `.suspended`, `.resumed`, `.terminated`, `.failed`, at least once, in no promised order). Registering it is an installation step: in Tensorlake Cloud, select the project, then **Webhooks** → **Create webhook**, with the relay's receiver URL for source `tensorlake` as the endpoint and those six events selected. Open the new destination and copy its signing secret (`whsec_…`): the relay holds it, as the source's Standard Webhooks (Svix) secret, and drydock never sees it. drydockd reads the deliveries from the relay when `[providers.<name>.events]` names it. A delivery for another project says nothing drydock follows.
 - Deleting images needs the project admin role, which an API key never has (403 "requires the 'admin' role"). Drydock cannot retire prepared images. A project admin removes stale `dd-` images with `tl sbx image rm` from a logged-in session.
 - There is no quota API. Plan limits arrive as 400 errors at create ("Per-sandbox vCPU limit exceeded", "project has reached its quota"); drydock reports a per-sandbox limit as refused and the project's quota as exhausted. Set `max_cpus` and `max_memory` to the plan's per-sandbox limits (default 4 vCPU and 16 GiB, Usage Credits) so oversized requests are refused before they reach Tensorlake.
 - Tensorlake's builders pull base images themselves, so a base must be in a registry they can reach; drydock refuses a private-address base up front. The pull credential goes to the build for the base's registry only.

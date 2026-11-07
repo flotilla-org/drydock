@@ -530,13 +530,15 @@ impl Daemon {
             .and_then(|d| d.capabilities.agent_tcp_port);
         launch::upload_agent(api, provider, &environment.id, build, fresh, tcp_port).await.map(Some)
     }
-    /// The agent build for a vessel's platform: `platform` when the caller
-    /// knows it, else the one the provider reports.
+    /// The agent build for a vessel's platform (see [`vessel_platform`]).
     async fn build_for(&self, environment: &Environment, platform: Option<&Platform>) -> Result<bytes::Bytes, Error> {
-        let platform = platform.or(environment.platform.as_ref()).ok_or_else(|| {
+        let host = self.host(&environment.provider)?;
+        let status = host.handle.status.borrow().clone();
+        let declared = status.providers.iter().find(|d| d.provider == environment.provider).map(|d| &d.capabilities.platforms[..]);
+        let platform = vessel_platform(platform, environment, declared.unwrap_or_default()).ok_or_else(|| {
             Error::Protocol(ProtocolError::Refused { reason: "the vessel's platform is unknown, so no agent build can be chosen".into() })
         })?;
-        self.agent_build(platform).await
+        self.agent_build(&platform).await
     }
     /// Wait for the vessel agent's current hello, pushing `build` (the agent for
     /// the prepared `platform`) to an older one.
@@ -983,6 +985,18 @@ impl Daemon {
     }
 }
 
+/// A vessel's platform: `asked` when the caller knows it, else the one the
+/// provider reports for the environment, else the provider's only declared
+/// platform. A vendor that states no platform per environment runs the one
+/// its module declares.
+fn vessel_platform(asked: Option<&Platform>, environment: &Environment, declared: &[Platform]) -> Option<Platform> {
+    let only = match declared {
+        [only] => Some(only),
+        _ => None,
+    };
+    asked.or(environment.platform.as_ref()).or(only).cloned()
+}
+
 /// The host's agent build for a prepared platform. A missing build refuses the
 /// launch, naming the file or variable that would supply it.
 // No unknown operation or platform is advertised as supported. BootstrapRoute
@@ -1009,5 +1023,34 @@ fn conservative_capabilities() -> Capabilities {
         agent_tcp_port: None,
         reach_ways: vec![],
         semantics: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An environment with no stated platform runs its provider's only declared one.
+    #[test]
+    fn vessel_platform_falls_back_to_the_only_declared_platform() {
+        let (amd, arm) = (Platform::new("linux", "amd64"), Platform::new("linux", "arm64"));
+        let environment = Environment {
+            id: "e".into(),
+            label: None,
+            provider: "p".into(),
+            state: Observation::Running,
+            granted_size: None,
+            egress: Enforcement::Advisory,
+            platform: None,
+            egress_measured: false,
+            egress_policy: None,
+            timestamp: None,
+            vendor: None,
+        };
+        assert_eq!(vessel_platform(None, &environment, std::slice::from_ref(&amd)), Some(amd.clone()));
+        assert_eq!(vessel_platform(None, &environment, &[amd.clone(), arm.clone()]), None);
+        assert_eq!(vessel_platform(Some(&arm), &environment, std::slice::from_ref(&amd)), Some(arm.clone()));
+        let reported = Environment { platform: Some(arm.clone()), ..environment };
+        assert_eq!(vessel_platform(None, &reported, std::slice::from_ref(&amd)), Some(arm));
     }
 }
