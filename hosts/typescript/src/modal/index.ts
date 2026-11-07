@@ -216,6 +216,9 @@ function protocolError(error: unknown): ProtocolFailure {
       kind: "refused",
       reason: `Modal refused the request: ${brief(detail)}`,
     });
+  // The SDK throws this class when a create is never scheduled for want of
+  // capacity, which is unavailable; the gRPC RESOURCE_EXHAUSTED code below is
+  // Modal's rate limit.
   if (error instanceof ResourceExhaustedError)
     return failure({
       kind: "unavailable",
