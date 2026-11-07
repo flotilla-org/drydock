@@ -724,7 +724,8 @@ The values shown are the defaults.
 
 A module declares its `ways_in`: how drydockd can hear of a change. Every
 module has `poll` (list at an interval); Daytona also declares `webhook`, its
-`sandbox.created` and `sandbox.state.updated` deliveries. The installation
+`sandbox.created` and `sandbox.state.updated` deliveries, and E2B its six
+`sandbox.lifecycle.*` deliveries. The installation
 chooses: an instance reads its vendor's webhooks from a
 [webhook relay](https://github.com/flotilla-org/flotilla.work) stream when
 given one:
@@ -744,7 +745,8 @@ observed (`observed.way`: `webhook` with its `delivery_id`, `poll`, or
 `reconstruction`) and carries the vendor's state verbatim (`vendor`, without
 tags). What a delivery does not state stays absent: Daytona's body gives no
 cause for a stop or a destruction (`cause` is then absent), and no labels or
-size.
+size; E2B's names its change (`sandbox.lifecycle.paused` is the vendor state)
+and gives a kill's `kill_reason` as the vendor reason, but no cause.
 Transitional states arrive as `transitioning` events. drydockd stores the
 relay cursor under its run directory (`events/<instance>.cursor`) and resumes
 from it after a restart. With no stored cursor, or when the relay reports a
