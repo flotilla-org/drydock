@@ -1,10 +1,14 @@
-//! Tensorlake sandboxes, reached through the sandbox proxy's TCP tunnel to the
-//! agent's token-gated listener. API: https://docs.tensorlake.ai/api-reference/openapi.yaml;
-//! the Image Service, snapshots and usage follow the SDK
-//! (https://github.com/tensorlakeai/tensorlake, crates/cloud-sdk).
+//! Tensorlake translator: each verb is Tensorlake's own operation, and each
+//! answer is what Tensorlake said. Waiting, idempotence and ownership are
+//! drydockd's, as the declared [`Semantics`] leave them (see `capabilities`).
+//! Sandboxes are reached through the sandbox proxy's TCP tunnel to the agent's
+//! token-gated listener. API: https://docs.tensorlake.ai/api-reference/openapi.yaml;
+//! the Image Service and snapshots follow the SDK
+//! (https://github.com/tensorlakeai/tensorlake, crates/cloud-sdk); webhooks:
+//! https://docs.tensorlake.ai/platform/webhooks/events.md.
 use crate::{
     kit::{
-        self, GIB, MIB, StateTable, Vendor,
+        self, GIB, LABEL_TAG, MIB, StateTable, Vendor,
         api::{Amount, Api, Auth, Body, Failure, Next, Paging, Text, absent_on_not_found},
         egress::{ipv6, normal_cidr, normal_host, private_host},
         guest::{Guest, GuestOutput},
@@ -14,6 +18,7 @@ use crate::{
     oci::ImageRef,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use drydock_protocol::*;
 use drydock_transport::{
     tcp::{self, Token},
@@ -40,20 +45,16 @@ const DISK_MB: std::ops::RangeInclusive<u64> = 10_240..=102_400;
 const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
 const TOKEN_FILE: &str = "/run/drydock/tcp-token";
 const AGENT: &str = "/opt/drydock/drydock-agent";
-const BUILD_POLL: Duration = Duration::from_secs(3);
-const BUILD_POLLS: u32 = 150;
-const STATE_POLL: Duration = Duration::from_secs(1);
-const STATE_POLLS: u32 = 120;
-const UPLOAD_DEADLINE: Duration = Duration::from_secs(300);
-const RESUME: &str = "tensorlake-resume-";
+// Tensorlake says neither whose a suspension or a termination was: its
+// outcome and reason, reported beside the state, say what it knows.
+// `resume_failed` is not classed: its state is reported as Tensorlake gives it.
 const STATES: StateTable = &[
     ("pending", kit::starting()),
     ("running", Observation::Running),
     ("snapshotting", Observation::Transitioning { phase: TransitionPhase::Reconfiguring }),
     ("suspending", kit::stopping()),
-    ("suspended", kit::stopped(StopCause::SuspendedByRequest)),
-    ("terminated", Observation::Gone { cause: Some(GoneCause::DestroyedAtProvider) }),
-    ("resume_failed", Observation::Unknown { reason: UnknownReason::ProviderApiError }),
+    ("suspended", Observation::Stopped { cause: None }),
+    ("terminated", Observation::Gone { cause: None }),
 ];
 
 pub struct TensorlakeModule {
@@ -68,50 +69,62 @@ impl TensorlakeModule {
     }
 }
 
+/// Every key has a default.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 struct Settings {
-    #[serde(default)]
-    organization_id: Option<String>,
-    #[serde(default = "api_url")]
+    /// The project whose webhooks the relay receives: a delivery for another
+    /// project says nothing drydock follows.
+    project_id: Option<String>,
     api_url: String,
-    #[serde(default = "sandbox_domain")]
     sandbox_domain: String,
-    #[serde(default = "tunnel_port")]
     tunnel_port: NonZeroU16,
-    #[serde(default = "max_cpus")]
     max_cpus: u32,
-    #[serde(default = "max_memory")]
     max_memory: u64,
-    #[serde(default = "poll_interval_ms")]
     poll_interval_ms: u64,
+    /// Prepare reads an image build's status every `build_poll_seconds`, up to
+    /// `build_polls` times, then answers unavailable.
+    build_poll_seconds: u64,
+    build_polls: u32,
+    /// The agent upload is one proxy request: an agent build (about 12 MB)
+    /// needs longer than an ordinary call on a slow link.
+    upload_seconds: u64,
 }
-fn api_url() -> String {
-    "https://api.tensorlake.ai/".into()
-}
-fn sandbox_domain() -> String {
-    "sandbox.tensorlake.ai".into()
-}
-fn tunnel_port() -> NonZeroU16 {
-    const { NonZeroU16::new(7811).unwrap() }
-}
-fn max_cpus() -> u32 {
-    4
-}
-fn max_memory() -> u64 {
-    16 * GIB
-}
-fn poll_interval_ms() -> u64 {
-    30_000
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            project_id: None,
+            api_url: "https://api.tensorlake.ai/".into(),
+            sandbox_domain: "sandbox.tensorlake.ai".into(),
+            tunnel_port: const { NonZeroU16::new(7811).unwrap() },
+            max_cpus: 4,
+            max_memory: 16 * GIB,
+            poll_interval_ms: 30_000,
+            build_poll_seconds: 3,
+            build_polls: 150,
+            upload_seconds: 300,
+        }
+    }
 }
 
+// Tensorlake's wire types (see the API contract above), only the fields read.
 #[derive(Deserialize)]
 struct Sandbox {
     id: Text,
-    name: Option<Text>,
+    name: Option<String>,
     status: Text,
+    outcome: Option<String>,
+    termination_reason: Option<String>,
     resources: Option<Resources>,
     network_policy: Option<Network>,
+}
+/// A create's answer: 200 with `status` when Tensorlake waited, 202 with
+/// `state` when it accepted the sandbox pending.
+#[derive(Deserialize)]
+struct Created {
+    sandbox_id: Text,
+    #[serde(alias = "state")]
+    status: Text,
 }
 #[derive(Deserialize)]
 struct Resources {
@@ -144,11 +157,6 @@ struct CreateSandbox<'a> {
     wait: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     network: Option<Network>,
-}
-#[derive(Deserialize)]
-struct CreateFailure {
-    status: Option<String>,
-    termination_reason: Option<String>,
 }
 #[derive(Serialize)]
 struct CreateBuild<'a> {
@@ -205,34 +213,6 @@ struct RunEvent {
     exit_code: Option<i64>,
     signal: Option<i64>,
 }
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum UsageRecord {
-    Window {
-        #[serde(rename = "attributedUsageCharge")]
-        charge: Option<Charge>,
-    },
-    Sandbox {
-        resources: BTreeMap<String, UsageQuantity>,
-    },
-    End {
-        count: u64,
-    },
-    #[serde(other)]
-    Other,
-}
-#[derive(Deserialize)]
-struct UsageQuantity {
-    quantity: String,
-    unit: String,
-}
-#[derive(Deserialize)]
-struct Charge {
-    currency: String,
-    #[serde(rename = "amountMinor")]
-    amount_minor: String,
-}
-
 #[async_trait]
 impl Module for TensorlakeModule {
     fn version(&self) -> &str {
@@ -245,15 +225,17 @@ impl Module for TensorlakeModule {
         let settings: Settings =
             serde_json::from_value(serde_json::json!(config.settings)).map_err(|e| refused(format!("invalid Tensorlake settings: {e}")))?;
         let api = Api::new(TENSORLAKE, &settings.api_url, Auth::Bearer, http)?.classify(classify);
-        if settings.organization_id.as_deref().is_some_and(str::is_empty)
+        if settings.project_id.as_deref().is_some_and(|p| p.is_empty() || p.trim() != p)
             || settings.max_cpus == 0
             || settings.max_memory < GIB
-            || settings.poll_interval_ms == 0
+            || [settings.poll_interval_ms, settings.build_poll_seconds, settings.upload_seconds].contains(&0)
+            || settings.build_polls == 0
             || settings.sandbox_domain.is_empty()
             || !settings.sandbox_domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
         {
             return Err(refused(
-                "Tensorlake requires a sandbox_domain host name, a tunnel port, and positive max_cpus, max_memory and poll_interval_ms",
+                "Tensorlake requires a sandbox_domain host name, a tunnel port, a project_id without surrounding spaces when set, and positive \
+                 max_cpus, max_memory, poll_interval_ms, build_poll_seconds, build_polls and upload_seconds",
             ));
         }
         Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone(), tokens: Mutex::default() }))
@@ -295,8 +277,9 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Tensorlake {
     fn guest(&self, id: &str, segments: &[&str]) -> Result<Url> {
+        // The proxy host is the sandbox's id or name, as one DNS label.
         if !name_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not a Tensorlake sandbox name".into() });
+            return Err(ProtocolError::NotFound { reason: "not a Tensorlake sandbox id".into() });
         }
         let base = Url::parse(&format!("https://{id}.{}/api/v1", self.settings.sandbox_domain)).map_err(|_| TENSORLAKE.bad_response())?;
         kit::api::join(&base, segments)
@@ -309,17 +292,9 @@ impl Tensorlake {
     async fn sandbox(&self, id: &str, c: &Credentials) -> Result<Sandbox> {
         self.api.get(self.api.url(&["sandboxes", id])?, c).await
     }
-    async fn status(&self, id: &str, c: &Credentials) -> Result<String> {
-        Ok(self.sandbox(id, c).await?.status.into())
-    }
-    // Archived records are addressed by id in the SDK; a name the direct
-    // lookup doesn't know is found in the archive list.
+    /// A terminated sandbox, which Tensorlake keeps by id for its retention window.
     async fn archived(&self, id: &str, c: &Credentials) -> Result<Option<Sandbox>> {
-        if let Some(row) = self.api.find(self.api.url(&["archived-sandboxes", id])?, c).await? {
-            return Ok(Some(row));
-        }
-        let rows: Vec<Sandbox> = self.paged(&["archived-sandboxes"], "sandboxes", c).await?;
-        Ok(rows.into_iter().find(|row| row.name.as_deref() == Some(id)))
+        self.api.find(self.api.url(&["archived-sandboxes", id])?, c).await
     }
     async fn snapshots(&self, sandbox_id: &str, c: &Credentials) -> Result<Vec<Snapshot>> {
         let rows = match self.paged(&["sandboxes", sandbox_id, "snapshots"], "snapshots", c).await {
@@ -328,8 +303,10 @@ impl Tensorlake {
         };
         Ok(rows.into_iter().filter(|s: &Snapshot| s.sandbox_id.as_deref() == Some(sandbox_id)).collect())
     }
-    fn environment(&self, v: &Sandbox) -> Result<Environment> {
-        let name = v.name.as_deref().ok_or_else(|| TENSORLAKE.bad_response())?;
+    fn tags(&self, name: Option<&str>) -> Option<BTreeMap<String, String>> {
+        tags(&self.name, name?)
+    }
+    fn environment(&self, v: Sandbox) -> Result<Environment> {
         let whole = |n: Amount| (n.get().fract() == 0.0 && n.get() <= u32::MAX as f64).then_some(n.get() as u64);
         let r = v.resources.as_ref();
         let granted_size = kit::granted(
@@ -340,18 +317,22 @@ impl Tensorlake {
             r.and_then(|r| whole(r.disk_mb)),
             MIB,
         )?;
+        let tags = self.tags(v.name.as_deref());
         Ok(Environment {
-            label: label_of(&sandbox_prefix(&self.name), name),
-            id: name.to_owned(),
+            label: tags.as_ref().and_then(|t| t.get(LABEL_TAG).cloned()),
+            id: v.id.to_string(),
             provider: self.name.clone(),
             state: kit::observe(STATES, &v.status),
             granted_size,
+            // No claim: drydockd's conformance verdict says whether the policy holds.
             egress: Enforcement::Advisory,
-            platform: Some(platform()),
+            // Tensorlake states no platform for a sandbox.
+            platform: None,
             egress_measured: false,
             egress_policy: Some(Policy::read(v.network_policy.as_ref()).fingerprint()),
+            // Tensorlake's rows say when the sandbox was made, not when it got to its state.
             timestamp: None,
-            vendor: None,
+            vendor: Some(VendorState { state: v.status.into(), reason: reason(v.outcome, v.termination_reason), tags }),
         })
     }
     async fn token(&self, id: &str, c: &Credentials) -> Result<Token> {
@@ -366,28 +347,6 @@ impl Tensorlake {
             )?;
         locked(&self.tokens).insert(id.to_owned(), token.clone());
         Ok(token)
-    }
-    async fn wait_running(&self, id: &str, c: &Credentials) -> Result<()> {
-        let running = kit::poll(STATE_POLLS, STATE_POLL, async || match self.status(id, c).await?.as_str() {
-            "running" => Ok(Some(())),
-            "terminated" | "resume_failed" => Err(refused(format!("Tensorlake sandbox {id} stopped before it ran"))),
-            _ => Ok(None),
-        })
-        .await?;
-        running.ok_or_else(|| ProtocolError::unavailable("Tensorlake sandbox has not started", Some(5)))
-    }
-    async fn adopt(&self, row: Sandbox, size: &Size, policy: &Policy, c: &Credentials) -> Result<Environment> {
-        let existing = self.environment(&row)?;
-        if existing.granted_size.as_ref() != Some(size) || &Policy::read(row.network_policy.as_ref()) != policy {
-            return Err(refused(
-                "an existing Tensorlake sandbox holds this label with a different size or egress policy; provision a new label",
-            ));
-        }
-        if &*row.status == "pending" {
-            self.wait_running(&existing.id, c).await?;
-            return self.inspect(&existing.id, c).await;
-        }
-        Ok(existing)
     }
     // The SDK reads a 400 from the name lookup as "not registered", as it does a 404.
     async fn image_exists(&self, name: &str, c: &Credentials) -> Result<bool> {
@@ -436,13 +395,17 @@ impl Tensorlake {
             let url = self.api.url(&["images", "v4", "builds", &id, "context", "seal"])?;
             self.api.call::<IgnoredAny>(Method::POST, url, Body::json(&seal)?, c).await?;
         }
-        let built = kit::poll(BUILD_POLLS, BUILD_POLL, async || {
+        // Tensorlake offers no other way to learn that a build finished, and
+        // nothing of drydockd's observes prepared forms: prepare waits here.
+        let (polls, interval) = (self.settings.build_polls, Duration::from_secs(self.settings.build_poll_seconds));
+        let built = kit::poll(polls, interval, async || {
             let build: BuildState = self.api.get(self.api.url(&["images", "v4", "builds", &id])?, c).await?;
             match &*build.status {
                 "succeeded" => Ok(Some(())),
-                "failed" => {
-                    Err(refused(format!("Tensorlake image build {id} failed: {}", build.error.as_deref().unwrap_or("no error recorded"))))
-                }
+                "failed" => Err(refused(match build.error {
+                    Some(error) => format!("Tensorlake image build {id} failed: {error}"),
+                    None => format!("Tensorlake image build {id} failed"),
+                })),
                 "cancelled" => Err(ProtocolError::unavailable(format!("Tensorlake image build {id} was cancelled"), None)),
                 _ => Ok(None),
             }
@@ -473,20 +436,30 @@ impl Tensorlake {
 
 // processes/run streams output as server-sent events of UTF-8 lines, other
 // bytes replaced; POST /processes echoes args unescaped, so it is not used.
-fn guest_output(events: &[u8]) -> GuestOutput {
+fn guest_output(events: &[u8]) -> Result<GuestOutput> {
     let mut output = GuestOutput::default();
     let text = String::from_utf8_lossy(events);
     for event in text.lines().filter_map(|l| serde_json::from_str::<RunEvent>(l.strip_prefix("data:")?.trim()).ok()) {
         if let Some(line) = event.line {
             output.chunks.push((event.stream.as_deref() == Some("stderr"), format!("{line}\n").into_bytes()));
         }
-        match (event.exit_code, event.signal) {
-            (Some(code), _) => output.exit = Some(i32::try_from(code).unwrap_or(-1)),
-            (None, Some(signal)) => output.exit = Some(128 + i32::try_from(signal).unwrap_or(0)),
-            _ => {}
+        let exit = match (event.exit_code, event.signal) {
+            (Some(code), _) => Some(i32::try_from(code).ok()),
+            (None, Some(signal)) => Some(i32::try_from(signal).ok().filter(|s| (1..128).contains(s)).map(|s| 128 + s)),
+            _ => None,
+        };
+        if let Some(exit) = exit {
+            output.exit = Some(exit.ok_or_else(|| TENSORLAKE.bad_response())?);
         }
     }
-    output
+    Ok(output)
+}
+/// Tensorlake's outcome and its reason, or its termination reason, verbatim.
+fn reason(outcome: Option<String>, reason: Option<String>) -> Option<String> {
+    match (outcome, reason) {
+        (Some(outcome), Some(reason)) => Some(format!("{outcome}: {reason}")),
+        (outcome, reason) => outcome.or(reason),
+    }
 }
 // The builder decodes every numeric tar header field; ustar leaves uid and gid NUL.
 fn build_context(dockerfile: &str) -> Result<Vec<u8>> {
@@ -522,7 +495,8 @@ fn registry_credentials(registry: &str, pull: &RegistryCredential) -> Result<Str
 struct Policy(Option<Rules>);
 #[derive(Debug, Clone, PartialEq)]
 struct Rules {
-    allow_internet_access: bool,
+    /// Absent when Tensorlake's policy leaves it out.
+    allow_internet_access: Option<bool>,
     allow_out: BTreeSet<String>,
 }
 impl Policy {
@@ -550,26 +524,28 @@ impl Policy {
                 }
             }
         }
-        Ok(Self(Some(Rules { allow_internet_access: !names.is_empty(), allow_out: addresses.into_iter().chain(names).collect() })))
+        Ok(Self(Some(Rules { allow_internet_access: Some(!names.is_empty()), allow_out: addresses.into_iter().chain(names).collect() })))
     }
     fn wire(&self) -> Option<Network> {
         let rules = self.0.as_ref()?;
         Some(Network {
-            allow_internet_access: Some(rules.allow_internet_access),
+            allow_internet_access: rules.allow_internet_access,
             allow_out: rules.allow_out.iter().cloned().collect(),
             deny_out: vec![],
         })
     }
+    /// A policy as Tensorlake reports it: none is open egress, and a policy
+    /// leaving `allow_internet_access` out is kept apart from one stating it.
     fn read(network: Option<&Network>) -> Self {
         let Some(network) = network else { return Self(None) };
         let normal = |item: &String| {
             let item = normal_host(item);
             normal_cidr(&item).filter(|_| item.contains('/')).unwrap_or(item)
         };
-        let allow_internet_access = network.allow_internet_access.unwrap_or(true);
+        let allow_internet_access = network.allow_internet_access;
         let mut allow_out: BTreeSet<String> = network.allow_out.iter().map(normal).collect();
         allow_out.extend(network.deny_out.iter().map(|d| format!("!{}", normal(d))));
-        if allow_internet_access && allow_out.is_empty() {
+        if allow_internet_access == Some(true) && allow_out.is_empty() {
             return Self(None);
         }
         Self(Some(Rules { allow_internet_access, allow_out }))
@@ -577,7 +553,10 @@ impl Policy {
     fn fingerprint(&self) -> String {
         kit::digest(&match &self.0 {
             None => "open".to_owned(),
-            Some(rules) => format!("{}\0{}", rules.allow_internet_access, rules.allow_out.iter().cloned().collect::<Vec<_>>().join("\0")),
+            Some(rules) => {
+                let internet = rules.allow_internet_access.map_or("unstated".to_owned(), |allowed| allowed.to_string());
+                format!("{internet}\0{}", rules.allow_out.iter().cloned().collect::<Vec<_>>().join("\0"))
+            }
         })
     }
 }
@@ -603,6 +582,18 @@ fn sandbox_name(instance: &str, label: &str) -> String {
         return format!("{prefix}b-{encoded}");
     }
     format!("{prefix}h-{}", &kit::digest(&format!("{instance}\0{label}"))[..40])
+}
+/// Sandboxes carry no labels or metadata: the name an instance gave a sandbox
+/// is the only mark that it is that instance's, and holds its label. Tags are
+/// reported only for a name `instance`'s prefix starts (the owner's decision
+/// on drydock#287). drydock#296, snapshots left on a shared account, is about
+/// drydockd's guard, not these tags.
+fn tags(instance: &str, name: &str) -> Option<BTreeMap<String, String>> {
+    let prefix = sandbox_prefix(instance);
+    name.starts_with(&prefix).then(|| {
+        let label = label_of(&prefix, name).map(|label| (LABEL_TAG.to_owned(), label));
+        [(OWNER_TAG.to_owned(), instance.to_owned())].into_iter().chain(label).collect()
+    })
 }
 fn label_of(prefix: &str, name: &str) -> Option<String> {
     let rest = name.strip_prefix(prefix)?;
@@ -689,7 +680,8 @@ impl Provider for Tensorlake {
             bootstrap: BootstrapRoute::Upload,
             agent: true,
             agent_tcp_port: Some(self.settings.tunnel_port),
-            exclusive_label: true,
+            // A name Tensorlake already holds is refused, not returned.
+            exclusive_label: false,
             platforms: vec![platform()],
             image_routes: vec![ImageRoute::RegistryPull {
                 auth: RegistryAuthKind::Basic,
@@ -697,24 +689,36 @@ impl Provider for Tensorlake {
                 digest_references: true,
                 tools_layer: ToolsLayer::Upload,
             }],
-            usage: self.settings.organization_id.is_some(),
+            // Usage is to be read as Tensorlake gives it (drydock#257).
+            usage: false,
             quota: false,
             host_filesystem: false,
             host_processes: false,
             // The agent carries outward exposures; the sandbox has no network of drydockd's.
             reach_ways: vec![ReachWay::OutwardExposure],
-            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
+            // Create, suspend and resume answer once Tensorlake accepted them,
+            // a second create of a name is refused (409), list and delete
+            // reach the whole project, and resume needs only the id.
+            semantics: Semantics { settles: false, idempotent: false, owner_scoped: false, token_is_id: true },
         }
     }
+    /// Tensorlake's webhooks are registered in its dashboard, per project, and
+    /// signed through Svix. Reading them needs `project_id`.
     fn ways_in(&self) -> Vec<WayIn> {
-        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
+        let poll = WayIn::Poll { interval_ms: self.settings.poll_interval_ms };
+        let webhook = self.settings.project_id.is_some().then(|| WayIn::Webhook {
+            registration: vec![WebhookRegistration::Dashboard],
+            events: EVENTS.iter().map(|e| (*e).to_owned()).collect(),
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        });
+        [poll].into_iter().chain(webhook).collect()
     }
     fn operations(&self) -> Operations<'_> {
         Operations {
             exec: Some(self),
             files: Some(self),
             suspend_resume: Some(self),
-            usage: self.settings.organization_id.is_some().then_some(self as &dyn UsageOperation),
+            events: self.settings.project_id.is_some().then_some(self as &dyn VendorEvents),
             ..Operations::default()
         }
     }
@@ -735,6 +739,8 @@ impl Provider for Tensorlake {
         }
         Ok(Prepared { provider: self.name.clone(), id: name, platform, image_digest: r.image_digest, tools_digest: r.tools_digest })
     }
+    /// One create, answered with what Tensorlake's answer states. Tensorlake
+    /// refuses a name it already holds (409), in its own words.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         check_prepared(TENSORLAKE, &self.name, &r.prepared, &image_name(&r.prepared.image_digest, &r.prepared.platform))?;
         let policy = Policy::request(&r.egress)?;
@@ -744,84 +750,68 @@ impl Provider for Tensorlake {
             image: &r.prepared.id,
             resources: self.resources(&r.size)?,
             timeout_secs: 0,
-            auto_resume: true,
-            wait: true,
+            // A suspended sandbox stays so until resumed: proxy traffic, such
+            // as a relay or a command, does not wake it.
+            auto_resume: false,
+            wait: false,
             network: policy.wire(),
         };
-        let url = self.api.url(&["sandboxes"])?;
-        let operation = kit::api::operation(&Method::POST, &url);
-        let response = self.api.send(Method::POST, url, Body::json(&body)?, c, true, &[]).await?;
-        match response.status().as_u16() {
-            409 => return Ok(Provisioned::Existing(self.adopt(self.sandbox(&name, c).await?, &r.size, &policy, c).await?)),
-            422 => {
-                if let Ok(CreateFailure { status: Some(status), termination_reason }) = serde_json::from_slice(response.body())
-                    && status == "failed"
-                {
-                    let reason = termination_reason.as_deref().unwrap_or("unknown");
-                    return Err(refused(format!("Tensorlake sandbox failed to start: {reason}")));
-                }
-                return Err(self.api.failure(&operation, &response));
-            }
-            200..=299 | 504 => {}
-            _ => return Err(self.api.failure(&operation, &response)),
-        }
-        self.wait_running(&name, c).await?;
-        Ok(Provisioned::Created(self.inspect(&name, c).await?))
+        let v: Created = self.api.call(Method::POST, self.api.url(&["sandboxes"])?, Body::json(&body)?, c).await?;
+        Ok(Provisioned::Created(Environment {
+            id: v.sandbox_id.to_string(),
+            label: Some(r.label),
+            provider: self.name.clone(),
+            state: kit::observe(STATES, &v.status),
+            granted_size: None,
+            egress: Enforcement::Advisory,
+            platform: None,
+            egress_measured: false,
+            egress_policy: None,
+            timestamp: None,
+            vendor: Some(VendorState { state: v.status.into(), reason: None, tags: self.tags(Some(&name)) }),
+        }))
     }
+    /// Every sandbox Tensorlake lists, in whatever state it reports.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
-        let prefix = sandbox_prefix(&self.name);
         let rows: Vec<Sandbox> = self.paged(&["sandboxes"], "sandboxes", c).await?;
-        rows.iter()
-            .filter(|row| row.name.as_deref().is_some_and(|name| name.starts_with(&prefix)))
-            .map(|row| self.environment(row))
-            .filter(|row| !matches!(row, Ok(Environment { state: Observation::Gone { .. }, .. })))
-            .collect()
+        rows.into_iter().map(|row| self.environment(row)).collect()
     }
+    /// One read by id; a sandbox Tensorlake no longer lists is read from its archive.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         match self.sandbox(id, c).await {
             Err(ProtocolError::NotFound { reason }) => match self.archived(id, c).await? {
-                Some(mut row) => {
-                    row.status = Text::try_from("terminated".to_owned()).map_err(|_| TENSORLAKE.bad_response())?;
-                    self.environment(&row)
-                }
+                Some(row) => self.environment(row),
                 None => Err(ProtocolError::NotFound { reason }),
             },
-            row => self.environment(&row?),
+            row => self.environment(row?),
         }
     }
-    // Every suspend leaves a snapshot that outlives the sandbox and bills until deleted.
+    /// The delete, then the snapshot sweep: a Tensorlake sandbox leaves
+    /// snapshots (one per suspend) that its delete does not remove and that
+    /// bill until deleted, so destroy needs this second call. A sandbox
+    /// Tensorlake no longer knows is not found, after the sweep: a retry
+    /// after a sweep that failed still finishes it.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        let sandbox_id = match self.sandbox(id, c).await {
-            Err(ProtocolError::NotFound { .. }) => self.archived(id, c).await?.map(|row| row.id.to_string()),
-            row => Some(row?.id.to_string()),
-        };
-        absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await)?;
+        let deleted = self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await;
+        let deleted = absent_on_not_found(deleted)?;
         locked(&self.tokens).remove(id);
-        let Some(sandbox_id) = sandbox_id else { return Ok(()) };
-        let mut remaining = 0;
-        for snapshot in self.snapshots(&sandbox_id, c).await? {
+        for snapshot in self.snapshots(id, c).await? {
             if snapshot.status.as_deref() == Some("deleting") {
                 continue;
             }
             let snapshot_id = snapshot.snapshot_id.or(snapshot.id).ok_or_else(|| TENSORLAKE.bad_response())?;
-            let url = self.api.url(&["snapshots", &snapshot_id])?;
-            if absent_on_not_found(self.api.call::<IgnoredAny>(Method::DELETE, url, Body::None, c).await).is_err() {
-                remaining += 1;
-            }
+            // A snapshot already gone is what the sweep is for.
+            absent_on_not_found(
+                self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["snapshots", &snapshot_id])?, Body::None, c).await,
+            )?;
         }
-        if remaining > 0 {
-            return Err(ProtocolError::unavailable(format!("{remaining} Tensorlake snapshots of {id} remain; retry destroy"), Some(10)));
-        }
-        Ok(())
+        deleted.map(drop).ok_or_else(|| ProtocolError::NotFound { reason: format!("Tensorlake has no sandbox {id}") })
     }
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
         Ok(Reach::relay(&self.name, id))
     }
-    // A tunnel to a suspended sandbox would wake it.
+    /// A dial to a sandbox that isn't running fails with Tensorlake's answer.
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-        if self.status(id, c).await? != "running" {
-            return Err(refused(format!("Tensorlake sandbox {id} is not running; resume it first")));
-        }
         let url = self.guest(id, &["tunnels", "tcp"])?;
         let host = url.host_str().ok_or_else(|| TENSORLAKE.bad_response())?;
         let url = format!("wss://{host}{}?port={}", url.path(), self.settings.tunnel_port);
@@ -853,34 +843,71 @@ impl Provider for Tensorlake {
     }
 }
 
+/// Suspend and resume. Tensorlake resumes by id alone, so the token is the id.
 #[async_trait]
 impl SuspendResume for Tensorlake {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
-        let status = self.status(id, c).await?;
-        if matches!(status.as_str(), "pending" | "resuming") {
-            return Err(ProtocolError::unavailable(format!("Tensorlake sandbox {id} is {status}"), Some(5)));
-        }
-        if status == "running" {
-            self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", id, "suspend"])?, Body::None, c).await?;
-        }
-        let suspended = kit::poll(STATE_POLLS, STATE_POLL, async || match self.status(id, c).await?.as_str() {
-            "suspended" => Ok(Some(TENSORLAKE.resume_marker(RESUME, &self.name, id))),
-            "suspending" | "snapshotting" | "running" => Ok(None),
-            other => Err(refused(format!("Tensorlake sandbox {id} is {other}, not suspending"))),
-        })
-        .await?;
-        suspended.ok_or_else(|| ProtocolError::unavailable("Tensorlake sandbox has not suspended", Some(5)))
+        self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", id, "suspend"])?, Body::None, c).await?;
+        Ok(ResumeToken { token: Secret::new(id) })
     }
-    async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
-        TENSORLAKE.check_resume(RESUME, &self.name, id, &token)?;
+    async fn resume(&self, id: &str, _: ResumeToken, c: &Credentials) -> Result<()> {
         locked(&self.tokens).remove(id);
-        if self.status(id, c).await? != "running" {
-            let mut url = self.api.url(&["sandboxes", id, "resume"])?;
-            url.query_pairs_mut().append_pair("wait_ms", "30000");
-            self.api.call::<IgnoredAny>(Method::POST, url, Body::None, c).await?;
-            self.wait_running(id, c).await?;
+        self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", id, "resume"])?, Body::None, c).await.map(drop)
+    }
+}
+
+const EVENTS: [&str; 6] = [
+    "tensorlake.sandbox.created",
+    "tensorlake.sandbox.running",
+    "tensorlake.sandbox.suspended",
+    "tensorlake.sandbox.resumed",
+    "tensorlake.sandbox.terminated",
+    "tensorlake.sandbox.failed",
+];
+/// A sandbox event's envelope, as recorded from Tensorlake on 2026-11-06,
+/// only the fields read. Deliveries are not ordered: drydockd's comparison of
+/// `occurred_at` with what it holds keeps a late one from overtaking a newer
+/// one, so `source_revision` and `source_ordinal` are not read.
+#[derive(Deserialize)]
+struct Delivered {
+    project_id: String,
+    occurred_at: DateTime<Utc>,
+    data: DeliveredData,
+}
+#[derive(Deserialize)]
+struct DeliveredData {
+    sandbox: DeliveredSandbox,
+}
+#[derive(Deserialize)]
+struct DeliveredSandbox {
+    id: Text,
+    name: Option<String>,
+    status: Text,
+    outcome: Option<String>,
+    outcome_reason: Option<String>,
+}
+/// Each sandbox event states the sandbox, Tensorlake's status for it, and its
+/// outcome once it terminated. Any other event, or one for another project,
+/// says nothing drydock follows.
+#[async_trait]
+impl VendorEvents for Tensorlake {
+    async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
+        let event = delivery.event.as_str();
+        if !EVENTS.contains(&event) {
+            return Ok(vec![]);
         }
-        Ok(())
+        let project = self.settings.project_id.as_deref().ok_or_else(|| refused("Tensorlake events need project_id"))?;
+        let v: Delivered = serde_json::from_value(delivery.body).map_err(|e| refused(format!("Tensorlake {event} body: {e}")))?;
+        if v.project_id != project {
+            return Ok(vec![]);
+        }
+        let s = v.data.sandbox;
+        Ok(vec![VendorObservation {
+            id: s.id.to_string(),
+            state: Some(kit::observe(STATES, &s.status)),
+            vendor: VendorState { tags: self.tags(s.name.as_deref()), reason: reason(s.outcome, s.outcome_reason), state: s.status.into() },
+            timestamp: Some(v.occurred_at.into()),
+        }])
     }
 }
 
@@ -900,7 +927,7 @@ impl Guest for Tensorlake {
         if !response.status().is_success() {
             return Err(self.api.failure(&operation, &response));
         }
-        Ok(guest_output(response.body()))
+        guest_output(response.body())
     }
 }
 #[async_trait]
@@ -917,7 +944,8 @@ impl GuestFiles for Tensorlake {
         let staging = format!("/tmp/drydock-upload-{}", &kit::digest(&file.path)[..16]);
         let mut url = self.guest(id, &["files"])?;
         url.query_pairs_mut().append_pair("path", &staging);
-        self.api.call_within::<IgnoredAny>(Method::PUT, url, Body::Bytes(bytes, "application/octet-stream"), c, UPLOAD_DEADLINE).await?;
+        let deadline = Duration::from_secs(self.settings.upload_seconds);
+        self.api.call_within::<IgnoredAny>(Method::PUT, url, Body::Bytes(bytes, "application/octet-stream"), c, deadline).await?;
         let install =
             kit::shell_command(&["install".into(), "-D".into(), "-m".into(), format!("{:04o}", file.mode), staging.clone(), file.path]);
         let remove = kit::shell_command(&["rm".into(), "-f".into(), staging]);
@@ -925,91 +953,174 @@ impl GuestFiles for Tensorlake {
     }
 }
 
-#[async_trait]
-impl UsageOperation for Tensorlake {
-    async fn usage(&self, period: Period, c: &Credentials) -> Result<Usage> {
-        let organization = self.settings.organization_id.as_deref().ok_or_else(|| refused("Tensorlake usage needs organization_id"))?;
-        let stamp = |t: &Timestamp| t.instant().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let mut url = self.api.url(&["platform", "v1", "organizations", organization, "sandbox-usage", "sandboxes", "export"])?;
-        url.query_pairs_mut().append_pair("fromDate", &stamp(period.start())).append_pair("toDate", &stamp(period.end()));
-        let operation = kit::api::operation(&Method::GET, &url);
-        let response = self.api.send(Method::GET, url, Body::None, c, true, &[]).await?;
-        if !response.status().is_success() {
-            return Err(self.api.failure(&operation, &response));
-        }
-        let (resources, cost) = usage_export(response.body())?;
-        Ok(Usage {
-            period,
-            environment_hours: vec![],
-            measurements: Some(UsageMeasurements { scope: UsageScope::Organization { id: organization.to_owned() }, resources, cost }),
-        })
-    }
-}
-// The export is NDJSON: a window, one record per sandbox, then an end record
-// with the count; a missing or disagreeing end is a truncated export.
-fn usage_export(body: &[u8]) -> Result<(BTreeMap<ResourceKind, Quantity>, Option<Cost>)> {
-    let mut resources: BTreeMap<ResourceKind, Quantity> = BTreeMap::new();
-    let mut add = |kind, unit: &str, amount: f64| {
-        resources.entry(kind).or_insert_with(|| Quantity { amount: 0.0, unit: unit.into() }).amount += amount
-    };
-    let (mut charge, mut sandboxes, mut end) = (None, 0u64, None);
-    for line in String::from_utf8_lossy(body).lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<UsageRecord>(line).map_err(|_| TENSORLAKE.bad_response())? {
-            UsageRecord::Window { charge: window } => charge = Some(window),
-            UsageRecord::Sandbox { resources: quantities } => {
-                sandboxes += 1;
-                for (key, kind, unit, expected, factor) in [
-                    ("cpu", ResourceKind::Cpu, "{vCPU}.s", "vCPU-hour", 3600.0),
-                    ("memory", ResourceKind::Memory, "By.s", "GiB-hour", GIB as f64 * 3600.0),
-                    ("sandboxStorage", ResourceKind::Disk, "By.s", "GiB-hour", GIB as f64 * 3600.0),
-                    ("snapshotStorage", ResourceKind::SnapshotStorage, "By.s", "GiB-hour", GIB as f64 * 3600.0),
-                ] {
-                    let Some(q) = quantities.get(key) else { continue };
-                    let amount = q.quantity.parse::<f64>().ok().filter(|a| a.is_finite() && *a >= 0.0 && q.unit == expected);
-                    add(kind, unit, amount.ok_or_else(|| TENSORLAKE.bad_response())? * factor);
-                }
-            }
-            UsageRecord::End { count } => end = Some(count),
-            UsageRecord::Other => {}
-        }
-    }
-    if end != Some(sandboxes) {
-        return Err(ProtocolError::unavailable("Tensorlake usage export ended early", Some(30)));
-    }
-    add(ResourceKind::Environments, "1", sandboxes as f64);
-    let cost = charge.ok_or_else(|| TENSORLAKE.bad_response())?.map(minor_to_cost).transpose()?;
-    Ok((resources, cost))
-}
-fn minor_to_cost(charge: Charge) -> Result<Cost> {
-    let currency = charge.currency.to_ascii_uppercase();
-    let minor = &charge.amount_minor;
-    if !["USD", "EUR", "GBP"].contains(&currency.as_str()) || minor.is_empty() || !minor.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(TENSORLAKE.bad_response());
-    }
-    let minor = format!("{minor:0>3}");
-    let (major, cents) = minor.split_at(minor.len() - 2);
-    let major = major.trim_start_matches('0');
-    Ok(Cost { amount: format!("{}.{cents}", if major.is_empty() { "0" } else { major }), currency })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rigging_http_client::ChannelLabel;
 
+    /// Answers each request with the next scripted (status, body), keeping
+    /// each request's method and path.
+    #[derive(Default)]
+    struct Script {
+        answers: Mutex<Vec<(u16, &'static str)>>,
+        asked: Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait]
+    impl HttpClient for Script {
+        async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
+            locked(&self.asked).push((request.method().to_string(), request.url().path().to_owned()));
+            let (status, body) = {
+                let mut answers = locked(&self.answers);
+                assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
+                answers.remove(0)
+            };
+            Ok(http::Response::builder().status(status).body(Bytes::from_static(body.as_bytes())).unwrap())
+        }
+    }
+    fn script(answers: &[(u16, &'static str)]) -> Arc<Script> {
+        Arc::new(Script { answers: Mutex::new(answers.to_vec()), ..Script::default() })
+    }
+    async fn configure(settings: serde_json::Value, script: Arc<Script>) -> Result<Arc<dyn Provider>> {
+        let config = ProviderConfiguration {
+            module: "tensorlake".into(),
+            settings: serde_json::from_value(settings).unwrap(),
+            ..Default::default()
+        };
+        TensorlakeModule::with_dialer(Arc::new(TlsDialer::new().unwrap())).configure("lab", &config, script).await
+    }
+    fn credentials() -> Credentials {
+        Credentials::new(Some(Secret::new("tl_apiKey_test")))
+    }
+
+    // Every setting has a default; zeroes, a project id with spaces around
+    // it and keys the module no longer reads are refused.
+    #[tokio::test]
+    async fn settings_refuse_zeroes_and_unknown_keys() {
+        assert!(configure(serde_json::json!({}), Arc::default()).await.is_ok());
+        for refused in [
+            serde_json::json!({"project_id": ""}),
+            serde_json::json!({"project_id": " project_123"}),
+            serde_json::json!({"build_polls": 0}),
+            serde_json::json!({"build_poll_seconds": 0}),
+            serde_json::json!({"upload_seconds": 0}),
+            serde_json::json!({"poll_interval_ms": 0}),
+            serde_json::json!({"organization_id": "org"}),
+        ] {
+            let result = configure(refused.clone(), Arc::default()).await;
+            assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{refused}");
+        }
+    }
+    // The webhook way in, and the port that reads it, need the project id:
+    // without it no delivery could be told from another project's.
+    #[tokio::test]
+    async fn webhooks_need_the_project_id() {
+        let webhook = |p: &Arc<dyn Provider>| p.ways_in().iter().any(|w| matches!(w, WayIn::Webhook { .. }));
+        let without = configure(serde_json::json!({}), Arc::default()).await.unwrap();
+        assert!(!webhook(&without) && without.operations().events.is_none());
+        let with = configure(serde_json::json!({"project_id": "project_1"}), Arc::default()).await.unwrap();
+        assert!(webhook(&with) && with.operations().events.is_some());
+    }
+    // An event the module does not read says nothing; a sandbox event whose
+    // body is not Tensorlake's envelope is refused, and drydockd skips it.
+    #[tokio::test]
+    async fn events_outside_the_sandbox_envelope() {
+        let provider = configure(serde_json::json!({"project_id": "project_1"}), Arc::default()).await.unwrap();
+        let events = provider.operations().events.unwrap();
+        let delivery = |event: &str, body: serde_json::Value| VendorDelivery {
+            event: event.into(),
+            delivery_id: "evt_1".into(),
+            received_at: "2026-11-06T17:07:15Z".parse().unwrap(),
+            body,
+        };
+        let other = events.event(delivery("tensorlake.application.created", serde_json::json!({"project_id": "project_1"}))).await;
+        assert_eq!(other.unwrap(), vec![]);
+        let malformed = events.event(delivery("tensorlake.sandbox.running", serde_json::json!({"project_id": "project_1"}))).await;
+        assert!(matches!(malformed, Err(ProtocolError::Refused { .. })), "{malformed:?}");
+    }
+    // Provision is one create, answered with what Tensorlake's answer states;
+    // a name Tensorlake already holds is refused in its words.
+    #[tokio::test]
+    async fn provision_is_one_create() {
+        let script = script(&[(202, r#"{"sandbox_id":"sbx1","name":"n","state":"pending"}"#), (409, "sandbox name already exists")]);
+        let provider = configure(serde_json::json!({}), script.clone()).await.unwrap();
+        let prepared = Prepared {
+            provider: "lab".into(),
+            id: image_name("image@sha256:aa", &platform()),
+            platform: platform(),
+            image_digest: "image@sha256:aa".into(),
+            tools_digest: "tools".into(),
+        };
+        let request = ProvisionRequest {
+            label: "crew-1".into(),
+            prepared,
+            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 10 * GIB },
+            egress: EgressRequest::Open,
+            ssh_public_key: None,
+        };
+        let made = provider.provision(request.clone(), &credentials()).await.unwrap().into_inner();
+        assert_eq!((made.id.as_str(), made.label.as_deref(), &made.state), ("sbx1", Some("crew-1"), &kit::starting()));
+        let vendor = made.vendor.unwrap();
+        assert_eq!((vendor.state.as_str(), vendor.tags), ("pending", tags("lab", &sandbox_name("lab", "crew-1"))));
+        let refused = provider.provision(request, &credentials()).await;
+        assert!(matches!(&refused, Err(ProtocolError::Refused { reason }) if reason.contains("already exists")), "{refused:?}");
+        assert_eq!(*locked(&script.asked), [("POST".into(), "/sandboxes".into()), ("POST".into(), "/sandboxes".into())]);
+    }
+    // Destroy deletes, then sweeps the snapshots the delete leaves. A retry
+    // once Tensorlake has forgotten the sandbox still sweeps, then answers not found.
+    #[tokio::test]
+    async fn destroy_sweeps_snapshots_even_when_the_sandbox_is_gone() {
+        let snapshots = r#"{"snapshots":[{"snapshot_id":"snap1","sandbox_id":"sbx1"},{"snapshot_id":"snap2","sandbox_id":"sbx1","status":"deleting"}]}"#;
+        let script = script(&[(200, ""), (200, snapshots), (200, "{}"), (404, "Sandbox not found"), (200, snapshots), (404, "gone")]);
+        let provider = configure(serde_json::json!({}), script.clone()).await.unwrap();
+        provider.destroy("sbx1", &credentials()).await.unwrap();
+        assert!(matches!(provider.destroy("sbx1", &credentials()).await, Err(ProtocolError::NotFound { .. })));
+        let sweep = [
+            ("DELETE".to_owned(), "/sandboxes/sbx1".to_owned()),
+            ("GET".into(), "/sandboxes/sbx1/snapshots".into()),
+            ("DELETE".into(), "/snapshots/snap1".into()),
+        ];
+        assert_eq!(*locked(&script.asked), [sweep.clone(), sweep].concat());
+    }
+
+    // Output lines keep their stream; a signal is 128 plus its number, and an
+    // exit status outside what a process can have is a bad response.
     #[test]
     fn run_events() {
         let events = "event: output\ndata: {\"line\":\"out\",\"stream\":\"stdout\"}\n\ndata: {\"line\":\"err\",\"stream\":\"stderr\"}\n\ndata: {\"exit_code\":null,\"signal\":9}\n";
-        let output = guest_output(events.as_bytes());
+        let output = guest_output(events.as_bytes()).unwrap();
         assert_eq!((output.stdout(), output.bytes(None), output.exit_code()), (b"out\n".to_vec(), b"out\nerr\n".to_vec(), 137));
+        assert!(guest_output(b"data: {\"exit_code\":4294967296}\n").is_err());
+        assert!(guest_output(b"data: {\"signal\":-1}\n").is_err());
+        assert!(guest_output(b"data: {\"signal\":0}\n").is_err());
     }
+    // A name this instance made carries its owner tag and the label it holds,
+    // even one only a digest keeps; another instance's names carry none.
     #[test]
-    fn usage_export_lines() {
-        let window = r#"{"type":"window","attributedUsageCharge":{"currency":"usd","amountMinor":"1234"}}"#;
-        let sandbox =
-            r#"{"type":"sandbox","resources":{"cpu":{"quantity":"1.5","unit":"vCPU-hour"},"networkEgress":{"quantity":"1","unit":"GiB"}}}"#;
-        let (resources, cost) = usage_export(format!("{window}\n{sandbox}\n{{\"type\":\"end\",\"count\":1}}\n").as_bytes()).unwrap();
-        assert_eq!(resources[&ResourceKind::Cpu].amount, 5400.0);
-        assert_eq!(cost.unwrap().amount, "12.34");
-        assert!(usage_export(format!("{window}\n{sandbox}\n").as_bytes()).is_err());
+    fn names_carry_their_instance_and_label() {
+        let tagged = |instance: &str, label: &str| tags(instance, &sandbox_name(instance, label));
+        let expect = |label: Option<&str>| {
+            let label = label.map(|l| (LABEL_TAG.to_owned(), l.to_owned()));
+            Some([(OWNER_TAG.to_owned(), "lab".to_owned())].into_iter().chain(label).collect())
+        };
+        assert_eq!(tagged("lab", "crew-1"), expect(Some("crew-1")));
+        assert_eq!(tagged("lab", "Crew/1"), expect(Some("Crew/1")));
+        assert_eq!(tagged("lab", &"x".repeat(80)), expect(None));
+        assert_eq!(tags("lab", &sandbox_name("other", "crew-1")), None);
+        assert_eq!(tags("lab", "build-runner"), None);
+    }
+    // A policy leaving allow_internet_access out is not the one stating it,
+    // and none at all is open.
+    #[test]
+    fn egress_fingerprint_keeps_unstated_apart() {
+        let read = |v: serde_json::Value| Policy::read(Some(&serde_json::from_value(v).unwrap())).fingerprint();
+        let open = Policy::read(None).fingerprint();
+        assert_eq!(read(serde_json::json!({"allow_internet_access": true})), open);
+        assert_ne!(read(serde_json::json!({})), open);
+        assert_ne!(
+            read(serde_json::json!({"allow_out": ["10.0.0.0/8"]})),
+            read(serde_json::json!({"allow_internet_access": true, "allow_out": ["10.0.0.0/8"]}))
+        );
+        let request = Policy::request(&EgressRequest::DenyAll { direct: vec![] }).unwrap();
+        assert_eq!(Policy::read(request.wire().as_ref()), request);
     }
 }
