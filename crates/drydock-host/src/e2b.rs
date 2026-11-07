@@ -574,13 +574,13 @@ fn network(request: &EgressRequest) -> Result<Network> {
     for destination in direct {
         match destination {
             Destination::HostPort { .. } => return Err(refused("E2B egress rules cannot restrict ports")),
-            Destination::Cidr { cidr } => {
-                allow.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?);
-            }
+            Destination::Cidr { cidr } if ipv6(cidr.as_str()) => return Err(refused("E2B egress takes IPv4 CIDRs only")),
             Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("E2B egress takes no IPv6 destinations")),
+            Destination::Cidr { cidr } => {
+                allow.insert(cidr.as_str().to_owned());
+            }
             Destination::Host { host } => {
-                let host = normal_host(host.as_str());
-                allow.insert(normal_cidr(&host).unwrap_or(host));
+                allow.insert(host.as_str().to_owned());
             }
         }
     }
@@ -1009,7 +1009,8 @@ mod tests {
         let host = |h: &str| Destination::Host { host: serde_json::from_value(serde_json::json!(h)).unwrap() };
         let open = network(&EgressRequest::Open).unwrap();
         assert_eq!(serde_json::to_value(&open).unwrap(), serde_json::json!({"allowPublicTraffic": false}));
-        let deny = network(&EgressRequest::DenyAll { direct: vec![host("Example.COM."), host("192.0.2.5")] }).unwrap();
+        let cidr = Destination::Cidr { cidr: "192.0.2.5/32".parse().unwrap() };
+        let deny = network(&EgressRequest::DenyAll { direct: vec![host("example.com"), cidr] }).unwrap();
         assert_eq!(
             serde_json::to_value(&deny).unwrap(),
             serde_json::json!({"allowPublicTraffic": false, "denyOut": ["0.0.0.0/0"], "allowOut": ["192.0.2.5/32", "example.com"]})

@@ -147,10 +147,9 @@ export function networkPolicy(
       refused("Namespace network policies cannot allow CIDRs");
     if (entry.kind === "host_port")
       refused("Namespace network policies cannot restrict ports");
-    const host = entry.host.replace(/\.$/, "").toLowerCase();
-    if (host.includes(":") || /^[0-9.]+$/.test(host))
+    if (entry.host.includes(":") || /^[0-9.]+$/.test(entry.host))
       refused("Namespace network policies allow domain names only");
-    domains.add(host);
+    domains.add(entry.host);
   }
   return { allowedDomains: [...domains].sort(), advisory: false };
 }

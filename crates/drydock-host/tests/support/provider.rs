@@ -42,6 +42,8 @@ pub struct Control {
     /// The credential each list call carried.
     pub list_credentials: std::sync::Mutex<Vec<Option<String>>>,
     pub configured: std::sync::atomic::AtomicUsize,
+    /// The egress each provision carried.
+    pub provisioned: std::sync::Mutex<Vec<EgressRequest>>,
     pub slow_configure: std::sync::atomic::AtomicBool,
 }
 #[derive(Default)]
@@ -144,6 +146,7 @@ impl drydock_host::module::Provider for ControlledProvider {
         self.inner.prepare(r, c).await
     }
     async fn provision(&self, r: ProvisionRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Provisioned> {
+        self.control.provisioned.lock().unwrap().push(r.egress.clone());
         self.inner.provision(r, c).await
     }
     async fn list(&self, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Vec<Environment>> {

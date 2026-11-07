@@ -1190,3 +1190,38 @@ async fn resume_succeeds_when_the_refresh_after_it_fails() {
     control.fail_inspect.store(true, std::sync::atomic::Ordering::SeqCst);
     client.resume("a", &environment.id, &token).await.unwrap();
 }
+
+/// The destinations a module receives for a provision asking for `direct`.
+async fn received(direct: Value) -> Value {
+    let (h, control) = controlled().await;
+    h.normal().await;
+    let prepared = h.prepared("a").await;
+    let mut body = request("normal", &prepared);
+    body["egress"] = json!({"mode": "deny_all", "direct": direct});
+    h.send(Method::POST, "/providers/a/environments", body).await;
+    let EgressRequest::DenyAll { direct } = control.provisioned.lock().unwrap().pop().unwrap() else { panic!("open egress") };
+    serde_json::to_value(direct).unwrap()
+}
+
+// A module receives host names, with a port or without, in lowercase and
+// with no final dot.
+#[tokio::test]
+async fn hosts_reach_modules_lowercase_without_a_final_dot() {
+    let direct = json!([{"kind": "host", "host": "GitHub.com."}, {"kind": "host_port", "host": "API.example.", "port": 443}]);
+    assert_eq!(
+        received(direct).await,
+        json!([{"kind": "host", "host": "github.com"}, {"kind": "host_port", "host": "api.example", "port": 443}])
+    );
+}
+
+// A module receives an IPv4 literal host as its /32 CIDR.
+#[tokio::test]
+async fn an_ipv4_host_reaches_modules_as_its_cidr() {
+    assert_eq!(received(json!([{"kind": "host", "host": "192.0.2.5"}])).await, json!([{"kind": "cidr", "cidr": "192.0.2.5/32"}]));
+}
+
+// A module receives an IPv4 CIDR with its host bits cleared.
+#[tokio::test]
+async fn a_cidr_reaches_modules_without_host_bits() {
+    assert_eq!(received(json!([{"kind": "cidr", "cidr": "10.0.0.12/24"}])).await, json!([{"kind": "cidr", "cidr": "10.0.0.0/24"}]));
+}

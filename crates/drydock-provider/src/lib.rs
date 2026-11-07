@@ -1,4 +1,5 @@
 //! Compiled Rust provider interface. Shared methods permit independent concurrent calls.
+pub mod egress;
 pub mod rest;
 use async_trait::async_trait;
 pub use bytes::Bytes;
@@ -142,6 +143,9 @@ pub trait Provider: Send + Sync {
     /// [`prepare_platform`]) and return it in the prepared form.
     /// See ci/tools-image/README.md for the full prepare/start outcome contract.
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
+    /// drydockd hands over deny-all destinations in normal form: host names
+    /// lowercase with no final dot, an IPv4 literal host as its /32 CIDR, and
+    /// IPv4 CIDRs with their host bits cleared.
     async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
     /// A row becoming running emits a Running event carrying its granted_size
     /// when stated; a row without one emits Running with no size.

@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::Ipv4Addr,
     num::NonZeroU16,
     sync::Arc,
     time::Duration,
@@ -489,19 +488,13 @@ impl Policy {
         for destination in direct {
             match destination {
                 Destination::HostPort { .. } => return Err(refused("Tensorlake egress rules cannot restrict ports")),
+                Destination::Cidr { cidr } if ipv6(cidr.as_str()) => return Err(refused("Tensorlake egress takes IPv4 CIDRs only")),
+                Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("Tensorlake egress takes no IPv6 destinations")),
                 Destination::Cidr { cidr } => {
-                    addresses.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("Tensorlake egress takes IPv4 CIDRs only"))?);
+                    addresses.insert(cidr.as_str().to_owned());
                 }
                 Destination::Host { host } => {
-                    let host = normal_host(host.as_str());
-                    if ipv6(&host) {
-                        return Err(refused("Tensorlake egress takes no IPv6 destinations"));
-                    }
-                    if host.parse::<Ipv4Addr>().is_ok() {
-                        addresses.insert(host)
-                    } else {
-                        names.insert(host)
-                    };
+                    names.insert(host.as_str().to_owned());
                 }
             }
         }

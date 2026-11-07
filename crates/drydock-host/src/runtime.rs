@@ -558,7 +558,7 @@ fn host_entry(host: &str) -> Result<String> {
     if host.contains(':') {
         return Err(refused("Runtime egress takes no IPv6 destinations"));
     }
-    Ok(normal_host(host))
+    Ok(host.to_owned())
 }
 
 fn egress_model() -> EgressModel {

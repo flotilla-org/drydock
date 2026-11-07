@@ -126,7 +126,7 @@ test("provision is one unnamed create tagged with the label and owner, then the 
   const { created, environment } = await provision("work", {
     mode: "deny_all",
     direct: [
-      { kind: "host", host: "Example.COM." },
+      { kind: "host", host: "example.com" },
       { kind: "cidr", cidr: "192.0.2.0/24" },
     ],
   });
