@@ -85,9 +85,16 @@ prepared forms and Environment rows, implements label idempotency, refuses reach
 until exposures land (#132), and exposes a 10ms polling declaration. It owns no event stream or replay.
 
 The built-in `namespace` module drives Namespace devboxes through
-`@namespacelabs/sdk/devbox` (`src/namespace/`). Settings: `workspace` (required:
-images go to `nscr.io/<workspace>/<repository>`), `repository` (default
-`drydock-vessel`), `site` (default the SDK's `iad`), `push_chunk_bytes` and
+`@namespacelabs/sdk/devbox` (`src/namespace/`). It translates: each verb is
+Namespace's own operation and each answer is what Namespace said, with
+Namespace's state word and the devbox's labels in `vendor`. It declares
+`settles`, `idempotent` and `owner_scoped` false and `token_is_id` true, so
+waiting, already-done success and the ownership of a shared account are
+drydockd's, as the instance's `semantics` and `ownership` ask. Settings:
+`workspace` (required: images go to `nscr.io/<workspace>/<repository>`),
+`repository` (default `drydock-vessel`), `site` (default the SDK's `iad`),
+`push_chunk_bytes` (default 64 MiB), `poll_interval_ms` (default 30000),
+`list_refreshes` (concurrent refreshes while listing, default 8) and
 `egress_probe` (`{command: [...]}`, run as root on inspect). The credential is
 `{"bearer_token": …}`, handed to the SDK through a TokenSource, never its
 defaults or token files, and used as the `nscr.io` push password (user `token`)
@@ -101,38 +108,49 @@ wait`, `ingress access` and `containerregistry *`,
   it by digest. The key is both digests and the platform (linux/amd64); the
   prepared form's ID is the registered reference. A registration with the key's
   name is reused, so re-preparing adds no version. Optimize is never called.
-- Provision creates a devbox from it with the client's label in
-  `drydock.label`, a named size (s, m, l, xl: 4/8/16/32 CPUs with 2 GiB per
-  CPU; disk is whole GiB of volume), the egress policy, no tenant checkout and
-  never `ephemeral`. PID 1 is Namespace's agent and the image's entrypoint
-  never runs, so drydock's agent is the service `drydock-agent`
-  (`/opt/drydock/drydock-agent`, on boot, always restarted, keeping the devbox
-  awake). A label finds its devbox again; a running one gets the service if it
-  is missing, a stopped one is returned untouched.
-- Reach is this host's relay route; the relay is an SSH exec channel over the
-  SDK's gateway running `drydock-agent --bridge`, since the gateway refuses
-  Unix-socket forwards. Exposures travel over that one agent connection. The
-  tools image's agent must have `--bridge`: an older pin's agent never answers
-  hello, so Namespace needs a tools image published from this revision on.
-- Suspend and resume are devbox stop and start: files survive, memory does not.
-  A devbox stopped by its lifetime cap or idling reads as `paused_by_provider`
-  and resumes; one this host stopped reads as `suspended_by_request` until the
-  host restarts (devbox labels are fixed at create, so that fact is not durable).
-- Observation polls every 30 s. List reports devboxes carrying `drydock.label`,
-  with state from `refresh` (list itself says `unknown`). Nothing that observes
-  runs a command or opens a connection on a stopped devbox, since those start it.
+- Provision is one create from the prepared form with the client's label in
+  `drydock.label` (and, on a `shared_account`, the instance's name in
+  `drydock.provider`), a named size (s, m, l, xl: 4/8/16/32 CPUs with 2 GiB
+  per CPU; disk is whole GiB of volume), the egress policy, no tenant checkout
+  and never `ephemeral`. PID 1 is Namespace's agent and the image's entrypoint
+  never runs, so the create is followed by drydock's agent as the service
+  `drydock-agent` (`/opt/drydock/drydock-agent`, on boot, always restarted,
+  keeping the devbox awake); if the service cannot be added provision fails
+  and leaves the devbox, naming its id, for the client to inspect or destroy.
+  It keeps billing until destroyed, and a retry makes another devbox. A label is the client's name: provisioning it
+  again makes another devbox. An unknown prepared form is Namespace's refusal.
+- Reach is this host's relay route, with no call to Namespace; the relay is an
+  SSH exec channel over the SDK's gateway running `drydock-agent --bridge`,
+  since the gateway refuses Unix-socket forwards. Opening it is Namespace's
+  activate, which starts a stopped devbox. Exposures travel over that one agent
+  connection. The tools image's agent must have `--bridge`.
+- Suspend and resume are devbox stop and start, sent as asked: files survive,
+  memory does not, and the agent service, being on boot, starts again by itself.
+  The resume token is the devbox id. Namespace's Stop and Expire take a
+  devbox's name, so the SDK looks the id up before stop, start and delete. A
+  stopped devbox has no cause: Namespace does not say whether its idle or
+  lifetime cap or a client stopped it.
+- Namespace offers no webhooks or state stream, so drydockd polls. List is
+  Namespace's list (on a `shared_account`, of devboxes carrying the instance's
+  `drydock.provider`), and each listed devbox is refreshed, since Namespace's
+  list states every state as `unknown`. A size, platform or label is reported
+  only when Namespace states it.
 - Egress maps host names to `networkPolicy.allowedDomains` (non-advisory) and
-  refuses CIDR, port and address entries; an absent request is deny all. The capability declares Namespace's
-  documented egress model (`EGRESS_MODEL`), never a verification; an
-  environment reports enforced only when `egress_probe` passes as root.
+  refuses CIDR, port and address entries; an absent request is deny all. The
+  capability declares Namespace's documented egress model (`EGRESS_MODEL`),
+  never a verification; an environment reports enforced only when
+  `egress_probe` passes as root, and a probe that fails or prints no proof
+  fails the inspect.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
-  platform class). The grants above do not cover it: without its grant quota
-  is refused and the provider stays ready. Usage is undeclared.
+  platform class) as Namespace gives it: a class without stated use has no row.
+  The grants above do not cover it: without its grant quota is refused and the
+  provider stays ready. Usage is undeclared.
 - A permission denial (a token lacking a grant) is a refusal; only an
   unauthenticated token is a rejected credential.
 - SDK calls through the gateway can fail with `Premature close` after taking
   effect; `src/namespace/vendor.ts` is the one place that retries them, and it
-  checks the resulting state first, so nothing is created or stopped twice.
+  checks the resulting state first, so no call is made twice. That gets one
+  call through the SDK's transport; it adds no guarantee of drydock's.
 - One SDK client is kept per credential. One a newer credential replaces is
   closed only after its last call and relay end, so rotation never cuts a live
   agent connection.

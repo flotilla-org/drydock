@@ -16,10 +16,6 @@ import type { Box, Concurrency, Vendor } from "../../src/namespace/vendor.ts";
 
 export const TOKEN = "test-only-namespace-token";
 export const CREDENTIAL = JSON.stringify({ bearer_token: TOKEN });
-const SHAPES: Record<string, { vCPUs: number; memoryMB: number }> = {
-  s: { vCPUs: 4, memoryMB: 8192 },
-  m: { vCPUs: 8, memoryMB: 16384 },
-};
 
 type Row = {
   info: DevboxInfo;
@@ -32,9 +28,8 @@ type Row = {
 export class StandIn implements Vendor {
   rows = new Map<string, Row>();
   registered: Image[] = [];
+  /** Every call, by operation. */
   calls: string[] = [];
-  /** Connection-backed calls that started a stopped devbox. */
-  activations = 0;
   /** What each opened channel ran. */
   channels: string[] = [];
   concurrencyRows: Concurrency[] = [];
@@ -43,24 +38,27 @@ export class StandIn implements Vendor {
   execExit = 0;
   /** How often the module closed its SDK client. */
   closed = 0;
+  tokens: string[] = [];
+  /** Adjusts each devbox handle before the module sees it. */
+  box: (box: Box) => void = () => {};
   private faults = new Map<string, number>();
   private next = 0;
-  tokens: string[] = [];
 
-  fail(operation: string, times = 1) {
-    this.faults.set(operation, times);
+  fail(operation: string) {
+    this.faults.set(operation, 1);
   }
 
+  count(operation: string) {
+    return this.calls.filter((c) => c === operation).length;
+  }
+
+  /** Records the call; the returned function fails it after it took effect. */
   private effect(operation: string) {
     this.calls.push(operation);
-    const left = this.faults.get(operation) ?? 0;
-    if (left > 0) {
-      this.faults.set(operation, left - 1);
-      return () => {
-        throw new Error("Premature close");
-      };
-    }
-    return () => {};
+    if (!this.faults.delete(operation)) return () => {};
+    return () => {
+      throw new Error("Premature close");
+    };
   }
 
   private row(ref: string): Row {
@@ -69,14 +67,6 @@ export class StandIn implements Vendor {
       [...this.rows.values()].find((r) => r.info.name === ref);
     if (!row) throw new ConnectError("devbox not found", Code.NotFound);
     return row;
-  }
-
-  // Connection-backed calls activate a stopped devbox, as the SDK documents.
-  private connect(row: Row) {
-    if (row.info.state !== "running") {
-      this.activations++;
-      row.info.state = "running";
-    }
   }
 
   private handle(row: Row, state: DevboxInfo["state"]): Box {
@@ -88,40 +78,26 @@ export class StandIn implements Vendor {
       info: { ...structuredClone(row.info), state } as DevboxInfo,
       services: {
         async list() {
-          standIn.connect(standIn.row(id));
+          standIn.calls.push("services.list");
           return structuredClone(standIn.row(id).services);
         },
         async create(input: CreateServiceInput) {
           const done = standIn.effect("services.create");
           const target = standIn.row(id);
-          standIn.connect(target);
-          if (target.services.some((s) => s.name === input.name))
-            // As Namespace answers it: an invalid argument, not AlreadyExists.
-            throw new ConnectError(
-              `conflict: service name "${input.name}" conflicts with svc-0`,
-              Code.InvalidArgument,
-            );
-          const service = {
+          target.services.push({
             id: `svc-${target.services.length}`,
             name: input.name,
             command: input.command,
-            args: [...(input.args ?? [])],
-            environment: {},
-            startPolicy: input.startPolicy ?? "on-boot",
-            restartPolicy: input.restartPolicy ?? "on-failure",
-            preventIdleShutdown: input.preventIdleShutdown ?? false,
-            stopped: false,
-            owner: "user",
-            ports: [],
-          } as Service;
-          target.services.push(service);
+            startPolicy: input.startPolicy,
+            restartPolicy: input.restartPolicy,
+            preventIdleShutdown: input.preventIdleShutdown,
+          } as Service);
           done();
-          return service;
+          return target.services.at(-1)!;
         },
       },
       async exec(argv: readonly string[]) {
         standIn.calls.push(`exec ${argv.join(" ")}`);
-        standIn.connect(standIn.row(id));
         return {
           exitCode: standIn.execExit,
           signal: null,
@@ -129,55 +105,35 @@ export class StandIn implements Vendor {
           stderr: "",
         };
       },
-      async start() {
-        const done = standIn.effect("start");
-        standIn.row(id).info.state = "running";
-        box.info = { ...structuredClone(standIn.row(id).info) };
-        done();
-      },
-      async stop() {
-        const done = standIn.effect("stop");
-        standIn.row(id).info.state = "stopped";
-        box.info = { ...structuredClone(standIn.row(id).info) };
-        done();
-      },
-      async delete() {
-        const done = standIn.effect("delete");
-        standIn.rows.delete(standIn.row(id).info.id);
-        done();
-      },
       async refresh() {
         standIn.calls.push("refresh");
-        box.info = { ...structuredClone(standIn.row(id).info) };
-      },
-      async update() {
-        throw new Error("not used");
+        box.info = structuredClone(standIn.row(id).info);
       },
     };
+    this.box(box);
     return box;
   }
 
   devboxes = {
     create: async (input: CreateDevboxInput) => {
       const done = this.effect("create");
-      // The module never asks for ephemeral devboxes: they are deleted on stop.
-      if (input.ephemeral !== undefined)
-        throw new Error("ephemeral devboxes are deleted on stop");
       if ([...this.rows.values()].some((r) => r.info.name === input.name))
         throw new ConnectError("name taken", Code.AlreadyExists);
       if (!this.registered.some((i) => i.ref === input.image))
         throw new ConnectError("unknown image", Code.InvalidArgument);
-      const shape = SHAPES[input.size as string];
-      if (!shape) throw new TypeError("unknown size");
       const info: DevboxInfo = {
         id: `devbox-${++this.next}`,
         name: input.name,
         labels: { ...input.labels },
-        state: input.start === false ? "stopped" : "running",
+        state: "running",
         image: input.image as string,
         size: input.size,
-        shape: { ...shape, architecture: "amd64", os: "linux" },
-        site: input.site ?? "iad",
+        shape: {
+          vCPUs: input.size === "m" ? 8 : 4,
+          memoryMB: input.size === "m" ? 16384 : 8192,
+          architecture: "amd64",
+          os: "linux",
+        },
         volumeSizeGB: input.volumeSizeGB ?? 64,
         ephemeral: false,
       };
@@ -196,26 +152,36 @@ export class StandIn implements Vendor {
       const row = this.row(ref);
       return this.handle(row, row.info.state);
     },
-    // List is cheap: state unknown. Two per page, so paging is exercised.
+    // As Namespace lists: every state unknown. Two per page, so paging is exercised.
     list: async (options: ListDevboxesOptions = {}) => {
       this.calls.push("list");
       const matching = [...this.rows.values()].filter((row) =>
-        (options.labelFilters ?? []).every((filter) => {
-          if ("anyOf" in filter) throw new Error("not used");
-          const value = row.info.labels[filter.name];
-          return filter.operator === "exists"
-            ? value !== undefined
-            : value === filter.value;
-        }),
+        (options.labelFilters ?? []).every(
+          (f) => "name" in f && row.info.labels[f.name] === f.value,
+        ),
       );
       const start = Number(options.cursor ?? 0);
-      const end = start + Math.min(options.limit ?? 2, 2);
       return {
         items: matching
-          .slice(start, end)
+          .slice(start, start + 2)
           .map((row) => this.handle(row, "unknown")),
-        nextCursor: end < matching.length ? String(end) : undefined,
+        nextCursor: start + 2 < matching.length ? String(start + 2) : undefined,
       };
+    },
+    start: async (ref: string) => {
+      const done = this.effect("start");
+      this.row(ref).info.state = "running";
+      done();
+    },
+    stop: async (ref: string) => {
+      const done = this.effect("stop");
+      this.row(ref).info.state = "stopped";
+      done();
+    },
+    delete: async (ref: string) => {
+      const done = this.effect("delete");
+      this.rows.delete(this.row(ref).info.id);
+      done();
     },
   };
 
@@ -248,11 +214,11 @@ export class StandIn implements Vendor {
   /** Each channel is answered by `agent`, standing in for the bridge to the agent's socket. */
   agent: (stream: Duplex) => void = (stream) => stream.pipe(stream);
 
-  async channel(box: Box, command: string) {
-    const done = this.effect("channel");
-    this.connect(this.row(box.id));
+  // Opening a channel is Namespace's activate: it starts a stopped devbox.
+  async channel(id: string, command: string) {
+    this.calls.push("channel");
+    this.row(id).info.state = "running";
     this.channels.push(command);
-    done();
     const [local, remote] = pair();
     this.agent(remote);
     return local;

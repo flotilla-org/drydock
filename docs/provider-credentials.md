@@ -35,6 +35,7 @@ containerregistry *  containerregistry/repository *  containerregistry/image *
 - Without `ingress access`, every SDK gateway call returns 403.
 - Quota (`UsageService/GetConcurrency`) needs a grant beyond these, not yet identified. Without it quota is refused and the provider stays ready.
 - Image optimize is refused for every grant a revocable token can carry; the module doesn't call it.
+- The module translates: provision is one create (then the agent service), and inspect, suspend, resume and destroy are one SDK call each; rows carry Namespace's state word and the devbox's labels in `vendor`. On a `shared_account` (the default) it tags what it makes with the `drydock.provider` label and lists only devboxes carrying it, and drydockd destroys, suspends and resumes only what does. On an `owned_account` nothing is tagged or filtered, so use a workspace that holds only drydock's devboxes. Devboxes made before this tag existed carry none, so a shared-account instance no longer lists or acts on them.
 
 ## Modal (`modal`, TypeScript host)
 

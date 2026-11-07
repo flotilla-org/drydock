@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { createDevboxClient } from "@namespacelabs/sdk/devbox";
 import {
   AGENT,
   LABEL,
+  OWNER,
+  POLICY,
   namespaceModule,
   networkPolicy,
 } from "../dist/namespace/index.js";
@@ -20,7 +23,10 @@ const GiB = 1024 ** 3;
 const SIZE = { cpus: 4, memory_bytes: 8 * GiB, disk_bytes: 0 };
 const kind = (k: string) => (e: any) => e.detail?.kind === k;
 
-async function setup(settings: Record<string, unknown> = {}) {
+async function setup(
+  settings: Record<string, unknown> = {},
+  ownership: Types["Ownership"] = "shared_account",
+) {
   const standIn = new StandIn(),
     registries = new Registries();
   const module = namespaceModule((token) => {
@@ -30,7 +36,11 @@ async function setup(settings: Record<string, unknown> = {}) {
   const abort = new AbortController();
   const provider: Provider = await module.configure(
     "ns",
-    { module: "namespace", settings: { workspace: "acme", ...settings } },
+    {
+      module: "namespace",
+      settings: { workspace: "acme", ...settings },
+      ownership,
+    },
     abort.signal,
   );
   const context = { credential: CREDENTIAL, signal: abort.signal };
@@ -56,8 +66,8 @@ async function setup(settings: Record<string, unknown> = {}) {
   return { standIn, registries, provider, context, request, provision };
 }
 
-// Settings name the workspace registry; the credential drydock passes is
-// `{"bearer_token": …}`, and anything else is not ready.
+// Settings name the workspace registry and tune polling; the credential
+// drydock passes is `{"bearer_token": …}`, and anything else is not ready.
 test("configure validates settings; readiness needs a bearer token document", async () => {
   const module = namespaceModule(() => new StandIn());
   const signal = new AbortController().signal;
@@ -65,6 +75,8 @@ test("configure validates settings; readiness needs a bearer token document", as
     {},
     { workspace: "acme", unknown: 1 },
     { workspace: "Bad/" },
+    { workspace: "acme", poll_interval_ms: 0 },
+    { workspace: "acme", list_refreshes: 0 },
   ])
     await assert.rejects(
       module.configure("ns", { module: "namespace", settings }, signal),
@@ -75,6 +87,16 @@ test("configure validates settings; readiness needs a bearer token document", as
     { module: "namespace", settings: { workspace: "acme" } },
     signal,
   );
+  assert.deepEqual(provider.waysIn, [{ way: "poll", interval_ms: 30_000 }]);
+  const tuned = await module.configure(
+    "ns",
+    {
+      module: "namespace",
+      settings: { workspace: "acme", poll_interval_ms: 5000 },
+    },
+    signal,
+  );
+  assert.deepEqual(tuned.waysIn, [{ way: "poll", interval_ms: 5000 }]);
   for (const credential of [undefined, TOKEN, "{}", '{"bearer_token":""}'])
     assert.equal(
       (await provider.readiness({ credential, signal })).status,
@@ -215,90 +237,99 @@ test("prepare pushes the layered image and registers it once", async () => {
   );
 });
 
-// Provision creates a non-ephemeral devbox from the registered image with the
-// client's label, a named size, its network policy, no tenant checkout, and
-// the agent as an on-boot, always-restarted service that keeps it awake.
-// The label is the idempotency key: it finds the same devbox again.
-test("provision creates a labelled devbox with the agent service, idempotently", async () => {
-  const { standIn, provider, context, request, provision } = await setup();
-  const egress: Types["EgressRequest"] = {
-    mode: "deny_all",
-    direct: [{ kind: "host", host: "Example.com." }],
-  };
-  const first = await provision("vessel", egress);
-  assert.equal(first.created, true);
-  const row = standIn.rows.get(first.environment.id)!;
-  assert.equal(row.info.labels[LABEL], "vessel");
-  assert.equal(row.info.ephemeral, false);
-  assert.deepEqual(row.networkPolicy, {
-    allowedDomains: ["example.com"],
-    advisory: false,
-  });
-  assert.deepEqual(row.versionControl, {});
-  assert.deepEqual(
-    row.services.map((s) => [
-      s.name,
-      s.command,
-      s.startPolicy,
-      s.restartPolicy,
-      s.preventIdleShutdown,
-    ]),
-    [["drydock-agent", AGENT, "on-boot", "always", true]],
-  );
-  assert.deepEqual(first.environment.state, { state: "running" });
-  assert.deepEqual(first.environment.granted_size, {
-    ...SIZE,
-    disk_bytes: 64 * GiB,
-  });
-  assert.equal(first.environment.label, "vessel");
-
-  const again = await provision("vessel", egress);
-  assert.equal(again.created, false);
-  assert.equal(again.environment.id, first.environment.id);
-  assert.equal(standIn.rows.size, 1);
-  assert.equal(row.services.length, 1);
-  // Concurrent provisions of a new label make one devbox and one service,
-  // even when both find the service missing before either creates it.
-  const get = standIn.devboxes.get;
-  let arrive = () => {};
-  const both = new Promise<void>((resolve) => {
-    let count = 0;
-    arrive = () => ++count === 2 && resolve();
-  });
-  standIn.devboxes.get = async (...args) => {
-    const box = await get(...args);
-    const list = box.services.list;
-    box.services.list = async (options) => {
-      const services = await list(options);
-      arrive();
-      await both;
-      return services;
+// Provision is one create with the client's label (and on a shared account
+// this instance's tag), a named size, its network policy and no tenant
+// checkout, then the agent as an on-boot, always-restarted service that keeps
+// the devbox awake. A label is a name, not a key: provisioning it again makes
+// another devbox.
+test("provision is one create and the agent service", async () => {
+  for (const ownership of ["shared_account", "owned_account"] as const) {
+    const { standIn, provider, context, request, provision } = await setup(
+      {},
+      ownership,
+    );
+    const egress: Types["EgressRequest"] = {
+      mode: "deny_all",
+      direct: [{ kind: "host", host: "Example.com." }],
     };
-    return box;
+    const prepared = await provider.prepare(request, context);
+    const calls = standIn.calls.length;
+    const first = await provider.provision(
+      { label: "vessel", prepared, size: SIZE, egress },
+      context,
+    );
+    assert.deepEqual(standIn.calls.slice(calls), ["create", "services.create"]);
+    assert.equal(first.created, true);
+    const row = standIn.rows.get(first.environment.id)!;
+    assert.equal(row.info.labels[LABEL], "vessel");
+    assert.equal(
+      row.info.labels[OWNER],
+      ownership === "shared_account" ? "ns" : undefined,
+    );
+    assert.deepEqual(row.networkPolicy, {
+      allowedDomains: ["example.com"],
+      advisory: false,
+    });
+    assert.deepEqual(row.versionControl, {});
+    assert.deepEqual(
+      row.services.map((s) => [
+        s.name,
+        s.command,
+        s.startPolicy,
+        s.restartPolicy,
+        s.preventIdleShutdown,
+      ]),
+      [["drydock-agent", AGENT, "on-boot", "always", true]],
+    );
+    assert.equal(first.environment.label, "vessel");
+    assert.deepEqual(first.environment.vendor, {
+      state: "running",
+      tags: row.info.labels,
+    });
+    const again = await provision("vessel", egress);
+    assert.notEqual(again.environment.id, first.environment.id);
+  }
+});
+
+// A devbox whose agent service cannot be added is left in place, and
+// provision answers with the service's failure, naming the devbox.
+test("provision leaves the devbox and names it when the agent service fails", async () => {
+  const { standIn, provision } = await setup();
+  standIn.box = (box) => {
+    box.services.create = async () => {
+      throw new ConnectError("no agent", Code.Unavailable);
+    };
   };
-  const raced = await Promise.all([
-    provision("raced", egress),
-    provision("raced", egress),
-  ]);
-  standIn.devboxes.get = get;
-  assert.deepEqual(raced.map((r) => r.created).sort(), [false, true]);
-  assert.equal(raced[0].environment.id, raced[1].environment.id);
-  assert.equal(standIn.rows.get(raced[0].environment.id)!.services.length, 1);
-  // The same label with another size or policy is not this devbox.
   await assert.rejects(
-    provision("vessel", egress, { ...SIZE, cpus: 8, memory_bytes: 16 * GiB }),
-    kind("refused"),
+    provision("vessel"),
+    (e: any) =>
+      e.detail?.kind === "unavailable" &&
+      /devbox devbox-\d+ was left for inspection$/.test(e.detail?.reason),
   );
-  await assert.rejects(provision("vessel", { mode: "open" }), kind("refused"));
-  // Unrepresentable sizes and unknown prepared forms are refused.
-  await assert.rejects(
-    provision("odd", egress, { ...SIZE, cpus: 3 }),
-    kind("refused"),
-  );
-  await assert.rejects(
-    provision("odd", egress, { ...SIZE, disk_bytes: 1 }),
-    kind("refused"),
-  );
+  assert.equal(standIn.rows.size, 1);
+  assert.equal(standIn.count("delete"), 0);
+});
+
+// The relay reaches the SDK's private connection manager; this pins the
+// shape of the real SDK client so an upgrade that moves it fails here.
+test("the SDK keeps its connections where the relay looks", () => {
+  const client = createDevboxClient({
+    tokenSource: { issueToken: async () => "t" },
+  });
+  assert.equal(typeof (client.devboxes as any).connections?.get, "function");
+  client.close();
+});
+
+// Sizes Namespace does not sell are refused before any call; a prepared form
+// Namespace does not know is Namespace's refusal.
+test("provision refuses unsold sizes; Namespace refuses unknown images", async () => {
+  const { standIn, provider, context, request, provision } = await setup();
+  for (const size of [
+    { ...SIZE, cpus: 3 },
+    { ...SIZE, disk_bytes: 1 },
+  ])
+    await assert.rejects(provision("odd", undefined, size), kind("refused"));
+  assert.equal(standIn.count("create"), 0);
   const prepared = await provider.prepare(request, context);
   await assert.rejects(
     provider.provision(
@@ -311,20 +342,7 @@ test("provision creates a labelled devbox with the agent service, idempotently",
     ),
     kind("refused"),
   );
-  // An absent egress request is the protocol's default: deny all.
-  const closed = await provider.provision(
-    { label: "closed", prepared, size: SIZE },
-    context,
-  );
-  assert.deepEqual(standIn.rows.get(closed.environment.id)!.networkPolicy, {
-    allowedDomains: [],
-    advisory: false,
-  });
-  // Re-adopting a stopped devbox neither starts it nor touches its guest.
-  row.info.state = "stopped";
-  const stopped = await provision("vessel", egress);
-  assert.equal(stopped.environment.state.state, "stopped");
-  assert.equal(standIn.activations, 0);
+  assert.equal(standIn.count("create"), 1);
 });
 
 // Domain entries become allowed domains; CIDRs, ports and address literals
@@ -369,97 +387,147 @@ test("premature close is confirmed, never repeated", async () => {
   assert.equal(standIn.registered.length, 1);
   standIn.fail("create");
   standIn.fail("services.create");
-  const { created, environment } = await provision("vessel");
-  assert.equal(created, true);
+  const { environment } = await provision("vessel");
   assert.equal(standIn.rows.size, 1);
   assert.equal(standIn.rows.get(environment.id)!.services.length, 1);
-  standIn.fail("stop");
-  await provider.suspend!(environment.id, context);
-  assert.equal(standIn.calls.filter((c) => c === "stop").length, 1);
-  standIn.fail("start");
-  await provider.resume!(
-    environment.id,
-    await provider.suspend!(environment.id, context),
-    context,
-  );
-  assert.equal(standIn.calls.filter((c) => c === "start").length, 1);
-  standIn.fail("delete");
+  for (const [operation, act] of [
+    ["stop", () => provider.suspend!(environment.id, context)],
+    ["start", () => provider.resume!(environment.id, { token: "" }, context)],
+    ["delete", () => provider.destroy(environment.id, context)],
+  ] as const) {
+    standIn.fail(operation);
+    await act();
+    assert.equal(standIn.count(operation), 1, operation);
+  }
+  assert.equal(standIn.rows.size, 0);
+});
+
+// List is Namespace's list (on a shared account, of devboxes carrying this
+// instance's tag), across pages, each refreshed because list states every
+// devbox's state as unknown. A stop has no cause: Namespace does not say
+// whether its caps or a client stopped it. Observing never starts a devbox.
+test("list reports devboxes as Namespace states them", async () => {
+  for (const ownership of ["shared_account", "owned_account"] as const) {
+    const { standIn, provider, context, provision } = await setup(
+      {},
+      ownership,
+    );
+    const ids = [];
+    for (const label of ["a", "b", "c"])
+      ids.push((await provision(label)).environment.id);
+    standIn.rows.get(ids[1])!.info.state = "stopped";
+    const foreign = await standIn.devboxes.create({
+      name: "someone-else",
+      image: standIn.registered[0].ref,
+      size: "s",
+    });
+    const rows = await provider.list(context);
+    const expected = [
+      [ids[0], { state: "running" }, "running"],
+      [ids[1], { state: "stopped" }, "stopped"],
+      [ids[2], { state: "running" }, "running"],
+    ];
+    if (ownership === "owned_account") {
+      expected.push([foreign.id, { state: "running" }, "running"]);
+      // A devbox drydock did not make is listed, with no label.
+      assert.ok(!("label" in rows.find((r) => r.id === foreign.id)!));
+    }
+    assert.deepEqual(
+      rows.map((r) => [r.id, r.state, r.vendor?.state]),
+      expected,
+    );
+    assert.equal(standIn.count("refresh"), expected.length);
+    assert.ok(!standIn.calls.includes("channel"));
+  }
+});
+
+// A row carries what Namespace states and nothing else: no size without a
+// stated volume, no platform without a stated shape, a running devbox is
+// running with or without a size, and Namespace's own state word beside an
+// unknown state.
+test("a row reports only what Namespace states", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
+  assert.deepEqual(environment.granted_size, {
+    ...SIZE,
+    disk_bytes: 64 * GiB,
+  });
+  assert.deepEqual(environment.platform, {
+    os: "linux",
+    architecture: "amd64",
+  });
+  assert.equal(environment.egress_policy?.startsWith("open"), true);
+  const info = standIn.rows.get(environment.id)!.info;
+  delete info.volumeSizeGB;
+  delete info.shape;
+  delete info.labels[LABEL];
+  delete info.labels[POLICY];
+  const sizeless = await provider.inspect(environment.id, context);
+  assert.deepEqual(sizeless.state, { state: "running" });
+  assert.ok(!("granted_size" in sizeless));
+  info.state = "unknown";
+  const row = await provider.inspect(environment.id, context);
+  for (const key of [
+    "granted_size",
+    "platform",
+    "label",
+    "egress_policy",
+    "timestamp",
+  ])
+    assert.ok(!(key in row), key);
+  assert.deepEqual(row.state, {
+    state: "unknown",
+    reason: "provider_state_unknown",
+  });
+  assert.deepEqual(row.vendor, { state: "unknown", tags: info.labels });
+});
+
+// Suspend is one stop and resume one start, each sent as asked whatever the
+// devbox's state; the token is the id. The agent service is Namespace's to
+// start again on boot.
+test("suspend and resume are one stop and one start", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
+  const calls = standIn.calls.length;
+  for (let i = 0; i < 2; i++)
+    assert.deepEqual(await provider.suspend!(environment.id, context), {
+      token: environment.id,
+    });
+  assert.equal(standIn.rows.get(environment.id)!.info.state, "stopped");
+  for (let i = 0; i < 2; i++)
+    await provider.resume!(environment.id, { token: "ignored" }, context);
+  assert.equal(standIn.rows.get(environment.id)!.info.state, "running");
+  assert.deepEqual(standIn.calls.slice(calls), [
+    "stop",
+    "stop",
+    "start",
+    "start",
+  ]);
+});
+
+// Destroy is one delete; an absent devbox is Namespace's not-found.
+test("destroy is one delete", async () => {
+  const { standIn, provider, context, provision } = await setup();
+  const { environment } = await provision("vessel");
   await provider.destroy(environment.id, context);
   assert.equal(standIn.rows.size, 0);
-  assert.equal(standIn.calls.filter((c) => c === "delete").length, 1);
-  // A failure that is not a premature close is reported, typed.
   await assert.rejects(
-    provider.inspect(environment.id, context),
+    provider.destroy(environment.id, context),
     kind("not_found"),
   );
 });
 
-// Inventory is drydock's labelled devboxes, across pages, with state from
-// refresh (list reports unknown), and observing never starts a devbox. A
-// stop drydock requested is suspended_by_request; any other (lifetime cap,
-// idle) is paused_by_provider and resumable.
-test("list and inspect observe without starting anything", async () => {
-  const { standIn, provider, context, provision } = await setup();
-  const ids = [];
-  for (const label of ["a", "b", "c"])
-    ids.push((await provision(label)).environment.id);
-  const foreign = await standIn.devboxes.create({
-    name: "someone-else",
-    image: standIn.registered[0].ref,
-    size: "s",
-  });
-  standIn.rows.get(ids[1])!.info.state = "stopped";
-  await provider.suspend!(ids[2], context);
-  const rows = await provider.list(context);
-  assert.deepEqual(rows.map((r) => [r.id, r.state]).sort(), [
-    [ids[0], { state: "running" }],
-    [ids[1], { state: "stopped", cause: "paused_by_provider" }],
-    [ids[2], { state: "stopped", cause: "suspended_by_request" }],
-  ]);
-  assert.ok(!rows.some((r) => r.id === foreign.id));
-  assert.deepEqual((await provider.inspect(ids[1], context)).state, {
-    state: "stopped",
-    cause: "paused_by_provider",
-  });
-  assert.equal(standIn.activations, 0);
-  await assert.rejects(provider.inspect("missing", context), kind("not_found"));
-});
-
-// Suspend is devbox stop and resume is start; the token is stable and bound
-// to the environment, and resume keeps the agent service in place.
-test("suspend and resume stop and start the devbox", async () => {
+// Reach is the host's relay route, with no call to Namespace; the relay is
+// an exec channel running `drydock-agent --bridge`, carrying bytes both ways.
+test("relay runs the agent bridge", async () => {
   const { standIn, provider, context, provision } = await setup();
   const { environment } = await provision("vessel");
-  const token = await provider.suspend!(environment.id, context);
-  assert.deepEqual(await provider.suspend!(environment.id, context), token);
-  assert.equal(standIn.calls.filter((c) => c === "stop").length, 1);
-  assert.equal(
-    (await provider.inspect(environment.id, context)).state.state,
-    "stopped",
-  );
-  await assert.rejects(
-    provider.resume!(environment.id, { token: "other" }, context),
-    kind("refused"),
-  );
-  for (let i = 0; i < 2; i++)
-    await provider.resume!(environment.id, token, context);
-  assert.equal(standIn.calls.filter((c) => c === "start").length, 1);
-  assert.deepEqual((await provider.inspect(environment.id, context)).state, {
-    state: "running",
-  });
-  assert.equal(standIn.rows.get(environment.id)!.services.length, 1);
-});
-
-// Reach is the host's relay route; the relay is an exec channel running
-// `drydock-agent --bridge`, carrying bytes both ways. A stopped devbox is
-// refused, since opening a channel would start it.
-test("relay runs the agent bridge on a running devbox only", async () => {
-  const { standIn, provider, context, provision } = await setup();
-  const { environment } = await provision("vessel");
+  const calls = standIn.calls.length;
   assert.deepEqual(await provider.reach(environment.id, context), {
     kind: "relay",
     path: `/v1/providers/ns/environments/${environment.id}/relay`,
   });
+  assert.equal(standIn.calls.length, calls);
   const stream = await provider.relay!(environment.id, context);
   assert.deepEqual(standIn.channels, [`${AGENT} --bridge`]);
   const echoed = new Promise<string>((resolve) =>
@@ -468,40 +536,38 @@ test("relay runs the agent bridge on a running devbox only", async () => {
   stream.write("hello");
   assert.equal(await echoed, "hello");
   stream.destroy();
-  await provider.suspend!(environment.id, context);
-  const activations = standIn.activations;
-  await assert.rejects(
-    provider.relay!(environment.id, context),
-    kind("refused"),
-  );
-  assert.equal(standIn.activations, activations);
-  assert.equal(standIn.channels.length, 1);
 });
 
 // Egress is enforced only when the operator's probe proves it as root on a
-// running, restricted devbox; otherwise it stays advisory and unmeasured.
+// running, restricted devbox. A probe that fails or prints no proof fails the
+// inspect rather than reading as unmeasured.
 test("egress is enforced only on a passing probe", async () => {
   const { standIn, provider, context, provision } = await setup({
     egress_probe: { command: ["/opt/drydock/egress-probe"] },
   });
   const deny = (await provision("deny", { mode: "deny_all" })).environment;
   const open = (await provision("open")).environment;
-  for (const [proof, egress, measured] of [
-    [{ uid: 0, unlisted_canary: false, raw_dns: false }, "enforced", true],
-    [{ uid: 1000, unlisted_canary: false, raw_dns: false }, "advisory", true],
-    [{ uid: 0, unlisted_canary: true, raw_dns: false }, "advisory", true],
-    [{ uid: 0 }, "advisory", false],
-    [null, "advisory", false],
+  const pass = { uid: 0, unlisted_canary: false, raw_dns: false };
+  for (const [exit, proof, egress] of [
+    [0, pass, "enforced"],
+    [0, { ...pass, uid: 1000 }, "advisory"],
+    [0, { ...pass, unlisted_canary: true }, "advisory"],
   ] as const) {
-    // A probe that exits non-zero proves nothing, whatever it printed.
-    standIn.execExit = proof ? 0 : 1;
-    standIn.execStdout = JSON.stringify(
-      proof ?? { uid: 0, unlisted_canary: false, raw_dns: false },
-    );
+    standIn.execExit = exit;
+    standIn.execStdout = JSON.stringify(proof);
     const row = await provider.inspect(deny.id, context);
-    assert.deepEqual([row.egress, row.egress_measured], [egress, measured]);
+    assert.deepEqual([row.egress, row.egress_measured], [egress, true]);
   }
   assert.ok(standIn.calls.some((c) => c.includes("DRYDOCK_PROBE_DENY_ALL=1")));
+  for (const [exit, stdout] of [
+    [1, JSON.stringify(pass)],
+    [0, "not json"],
+    [0, JSON.stringify({ uid: 0 })],
+  ] as const) {
+    standIn.execExit = exit;
+    standIn.execStdout = stdout;
+    await assert.rejects(provider.inspect(deny.id, context), kind("internal"));
+  }
   const probes = standIn.calls.filter((c) => c.startsWith("exec")).length;
   assert.equal(
     (await provider.inspect(open.id, context)).egress_measured,
@@ -513,22 +579,12 @@ test("egress is enforced only on a passing probe", async () => {
     standIn.calls.filter((c) => c.startsWith("exec")).length,
     probes,
   );
-  assert.equal(standIn.activations, 0);
-});
-
-// Destroy deletes the devbox and is idempotent.
-test("destroy is idempotent", async () => {
-  const { standIn, provider, context, provision } = await setup();
-  const { environment } = await provision("vessel");
-  await provider.destroy(environment.id, context);
-  await provider.destroy(environment.id, context);
-  assert.equal(standIn.rows.size, 0);
-  assert.equal(standIn.calls.filter((c) => c === "delete").length, 1);
 });
 
 // Quota reads GetConcurrency's live limits and use per platform class, in
-// shared units; a zero limit is unset, not a limit of nothing.
-test("quota reports live concurrency", async () => {
+// shared units, as Namespace gives them: a zero limit is zero, and a class
+// with no stated use has no row.
+test("quota reports live concurrency as given", async () => {
   const { standIn, provider, context } = await setup();
   standIn.concurrencyRows = [
     {
@@ -537,6 +593,7 @@ test("quota reports live concurrency", async () => {
       limits: { maxCpu: 32n, maxMemoryMb: 0n, maxInstanceCount: 3n },
       activeConcurrency: { instanceCount: 1n, cpu: 4n, memoryMb: 8192n },
     },
+    { name: "macos", platforms: ["macos/arm64"] },
   ];
   const quota = await provider.quota!(context);
   assert.deepEqual(
@@ -549,7 +606,7 @@ test("quota reports live concurrency", async () => {
     ]),
     [
       ["cpu", "linux", "{vCPU}", 4, 32],
-      ["memory", "linux", "By", 8 * GiB, null],
+      ["memory", "linux", "By", 8 * GiB, 0],
       ["environments", "linux", "{instance}", 1, 3],
     ],
   );
