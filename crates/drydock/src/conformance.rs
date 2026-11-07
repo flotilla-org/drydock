@@ -842,12 +842,13 @@ impl Target<'_> {
                 async {
                     let EventKind::Running { granted_size } = &event.event else { unreachable!() };
                     let current = client.inspect(provider, &environment.id).await.map_err(SafeError::category)?;
-                    // The event's size is the row's: both stated and valid, or both absent.
+                    // The event and the row are separate reports: a webhook may state
+                    // no size where a read states one, so the two are not compared.
                     require(
                         granted_size.as_ref().is_none_or(valid_size)
-                            && current.granted_size == *granted_size
+                            && current.granted_size.as_ref().is_none_or(valid_size)
                             && matches!(current.state, Observation::Running),
-                        "running event has wrong granted size or billing state",
+                        "running event or row states an invalid size, or the row is not running",
                     )
                 }
                 .await,

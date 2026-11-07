@@ -71,7 +71,9 @@ def emit(row, kind, **fields):
             event["timestamp"] = "2026-99-99T00:00:00Z"
         if fault == "poll_timestamp":
             event["timestamp_source"] = "adaptor"
-        if fault in ("size", "running_state") and kind == "running":
+        if fault == "unsized_running" and kind == "running":
+            event["event"].pop("granted_size", None)
+        if fault == "size" and kind == "running":
             event["event"]["granted_size"] = {**size, "cpus": 99}
         if kind == "gone":
             cause = fields["cause"]["kind"]
@@ -348,6 +350,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(204)
         count=inspect_attempts.get(identifier,0);inspect_attempts[identifier]=count+1
         if fault=="inspect" and count==0:return self.respond(503,{"kind":"unavailable","reason":"inspect not ready","retry_after":None})
+        if fault=="running_state" and count==0 and row:return self.respond(200,{**row,"state":{"state":"stopped"}})
         return self.respond(200,row)
 
 
