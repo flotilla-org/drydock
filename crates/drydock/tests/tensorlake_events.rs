@@ -39,7 +39,6 @@ fn project() -> String {
 fn occurred(frame: &Value) -> Timestamp {
     frame["body"]["occurred_at"].as_str().unwrap().parse().unwrap()
 }
-const SIZE: Size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 10 << 30 };
 
 /// What the vendor stand-in lists.
 #[derive(Default)]
@@ -71,14 +70,14 @@ struct RecordedProvider {
     tensorlake: Arc<dyn Provider>,
     vendor: Arc<Vendor>,
 }
-/// The recorded sandbox as a list shows it once it is made: pending, with its size.
+/// The recorded sandbox as a list shows it once it is made: pending.
 fn listed(provider: &str) -> Environment {
     Environment {
         id: recorded_id(),
         label: Some("vessel".into()),
         provider: provider.into(),
         state: Observation::Transitioning { phase: TransitionPhase::Starting },
-        granted_size: Some(SIZE),
+        granted_size: None,
         egress: Enforcement::Advisory,
         platform: None,
         egress_measured: false,
@@ -226,11 +225,11 @@ async fn a_lifecycle_arrives_as_events_with_tensorlake_status() {
         seen,
         [
             (starting.clone(), "pending", id(0)),
-            (EventKind::Running { granted_size: SIZE }, "running", id(1)),
+            (EventKind::Running { granted_size: None }, "running", id(1)),
             (EventKind::Stopped { cause: None }, "suspended", id(2)),
             (starting, "pending", id(3)),
             (EventKind::Resumed, "running", id(4)),
-            (EventKind::Running { granted_size: SIZE }, "running", id(4)),
+            (EventKind::Running { granted_size: None }, "running", id(4)),
             (EventKind::Gone { cause: None }, "terminated", id(5)),
         ]
     );
