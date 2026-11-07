@@ -32,8 +32,6 @@ use std::{
 const E2B: Vendor = Vendor("E2B");
 const ENVD_PORT: u16 = 49983;
 const AGENT_PORT: u16 = 7811;
-const PRINT_TOKEN: &str = "/opt/drydock/drydock-agent --print-token --tcp-token-file /run/drydock/tcp-token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
 /// E2B's largest page of sandboxes.
 const SANDBOX_PAGE_LIMIT: &str = "100";
@@ -503,16 +501,6 @@ impl E2b {
         }
         Ok(response)
     }
-    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<String> {
-        let run = self.run(id, PRINT_TOKEN, BTreeMap::new(), c).await?.success(E2B)?;
-        let stdout = String::from_utf8_lossy(&run.stdout()).into_owned();
-        stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).filter(|t| !t.is_empty()).map(str::to_owned).ok_or_else(|| {
-            ProtocolError::Internal {
-                reason: "the agent's TCP token was not read back".into(),
-                provider_error: format!("no {TOKEN_LINE:?} line in the agent's output"),
-            }
-        })
-    }
 }
 
 #[async_trait]
@@ -788,7 +776,7 @@ impl Provider for E2b {
         let expires_at = v.end_at.ok_or_else(|| E2B.bad_response())?;
         Ok(Reach::Dial {
             url: self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string(),
-            token: Secret::new(token),
+            token,
             headers,
             expires_at: Some(expires_at.into()),
         })

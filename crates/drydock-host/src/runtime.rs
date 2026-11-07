@@ -31,9 +31,6 @@ const RUNTIME: Vendor = Vendor("Runtime");
 const SIZES: SizeLimits =
     SizeLimits { cpus: (1, 16), memory: (128 * MIB, 64 * GIB), memory_step: MIB, disk: (3 * GIB, 400 * GIB), disk_step: MIB };
 const PAGED: Paging = Paging { rows: Some("data"), cursor: "cursor", next: Next::Body(&["nextCursor"]) };
-const AGENT: &str = "/opt/drydock/drydock-agent";
-const TOKEN_FILE: &str = "/run/drydock/tcp-token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 const POLICY_LABEL: &str = "drydock.egress";
 const ENFORCED_LABEL: &str = "drydock.enforced";
 const LABEL_LIMIT: usize = 256;
@@ -502,14 +499,6 @@ impl Runtime {
             return Err(RUNTIME.bad_response());
         }
         Ok(preview)
-    }
-    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<Secret> {
-        let output = self.run(id, &format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}"), BTreeMap::new(), c).await?;
-        let token = String::from_utf8_lossy(&output.stdout()).lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).map(str::to_owned);
-        match token {
-            Some(token) if output.exit_code() == 0 => Ok(Secret::new(token)),
-            _ => Err(ProtocolError::unavailable(format!("Runtime sandbox {id}'s agent has no TCP token yet"), Some(2))),
-        }
     }
 }
 

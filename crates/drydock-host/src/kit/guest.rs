@@ -1,12 +1,16 @@
 //! Running commands in a guest through whatever runs them there (a
 //! vendor's exec API): what a command printed and how it ended, the errors
-//! that makes, and a user's exec on top. A module supplies only
-//! [`Guest::run`].
+//! that makes, and a user's exec and the agent's TCP token on top. A module
+//! supplies only [`Guest::run`].
 use super::{Vendor, shell_command};
 use crate::module::{ByteStream, Credentials, Result};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use std::collections::BTreeMap;
+
+const AGENT: &str = "/opt/drydock/drydock-agent";
+const TOKEN_FILE: &str = "/run/drydock/tcp-token";
+const TOKEN_LINE: &str = "drydock-tcp-token ";
 
 /// What one guest command printed and how it ended.
 #[derive(Default, Debug)]
@@ -70,6 +74,19 @@ pub trait Guest: Send + Sync {
     /// A user's command, as the exec port runs it.
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream> {
         Ok(self.run(id, &shell_command(&request.command), BTreeMap::new(), c).await?.success(self.vendor())?.into_stream())
+    }
+    /// The token the guest's agent serves its TCP listener with.
+    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<Secret> {
+        let output = self.run(id, &format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}"), BTreeMap::new(), c).await?;
+        let token = String::from_utf8_lossy(&output.stdout())
+            .lines()
+            .find_map(|line| line.strip_prefix(TOKEN_LINE))
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned);
+        match token {
+            Some(token) if output.exit_code() == 0 => Ok(Secret::new(token)),
+            _ => Err(ProtocolError::unavailable(format!("{} sandbox {id}'s agent has no TCP token yet", self.vendor()), Some(2))),
+        }
     }
 }
 
