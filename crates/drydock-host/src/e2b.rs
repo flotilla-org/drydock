@@ -688,11 +688,26 @@ impl Provider for E2b {
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
         }
     }
+    /// E2B's webhooks are registered in its dashboard or through its API.
     fn ways_in(&self) -> Vec<WayIn> {
-        vec![WayIn::Poll { interval_ms: self.settings.poll_interval_ms }]
+        vec![
+            WayIn::Poll { interval_ms: self.settings.poll_interval_ms },
+            WayIn::Webhook {
+                registration: vec![WebhookRegistration::Dashboard, WebhookRegistration::Api],
+                events: LIFECYCLE.iter().map(|&(event, _)| event.into()).collect(),
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            },
+        ]
     }
     fn operations(&self) -> Operations<'_> {
-        Operations { exec: Some(self), suspend_resume: Some(self), quota: Some(self), files: Some(self), ..Operations::default() }
+        Operations {
+            exec: Some(self),
+            suspend_resume: Some(self),
+            quota: Some(self),
+            files: Some(self),
+            events: Some(self),
+            ..Operations::default()
+        }
     }
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.settings.rate_limits.clone().unwrap_or_default()
@@ -780,6 +795,54 @@ impl Provider for E2b {
     }
     async fn relay(&self, _: &str, _: &Credentials) -> Result<ByteStream> {
         Err(refused("drydockd dials E2B's proxy from the reach"))
+    }
+}
+
+/// E2B's lifecycle events, each with the drydock state its type names, if any.
+/// A pause or a kill states no cause; an update or a checkpoint states no state.
+/// The 2026-11-06 recording has no update or checkpoint, so neither is tested.
+const LIFECYCLE: &[(&str, Option<Observation>)] = &[
+    ("sandbox.lifecycle.created", Some(Observation::Running)),
+    ("sandbox.lifecycle.updated", None),
+    ("sandbox.lifecycle.paused", Some(Observation::Stopped { cause: None })),
+    ("sandbox.lifecycle.resumed", Some(Observation::Running)),
+    ("sandbox.lifecycle.checkpointed", None),
+    ("sandbox.lifecycle.killed", Some(Observation::Gone { cause: None })),
+];
+/// A lifecycle event's body, as recorded from E2B on 2026-11-06, only the
+/// fields read. `event_data.execution` is usage, left for drydock#257.
+#[derive(Deserialize)]
+struct Lifecycle {
+    sandbox_id: Text,
+    timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    event_data: LifecycleData,
+}
+#[derive(Deserialize, Default)]
+struct LifecycleData {
+    kill_reason: Option<String>,
+    sandbox_metadata: Option<BTreeMap<String, String>>,
+}
+/// Each lifecycle event states one sandbox; E2B's event type (the body's
+/// `type`, which the relay gives as the event name) as its state; the kill
+/// reason and the sandbox's metadata as E2B gives them; and when it happened.
+/// Any other event, or one for another team, says nothing drydock follows.
+#[async_trait]
+impl VendorEvents for E2b {
+    async fn event(&self, delivery: VendorDelivery) -> Result<Vec<VendorObservation>> {
+        let Some((_, state)) = LIFECYCLE.iter().find(|(event, _)| *event == delivery.event) else { return Ok(vec![]) };
+        // Another team's body, or one naming no team, is not read further.
+        if delivery.body.get("sandbox_team_id").and_then(serde_json::Value::as_str) != Some(self.settings.team_id.as_str()) {
+            return Ok(vec![]);
+        }
+        let event = delivery.event.as_str();
+        let v: Lifecycle = serde_json::from_value(delivery.body).map_err(|e| refused(format!("E2B {event} body: {e}")))?;
+        Ok(vec![VendorObservation {
+            id: v.sandbox_id.to_string(),
+            state: state.clone(),
+            vendor: VendorState { state: delivery.event, reason: v.event_data.kill_reason, tags: v.event_data.sandbox_metadata },
+            timestamp: v.timestamp.map(Into::into),
+        }])
     }
 }
 
