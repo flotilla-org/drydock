@@ -1,11 +1,14 @@
 // Namespace devboxes through `@namespacelabs/sdk/devbox` (owner ruling
-// 2026-10-19: devboxes and the SDK, not the public compute API). Prepare
+// 2026-10-19: devboxes and the SDK, not the public compute API). Each verb is
+// Namespace's own operation and each answer is what Namespace said; waiting,
+// idempotence and ownership are drydockd's, as the declared semantics leave
+// them (see `capabilities`). Prepare
 // layers the tools image onto the base here and registers the result; the
 // agent runs as a devbox service, because PID 1 is Namespace's own agent and
 // the image's entrypoint never runs; drydock reaches it through the relay
 // route, which this module carries over an SSH exec channel to
 // `drydock-agent --bridge`. Suspend is devbox stop: files survive, memory not.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Duplex } from "node:stream";
 import type { NetworkPolicy } from "@namespacelabs/sdk/devbox";
 import {
@@ -35,17 +38,21 @@ import {
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
-/** The devbox label holding the client's label, which keys idempotency. */
+/** The devbox label holding the client's label: its name, not a handle. */
 export const LABEL = "drydock.label";
+/** The devbox label naming the instance that made it, on a shared account. */
+export const OWNER = "drydock.provider";
 /** The devbox label holding the egress policy identity requested at create. */
 export const POLICY = "drydock.egress";
 export const SERVICE = "drydock-agent";
 export const AGENT = "/opt/drydock/drydock-agent";
 const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 const REGISTRY = "nscr.io";
-/** Concurrent `refresh` calls while listing. */
-const REFRESHES = 8;
-/** Linux machine sizes, as the SDK resolves them client-side. */
+/**
+ * Linux machine sizes, as the SDK resolves them client-side. Namespace sells
+ * these fixed shapes; the SDK keeps its table private and offers no call that
+ * lists them, so the table is copied here.
+ */
 const SIZES: Record<string, { cpus: number; memoryMB: number }> = {
   s: { cpus: 4, memoryMB: 8 * 1024 },
   m: { cpus: 8, memoryMB: 16 * 1024 },
@@ -64,6 +71,10 @@ const settingsValid = compile({
     repository: { type: "string", pattern: `^${component}(?:/${component})*$` },
     site: { type: "string", minLength: 1 },
     push_chunk_bytes: { type: "integer", minimum: 1 },
+    /** How often drydockd lists this instance's devboxes. */
+    poll_interval_ms: { type: "integer", minimum: 1 },
+    /** Concurrent `refresh` calls while listing. */
+    list_refreshes: { type: "integer", minimum: 1 },
     /** Operator-supplied egress conformance command, run as root on inspect. */
     egress_probe: {
       type: "object",
@@ -84,6 +95,8 @@ type Settings = {
   repository?: string;
   site?: string;
   push_chunk_bytes?: number;
+  poll_interval_ms?: number;
+  list_refreshes?: number;
   egress_probe?: { command: string[] };
 };
 
@@ -200,7 +213,13 @@ export function namespaceModule(
     async configure(name, config) {
       if (!settingsValid(config.settings ?? {}))
         refused("invalid namespace settings");
-      return new Namespace(name, config.settings as Settings, vendor, fetcher);
+      return new Namespace(
+        name,
+        config.settings as Settings,
+        config.ownership ?? "shared_account",
+        vendor,
+        fetcher,
+      );
     },
   };
 }
@@ -212,13 +231,15 @@ class Namespace implements Provider {
     checkout_strategies: ["clone_in_vessel"],
     workspace_root: "/workspace",
     suspend_resume: true,
-    exclusive_label: true,
-    // Its own operations wait, are idempotent and check ownership.
+    // A label is the client's name for what it made: every provision creates.
+    exclusive_label: false,
+    // Each verb is Namespace's own operation: no waiting, no already-done
+    // success, no ownership check. Namespace resumes by id.
     semantics: {
-      settles: true,
-      idempotent: true,
-      owner_scoped: true,
-      token_is_id: false,
+      settles: false,
+      idempotent: false,
+      owner_scoped: false,
+      token_is_id: true,
     },
     // Devbox stop keeps the filesystem; memory and processes are lost.
     suspend_preserves_memory: false,
@@ -243,14 +264,11 @@ class Namespace implements Provider {
       },
     ],
   };
-  waysIn: Types["WayIn"][] = [{ way: "poll", interval_ms: 30_000 }];
+  // Namespace offers no webhooks or state stream (WaitInstance streams only
+  // until an instance runs), so listing is the only way to hear of a stop at
+  // its idle or lifetime cap.
+  waysIn: Types["WayIn"][];
   rateLimits: Types["RateLimit"][] = [];
-  /**
-   * Devboxes this host stopped, so their stop reads as requested. Labels are
-   * fixed at create, so this is process-local: after a host restart such a stop
-   * reads as paused_by_provider, which is still resumable.
-   */
-  private suspended = new Set<string>();
   /** SDK clients by token, with the calls and relays using each. */
   private clients = new Map<
     string,
@@ -260,9 +278,14 @@ class Namespace implements Provider {
   constructor(
     private name: string,
     private settings: Settings,
+    private ownership: Types["Ownership"],
     private connect: (token: string) => Vendor,
     private fetcher: Fetch,
-  ) {}
+  ) {
+    this.waysIn = [
+      { way: "poll", interval_ms: settings.poll_interval_ms ?? 30_000 },
+    ];
+  }
 
   /**
    * The SDK client for the credential a call carries, held until `release`.
@@ -452,48 +475,24 @@ class Namespace implements Provider {
     };
   }
 
-  private async labelled(vendor: Vendor, label: string, signal: AbortSignal) {
-    const page = await call(() =>
-      vendor.devboxes.list({
-        labelFilters: [{ name: LABEL, value: label }],
-        limit: 2,
-        signal,
-      }),
+  /** The agent service; on-boot, so Namespace starts it again on resume. */
+  private async addAgent(box: Box, signal: AbortSignal) {
+    await call(
+      () =>
+        box.services.create(
+          {
+            name: SERVICE,
+            command: AGENT,
+            description: "drydock vessel agent",
+            startPolicy: "on-boot",
+            restartPolicy: "always",
+            preventIdleShutdown: true,
+          },
+          { signal },
+        ),
+      async () =>
+        (await box.services.list({ signal })).find((s) => s.name === SERVICE),
     );
-    return page.items.find((box) => box.info.labels[LABEL] === label);
-  }
-
-  /** The devbox with its authoritative runtime state. */
-  private current(vendor: Vendor, id: string, signal: AbortSignal) {
-    return call(() => vendor.devboxes.get(id, { signal }));
-  }
-
-  /** The agent service, created once; on-boot, so it returns after resume. */
-  private async ensureAgent(box: Box, signal: AbortSignal) {
-    const present = async () =>
-      (await box.services.list({ signal })).find((s) => s.name === SERVICE);
-    if (await call(present)) return;
-    try {
-      await call(
-        () =>
-          box.services.create(
-            {
-              name: SERVICE,
-              command: AGENT,
-              description: "drydock vessel agent",
-              startPolicy: "on-boot",
-              restartPolicy: "always",
-              preventIdleShutdown: true,
-            },
-            { signal },
-          ),
-        present,
-      );
-    } catch (error) {
-      // A concurrent provision of the same label created it first; Namespace
-      // refuses the second create as a name conflict.
-      if (!(await call(present))) throw error;
-    }
   }
 
   async provision(
@@ -509,23 +508,7 @@ class Namespace implements Provider {
     );
   }
 
-  /** A devbox this label names, if its size and egress policy are the request's. */
-  private adopt(
-    box: Box,
-    shape: ReturnType<typeof machine>,
-    policy: NetworkPolicy | undefined,
-  ) {
-    if (
-      box.info.size !== shape.size ||
-      (shape.volumeSizeGB !== undefined &&
-        box.info.volumeSizeGB !== shape.volumeSizeGB) ||
-      (box.info.labels[POLICY] ?? null) !== policyIdentity(policy)
-    )
-      refused(
-        "existing Namespace label has a different size or egress policy; provision a new label",
-      );
-  }
-
+  /** One create, then the agent service: PID 1 is Namespace's own agent. */
   private async provisioned(
     vendor: Vendor,
     request: Types["ProvisionRequest"],
@@ -533,114 +516,94 @@ class Namespace implements Provider {
     policy: NetworkPolicy | undefined,
     signal: AbortSignal,
   ): Promise<{ created: boolean; environment: Types["Environment"] }> {
-    const existing = await this.labelled(vendor, request.label, signal);
-    if (existing) {
-      const box = await this.current(vendor, existing.id, signal);
-      this.adopt(box, shape, policy);
-      // Re-adoption never resumes: a stopped devbox stays as it is.
-      if (box.info.state !== "running")
-        return { created: false, environment: this.row(box) };
-      await this.ensureAgent(box, signal);
-      return {
-        created: false,
-        environment: await this.observe(vendor, box, signal),
-      };
-    }
-    const { prepared } = request;
-    const image = await this.registered(
-      vendor,
-      imageName(
-        prepared.image_digest,
-        prepared.tools_digest,
-        prepared.platform,
-      ),
-      signal,
+    const labels: Record<string, string> = {
+      [LABEL]: request.label,
+      [POLICY]: policyIdentity(policy),
+    };
+    if (this.ownership === "shared_account") labels[OWNER] = this.name;
+    // Namespace names must be unique, and a label may be provisioned again.
+    const name = `drydock-${randomBytes(12).toString("hex")}`;
+    const box = await call(
+      () =>
+        vendor.devboxes.create(
+          {
+            name,
+            image: request.prepared.id,
+            ...shape,
+            site: this.settings.site,
+            labels,
+            networkPolicy: policy,
+            // No tenant-default checkout: drydock owns the workspace.
+            versionControl: {},
+            purpose: "drydock vessel",
+            start: true,
+          },
+          { signal },
+        ),
+      async () => {
+        try {
+          return await vendor.devboxes.get(name, { signal });
+        } catch (error) {
+          if (protocolError(error).detail.kind === "not_found") return;
+          throw error;
+        }
+      },
     );
-    if (!image || image.ref !== prepared.id) refused("unknown prepared form");
-    let created = true;
-    let box: Box;
     try {
-      box = await call(
-        () =>
-          vendor.devboxes.create(
-            {
-              name: `drydock-${hex(request.label).slice(0, 24)}`,
-              image: prepared.id,
-              ...shape,
-              site: this.settings.site,
-              labels: {
-                [LABEL]: request.label,
-                [POLICY]: policyIdentity(policy),
-              },
-              networkPolicy: policy,
-              // No tenant-default checkout: drydock owns the workspace.
-              versionControl: {},
-              purpose: "drydock vessel",
-              start: true,
-            },
-            { signal },
-          ),
-        () => this.labelled(vendor, request.label, signal),
-      );
+      await this.addAgent(box, signal);
     } catch (error) {
-      // A concurrent provision of the same label created it first.
-      const raced = await this.labelled(vendor, request.label, signal);
-      if (!raced) throw error;
-      this.adopt(raced, shape, policy);
-      box = raced;
-      created = false;
+      // The devbox stays for the client to inspect or destroy; the failure
+      // names it, since a failed provision returns no environment.
+      const failure = protocolError(error);
+      const detail = failure.detail as { reason?: string };
+      detail.reason = `${detail.reason ?? failure.detail.kind}; devbox ${box.id} was left for inspection`;
+      throw failure;
     }
-    box = await this.current(vendor, box.id, signal);
-    if (box.info.state === "running") await this.ensureAgent(box, signal);
-    return { created, environment: await this.observe(vendor, box, signal) };
+    return { created: true, environment: this.row(box) };
   }
 
-  /** The provider's facts about one devbox, without touching the guest. */
+  /** The devbox as Namespace states it, without touching the guest. */
   private row(box: Box): Types["Environment"] {
     const { info } = box;
     const state: Types["Observation"] =
       info.state === "running"
         ? { state: "running" }
         : info.state === "stopped"
-          ? {
-              state: "stopped",
-              // Namespace stops a devbox at its lifetime cap or when idle, and
-              // it stays resumable; only a stop this host requested is ours.
-              cause: this.suspended.has(info.id)
-                ? "suspended_by_request"
-                : "paused_by_provider",
-            }
+          ? // Namespace does not say whether its idle or lifetime cap or a
+            // client stopped it.
+            { state: "stopped" }
           : { state: "unknown", reason: "provider_state_unknown" };
     const shape = info.shape;
-    return {
+    const disk = info.volumeSizeGB;
+    const row: Types["Environment"] = {
       provider: this.name,
       id: info.id,
-      label: info.labels[LABEL] ?? null,
       state,
-      granted_size: shape
-        ? {
-            cpus: shape.vCPUs,
-            memory_bytes: shape.memoryMB * MiB,
-            disk_bytes: (info.volumeSizeGB ?? 0) * GiB,
-          }
-        : null,
-      platform:
-        shape?.os && shape.architecture
-          ? { os: shape.os, architecture: shape.architecture }
-          : PLATFORM,
       egress: "advisory",
       egress_measured: false,
-      egress_policy: info.labels[POLICY] ?? null,
-      timestamp: null,
+      vendor: { state: info.state, tags: { ...info.labels } },
     };
+    if (info.labels[LABEL] !== undefined) row.label = info.labels[LABEL];
+    if (info.labels[POLICY] !== undefined)
+      row.egress_policy = info.labels[POLICY];
+    // A size is all three, as Namespace states them, or none.
+    if (shape?.vCPUs && shape.memoryMB && disk)
+      row.granted_size = {
+        cpus: shape.vCPUs,
+        memory_bytes: shape.memoryMB * MiB,
+        disk_bytes: disk * GiB,
+      };
+    if (shape?.os && shape.architecture)
+      row.platform = { os: shape.os, architecture: shape.architecture };
+    return row;
   }
 
   /**
    * The row, measuring a restricted running devbox's egress with the
-   * operator's probe. Enforced only when the probe proves it as root.
+   * operator's probe. Enforced only when the probe proves it as root; a probe
+   * that fails, or whose output is not a proof, fails the inspect.
    */
   private async observe(
-    vendor: Vendor,
     box: Box,
     signal: AbortSignal,
   ): Promise<Types["Environment"]> {
@@ -653,122 +616,127 @@ class Namespace implements Provider {
     if (!probe || policy === "open" || row.state.state !== "running")
       return row;
     const deny = policy.startsWith("deny-") ? "1" : "0";
+    const result = await call(() =>
+      box.exec(
+        [
+          "sh",
+          "-c",
+          `test "$(id -u)" = 0 && DRYDOCK_PROBE_DENY_ALL=${deny} exec "$@"`,
+          "probe",
+          ...probe.command,
+        ],
+        { signal },
+      ),
+    );
+    const failed = (reason: string): never => {
+      throw new ProtocolFailure({
+        kind: "internal",
+        reason: `Namespace egress probe failed: ${reason}`,
+        provider_error: result.stderr || result.stdout,
+      });
+    };
+    if (result.exitCode !== 0) failed(`exit status ${result.exitCode}`);
+    let proof: any;
     try {
-      const result = await call(() =>
-        box.exec(
-          [
-            "sh",
-            "-c",
-            `test "$(id -u)" = 0 && DRYDOCK_PROBE_DENY_ALL=${deny} exec "$@"`,
-            "probe",
-            ...probe.command,
-          ],
-          { signal },
-        ),
-      );
-      if (result.exitCode !== 0) return row;
-      const proof = JSON.parse(result.stdout);
-      const flags = ["unlisted_canary", "raw_dns"];
-      if (deny === "0") flags.push("listed_direct");
-      if (
-        typeof proof?.uid !== "number" ||
-        flags.some((f) => typeof proof[f] !== "boolean")
-      )
-        return row;
-      const enforced =
-        proof.uid === 0 &&
-        proof.unlisted_canary === false &&
-        proof.raw_dns === false &&
-        (deny === "1" || proof.listed_direct === true);
-      return {
-        ...row,
-        egress: enforced ? "enforced" : "advisory",
-        egress_measured: true,
-      };
+      proof = JSON.parse(result.stdout);
     } catch {
-      // A failed probe still returns the environment, unmeasured.
-      return row;
+      failed("output is not JSON");
     }
+    const flags = ["unlisted_canary", "raw_dns"];
+    if (deny === "0") flags.push("listed_direct");
+    if (
+      typeof proof?.uid !== "number" ||
+      flags.some((f) => typeof proof[f] !== "boolean")
+    )
+      failed(`output lacks uid or ${flags.join(", ")}`);
+    const enforced =
+      proof.uid === 0 &&
+      proof.unlisted_canary === false &&
+      proof.raw_dns === false &&
+      (deny === "1" || proof.listed_direct === true);
+    return {
+      ...row,
+      egress: enforced ? "enforced" : "advisory",
+      egress_measured: true,
+    };
   }
 
   async list({ credential, signal }: Context) {
     return this.using(credential, (vendor) => this.listed(vendor, signal));
   }
 
+  /**
+   * Every devbox Namespace lists, or on a shared account those carrying this
+   * instance's tag. Namespace's list states every devbox's state as
+   * `unknown` ("a list skips per-Devbox runtime lookups"), so each listed
+   * devbox is refreshed: a second call, a few devboxes at a time.
+   */
   private async listed(vendor: Vendor, signal: AbortSignal) {
+    const labelFilters =
+      this.ownership === "shared_account"
+        ? [{ name: OWNER, value: this.name }]
+        : undefined;
     const boxes: Box[] = [];
     let cursor: string | undefined;
     do {
       const page = await call(() =>
-        vendor.devboxes.list({
-          labelFilters: [{ name: LABEL, operator: "exists" }],
-          cursor,
-          signal,
-        }),
+        vendor.devboxes.list({ labelFilters, cursor, signal }),
       );
       boxes.push(...page.items);
       cursor = page.nextCursor;
     } while (cursor);
-    // List reports state unknown; refresh resolves it without starting
-    // anything, a few devboxes at a time.
-    const rows: Types["Environment"][] = [];
-    const queue = [...boxes];
+    // In Namespace's list order. One failed refresh fails the list: a
+    // partial inventory would read the missing devboxes as gone.
+    const rows: (Types["Environment"] | undefined)[] = [];
+    const queue = boxes.entries();
     const worker = async () => {
-      for (let box = queue.shift(); box; box = queue.shift()) {
+      for (const [index, box] of queue) {
         try {
           await call(() => box.refresh({ signal }));
-          rows.push(this.row(box));
+          rows[index] = this.row(box);
         } catch (error) {
+          // Destroyed since the list: it is not in the inventory.
           if (protocolError(error).detail.kind !== "not_found") throw error;
         }
       }
     };
-    await Promise.all(Array.from({ length: REFRESHES }, worker));
-    return rows;
+    const workers = this.settings.list_refreshes ?? 8;
+    await Promise.all(Array.from({ length: workers }, worker));
+    return rows.filter((row) => row !== undefined);
   }
 
   async inspect(id: string, { credential, signal }: Context) {
     return this.using(credential, async (vendor) =>
-      this.observe(vendor, await this.current(vendor, id, signal), signal),
+      this.observe(
+        await call(() => vendor.devboxes.get(id, { signal })),
+        signal,
+      ),
     );
   }
 
+  /** Namespace's delete; an absent devbox is Namespace's not-found. */
   async destroy(id: string, { credential, signal }: Context) {
-    return this.using(credential, (vendor) =>
-      this.destroyed(vendor, id, signal),
+    await this.using(credential, (vendor) =>
+      call(
+        async () => {
+          await vendor.devboxes.delete(id, { signal });
+          return true;
+        },
+        async () => {
+          try {
+            await vendor.devboxes.get(id, { signal });
+            return undefined;
+          } catch (error) {
+            if (protocolError(error).detail.kind === "not_found") return true;
+            throw error;
+          }
+        },
+      ),
     );
   }
 
-  private async destroyed(vendor: Vendor, id: string, signal: AbortSignal) {
-    const gone = async () => {
-      try {
-        await vendor.devboxes.get(id, { signal });
-        return undefined;
-      } catch (error) {
-        if (protocolError(error).detail.kind === "not_found") return true;
-        throw error;
-      }
-    };
-    let box: Box;
-    try {
-      box = await this.current(vendor, id, signal);
-    } catch (error) {
-      // Destroy is idempotent: an absent devbox is already destroyed.
-      if (protocolError(error).detail.kind === "not_found") return;
-      throw error;
-    }
-    await call(async () => {
-      await box.delete({ signal });
-      return true;
-    }, gone);
-    this.suspended.delete(id);
-  }
-
-  async reach(
-    id: string,
-    { credential, signal }: Context,
-  ): Promise<Types["Reach"]> {
-    await this.using(credential, (vendor) => this.current(vendor, id, signal));
+  /** This host's relay route, without a call to Namespace. */
+  async reach(id: string): Promise<Types["Reach"]> {
     const segment = encodeURIComponent;
     return {
       kind: "relay",
@@ -776,16 +744,13 @@ class Namespace implements Provider {
     };
   }
 
+  /** Opening the channel is Namespace's activate: it starts a stopped devbox. */
   async relay(id: string, { credential, signal }: Context): Promise<Duplex> {
     // The relay holds its SDK client until the channel closes.
     const { vendor, release } = this.acquire(credential);
     try {
-      const box = await this.current(vendor, id, signal);
-      // Opening a channel starts a stopped devbox; reach never resumes one.
-      if (box.info.state !== "running")
-        refused("Namespace devbox is not running; resume it first");
       const stream = await call(() =>
-        vendor.channel(box, `${AGENT} --bridge`, signal),
+        vendor.channel(id, `${AGENT} --bridge`, signal),
       );
       stream.once("close", release);
       return stream;
@@ -795,57 +760,42 @@ class Namespace implements Provider {
     }
   }
 
-  private resumeToken(id: string): Types["ResumeToken"] {
-    // Binds provider and id; not an access credential.
-    return { token: hex(`resume\0${this.name}\0${id}`) };
-  }
-
+  /** Namespace's stop, sent as asked. Namespace resumes by id: the token. */
   async suspend(id: string, { credential, signal }: Context) {
-    return this.using(credential, (vendor) => this.stopped(vendor, id, signal));
-  }
-
-  private async stopped(vendor: Vendor, id: string, signal: AbortSignal) {
-    const box = await this.current(vendor, id, signal);
-    if (box.info.state !== "stopped")
-      await call(
+    await this.using(credential, (vendor) =>
+      call(
         async () => {
-          await box.stop({ signal });
+          await vendor.devboxes.stop(id, { signal });
           return true;
         },
         async () =>
           (await vendor.devboxes.get(id, { signal })).info.state ===
             "stopped" || undefined,
-      );
-    this.suspended.add(id);
-    return this.resumeToken(id);
+      ),
+    );
+    return { token: id };
   }
 
+  /**
+   * Namespace's start, sent as asked. The agent service is on-boot and
+   * Namespace keeps services across a stop, so it comes back by itself.
+   */
   async resume(
     id: string,
-    token: Types["ResumeToken"],
+    _token: Types["ResumeToken"],
     { credential, signal }: Context,
   ) {
-    if (token.token !== this.resumeToken(id).token)
-      refused("resume token belongs to another environment");
-    return this.using(credential, (vendor) => this.resumed(vendor, id, signal));
-  }
-
-  private async resumed(vendor: Vendor, id: string, signal: AbortSignal) {
-    let box = await this.current(vendor, id, signal);
-    if (box.info.state !== "running") {
-      await call(
+    await this.using(credential, (vendor) =>
+      call(
         async () => {
-          await box.start({ signal });
+          await vendor.devboxes.start(id, { signal });
           return true;
         },
         async () =>
           (await vendor.devboxes.get(id, { signal })).info.state ===
             "running" || undefined,
-      );
-      box = await this.current(vendor, id, signal);
-    }
-    this.suspended.delete(id);
-    await this.ensureAgent(box, signal);
+      ),
+    );
   }
 
   async quota({ credential, signal }: Context): Promise<Types["Quota"]> {
@@ -858,18 +808,18 @@ class Namespace implements Provider {
   ): Promise<Types["Quota"]> {
     const rows: Types["ResourceQuota"][] = [];
     for (const entry of await call(() => vendor.concurrency(signal))) {
-      const limits = entry.limits;
+      // Use is reported only where Namespace states it, limits as it gives
+      // them: Namespace does not document what a zero limit means.
       const active = entry.activeConcurrency;
-      // Zero is Namespace's unset limit, not a limit of nothing.
-      const limit = (value: bigint | undefined, factor = 1) =>
-        value ? Number(value) * factor : null;
+      if (!active) continue;
+      const limits = entry.limits;
       for (const [resource, unit, used, max, factor] of [
-        ["cpu", "{vCPU}", active?.cpu, limits?.maxCpu, 1],
-        ["memory", "By", active?.memoryMb, limits?.maxMemoryMb, MiB],
+        ["cpu", "{vCPU}", active.cpu, limits?.maxCpu, 1],
+        ["memory", "By", active.memoryMb, limits?.maxMemoryMb, MiB],
         [
           "environments",
           "{instance}",
-          active?.instanceCount,
+          active.instanceCount,
           limits?.maxInstanceCount,
           1,
         ],
@@ -877,8 +827,8 @@ class Namespace implements Provider {
         rows.push({
           key: { resource, class: entry.name || null, region: null },
           unit,
-          in_use: Number(used ?? 0n) * factor,
-          limit: limit(max, factor),
+          in_use: Number(used) * factor,
+          limit: max === undefined ? null : Number(max) * factor,
         });
     }
     return {
