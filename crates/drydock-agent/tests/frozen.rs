@@ -107,9 +107,9 @@ async fn drain_waits_for_running_processes_and_reports_those_past_the_limit() {
     let digest = sha256(&candidate);
     client.upload(&digest, candidate.len() as u64, std::io::Cursor::new(candidate.clone())).await.unwrap();
     let marker = dir.path().join("finished");
+    let started = Instant::now();
     let short = client.spawn(shell(&format!("sleep 1; touch '{}'", marker.display()))).await.unwrap();
     let observer = connect(&socket, &sha256(&binary)).await;
-    let started = Instant::now();
     let activation = tokio::spawn(async move { client.activate_upgrade_draining(&digest, Duration::from_secs(20)).await });
     // While draining, the agent refuses to start anything new.
     let refused = tokio::time::timeout(Duration::from_secs(5), async {
