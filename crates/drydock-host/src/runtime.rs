@@ -177,7 +177,8 @@ struct Settings {
     build_polls: u32,
     /// How long a preview token reach signs lasts.
     preview_ttl_seconds: u32,
-    /// Runtime's limit on one command.
+    /// Runtime's limit on one command; the exec request waits that long and
+    /// five seconds more.
     exec_seconds: u64,
 }
 impl Default for Settings {
@@ -447,7 +448,10 @@ impl Guest for Runtime {
         if !env.is_empty() {
             body["env"] = json!(env);
         }
-        let v: Executed = self.api.call(Method::POST, self.sandbox_url(id, Some("exec"), &[])?, Body::json(&body)?, c).await?;
+        // The request lasts as long as Runtime may run the command, and a little more.
+        let deadline = Duration::from_secs(self.settings.exec_seconds.saturating_add(5));
+        let url = self.sandbox_url(id, Some("exec"), &[])?;
+        let v: Executed = self.api.call_within(Method::POST, url, Body::json(&body)?, c, deadline).await?;
         Ok(GuestOutput { timed_out: v.timed_out, ..GuestOutput::from_text(&v.stdout, &v.stderr, v.exit_code) })
     }
 }
@@ -834,21 +838,30 @@ mod tests {
     }
 
     // Suspend is one pause, its token the id. Resume reads the state once to
-    // pick Runtime's operation: restart for a stopped sandbox, else wake.
+    // pick Runtime's operation: restart for a stopped sandbox, else wake,
+    // whose answer passes through.
     #[tokio::test]
     async fn suspend_pauses_and_resume_picks_wake_or_restart() {
         let paused = r#"{"id":"7f3a2c10-58d4-4b9e-9c61-0a2b3c4d5e6f","state":"paused"}"#;
         let stopped = r#"{"id":"7f3a2c10-58d4-4b9e-9c61-0a2b3c4d5e6f","state":"stopped"}"#;
-        let (runtime, script) =
-            runtime(Ownership::OwnedAccount, vec![(200, paused), (200, paused), (200, STARTING), (200, stopped), (200, STARTING)]).await;
+        let running = r#"{"id":"7f3a2c10-58d4-4b9e-9c61-0a2b3c4d5e6f","state":"running"}"#;
+        let busy = r#"{"error":{"code":"invalid_state","message":"sandbox is running"}}"#;
+        let (runtime, script) = runtime(
+            Ownership::OwnedAccount,
+            vec![(200, paused), (200, paused), (200, STARTING), (200, stopped), (200, STARTING), (200, running), (409, busy)],
+        )
+        .await;
         let port = runtime.operations().suspend_resume.unwrap();
         assert_eq!(port.suspend(ID, &key()).await.unwrap(), ResumeToken { token: Secret::new(ID) });
         for _ in 0..2 {
             port.resume(ID, ResumeToken { token: Secret::new("anything") }, &key()).await.unwrap();
         }
+        // A running sandbox gets a wake too, and Runtime's refusal of it.
+        let result = port.resume(ID, ResumeToken { token: Secret::new(ID) }, &key()).await;
+        assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{result:?}");
         let read = format!("GET /v1/sandboxes/{ID}");
         let act = |action: &str| format!("POST /v1/sandboxes/{ID}:{action}");
-        assert_eq!(script.asked(), [act("pause"), read.clone(), act("wake"), read, act("restart")]);
+        assert_eq!(script.asked(), [act("pause"), read.clone(), act("wake"), read.clone(), act("restart"), read, act("wake")]);
     }
 
     // Reach makes no state read: the agent's token, then its preview.

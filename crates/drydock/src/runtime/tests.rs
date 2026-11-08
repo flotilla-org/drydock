@@ -775,17 +775,23 @@ mod semantics_layer {
     }
 
     // ADR 0070: on a shared account destroy, suspend and resume refuse an
-    // environment another instance made, without calling the vendor.
+    // environment another instance made, or one whose vendor row states no
+    // tags or no vendor row at all, without calling the vendor.
     #[tokio::test]
     async fn mutations_refuse_another_instances_environment() {
-        let (provider, calls) = shared(Some(tagged("other"))).await;
-        let c = Credentials::default();
-        let port = provider.operations().suspend_resume.unwrap();
-        assert!(matches!(provider.destroy("e", &c).await, Err(ProtocolError::Refused { .. })));
-        assert!(matches!(port.suspend("e", &c).await, Err(ProtocolError::Refused { .. })));
-        let token = ResumeToken { token: Secret::new("e") };
-        assert!(matches!(port.resume("e", token, &c).await, Err(ProtocolError::Refused { .. })));
-        assert!(calls.recover().is_empty());
+        let mut untagged = tagged("a");
+        untagged.vendor.as_mut().unwrap().tags = None;
+        let unstated = Environment { vendor: None, ..tagged("a") };
+        for row in [tagged("other"), untagged, unstated] {
+            let (provider, calls) = shared(Some(row)).await;
+            let c = Credentials::default();
+            let port = provider.operations().suspend_resume.unwrap();
+            assert!(matches!(provider.destroy("e", &c).await, Err(ProtocolError::Refused { .. })));
+            assert!(matches!(port.suspend("e", &c).await, Err(ProtocolError::Refused { .. })));
+            let token = ResumeToken { token: Secret::new("e") };
+            assert!(matches!(port.resume("e", token, &c).await, Err(ProtocolError::Refused { .. })));
+            assert!(calls.recover().is_empty());
+        }
     }
 
     // An idempotent suspend of a stopped environment still asks the vendor
