@@ -105,8 +105,9 @@ fn chown(file: &std::fs::File, uid: Option<u32>, gid: Option<u32>) -> io::Result
 /// concern the same inode. It needs no read permission, so an owner can
 /// still change an entry whose mode lets nobody read it; it neither blocks
 /// on a FIFO nor acquires a terminal. Elsewhere it is the path and the
-/// inode it named, changed without following a symlink and checked again
-/// afterwards.
+/// inode it named, changed without following a symlink. An entry replaced
+/// between the check and the change is not prevented from changing; the
+/// second check afterwards reports it.
 #[cfg(target_os = "linux")]
 struct Itself(rustix::fd::OwnedFd);
 #[cfg(not(target_os = "linux"))]
