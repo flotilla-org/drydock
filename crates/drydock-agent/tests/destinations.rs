@@ -25,10 +25,11 @@ fn blackhole() -> (std::net::TcpListener, Vec<std::net::TcpStream>) {
     use socket2::{Domain, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
-    socket.listen(0).unwrap();
+    // macOS reads a backlog of 0 as its maximum.
+    socket.listen(1).unwrap();
     let address = socket.local_addr().unwrap().as_socket().unwrap();
     let mut fillers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         let probe = socket2::Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         probe.set_nonblocking(true).unwrap();
         let _ = probe.connect(&address.into());
