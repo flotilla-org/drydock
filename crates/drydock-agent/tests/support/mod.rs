@@ -223,16 +223,17 @@ pub fn process_state(pid: &str) -> Pid {
     }
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Pid::Gone;
+        }
         // SAFETY: an all-zero proc_bsdinfo is a valid value to be overwritten.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of_val(&info) as libc::c_int;
         // SAFETY: `info` is `size` bytes, valid for the call to fill.
         let filled = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-        match filled {
-            n if n < size => Pid::Gone,
-            _ if info.pbi_status == libc::SZOMB => Pid::Zombie,
-            _ => Pid::Live,
-        }
+        // A zombie still exists but has no task information.
+        if filled < size || info.pbi_status == libc::SZOMB { Pid::Zombie } else { Pid::Live }
     }
 }
 /// The process's peak resident set in bytes. An agent run in this process
