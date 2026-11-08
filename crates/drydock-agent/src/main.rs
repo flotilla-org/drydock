@@ -174,9 +174,14 @@ async fn collect(args: &[std::ffi::OsString]) -> io::Result<()> {
 // Re-exec keeps the PID and its children, but loses Tokio's old Child handles.
 // Reap only the children inherited at startup, so this cannot steal statuses
 // from commands launched by the new runtime. Provider init owns crash orphans.
-#[cfg(target_os = "linux")]
 fn reap_inherited_children() {
-    let mut children = inherited_children(std::path::Path::new("/proc/self/task"));
+    let mut children = match inherited_children() {
+        Ok(children) => children,
+        Err(error) => {
+            tracing::warn!(%error, "children inherited from before an upgrade are not reaped");
+            return;
+        }
+    };
     if !children.is_empty() {
         tokio::spawn(async move {
             while !children.is_empty() {
@@ -189,8 +194,6 @@ fn reap_inherited_children() {
         });
     }
 }
-#[cfg(not(target_os = "linux"))]
-fn reap_inherited_children() {}
 
 // execv deliberately does not apply execvp's ENOEXEC shell-script fallback.
 // A rejected agent image must return here so the previous binary can recover.
@@ -212,7 +215,11 @@ fn replace_image(path: &std::path::Path, args: &[std::ffi::OsString]) -> io::Err
 }
 
 #[cfg(target_os = "linux")]
-fn inherited_children(root: &std::path::Path) -> Vec<libc::pid_t> {
+fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
+    Ok(children_of_tasks(std::path::Path::new("/proc/self/task")))
+}
+#[cfg(target_os = "linux")]
+fn children_of_tasks(root: &std::path::Path) -> Vec<libc::pid_t> {
     let mut children = std::collections::HashSet::new();
     if let Ok(tasks) = std::fs::read_dir(root) {
         for task in tasks.flatten() {
@@ -223,12 +230,40 @@ fn inherited_children(root: &std::path::Path) -> Vec<libc::pid_t> {
     }
     children.into_iter().collect()
 }
+#[cfg(target_os = "macos")]
+fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
+    let parent = std::process::id() as libc::pid_t;
+    loop {
+        // SAFETY: a null buffer asks only for an upper bound.
+        let bound = unsafe { libc::proc_listchildpids(parent, std::ptr::null_mut(), 0) };
+        if bound < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pids = vec![0; bound as usize + 1];
+        let size = std::mem::size_of_val(pids.as_slice()) as libc::c_int;
+        // SAFETY: the buffer is `size` bytes of pid_t.
+        let found = unsafe { libc::proc_listchildpids(parent, pids.as_mut_ptr().cast(), size) };
+        if found < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A full buffer may have left children out.
+        if (found as usize) < pids.len() {
+            pids.truncate(found as usize);
+            return Ok(pids);
+        }
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "listing a process's children is not built for this platform yet"))
+}
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     // Fake procfs boundary: child lists can belong to any thread, overlap, or
     // disappear while scanning. Missing CONFIG_PROC_CHILDREN must not bar startup.
+    #[cfg(target_os = "linux")]
     #[test]
     fn proc_children_scan_all_threads_and_tolerate_missing_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -238,28 +273,21 @@ mod tests {
                 std::fs::write(dir.path().join(thread).join("children"), pids).unwrap();
             }
         }
-        let mut pids = inherited_children(dir.path());
+        let mut pids = children_of_tasks(dir.path());
         pids.sort();
         assert_eq!(pids, vec![11, 22, 33]);
-        assert!(inherited_children(&dir.path().join("missing")).is_empty());
+        assert!(children_of_tasks(&dir.path().join("missing")).is_empty());
     }
-    // Linux keeps an exited, unreaped child in procfs. Exiting before the startup
-    // scan does not hide it; waitpid can still reap the recorded PID afterwards.
+    // A child that exited before the startup scan is still listed while
+    // unreaped, so it is reaped afterwards; once reaped it is not listed.
     #[test]
-    fn proc_scan_includes_already_exited_children() {
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
-        let pid = child.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-            if stat.rsplit_once(')').unwrap().1.trim_start().starts_with('Z') {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(inherited_children(std::path::Path::new("/proc/self/task")).contains(&(pid as i32)));
+    fn inherited_children_include_exited_unreaped_ones() {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        waitid(WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT).unwrap();
+        assert!(inherited_children().unwrap().contains(&pid));
         child.wait().unwrap();
-        assert!(!inherited_children(std::path::Path::new("/proc/self/task")).contains(&(pid as i32)));
+        assert!(!inherited_children().unwrap().contains(&pid));
     }
 }
