@@ -26,7 +26,8 @@ time) and keeps the rest, tags included; a listed row likewise keeps what it
 does not state (label, granted size, platform, tags). What this instance's
 provision returned is held until a list shows it, whatever its semantic
 options, so its deliveries start from that row. For an environment drydockd
-holds no row of, a delivery makes events alone, and the next list makes the
+holds no row of, a delivery makes events alone, kept against the last stable
+state its deliveries stated, as a held row's are, and the next list makes the
 row. On a shared account, deliveries for an id no list or provision has shown
 to be this instance's are held, and applied in order once its provision returns the id;
 the next list drops the rest. A delivery may state no drydock state (Daytona's

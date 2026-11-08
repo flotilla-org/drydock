@@ -166,6 +166,18 @@ impl webhooks::Vendor for Creating {
     }
 }
 
+/// drydockd with the `tensorlake` instance configured with `options`, reading
+/// the relay at `url`, past its first list, which shows nothing.
+async fn unlisted(dir: &Path, relay: &Relay, url: &str, options: &str) -> Arc<drydock::daemon::Daemon> {
+    let module = Arc::new(drydock_host::tensorlake::TensorlakeModule::new().unwrap());
+    let settings = json!({"project_id": project()});
+    webhooks::host(dir, "tensorlake", Arc::new(Recorded { module, module_name: "tensorlake", settings, stand_in: Arc::new(Creating) }))
+        .await;
+    let daemon = webhooks::drydockd_configured(dir, "tensorlake", url, options).await;
+    webhooks::caught_up(relay, dir, "tensorlake").await;
+    daemon
+}
+
 // With every option off on an owned account, a sandbox this instance made
 // and no list has shown yet is still held from its provision on: its resume
 // is reported as a resume, as it is with the default options.
@@ -174,17 +186,8 @@ async fn a_resume_is_reported_with_every_option_off() {
     let dir = tempfile::tempdir().unwrap();
     let frames = recorded();
     let (relay, url) = Relay::serving(frames.clone()).await;
-    let module = Arc::new(drydock_host::tensorlake::TensorlakeModule::new().unwrap());
-    let settings = json!({"project_id": project()});
-    webhooks::host(
-        dir.path(),
-        "tensorlake",
-        Arc::new(Recorded { module, module_name: "tensorlake", settings, stand_in: Arc::new(Creating) }),
-    )
-    .await;
     let options = "ownership = 'owned_account'\nsemantics = { settle = false, idempotent = false }";
-    let daemon = webhooks::drydockd_configured(dir.path(), "tensorlake", &url, options).await;
-    webhooks::caught_up(&relay, dir.path(), "tensorlake").await;
+    let daemon = unlisted(dir.path(), &relay, &url, options).await;
     let mut stream = subscribe(&daemon).await;
     let prepared = Prepared {
         provider: "tensorlake".into(),
@@ -217,6 +220,33 @@ async fn a_resume_is_reported_with_every_option_off() {
             (EventKind::Resumed, id(4)),
             (EventKind::Running { granted_size: None }, id(4)),
             (EventKind::Gone { cause: None }, id(5)),
+        ]
+    );
+}
+
+// A sandbox drydockd did not provision and no list has shown is followed
+// through its deliveries alone. A pending delivery doesn't replace the
+// suspension it last stated, so the running that follows is a resume.
+#[tokio::test]
+async fn a_resume_is_reported_of_a_sandbox_no_list_has_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    // Suspended, resumed (pending), running.
+    let frames = recorded()[2..5].to_vec();
+    let (relay, url) = Relay::serving(frames.clone()).await;
+    let daemon = unlisted(dir.path(), &relay, &url, "ownership = 'owned_account'").await;
+    let mut stream = subscribe(&daemon).await;
+    relay.publish(frames.len());
+    let events = events(&mut stream, |e| matches!(e.event, EventKind::Running { .. })).await;
+    let kinds: Vec<_> = events.iter().map(|e| (e.event.clone(), delivery(e))).collect();
+    let id = |i: usize| frames[i]["delivery_id"].as_str();
+    assert_eq!(
+        kinds,
+        [
+            (EventKind::Created, id(0)),
+            (EventKind::Stopped { cause: None }, id(0)),
+            (EventKind::Transitioning { phase: TransitionPhase::Starting }, id(1)),
+            (EventKind::Resumed, id(2)),
+            (EventKind::Running { granted_size: None }, id(2)),
         ]
     );
 }

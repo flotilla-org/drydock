@@ -186,7 +186,8 @@ async fn deliver(
 /// What deliveries said of environments no list has shown yet. A list clears it.
 #[derive(Default)]
 struct Pushed {
-    /// The last delivery for each environment drydockd holds no row of.
+    /// The last delivery for each environment drydockd holds no row of, with
+    /// the last stable state it stated.
     announced: BTreeMap<String, VendorObservation>,
     /// Deliveries that may be about another instance's environments, in order,
     /// until this instance's provision returns the id.
@@ -255,6 +256,14 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
         }
         let events = pending(None, transitions(known, v.state.as_ref(), None, confirmed, true));
         instance.events.update(None, events, observed);
+        // As a held row does, keep the last stable state through a transition.
+        let mut v = v;
+        if matches!(v.state, Some(Observation::Transitioning { .. }))
+            && let Some(stable) = pushed.announced.get(&v.id).and_then(|a| a.state.clone())
+            && !matches!(stable, Observation::Transitioning { .. })
+        {
+            v.state = Some(stable);
+        }
         pushed.announced.insert(v.id.clone(), v);
         return;
     };
