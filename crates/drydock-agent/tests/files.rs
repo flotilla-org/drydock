@@ -448,8 +448,9 @@ async fn symlinks() {
 
 // Creating a directory defaults to 0700 and is idempotent: an existing
 // directory is accepted (taking a newly given mode), unless `exclusive`. A
-// file in the way is refused. Set_attributes changes a mode and reports the
-// entry; a symlink has no mode of its own, so asking for one changes nothing.
+// file in the way is refused. Set_attributes changes a mode, even one nobody
+// can read and a socket's, and reports the entry; a symlink has no mode of
+// its own, so asking for one changes nothing.
 #[tokio::test]
 async fn directories_and_attributes() {
     let h = agent().await;
@@ -477,6 +478,10 @@ async fn directories_and_attributes() {
     std::fs::set_permissions(root.join("file"), std::fs::Permissions::from_mode(0o000)).unwrap();
     h.client.set_attributes(&root.join("file"), &mode(0o604)).await.unwrap();
     assert_eq!(mode_of(&root.join("file")), 0o604, "an owner changes a mode nobody can read");
+    let socket = root.join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    h.client.set_attributes(&socket, &mode(0o600)).await.unwrap();
+    assert_eq!(mode_of(&socket), 0o600, "a socket's mode changes");
     std::os::unix::fs::symlink("file", root.join("link")).unwrap();
     assert_eq!(kind(&h.client.set_attributes(&root.join("link"), &mode(0o600)).await.unwrap_err()), ErrorKind::InvalidInput);
     assert_eq!(mode_of(&root.join("file")), 0o604, "the link's target is untouched");

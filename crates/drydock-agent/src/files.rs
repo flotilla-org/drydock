@@ -104,16 +104,18 @@ fn chown(file: &std::fs::File, uid: Option<u32>, gid: Option<u32>) -> io::Result
 /// On Linux it is an `O_PATH` descriptor, so a check and a change always
 /// concern the same inode. It needs no read permission, so an owner can
 /// still change an entry whose mode lets nobody read it; it neither blocks
-/// on a FIFO nor acquires a terminal. Elsewhere it is the path and the
-/// inode it named, changed without following a symlink. An entry replaced
-/// between the check and the change is not prevented from changing; the
-/// second check afterwards reports it.
+/// on a FIFO nor acquires a terminal.
 #[cfg(target_os = "linux")]
 struct Itself(rustix::fd::OwnedFd);
+/// Elsewhere it is a descriptor where one can be opened without side
+/// effects. A socket, a device, or an entry its owner may not read is held
+/// by its path instead and changed without following a symlink; an entry
+/// replaced before that change is not prevented from changing, but is
+/// reported afterwards.
 #[cfg(not(target_os = "linux"))]
-struct Itself<'a> {
-    path: &'a Path,
-    inode: (u64, u64),
+enum Itself<'a> {
+    Open(rustix::fd::OwnedFd),
+    Path { path: &'a Path, inode: (u64, u64) },
 }
 #[cfg(target_os = "linux")]
 fn itself(path: &Path, directory: bool) -> io::Result<Itself> {
@@ -128,14 +130,25 @@ fn itself(path: &Path, directory: bool) -> io::Result<Itself> {
 }
 #[cfg(not(target_os = "linux"))]
 fn itself(path: &Path, directory: bool) -> io::Result<Itself<'_>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+    let kind = metadata.file_type();
+    if kind.is_symlink() {
         return Err(io::Error::from_raw_os_error(if directory { libc::ENOTDIR } else { libc::ELOOP }));
     }
-    if directory && !metadata.is_dir() {
+    if directory && !kind.is_dir() {
         return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
     }
-    Ok(Itself { path, inode: (metadata.dev(), metadata.ino()) })
+    if kind.is_file() || kind.is_dir() || kind.is_fifo() {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+        match rustix::fs::open(path, if directory { flags | OFlags::DIRECTORY } else { flags }, Mode::empty()) {
+            Ok(fd) => return Ok(Itself::Open(fd)),
+            Err(rustix::io::Errno::ACCESS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Itself::Path { path, inode: (metadata.dev(), metadata.ino()) })
 }
 #[cfg(target_os = "linux")]
 fn change(entry: &Itself, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
@@ -160,16 +173,29 @@ fn change(entry: &Itself, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>)
 #[cfg(not(target_os = "linux"))]
 fn change(entry: &Itself, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     use rustix::fs::{AtFlags, CWD, Gid, Mode, Uid};
-    if uid.is_some() || gid.is_some() {
-        let (uid, gid) = (uid.map(Uid::from_raw_unchecked), gid.map(Gid::from_raw_unchecked));
-        rustix::fs::chownat(CWD, entry.path, uid, gid, AtFlags::SYMLINK_NOFOLLOW)?;
-    }
-    if let Some(mode) = mode {
-        rustix::fs::chmodat(CWD, entry.path, Mode::from_raw_mode(permitted(mode) as _), AtFlags::SYMLINK_NOFOLLOW)?;
-    }
-    let metadata = std::fs::symlink_metadata(entry.path)?;
-    if (metadata.dev(), metadata.ino()) != entry.inode {
-        return Err(io::Error::other("the entry was replaced while it was being changed"));
+    let (uid, gid) = (uid.map(Uid::from_raw_unchecked), gid.map(Gid::from_raw_unchecked));
+    let mode = mode.map(|mode| Mode::from_raw_mode(permitted(mode) as _));
+    match entry {
+        Itself::Open(fd) => {
+            if uid.is_some() || gid.is_some() {
+                rustix::fs::fchown(fd, uid, gid)?;
+            }
+            if let Some(mode) = mode {
+                rustix::fs::fchmod(fd, mode)?;
+            }
+        }
+        Itself::Path { path, inode } => {
+            if uid.is_some() || gid.is_some() {
+                rustix::fs::chownat(CWD, *path, uid, gid, AtFlags::SYMLINK_NOFOLLOW)?;
+            }
+            if let Some(mode) = mode {
+                rustix::fs::chmodat(CWD, *path, mode, AtFlags::SYMLINK_NOFOLLOW)?;
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if (metadata.dev(), metadata.ino()) != *inode {
+                return Err(io::Error::other("the entry was replaced while it was being changed"));
+            }
+        }
     }
     Ok(())
 }
