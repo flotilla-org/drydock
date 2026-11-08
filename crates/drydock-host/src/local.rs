@@ -628,6 +628,7 @@ mod tests {
     use super::*;
     // An executable held open for writing cannot be spawned (ETXTBSY);
     // spawn_retrying_busy retries until the writer closes it, then starts it.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn spawn_waits_out_a_busy_executable() {
         let dir = tempfile::tempdir().unwrap();
