@@ -114,7 +114,7 @@ async fn drain_waits_for_running_processes_and_reports_those_past_the_limit() {
     // While draining, the agent refuses to start anything new.
     let refused = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match observer.spawn(Exec::new("/bin/true", [""; 0])).await {
+            match observer.spawn(Exec::new("true", [""; 0])).await {
                 Err(error) => break error,
                 Ok(process) => {
                     let _ = process.remove().await;
