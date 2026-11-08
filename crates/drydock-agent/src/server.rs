@@ -837,6 +837,7 @@ async fn confirm_upgrade(State(s): State<Arc<Shared>>) -> Refusal<StatusCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
     async fn agent(dir: &std::path::Path) -> (drydock_transport::MemoryDialer, Agent) {
         let (dialer, listener) = drydock_transport::memory();
