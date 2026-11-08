@@ -25,6 +25,7 @@ async fn main() -> io::Result<()> {
         // open, returning would leave the process, and so its stdout, open
         // after the agent closed. Exit instead, so the channel sees the end.
         if let Err(error) = &bridged {
+            // As std prints an `Err` returned from `main`.
             eprintln!("Error: {error:?}");
         }
         std::process::exit(i32::from(bridged.is_err()));

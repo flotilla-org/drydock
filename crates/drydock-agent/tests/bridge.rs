@@ -15,7 +15,8 @@ async fn bridge_exits_when_the_agent_closes_while_its_input_stays_open() {
     let socket = dir.path().join("run/agent.sock");
     let mut agent = Command::new(env!("CARGO_BIN_EXE_drydock-agent")).arg("--socket").arg(&socket).kill_on_drop(true).spawn().unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while tokio::net::UnixStream::connect(&socket).await.is_err() {
+        // The socket is bound, so connections queue, once its path exists.
+        while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -41,6 +42,7 @@ async fn bridge_exits_when_the_agent_closes_while_its_input_stays_open() {
     assert!(reply.starts_with("HTTP/1.1 200") && reply.contains("fingerprint"), "{reply}");
     let status = tokio::time::timeout(Duration::from_secs(10), bridge.wait()).await.unwrap().unwrap();
     assert!(status.success(), "{status}");
+    // Only now does the bridge's input end: it stayed open throughout.
     drop(input);
     agent.kill().await.unwrap();
 }
