@@ -44,17 +44,45 @@ fn spawn(command: &mut Command) -> Child {
         }
     }
 }
-// Every process's PID and space-joined argv, from ps rather than /proc so the
-// listing (and cleanup that depends on it) also works off Linux.
+/// Every process's PID and space-joined argv.
 fn processes() -> Vec<(i32, String)> {
-    let output = Command::new("ps").args(["-axww", "-o", "pid=,command="]).output().expect("ps lists processes");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (pid, command) = line.trim_start().split_once(' ')?;
-            Some((pid.parse().ok()?, command.trim().to_owned()))
-        })
-        .collect()
+    pids().into_iter().filter_map(|pid| Some((pid, arguments(pid)?.join(" ")))).collect()
+}
+#[cfg(target_os = "linux")]
+fn pids() -> Vec<i32> {
+    std::fs::read_dir("/proc").unwrap().flatten().filter_map(|entry| entry.file_name().to_str()?.parse().ok()).collect()
+}
+#[cfg(target_os = "linux")]
+fn arguments(pid: i32) -> Option<Vec<String>> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(cmdline.split(|&byte| byte == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
+}
+#[cfg(target_os = "macos")]
+fn pids() -> Vec<i32> {
+    // SAFETY: a null buffer asks only for an upper bound.
+    let bound = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    assert!(bound > 0, "{}", std::io::Error::last_os_error());
+    let mut pids = vec![0; bound as usize * 2];
+    // SAFETY: the buffer holds the size given, in bytes, of pid_t.
+    let found = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), std::mem::size_of_val(pids.as_slice()) as libc::c_int) };
+    assert!(found > 0, "{}", std::io::Error::last_os_error());
+    pids.truncate(found as usize);
+    pids
+}
+#[cfg(target_os = "macos")]
+fn arguments(pid: i32) -> Option<Vec<String>> {
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut size = buffer.len();
+    let mut name = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: `buffer` is `size` bytes, valid for the call to fill.
+    let read = unsafe { libc::sysctl(name.as_mut_ptr(), 3, buffer.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
+    if read != 0 || size < 4 {
+        return None;
+    }
+    // argc, the executable's path, NUL padding, then argc NUL-terminated arguments.
+    let argc = i32::from_ne_bytes(buffer[..4].try_into().unwrap()) as usize;
+    let fields = buffer[4..size].split(|&byte| byte == 0).skip(1).skip_while(|field| field.is_empty());
+    Some(fields.take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect())
 }
 fn agents(socket: &Path) -> Vec<i32> {
     let suffix = format!("--socket {}", socket.display());

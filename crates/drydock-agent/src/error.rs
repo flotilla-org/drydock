@@ -155,7 +155,9 @@ impl AgentError {
             causes.push(cause.to_string());
             source = cause.source();
         }
-        let mut agent = Self::new(operation, subject, error.kind().into(), error.to_string());
+        // A name the filesystem refuses, such as one that is not UTF-8 on APFS.
+        let kind = if error.raw_os_error() == Some(libc::EILSEQ) { ErrorKind::InvalidInput } else { error.kind().into() };
+        let mut agent = Self::new(operation, subject, kind, error.to_string());
         if let Some(code) = error.raw_os_error() {
             causes.push(format!("os error {code}"));
             agent.message = io::Error::from_raw_os_error(code).to_string();

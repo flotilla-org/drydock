@@ -25,16 +25,29 @@ fn blackhole() -> (std::net::TcpListener, Vec<std::net::TcpStream>) {
     use socket2::{Domain, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into()).unwrap();
-    socket.listen(0).unwrap();
+    // macOS reads a backlog of 0 as its maximum.
+    socket.listen(1).unwrap();
     let address = socket.local_addr().unwrap().as_socket().unwrap();
     let mut fillers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         let probe = socket2::Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         probe.set_nonblocking(true).unwrap();
         let _ = probe.connect(&address.into());
         fillers.push(probe.into());
     }
     (socket.into(), fillers)
+}
+/// The passwd database's name for `uid`.
+fn user_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: an all-zero passwd is a valid value to be overwritten.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call and `buffer` is its length.
+    let error = unsafe { libc::getpwuid_r(uid, &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut found) };
+    assert_eq!(error, 0);
+    // SAFETY: on success pw_name is a C string inside `buffer`.
+    (!found.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }.to_string_lossy().into_owned())
 }
 /// A resolver answering every query with `code` and, for NoError, 192.0.2.7.
 async fn resolver(code: ResponseCode) -> SocketAddr {
@@ -79,6 +92,7 @@ async fn says_which_user_it_ran_as() {
     let h = harness(false, "test-build").await;
     let attempts = h.client.try_destinations(&Attempt::default()).await.unwrap();
     assert_eq!(attempts.user.uid, rustix::process::geteuid().as_raw());
+    assert_eq!(attempts.user.name, user_name(attempts.user.uid));
     assert!(attempts.results.is_empty());
 }
 

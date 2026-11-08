@@ -448,8 +448,9 @@ async fn symlinks() {
 
 // Creating a directory defaults to 0700 and is idempotent: an existing
 // directory is accepted (taking a newly given mode), unless `exclusive`. A
-// file in the way is refused. Set_attributes changes a mode and reports the
-// entry; a symlink has no mode of its own, so asking for one changes nothing.
+// file in the way is refused. Set_attributes changes a mode, even one nobody
+// can read and a socket's, and reports the entry; a symlink has no mode of
+// its own, so asking for one changes nothing.
 #[tokio::test]
 async fn directories_and_attributes() {
     let h = agent().await;
@@ -477,6 +478,10 @@ async fn directories_and_attributes() {
     std::fs::set_permissions(root.join("file"), std::fs::Permissions::from_mode(0o000)).unwrap();
     h.client.set_attributes(&root.join("file"), &mode(0o604)).await.unwrap();
     assert_eq!(mode_of(&root.join("file")), 0o604, "an owner changes a mode nobody can read");
+    let socket = root.join("socket");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    h.client.set_attributes(&socket, &mode(0o600)).await.unwrap();
+    assert_eq!(mode_of(&socket), 0o600, "a socket's mode changes");
     std::os::unix::fs::symlink("file", root.join("link")).unwrap();
     assert_eq!(kind(&h.client.set_attributes(&root.join("link"), &mode(0o600)).await.unwrap_err()), ErrorKind::InvalidInput);
     assert_eq!(mode_of(&root.join("file")), 0o604, "the link's target is untouched");
@@ -484,11 +489,14 @@ async fn directories_and_attributes() {
 
 // Any Unix name can be addressed: names needing percent-encoding (space,
 // `%`, `?`, `#`, `+`, `&`, `=`) and non-UTF-8 bytes round-trip through write,
-// read, head and stat, and appear in a listing.
+// read, head and stat, and appear in a listing. A name the filesystem
+// refuses, as APFS refuses non-UTF-8 ones, is refused as invalid input.
 #[tokio::test]
 async fn unusual_names_round_trip() {
     let h = agent().await;
     let root = h.vessel();
+    let probe = h.dir.path().join("probe");
+    std::fs::create_dir(&probe).unwrap();
     let names: Vec<&[u8]> = vec![
         b"with space",
         b"per%cent",
@@ -500,8 +508,16 @@ async fn unusual_names_round_trip() {
         b"raw\x80\xfe\xff",
         b"\xe9t\xe9",
     ];
+    let mut kept = Vec::new();
     for name in &names {
         let path = root.join(OsStr::from_bytes(name));
+        if let Err(error) = std::fs::write(probe.join(OsStr::from_bytes(name)), b"") {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{path:?}: {error}");
+            let error = h.client.write_bytes(&path, name.to_vec(), &FileOptions::default()).await.unwrap_err();
+            assert_eq!(kind(&error), ErrorKind::InvalidInput, "{error}");
+            continue;
+        }
+        kept.push(name);
         h.client.write_bytes(&path, name.to_vec(), &FileOptions::default()).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), *name, "{path:?} written at the exact name");
         assert_eq!(h.client.read_bytes(&path, 1024).await.unwrap(), *name);
@@ -510,7 +526,7 @@ async fn unusual_names_round_trip() {
         assert_eq!((entry.name, entry.size), (String::from_utf8_lossy(name).into_owned(), name.len() as u64));
     }
     let listed: Vec<String> = h.client.list(&root).await.unwrap().into_iter().map(|e| e.name).collect();
-    let mut expected: Vec<String> = names.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+    let mut expected: Vec<String> = kept.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
     expected.sort();
     assert_eq!(listed, expected);
 }

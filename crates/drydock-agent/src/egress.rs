@@ -341,13 +341,13 @@ async fn serve_dns_udp(socket: UdpSocket, map: Arc<Mutex<FakeDns>>) {
 pub(crate) struct Capture {
     tasks: JoinSet<()>,
     id: Arc<Mutex<String>>,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     dns_address: SocketAddr,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     proxy_address: SocketAddr,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     capture_address: SocketAddr,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     slots: Arc<tokio::sync::Semaphore>,
 }
 impl Capture {
@@ -358,15 +358,15 @@ impl Capture {
     }
     async fn prepare_at(outward: Arc<Outward>, id: String, capture_port: u16, proxy_port: u16, dns_port: u16) -> io::Result<Self> {
         if !cfg!(target_os = "linux") {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture is not built for this platform yet"));
         }
         let tcp = dual_listener(capture_port)?;
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         let capture_address = SocketAddr::from((Ipv4Addr::LOCALHOST, tcp.local_addr()?.port()));
         let explicit = TcpListener::bind((Ipv4Addr::LOCALHOST, proxy_port)).await?;
         let dns_tcp = dual_listener(dns_port)?;
         let dns_port = dns_tcp.local_addr()?.port();
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         let proxy_address = explicit.local_addr()?;
         let udp = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
         udp.set_only_v6(false)?;
@@ -390,13 +390,13 @@ impl Capture {
         Ok(Self {
             tasks,
             id,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             dns_address: (Ipv4Addr::LOCALHOST, dns_port).into(),
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             proxy_address,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             capture_address,
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             slots: state.slots,
         })
     }
@@ -433,7 +433,7 @@ fn original_destination(stream: &TcpStream) -> io::Result<SocketAddr> {
 }
 #[cfg(not(target_os = "linux"))]
 fn original_destination(_: &TcpStream) -> io::Result<SocketAddr> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "egress requires Linux"))
+    Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture is not built for this platform yet"))
 }
 
 /// The capture table for this state: empty without egress, else redirects

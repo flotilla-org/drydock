@@ -204,6 +204,65 @@ pub fn leftovers(dir: &Path, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// What, if anything, has a PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pid {
+    Live,
+    Zombie,
+    Gone,
+}
+pub fn process_state(pid: &str) -> Pid {
+    let pid: libc::pid_t = pid.trim().parse().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => Pid::Gone,
+            Ok(stat) if stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')) => Pid::Zombie,
+            Ok(_) => Pid::Live,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return Pid::Gone;
+        }
+        // SAFETY: an all-zero proc_bsdinfo is a valid value to be overwritten.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        // SAFETY: `info` is `size` bytes, valid for the call to fill.
+        let filled = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+        // A zombie still exists but has no task information.
+        if filled < size || info.pbi_status == libc::SZOMB { Pid::Zombie } else { Pid::Live }
+    }
+}
+/// The process's peak resident set in bytes. An agent run in this process
+/// counts towards it.
+pub fn peak_rss() -> u64 {
+    // On Linux getrusage would also count the peak of the process that
+    // forked this one, which Cargo's is; VmHWM can be reset instead.
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).expect("VmHWM in /proc/self/status");
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: an all-zero rusage is a valid value to be overwritten.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is valid for the call to fill.
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        // In bytes on macOS.
+        usage.ru_maxrss as u64
+    }
+}
+/// Reset the peak to the current resident set where the kernel allows it,
+/// so a baseline excludes whatever setup touched.
+pub fn reset_peak() {
+    #[cfg(target_os = "linux")]
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
 /// The agent executable this package builds.
 pub fn agent_binary() -> Vec<u8> {
     std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap()

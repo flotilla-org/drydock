@@ -14,8 +14,21 @@ fn forward(h: &Harness, id: &str) -> OutwardForward {
 fn segment(id: &str) -> String {
     percent_encoding::utf8_percent_encode(id, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
-fn free_port() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+/// Upsert `f` with its TCP listener on a free loopback port. Another socket
+/// can take the port between this probe and the agent's bind, as outgoing
+/// connections do on macOS, so a taken port is passed over.
+async fn put_with_free_port(h: &Harness, mut f: OutwardForward, endpoint: Endpoint) -> OutwardForward {
+    for _ in 0..10 {
+        f.tcp = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap());
+        match h.client.put_outward_forward(f.clone(), endpoint.clone()).await {
+            Ok(()) => return f,
+            Err(error)
+                if drydock_agent::AgentError::of(&error)
+                    .is_some_and(|e| e.kind == ErrorKind::AddrInUse && e.operation == "forward.listen") => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("no free loopback port was bound")
 }
 
 // ADR 0070: hello is readiness and reports a fresh boot ID; each pushed
@@ -141,15 +154,13 @@ async fn forwards_are_resources_with_idempotent_upserts() {
         exchange(&mut unix, b"before").await;
         h.client.put_outward_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
         exchange(&mut unix, b"identical upsert keeps the stream").await;
-        let mut changed = f.clone();
-        changed.tcp = Some(free_port());
-        h.client.put_outward_forward(changed.clone(), Endpoint::Unix(target.clone())).await.unwrap();
+        let changed = put_with_free_port(&h, f.clone(), Endpoint::Unix(target.clone())).await;
         assert_eq!(h.client.outward_forwards().await.unwrap(), vec![changed.clone()]);
         let mut tcp: ByteStream = Box::new(tokio::net::TcpStream::connect(changed.tcp.unwrap()).await.unwrap());
         exchange(&mut tcp, b"added TCP").await;
         exchange(&mut unix, b"Unix survives a TCP change").await;
         h.client.put_outward_forward(f.clone(), Endpoint::Unix(target.clone())).await.unwrap();
-        assert!(tokio::net::TcpStream::connect(changed.tcp.unwrap()).await.is_err());
+        assert_eq!(h.client.outward_forward("changing").await.unwrap(), f, "the TCP listener is removed");
         let mut retained: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
         exchange(&mut retained, b"retained Unix").await;
         h.client.remove_outward_forward("changing").await.unwrap();
@@ -321,9 +332,7 @@ async fn tcp_endpoints_and_refused_upserts() {
         });
         let other = harness(unix, "test-build").await;
         let alias = std::net::SocketAddr::from(([127, 0, 0, 2], endpoint.port()));
-        let mut f = forward(&h, "configured");
-        f.tcp = Some(free_port());
-        h.client.put_outward_forward(f.clone(), Endpoint::Tcp(endpoint)).await.unwrap();
+        let f = put_with_free_port(&h, forward(&h, "configured"), Endpoint::Tcp(endpoint)).await;
         assert_refused(other.client.register_host_endpoint("alias".into(), Endpoint::Tcp(alias)));
         let mut socket: ByteStream = Box::new(UnixStream::connect(&f.unix).await.unwrap());
         let mut loopback: ByteStream = Box::new(tokio::net::TcpStream::connect(f.tcp.unwrap()).await.unwrap());
@@ -343,11 +352,7 @@ async fn tcp_endpoints_and_refused_upserts() {
         exchange(&mut host, b"host to guest TCP").await;
         h.client.remove_outward_forward("configured").await.unwrap();
         assert!(!f.unix.exists());
-        // The freed port is ephemeral, so connect may pick it as its own source
-        // and reach itself (TCP simultaneous open); only a listener is a failure.
-        if let Ok(stream) = tokio::net::TcpStream::connect(f.tcp.unwrap()).await {
-            assert_eq!(stream.local_addr().unwrap(), stream.peer_addr().unwrap(), "removed forward still listens");
-        }
+        assert_eq!(kind(&h.client.outward_forward("configured").await.unwrap_err()), ErrorKind::NotFound);
         // Removal ends the forward's streams, and with them their claim on the
         // host endpoint; until they have closed, nobody can claim it again.
         drop((socket, loopback));
@@ -375,10 +380,7 @@ async fn occupied_port_swap_refuses_without_changing_forwards() {
     for id in ["port-a", "port-b"] {
         let target = h.dir.path().join(format!("target-{id}"));
         echo_tasks.push(tokio::spawn(echo(UnixListener::bind(&target).unwrap())));
-        let mut f = forward(&h, id);
-        f.tcp = Some(free_port());
-        h.client.put_outward_forward(f.clone(), Endpoint::Unix(target)).await.unwrap();
-        forwards.push(f);
+        forwards.push(put_with_free_port(&h, forward(&h, id), Endpoint::Unix(target)).await);
     }
     let before = h.client.outward_forwards().await.unwrap();
     let mut swapped = forwards[0].clone();

@@ -336,8 +336,10 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
     // rustix has no mknodat or mkfifoat on Apple platforms.
-    fn fifo(path: &Path) {
-        assert!(std::process::Command::new("mkfifo").arg(path).status().unwrap().success());
+    fn make_fifo(path: &Path) {
+        let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0, "{}", io::Error::last_os_error());
     }
 
     // No file: one is created at mode 0600 with the supplied token, or a fresh
@@ -378,7 +380,7 @@ mod tests {
                 std::fs::write(&target, format!("{}\n", old.secret())).unwrap();
                 std::os::unix::fs::symlink(&target, &path).unwrap();
             },
-            &|| fifo(&path),
+            &|| make_fifo(&path),
         ];
         for (index, break_it) in broken.iter().enumerate() {
             let _ = std::fs::remove_file(&path);
@@ -424,7 +426,7 @@ mod tests {
     fn a_fifo_lock_is_refused_not_waited_on() {
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("tcp.token.lock");
-        fifo(&lock);
+        make_fifo(&lock);
         assert!(provision_token(&dir.path().join("tcp.token"), None).is_err());
     }
 
@@ -457,7 +459,7 @@ mod tests {
         assert!(admissible(false, euid, 0o600, euid).is_err());
         assert!(read_token(dir.path()).is_err());
         let fifo = dir.path().join("fifo");
-        self::fifo(&fifo);
+        make_fifo(&fifo);
         assert!(read_token(&fifo).is_err());
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();

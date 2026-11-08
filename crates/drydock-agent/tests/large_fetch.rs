@@ -10,16 +10,6 @@ const MIB: u64 = 1 << 20;
 /// Past 512 MiB and not a multiple of any buffer size.
 const SIZE: u64 = 520 * MIB + 12_345;
 
-/// The process's peak resident set (VmHWM) in bytes. The agent and the
-/// download host run in this process, so this covers both.
-fn peak_rss() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).expect("VmHWM in /proc/self/status");
-    line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
-}
-fn reset_peak() {
-    let _ = std::fs::write("/proc/self/clear_refs", "5");
-}
 /// SIZE pseudo-random bytes written a MiB at a time, and their digest.
 fn generate(path: &Path) -> String {
     let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());

@@ -98,45 +98,104 @@ fn entry_at(operation: &str, path: &Path) -> Refusal<Entry> {
 fn chown(file: &std::fs::File, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     std::os::unix::fs::fchown(file, uid, gid)
 }
-/// `path` itself, opened to change its mode and owner through the
-/// descriptor, never a symlink's target: a check and a change then always
-/// concern the same inode. A symlink is ELOOP (ENOTDIR for a `directory`).
-/// On Linux the descriptor is `O_PATH`, which needs no read permission, so
-/// an owner can still change an entry whose mode lets nobody read it; it
-/// neither blocks on a FIFO nor acquires a terminal.
-fn open_nofollow(path: &Path, directory: bool) -> io::Result<rustix::fd::OwnedFd> {
+/// `path` itself, held to change its mode and owner, never a symlink's
+/// target. A symlink is ELOOP (ENOTDIR for a `directory`).
+///
+/// On Linux it is an `O_PATH` descriptor, so a check and a change always
+/// concern the same inode. It needs no read permission, so an owner can
+/// still change an entry whose mode lets nobody read it; it neither blocks
+/// on a FIFO nor acquires a terminal.
+#[cfg(target_os = "linux")]
+struct Itself(rustix::fd::OwnedFd);
+/// Elsewhere it is a descriptor where one can be opened without side
+/// effects. A socket, a device, or an entry its owner may not read is held
+/// by its path instead and changed without following a symlink; an entry
+/// replaced before that change is not prevented from changing, but is
+/// reported afterwards.
+#[cfg(not(target_os = "linux"))]
+enum Itself<'a> {
+    Open(rustix::fd::OwnedFd),
+    Path { path: &'a Path, inode: (u64, u64) },
+}
+#[cfg(target_os = "linux")]
+fn itself(path: &Path, directory: bool) -> io::Result<Itself> {
     use rustix::fs::{FileType, Mode, OFlags};
-    #[cfg(target_os = "linux")]
     let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    #[cfg(not(target_os = "linux"))]
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
     let fd = rustix::fs::open(path, if directory { flags | OFlags::DIRECTORY } else { flags }, Mode::empty())?;
     // O_PATH opens a symlink itself rather than refusing it.
     if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) == FileType::Symlink {
         return Err(io::Error::from_raw_os_error(libc::ELOOP));
     }
-    Ok(fd)
+    Ok(Itself(fd))
 }
-fn change(fd: &rustix::fd::OwnedFd, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+#[cfg(not(target_os = "linux"))]
+fn itself(path: &Path, directory: bool) -> io::Result<Itself<'_>> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::FileTypeExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = metadata.file_type();
+    if kind.is_symlink() {
+        return Err(io::Error::from_raw_os_error(if directory { libc::ENOTDIR } else { libc::ELOOP }));
+    }
+    if directory && !kind.is_dir() {
+        return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+    }
+    if kind.is_file() || kind.is_dir() || kind.is_fifo() {
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+        match rustix::fs::open(path, if directory { flags | OFlags::DIRECTORY } else { flags }, Mode::empty()) {
+            Ok(fd) => return Ok(Itself::Open(fd)),
+            Err(rustix::io::Errno::ACCESS) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Itself::Path { path, inode: (metadata.dev(), metadata.ino()) })
+}
+#[cfg(target_os = "linux")]
+fn change(entry: &Itself, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     use rustix::fs::{Gid, Mode, Uid};
     if uid.is_some() || gid.is_some() {
-        let (uid, gid) = (uid.map(Uid::from_raw_unchecked), gid.map(Gid::from_raw_unchecked));
         // An O_PATH descriptor's owner changes through chownat on itself.
-        #[cfg(target_os = "linux")]
-        rustix::fs::chownat(fd, "", uid, gid, rustix::fs::AtFlags::EMPTY_PATH)?;
-        #[cfg(not(target_os = "linux"))]
-        rustix::fs::fchown(fd, uid, gid)?;
+        rustix::fs::chownat(
+            &entry.0,
+            "",
+            uid.map(Uid::from_raw_unchecked),
+            gid.map(Gid::from_raw_unchecked),
+            rustix::fs::AtFlags::EMPTY_PATH,
+        )?;
     }
     if let Some(mode) = mode {
-        let mode = Mode::from_raw_mode(permitted(mode) as _);
         // fchmod refuses an O_PATH descriptor; its /proc link names the same inode.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode)?;
+        use std::os::fd::AsRawFd;
+        rustix::fs::chmod(format!("/proc/self/fd/{}", entry.0.as_raw_fd()), Mode::from_raw_mode(permitted(mode) as _))?;
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+fn change(entry: &Itself, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    use rustix::fs::{AtFlags, CWD, Gid, Mode, Uid};
+    let (uid, gid) = (uid.map(Uid::from_raw_unchecked), gid.map(Gid::from_raw_unchecked));
+    let mode = mode.map(|mode| Mode::from_raw_mode(permitted(mode) as _));
+    match entry {
+        Itself::Open(fd) => {
+            if uid.is_some() || gid.is_some() {
+                rustix::fs::fchown(fd, uid, gid)?;
+            }
+            if let Some(mode) = mode {
+                rustix::fs::fchmod(fd, mode)?;
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        rustix::fs::fchmod(fd, mode)?;
+        Itself::Path { path, inode } => {
+            if uid.is_some() || gid.is_some() {
+                rustix::fs::chownat(CWD, *path, uid, gid, AtFlags::SYMLINK_NOFOLLOW)?;
+            }
+            if let Some(mode) = mode {
+                rustix::fs::chmodat(CWD, *path, mode, AtFlags::SYMLINK_NOFOLLOW)?;
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if (metadata.dev(), metadata.ino()) != *inode {
+                return Err(io::Error::other("the entry was replaced while it was being changed"));
+            }
+        }
     }
     Ok(())
 }
@@ -177,7 +236,7 @@ fn make_directory(
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists && !exclusive => false,
         Err(error) => return Err(AgentError::io(operation, path.display(), error)),
     };
-    let directory = open_nofollow(path, true).map_err(|error| match error.raw_os_error() {
+    let directory = itself(path, true).map_err(|error| match error.raw_os_error() {
         Some(libc::ELOOP | libc::ENOTDIR) => {
             AgentError::new(operation, path.display(), ErrorKind::AlreadyExists, "exists and is not a directory")
         }
@@ -548,7 +607,7 @@ pub(crate) async fn patch_entry(uri: Uri, Json(attributes): Json<Attributes>) ->
     let path = tail_path(OP, &uri, "/entries")?;
     check_mode(OP, &path, attributes.mode)?;
     let at = |e| AgentError::io(OP, path.display(), e);
-    match open_nofollow(&path, false) {
+    match itself(&path, false) {
         Ok(file) => change(&file, attributes.mode, attributes.uid, attributes.gid).map_err(at)?,
         // A symlink: refuse a mode before changing anything, so a refusal
         // changes nothing. lchown never follows the link.

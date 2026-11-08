@@ -48,9 +48,27 @@ impl Drop for Claim {
 }
 fn canonical(endpoint: Endpoint) -> io::Result<Endpoint> {
     Ok(match endpoint {
-        Endpoint::Unix(path) => Endpoint::Unix(std::fs::canonicalize(path)?),
+        Endpoint::Unix(path) => Endpoint::Unix(resolved(path)?),
         other => other,
     })
+}
+/// `path` with its directory resolved and symlinks followed, ending in the
+/// name the socket has there. A canonicalized hard link to a socket can end
+/// in the original file's name instead, as it does on macOS.
+fn resolved(mut path: PathBuf) -> io::Result<PathBuf> {
+    // The same bound as Linux's on symlinks followed in one lookup.
+    for _ in 0..40 {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return std::fs::canonicalize(path) };
+        let parent = std::fs::canonicalize(if parent.as_os_str().is_empty() { Path::new(".") } else { parent })?;
+        let path_in_parent = parent.join(name);
+        match std::fs::read_link(&path_in_parent) {
+            Ok(target) => path = parent.join(target),
+            // EINVAL: not a symlink.
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Ok(path_in_parent),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::from_raw_os_error(libc::ELOOP))
 }
 fn claim(endpoint: Endpoint) -> io::Result<Claim> {
     let endpoint = canonical(endpoint)?;
