@@ -59,7 +59,7 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 
 Credential: an API key (`rtcloud_…`), as a plain token file.
 
-Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Runtime keys are full or read-only, and see only what they made (`reach: agent`, the default) or the whole account.
+Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Runtime keys are full or read-only, and see only what they made (`reach: agent`, the default) or the whole account. The module translates: provision, list, destroy and suspend are Runtime's own operations, and rows carry Runtime's state name, its `stopReason` and the sandbox's labels in `vendor`. On a `shared_account` (the default) it labels what it makes with `drydock.provider`, lists with Runtime's `label=` filter, and drydockd destroys, suspends and resumes only sandboxes that carry the label. On an `owned_account` nothing is tagged or filtered. The client's label is the `flotilla.label` label; the sandbox's Runtime name comes from the instance and the label, so a second provision of a live label is Runtime's refusal of the name.
 
 | Setting | Why |
 |---|---|
@@ -67,12 +67,27 @@ Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Run
 | Reach: agent | drydock sees only the sandboxes and images this key made, which is what `list` should return |
 | Daily limit: set one | caps what a runaway launch loop can spend; `GET /v1/limits` reports it as quota |
 
+| Call | Used for |
+|---|---|
+| `GET /v1/images?name=`, `POST /v1/images`, `GET /v1/images/{id}` | prepare |
+| `POST /v1/sandboxes` | provision |
+| `GET /v1/sandboxes` (every page, stopped ones included) | list |
+| `GET /v1/sandboxes/{id}`, `GET /v1/sandboxes/{id}/network` | inspect |
+| `DELETE /v1/sandboxes/{id}/previews/7811`, `DELETE /v1/sandboxes/{id}` | destroy (Runtime keeps a preview after its sandbox goes) |
+| `POST /v1/sandboxes/{id}:pause` | suspend (the resume token is the sandbox id) |
+| `GET /v1/sandboxes/{id}`, then `:wake` (paused) or `:restart` (stopped) | resume |
+| `POST /v1/sandboxes/{id}:exec`, `/files/archive/uploads` | exec, the agent's upload |
+| `GET` or `POST /v1/sandboxes/{id}/previews` | reach |
+| `GET /v1/limits` | quota |
+
 - `reach: agent` scopes listing to the key. A sandbox made by another key, or before a key rotation, is invisible: list shows nothing and inspect returns 404, as if it were gone. Destroy drydock's sandboxes before revoking a key, or use `reach: account`.
 - A read-only key fails at prepare with a permission error, but list and quota still work, so the provider looks ready.
-- drydock reaches the agent through a private preview of its port (7811): each reach signs a preview token good for a day, and drydockd sends it in `x-runtime-preview-token` beside the agent's own token. The preview goes with the sandbox at destroy.
-- An environment reports egress `enforced` once Runtime has applied the rules drydock set and they match the request. A later change to them through Runtime's console or API, with the same key, is not detected.
-- Usage takes running time and size from Runtime's sandbox events, which it keeps 14 days, and cost from the settled usage export; a period that starts earlier is refused.
-- Without credit, sandboxes reach ports 80 and 443 only and Runtime refuses host:port rules (`connect`). Persistent sandboxes need credit too, so without it drydock creates ordinary ones, which keep no disk once stopped.
+- Create, pause, wake and restart send `Prefer: wait=25`, so Runtime answers once the sandbox settled or after 25 seconds; the module waits no longer. drydockd's `settle` option waits the rest.
+- drydock reaches the agent through a private preview of its port (7811): each reach signs a preview token good for `preview_ttl_seconds` (default 86400), and drydockd sends it in `x-runtime-preview-token` beside the agent's own token. Reach reads no state: Runtime's exec wakes a paused sandbox that has `autoWake`.
+- Inspect reports egress `enforced` when Runtime's network read says its host holds the current version of the rules (`enforced`, with `enforcedVersion` equal to `version`); the policy identity is a digest of the rules Runtime states. A list row carries no network, so it is advisory with no policy identity.
+- The module declares no usage. Runtime's usage export and its sandbox event log are the sources to collect as Runtime gives them (drydock#257).
+- Without credit, sandboxes reach ports 80 and 443 only and Runtime refuses host:port rules (`connect`). Runtime refuses persistent sandboxes without credit too: set `persistent` (default true) to false on such an account; ordinary sandboxes keep no disk once stopped.
+- Prepare waits for an image build by reading it every `build_poll_seconds` (default 3), up to `build_polls` times (default 150), then answers unavailable. Runtime ends a command after `exec_seconds` (default 25). drydockd lists sandboxes every `poll_seconds` (default 30).
 - The key goes as a Bearer header to `api_url` (default `https://api.withruntime.com/v1`) only. Change that setting only to a host you trust with the key.
 
 ## Tensorlake (`tensorlake`, Rust host)
