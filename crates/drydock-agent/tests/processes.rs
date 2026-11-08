@@ -53,11 +53,11 @@ async fn exited(process: &drydock_agent::Process) -> ExitStatus {
 /// A PID that no longer names a live process: gone, or a zombie whose reaper
 /// is not the agent.
 fn dead(pid: &str) -> bool {
-    process_state(pid).is_none_or(|state| state.starts_with('Z'))
+    process_state(pid) != Pid::Live
 }
 /// A PID the agent has reaped.
 fn reaped(pid: &str) -> bool {
-    process_state(pid).is_none()
+    process_state(pid) == Pid::Gone
 }
 fn gated(gate: &Path, before: &str, after: &str) -> Exec {
     shell(&format!("{before}; while test ! -f '{}'; do sleep 0.01; done; {after}", gate.display()))

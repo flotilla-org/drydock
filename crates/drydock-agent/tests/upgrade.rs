@@ -118,7 +118,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     .await
     .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while process_state(&launched_pid).is_some() {
+        while process_state(&launched_pid) != Pid::Gone {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })

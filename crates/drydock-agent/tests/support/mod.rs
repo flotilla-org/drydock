@@ -204,11 +204,36 @@ pub fn leftovers(dir: &Path, prefix: &str) -> Vec<String> {
         .collect()
 }
 
-/// The state ps reports for `pid` (`Z` for a zombie), or None once no
-/// process has it. ps rather than /proc, so this also works off Linux.
-pub fn process_state(pid: &str) -> Option<String> {
-    let output = std::process::Command::new("ps").args(["-o", "stat=", "-p", pid.trim()]).output().expect("ps reports a process");
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()).filter(|state| !state.is_empty())
+/// What, if anything, has a PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pid {
+    Live,
+    Zombie,
+    Gone,
+}
+pub fn process_state(pid: &str) -> Pid {
+    let pid: libc::pid_t = pid.trim().parse().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => Pid::Gone,
+            Ok(stat) if stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')) => Pid::Zombie,
+            Ok(_) => Pid::Live,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: an all-zero proc_bsdinfo is a valid value to be overwritten.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        // SAFETY: `info` is `size` bytes, valid for the call to fill.
+        let filled = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+        match filled {
+            n if n < size => Pid::Gone,
+            _ if info.pbi_status == libc::SZOMB => Pid::Zombie,
+            _ => Pid::Live,
+        }
+    }
 }
 /// The process's peak resident set in bytes. An agent run in this process
 /// counts towards it.
