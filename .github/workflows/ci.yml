@@ -60,3 +60,13 @@ jobs:
         run: |
           python -m pip install openapi-spec-validator==0.7.2
           python -m openapi_spec_validator openapi.json
+  # The agent is to run on macOS too; only its crate is covered here.
+  agent-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust
+        run: rustup show
+      - run: cargo clippy -p drydock-agent --all-targets --locked -- -D warnings
+      - run: cargo test -p drydock-agent --locked
