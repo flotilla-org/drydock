@@ -79,6 +79,8 @@ async fn says_which_user_it_ran_as() {
     let h = harness(false, "test-build").await;
     let attempts = h.client.try_destinations(&Attempt::default()).await.unwrap();
     assert_eq!(attempts.user.uid, rustix::process::geteuid().as_raw());
+    let id = std::process::Command::new("id").arg("-un").output().unwrap();
+    assert_eq!(attempts.user.name, id.status.success().then(|| String::from_utf8(id.stdout).unwrap().trim().to_owned()));
     assert!(attempts.results.is_empty());
 }
 

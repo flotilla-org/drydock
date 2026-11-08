@@ -99,14 +99,26 @@ pub struct Identity {
 
 fn identity() -> Identity {
     let uid = rustix::process::geteuid().as_raw();
-    let name = std::fs::read_to_string("/etc/passwd").ok().and_then(|passwd| {
-        passwd.lines().find_map(|line| {
-            let mut fields = line.split(':');
-            let name = fields.next()?;
-            (fields.nth(1)? == uid.to_string()).then(|| name.to_owned())
-        })
-    });
-    Identity { uid, name }
+    Identity { uid, name: user_name(uid) }
+}
+fn user_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 1024];
+    loop {
+        // SAFETY: an all-zero passwd is a valid value to be overwritten.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call and `buffer` is its length.
+        let error = unsafe { libc::getpwuid_r(uid, &mut entry, buffer.as_mut_ptr(), buffer.len(), &mut found) };
+        if error == libc::ERANGE && buffer.len() < 1 << 20 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if error != 0 || found.is_null() || entry.pw_name.is_null() {
+            return None;
+        }
+        // SAFETY: on success pw_name is a C string inside `buffer`.
+        return Some(unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }.to_string_lossy().into_owned());
+    }
 }
 
 /// Try every target concurrently; results keep request order.
