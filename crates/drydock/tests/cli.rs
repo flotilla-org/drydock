@@ -469,7 +469,7 @@ async fn optional_discovery_failure_is_isolated_and_required_failure_is_reported
     let broken = |optional| HostOption {
         name: "python".into(),
         optional,
-        connection: HostConnection::Managed { command: vec!["/bin/false".into()], runtime: None },
+        connection: HostConnection::Managed { command: vec!["false".into()], runtime: None },
     };
     let run = dir.path().join("run");
     let daemon = Daemon::start_with_resolver(

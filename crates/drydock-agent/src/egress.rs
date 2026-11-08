@@ -609,6 +609,7 @@ mod tests {
     // Socket-boundary proxy stand-in: enforce CONNECT before permitting tunnel
     // bytes. Exercise the real vessel-scoped forward and its opening handshake.
     // Explicit HTTPS_PROXY bytes must pass through byte-for-byte, without nesting.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn redirected_and_explicit_proxy_use_vessel_forward() {
         use crate::{Agent, Client, Endpoint};
@@ -892,6 +893,7 @@ mod tests {
 
     // All three TCP listeners share the same bounded connection budget; holding
     // DNS sockets cannot grow an unbounded set of proxy or capture streams.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn capture_connection_budget_is_shared_and_released() {
         let events = Arc::new(crate::events::Events::new("test".into()));

@@ -366,6 +366,7 @@ async fn an_outward_exposure_reaches_a_socket_on_drydocks_machine() {
 // address in the vessel and a hosts-file line, and reaches its destination,
 // whose name was resolved when set. Removing one removes its line only;
 // lines drydock did not write are kept.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn named_outward_exposures_get_loopback_addresses_and_hosts_lines() {
     let h = Harness::start().await;
@@ -418,6 +419,7 @@ async fn named_outward_exposures_get_loopback_addresses_and_hosts_lines() {
 // A guest name removed while the vessel is stopped loses its hosts line
 // when the vessel runs again, even when no exposure is left.
 // Stand-in vessels share this host's loopback, so this test's guest port is its own.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_guest_name_removed_while_stopped_loses_its_hosts_line_on_resume() {
     let h = Harness::start().await;
