@@ -257,6 +257,8 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
         let events = pending(None, transitions(known, v.state.as_ref(), None, confirmed, true));
         instance.events.update(None, events, observed);
         // As a held row does, keep the last stable state through a transition.
+        // The vendor state and time stay the delivery's own: a redelivery or
+        // an older delivery is judged against the newest one.
         let mut v = v;
         if matches!(v.state, Some(Observation::Transitioning { .. }))
             && let Some(stable) = pushed.announced.get(&v.id).and_then(|a| a.state.clone())

@@ -29,9 +29,9 @@ options, so its deliveries start from that row. For an environment drydockd
 holds no row of, a delivery makes events alone, kept against the last stable
 state its deliveries stated, as a held row's are, and the next list makes the
 row. On a shared account, deliveries for an id no list or provision has shown
-to be this instance's are held, and applied in order once its provision returns the id;
-the next list drops the rest. A delivery may state no drydock state (Daytona's
-`sandbox.created`): it is the environment's creation, or nothing. Deliveries come at least once and in no promised order: one whose vendor timestamp is older than the row drydockd holds, or as old with the same vendor state, is a redelivery or overtaken by a list, and is skipped. A `gap` frame, or a start with no
+to be this instance's are held, and applied in order once its provision returns
+the id; the next list drops the rest. A delivery may state no drydock state
+(Daytona's `sandbox.created`): it is the environment's creation, or nothing. Deliveries come at least once and in no promised order: one whose vendor timestamp is older than the row drydockd holds, or as old with the same vendor state, is a redelivery or overtaken by a list, and is skipped. A `gap` frame, or a start with no
 stored cursor, is answered by a list whose events are marked `reconstruction`;
 the cursor is stored only once what came before it is applied. Waits wake on
 the log's change signal and ask for a poll only when the instance has no relay. It stretches the interval
