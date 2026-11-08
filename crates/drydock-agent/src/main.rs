@@ -118,7 +118,7 @@ async fn main() -> io::Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     if vsock.is_some() {
-        return Err(io::Error::other("vsock requires Linux"));
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "the vsock listener is not built for this platform yet"));
     }
     let path = agent.run().await?;
     let _ = std::fs::remove_file(socket);

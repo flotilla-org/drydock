@@ -358,7 +358,7 @@ impl Capture {
     }
     async fn prepare_at(outward: Arc<Outward>, id: String, capture_port: u16, proxy_port: u16, dns_port: u16) -> io::Result<Self> {
         if !cfg!(target_os = "linux") {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture requires Linux"));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture is not built for this platform yet"));
         }
         let tcp = dual_listener(capture_port)?;
         #[cfg(test)]
@@ -433,7 +433,7 @@ fn original_destination(stream: &TcpStream) -> io::Result<SocketAddr> {
 }
 #[cfg(not(target_os = "linux"))]
 fn original_destination(_: &TcpStream) -> io::Result<SocketAddr> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "egress requires Linux"))
+    Err(io::Error::new(io::ErrorKind::Unsupported, "egress capture is not built for this platform yet"))
 }
 
 /// The capture table for this state: empty without egress, else redirects

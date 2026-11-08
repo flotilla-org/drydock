@@ -484,11 +484,14 @@ async fn directories_and_attributes() {
 
 // Any Unix name can be addressed: names needing percent-encoding (space,
 // `%`, `?`, `#`, `+`, `&`, `=`) and non-UTF-8 bytes round-trip through write,
-// read, head and stat, and appear in a listing.
+// read, head and stat, and appear in a listing. A name the filesystem
+// refuses, as APFS refuses non-UTF-8 ones, is refused as invalid input.
 #[tokio::test]
 async fn unusual_names_round_trip() {
     let h = agent().await;
     let root = h.vessel();
+    let probe = h.dir.path().join("probe");
+    std::fs::create_dir(&probe).unwrap();
     let names: Vec<&[u8]> = vec![
         b"with space",
         b"per%cent",
@@ -500,8 +503,16 @@ async fn unusual_names_round_trip() {
         b"raw\x80\xfe\xff",
         b"\xe9t\xe9",
     ];
+    let mut kept = Vec::new();
     for name in &names {
         let path = root.join(OsStr::from_bytes(name));
+        if std::fs::write(probe.join(OsStr::from_bytes(name)), b"").is_err() {
+            assert!(std::str::from_utf8(name).is_err(), "{path:?} is refused only for not being UTF-8");
+            let error = h.client.write_bytes(&path, name.to_vec(), &FileOptions::default()).await.unwrap_err();
+            assert_eq!(kind(&error), ErrorKind::InvalidInput, "{error}");
+            continue;
+        }
+        kept.push(name);
         h.client.write_bytes(&path, name.to_vec(), &FileOptions::default()).await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), *name, "{path:?} written at the exact name");
         assert_eq!(h.client.read_bytes(&path, 1024).await.unwrap(), *name);
@@ -510,7 +521,7 @@ async fn unusual_names_round_trip() {
         assert_eq!((entry.name, entry.size), (String::from_utf8_lossy(name).into_owned(), name.len() as u64));
     }
     let listed: Vec<String> = h.client.list(&root).await.unwrap().into_iter().map(|e| e.name).collect();
-    let mut expected: Vec<String> = names.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
+    let mut expected: Vec<String> = kept.iter().map(|n| String::from_utf8_lossy(n).into_owned()).collect();
     expected.sort();
     assert_eq!(listed, expected);
 }
