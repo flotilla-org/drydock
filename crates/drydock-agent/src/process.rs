@@ -438,19 +438,31 @@ impl Processes {
     }
 }
 /// A child's exit, awaited without reaping it, so its PID keeps naming it
-/// until the waiter reaps it. On Linux a pidfd, and on macOS a kqueue
-/// watching the process, turns readable at the exit, so no thread waits.
-struct ExitWatch(Option<tokio::io::unix::AsyncFd<rustix::fd::OwnedFd>>);
+/// until the waiter reaps it. A pidfd on Linux, or a kqueue watching the
+/// process on macOS, turns readable at the exit, so no thread waits. On a
+/// Linux kernel without pidfds, a blocking `waitid(WNOWAIT)` waits instead.
+enum ExitWatch {
+    Readable(tokio::io::unix::AsyncFd<rustix::fd::OwnedFd>),
+    #[cfg(target_os = "macos")]
+    Exited,
+    #[cfg(target_os = "linux")]
+    Blocking(rustix::process::Pid),
+}
 impl ExitWatch {
     #[cfg(target_os = "linux")]
     fn new(pid: rustix::process::Pid) -> io::Result<Self> {
-        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
-        // Deprecated in tokio 1.54 for descriptors a caller might close
-        // early; the AsyncFd owns this OwnedFd, so that cannot happen. Its
-        // replacement is missing from the tokio versions consumers lock.
-        // TODO: use register_with_interest once the tokio floor is 1.54.
-        #[allow(deprecated)]
-        Ok(Self(Some(tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE)?)))
+        match rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) {
+            // Deprecated in tokio 1.54 for descriptors a caller might close
+            // early; the AsyncFd owns this OwnedFd, so that cannot happen. Its
+            // replacement is missing from the tokio versions consumers lock.
+            // TODO: use register_with_interest once the tokio floor is 1.54.
+            #[allow(deprecated)]
+            Ok(pidfd) => Ok(Self::Readable(tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE)?)),
+            Err(error) => {
+                tracing::debug!(%error, "no pidfd for this process; a blocking thread waits for its exit");
+                Ok(Self::Blocking(pid))
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     fn new(pid: rustix::process::Pid) -> io::Result<Self> {
@@ -461,25 +473,42 @@ impl ExitWatch {
         // SAFETY: the event names a process, not a descriptor.
         match unsafe { kevent(&queue, &[watch], &mut [] as &mut [Event; 0], None) } {
             // The process already exited; it is a zombie until reaped.
-            Err(rustix::io::Errno::SRCH) => return Ok(Self(None)),
+            Err(rustix::io::Errno::SRCH) => return Ok(Self::Exited),
             result => result?,
         };
         // NOTE_EXIT fires only for an exit after it is registered.
         if waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG)?.is_some() {
-            return Ok(Self(None));
+            return Ok(Self::Exited);
         }
         #[allow(deprecated)]
-        Ok(Self(Some(tokio::io::unix::AsyncFd::with_interest(queue, tokio::io::Interest::READABLE)?)))
+        Ok(Self::Readable(tokio::io::unix::AsyncFd::with_interest(queue, tokio::io::Interest::READABLE)?))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn new(_: rustix::process::Pid) -> io::Result<Self> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "waiting for a process to exit is not built for this platform yet"))
     }
     async fn exited(self) -> io::Result<()> {
-        if let Some(fd) = self.0 {
-            let _ = fd.readable().await?;
+        match self {
+            Self::Readable(fd) => {
+                let _ = fd.readable().await?;
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Self::Exited => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::Blocking(pid) => {
+                tokio::task::spawn_blocking(move || {
+                    use rustix::process::{WaitId, WaitIdOptions, waitid};
+                    loop {
+                        match waitid(WaitId::Pid(pid), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
+                            Err(rustix::io::Errno::INTR) => continue,
+                            result => return result.map(drop).map_err(Into::into),
+                        }
+                    }
+                })
+                .await?
+            }
         }
-        Ok(())
     }
 }
 /// Move one pipe's bytes into the handle's buffer while it has room. The
