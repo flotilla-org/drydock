@@ -38,6 +38,9 @@ const LABEL_LIMIT: usize = 256;
 /// settled, or after this many seconds, inside drydock's HTTP deadline.
 const PREFER_WAIT: &str = "wait=25";
 const PREVIEW_TOKEN_HEADER: &str = "x-runtime-preview-token";
+/// How long an exec request outlasts Runtime's limit on the command, for
+/// Runtime's answer to arrive once the command ends.
+const EXEC_MARGIN: Duration = Duration::from_secs(5);
 
 /// Runtime does not say whether a client or Runtime paused or stopped a
 /// sandbox in its state; `stopReason`, reported beside it, does.
@@ -178,7 +181,7 @@ struct Settings {
     /// How long a preview token reach signs lasts.
     preview_ttl_seconds: u32,
     /// Runtime's limit on one command; the exec request waits that long and
-    /// five seconds more.
+    /// [`EXEC_MARGIN`] more.
     exec_seconds: u64,
 }
 impl Default for Settings {
@@ -448,8 +451,7 @@ impl Guest for Runtime {
         if !env.is_empty() {
             body["env"] = json!(env);
         }
-        // The request lasts as long as Runtime may run the command, and a little more.
-        let deadline = Duration::from_secs(self.settings.exec_seconds.saturating_add(5));
+        let deadline = Duration::from_secs(self.settings.exec_seconds).saturating_add(EXEC_MARGIN);
         let url = self.sandbox_url(id, Some("exec"), &[])?;
         let v: Executed = self.api.call_within(Method::POST, url, Body::json(&body)?, c, deadline).await?;
         Ok(GuestOutput { timed_out: v.timed_out, ..GuestOutput::from_text(&v.stdout, &v.stderr, v.exit_code) })
@@ -696,11 +698,12 @@ mod tests {
     use std::sync::Mutex;
 
     /// Answers each request with the next scripted (status, body), keeping
-    /// each request's method, path and query, and body.
+    /// each request's method, path and query, body and deadline.
     #[derive(Default)]
     struct Script {
         answers: Mutex<Vec<(u16, &'static str)>>,
         asked: Mutex<Vec<(String, String, serde_json::Value)>>,
+        deadlines: Mutex<Vec<Option<Duration>>>,
     }
     #[async_trait]
     impl HttpClient for Script {
@@ -709,6 +712,7 @@ mod tests {
             let url = request.url();
             let target = url.query().map_or_else(|| url.path().to_owned(), |q| format!("{}?{q}", url.path()));
             self.asked.lock().unwrap().push((request.method().to_string(), target, body));
+            self.deadlines.lock().unwrap().push(request.timeout().copied());
             let (status, body) = {
                 let mut answers = self.answers.lock().unwrap();
                 assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
@@ -881,13 +885,18 @@ mod tests {
         );
     }
 
-    // An exec answer missing a field Runtime states is a bad response, not
-    // empty output.
+    // An exec asks Runtime for its command limit and waits that long and the
+    // margin more. An answer missing a field Runtime states is a bad
+    // response, not empty output.
     #[tokio::test]
-    async fn exec_answers_are_taken_as_stated() {
-        let (runtime, _) = runtime(Ownership::OwnedAccount, vec![(200, r#"{"exitCode":0,"stdout":"","timedOut":false}"#)]).await;
+    async fn exec_waits_out_its_limit_and_takes_answers_as_stated() {
+        let script =
+            Arc::new(Script { answers: Mutex::new(vec![(200, r#"{"exitCode":0,"stdout":"","timedOut":false}"#)]), ..Script::default() });
+        let runtime = configure(Ownership::OwnedAccount, json!({"exec_seconds": 60}), script.clone()).await.unwrap();
         let request = ExecRequest { command: vec!["true".into()] };
         assert!(matches!(runtime.operations().exec.unwrap().exec(ID, request, &key()).await, Err(ProtocolError::Internal { .. })));
+        assert_eq!(script.asked.lock().unwrap()[0].2["timeoutMs"], 60_000);
+        assert_eq!(*script.deadlines.lock().unwrap(), [Some(Duration::from_secs(60) + EXEC_MARGIN)]);
     }
 
     // A failed build without Runtime's error says only that it failed.
