@@ -63,6 +63,7 @@ fn resolved(mut path: PathBuf) -> io::Result<PathBuf> {
         let path_in_parent = parent.join(name);
         match std::fs::read_link(&path_in_parent) {
             Ok(target) => path = parent.join(target),
+            // EINVAL: not a symlink.
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Ok(path_in_parent),
             Err(error) => return Err(error),
         }
