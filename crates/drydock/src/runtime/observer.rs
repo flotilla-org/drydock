@@ -353,7 +353,9 @@ fn reconcile(
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
     {
         // What a listed row doesn't state keeps what drydockd holds of it, as
-        // with a delivery.
+        // with a delivery, which reads the same rows first. The inventory row
+        // is never older than `seen`, which keeps a stable row through a
+        // transition; `seen` serves only before the first list's inventory.
         let log = instance.events.shared.log.recover();
         let inventory: BTreeMap<_, _> = log.inventories.get(&instance.name).into_iter().flatten().map(|r| (&r.id, r)).collect();
         for (id, row) in &mut current {

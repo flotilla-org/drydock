@@ -27,8 +27,8 @@ does not state (label, granted size, platform, tags). What this instance's
 provision returned is held until a list shows it, whatever its semantic
 options, so its deliveries start from that row. For an environment drydockd
 holds no row of, a delivery makes events alone, and the next list makes the
-row. On a shared account, deliveries for an id no list or provision has shown to be this
-instance's are held, and applied in order once its provision returns the id;
+row. On a shared account, deliveries for an id no list or provision has shown
+to be this instance's are held, and applied in order once its provision returns the id;
 the next list drops the rest. A delivery may state no drydock state (Daytona's
 `sandbox.created`): it is the environment's creation, or nothing. Deliveries come at least once and in no promised order: one whose vendor timestamp is older than the row drydockd holds, or as old with the same vendor state, is a redelivery or overtaken by a list, and is skipped. A `gap` frame, or a start with no
 stored cursor, is answered by a list whose events are marked `reconstruction`;
