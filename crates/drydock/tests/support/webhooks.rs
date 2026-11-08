@@ -120,8 +120,12 @@ pub async fn host(dir: &Path, instance: &str, module: Arc<dyn Module>) {
 /// drydockd with `instance` on the host's module, reading the relay at `url`
 /// as its source, listing only at start: every later observation comes from the relay.
 pub async fn drydockd(dir: &Path, instance: &str, url: &str, ownership: &str) -> Arc<Daemon> {
+    drydockd_configured(dir, instance, url, &format!("ownership = '{ownership}'")).await
+}
+/// [`drydockd`], with `settings` (TOML keys) in the instance's table.
+pub async fn drydockd_configured(dir: &Path, instance: &str, url: &str, settings: &str) -> Arc<Daemon> {
     let text = format!(
-        "[providers.{instance}]\nmodule = 'recorded-{instance}'\nownership = '{ownership}'\n\
+        "[providers.{instance}]\nmodule = 'recorded-{instance}'\n{settings}\n\
          [providers.{instance}.events]\nrelay = '{url}'\nsource = '{instance}'\ntoken = {{ file = '{}' }}\npoll_seconds = 3600\n",
         dir.join("relay.token").display()
     );

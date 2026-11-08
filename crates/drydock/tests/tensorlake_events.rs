@@ -13,6 +13,8 @@ use std::{
 mod relay;
 #[path = "support/webhooks.rs"]
 mod webhooks;
+use drydock::daemon::ProviderApi;
+use drydock_host::module::Provisioned;
 use relay::{Relay, cursor};
 use webhooks::{Recorded, delivery, events, held, subscribe, taken};
 
@@ -149,4 +151,72 @@ async fn a_delivery_carries_the_instance_and_label_its_name_holds() {
     let label = name.split_once("-r-").unwrap().1;
     let tags = held(&daemon, &recorded_id()).await.unwrap().vendor.unwrap().tags.unwrap();
     assert_eq!(tags, [(OWNER_TAG.to_owned(), "tensorlake".to_owned()), ("flotilla.label".to_owned(), label.to_owned())].into());
+}
+
+/// Tensorlake behind the module: it lists nothing yet, and a create answers
+/// with the recorded sandbox, pending.
+struct Creating;
+#[async_trait::async_trait]
+impl webhooks::Vendor for Creating {
+    async fn list(&self) -> Vec<Environment> {
+        vec![]
+    }
+    async fn provision(&self, instance: &str) -> Provisioned {
+        Provisioned::Created(listed(instance))
+    }
+}
+
+// With every option off on an owned account, a sandbox this instance made
+// and no list has shown yet is still held from its provision on: its resume
+// is reported as a resume, as it is with the default options.
+#[tokio::test]
+async fn a_resume_is_reported_with_every_option_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let frames = recorded();
+    let (relay, url) = Relay::serving(frames.clone()).await;
+    let module = Arc::new(drydock_host::tensorlake::TensorlakeModule::new().unwrap());
+    let settings = json!({"project_id": project()});
+    webhooks::host(
+        dir.path(),
+        "tensorlake",
+        Arc::new(Recorded { module, module_name: "tensorlake", settings, stand_in: Arc::new(Creating) }),
+    )
+    .await;
+    let options = "ownership = 'owned_account'\nsemantics = { settle = false, idempotent = false }";
+    let daemon = webhooks::drydockd_configured(dir.path(), "tensorlake", &url, options).await;
+    webhooks::caught_up(&relay, dir.path(), "tensorlake").await;
+    let mut stream = subscribe(&daemon).await;
+    let prepared = Prepared {
+        provider: "tensorlake".into(),
+        id: "image".into(),
+        platform: Platform::new("linux", "amd64"),
+        image_digest: "image".into(),
+        tools_digest: "tools".into(),
+    };
+    let request = ProvisionRequest {
+        label: "vessel".into(),
+        prepared,
+        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 10 << 30 },
+        egress: EgressRequest::Open,
+        ssh_public_key: None,
+    };
+    ProviderApi::provision(&*daemon, "tensorlake", &request).await.unwrap();
+    relay.publish(frames.len());
+    let events = events(&mut stream, |e| matches!(e.event, EventKind::Gone { .. })).await;
+    let kinds: Vec<_> = events.iter().map(|e| (e.event.clone(), delivery(e))).collect();
+    let id = |i: usize| frames[i]["delivery_id"].as_str();
+    let starting = EventKind::Transitioning { phase: TransitionPhase::Starting };
+    assert_eq!(
+        kinds,
+        [
+            (EventKind::Created, id(0)),
+            (starting.clone(), id(0)),
+            (EventKind::Running { granted_size: None }, id(1)),
+            (EventKind::Stopped { cause: None }, id(2)),
+            (starting, id(3)),
+            (EventKind::Resumed, id(4)),
+            (EventKind::Running { granted_size: None }, id(4)),
+            (EventKind::Gone { cause: None }, id(5)),
+        ]
+    );
 }

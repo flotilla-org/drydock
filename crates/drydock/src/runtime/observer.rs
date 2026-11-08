@@ -325,6 +325,19 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
     kinds
 }
 
+/// `row`, with what it doesn't state taken from `held`: its label, granted
+/// size, platform and the vendor's tags.
+fn merge(row: &mut Environment, held: &Environment) {
+    row.label = row.label.take().or_else(|| held.label.clone());
+    row.granted_size = row.granted_size.take().or_else(|| held.granted_size.clone());
+    row.platform = row.platform.take().or_else(|| held.platform.clone());
+    if let Some(vendor) = &mut row.vendor
+        && vendor.tags.is_none()
+    {
+        vendor.tags = held.vendor.as_ref().and_then(|h| h.tags.clone());
+    }
+}
+
 fn reconcile(
     instance: &Instance,
     seen: &mut BTreeMap<String, Environment>,
@@ -336,6 +349,17 @@ fn reconcile(
     carry_egress(instance, &mut rows, generation);
     let mut pending = vec![];
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+    {
+        // What a listed row doesn't state keeps what drydockd holds of it, as
+        // with a delivery.
+        let log = instance.events.shared.log.recover();
+        let inventory = log.inventories.get(&instance.name);
+        for (id, row) in &mut current {
+            if let Some(held) = inventory.and_then(|rows| rows.iter().find(|r| &r.id == id)).or_else(|| seen.get(id)) {
+                merge(row, held);
+            }
+        }
+    }
     {
         let inspected = instance.inspected.recover();
         for (id, row) in &mut current {

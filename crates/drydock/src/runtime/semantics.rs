@@ -66,9 +66,8 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
         observed,
         inner: provider,
     };
-    if added.owner.is_none() && !added.settle && !added.idempotent {
-        return Ok(added.inner);
-    }
+    // Applied even when it adds nothing: its provision tells the observer what
+    // this instance made, so the environment's first delivery starts a row.
     Ok(Arc::new(added))
 }
 

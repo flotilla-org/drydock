@@ -22,8 +22,11 @@ stream in the same loop. A relay makes the list a gap filler, every
 port, which reads it into observations; each observation becomes events marked
 `webhook` and carrying the vendor state. A delivery replaces only what it
 states of a row drydockd holds (the state, the vendor's state and reason, the
-time) and keeps the rest, tags included; for an environment drydockd holds no
-row of it makes events alone, and the next list makes the row. On a shared
+time) and keeps the rest, tags included; a listed row likewise keeps what it
+does not state (label, granted size, platform, tags). What this instance's
+provision returned is held until a list shows it, whatever its semantic
+options, so its deliveries start from that row. For an environment drydockd
+holds no row of a delivery makes events alone, and the next list makes the row. On a shared
 account, deliveries for an id no list or provision has shown to be this
 instance's are held, and applied in order once its provision returns the id;
 the next list drops the rest. A delivery may state no drydock state (Daytona's
