@@ -15,18 +15,6 @@ const MIB: u64 = 1 << 20;
 /// every stream is a partial one.
 const SIZE: u64 = 520 * MIB + 12_345;
 
-/// The process's peak resident set (VmHWM) in bytes. The agent runs in this
-/// process, so this covers the client and the agent together.
-fn peak_rss() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status.lines().find(|l| l.starts_with("VmHWM:")).expect("VmHWM in /proc/self/status");
-    line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
-}
-/// Reset the peak to the current RSS, where the kernel allows it, so the
-/// baseline excludes whatever setup touched.
-fn reset_peak() {
-    let _ = std::fs::write("/proc/self/clear_refs", "5");
-}
 /// Stream SIZE pseudo-random bytes (xorshift64) to `path` a MiB at a time,
 /// hashing as they are written; the content is never held in memory.
 fn generate(path: &Path, seed: u64) -> String {

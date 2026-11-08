@@ -84,7 +84,7 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     let file = dir.path().join("forbidden");
     assert_mismatch(mismatch.configure(Configuration::default()).await);
     assert_mismatch(mismatch.configuration().await);
-    assert_mismatch(mismatch.exec(Exec::new("/bin/true", [""; 0])).await);
+    assert_mismatch(mismatch.exec(Exec::new("true", [""; 0])).await);
     assert_mismatch(mismatch.write_bytes(&file, vec![], &FileOptions::default()).await);
     assert_mismatch(mismatch.read(&file).await);
     assert_mismatch(mismatch.open_inward("x").await);
@@ -117,9 +117,8 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
     })
     .await
     .unwrap();
-    #[cfg(target_os = "linux")]
     tokio::time::timeout(Duration::from_secs(5), async {
-        while std::path::Path::new(&format!("/proc/{launched_pid}")).exists() {
+        while process_state(&launched_pid).is_some() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -163,7 +162,6 @@ async fn binary_upgrade_preserves_children_and_gates_mismatched_client() {
 
 // Exercise Tokio's deferred write error in a separate process, without changing
 // limits or signal handling in the parallel test runner.
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn failed_file_write_never_publishes_a_partial_file_or_upgrade() {
     let dir = tempfile::tempdir().unwrap();

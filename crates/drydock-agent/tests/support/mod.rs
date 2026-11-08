@@ -204,6 +204,39 @@ pub fn leftovers(dir: &Path, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// The state ps reports for `pid` (`Z` for a zombie), or None once no
+/// process has it. ps rather than /proc, so this also works off Linux.
+pub fn process_state(pid: &str) -> Option<String> {
+    let output = std::process::Command::new("ps").args(["-o", "stat=", "-p", pid.trim()]).output().expect("ps reports a process");
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned()).filter(|state| !state.is_empty())
+}
+/// The process's peak resident set in bytes. An agent run in this process
+/// counts towards it.
+pub fn peak_rss() -> u64 {
+    // On Linux getrusage would also count the peak of the process that
+    // forked this one, which Cargo's is; VmHWM can be reset instead.
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).expect("VmHWM in /proc/self/status");
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: an all-zero rusage is a valid value to be overwritten.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is valid for the call to fill.
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+        // In bytes on macOS.
+        usage.ru_maxrss as u64
+    }
+}
+/// Reset the peak to the current resident set where the kernel allows it,
+/// so a baseline excludes whatever setup touched.
+pub fn reset_peak() {
+    #[cfg(target_os = "linux")]
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
 /// The agent executable this package builds.
 pub fn agent_binary() -> Vec<u8> {
     std::fs::read(env!("CARGO_BIN_EXE_drydock-agent")).unwrap()

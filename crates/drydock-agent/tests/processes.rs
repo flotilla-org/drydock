@@ -53,10 +53,11 @@ async fn exited(process: &drydock_agent::Process) -> ExitStatus {
 /// A PID that no longer names a live process: gone, or a zombie whose reaper
 /// is not the agent.
 fn dead(pid: &str) -> bool {
-    match std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
-        Err(_) => true,
-        Ok(stat) => stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
-    }
+    process_state(pid).is_none_or(|state| state.starts_with('Z'))
+}
+/// A PID the agent has reaped.
+fn reaped(pid: &str) -> bool {
+    process_state(pid).is_none()
 }
 fn gated(gate: &Path, before: &str, after: &str) -> Exec {
     shell(&format!("{before}; while test ! -f '{}'; do sleep 0.01; done; {after}", gate.display()))
@@ -146,7 +147,7 @@ async fn kill_ends_the_process_group() {
     let (_, _, exit) = output(reader).await;
     assert_eq!(exit, status(None, Some(libc::SIGKILL), false));
     eventually("the grandchild to die", async || dead(&grandchild).then_some(())).await;
-    assert!(dead(&process.pid().to_string()), "the agent reaps its own child");
+    assert!(reaped(&process.pid().to_string()), "the agent reaps its own child");
 }
 
 // Signals are delivered, not just used to kill: a shell trapping SIGTERM runs
@@ -315,7 +316,7 @@ async fn detached_process_finishes_and_is_reaped() {
     let process = h.client.spawn(shell(&format!("head -c 131072 /dev/zero; printf complete > '{}'", done.display()))).await.unwrap();
     let pid = process.pid().to_string();
     eventually("the detached process to finish and be reaped", async || {
-        (std::fs::read(&done).ok().as_deref() == Some(b"complete") && !Path::new(&format!("/proc/{pid}")).exists()).then_some(())
+        (std::fs::read(&done).ok().as_deref() == Some(b"complete") && reaped(&pid)).then_some(())
     })
     .await;
     assert_eq!(exited(&process).await, status(Some(0), None, false));
@@ -357,13 +358,13 @@ async fn spawn_refusals() {
     let missing = h.dir.path().join("absent");
     let detail = refusal(h.client.spawn(Exec::new("/no/such/program", ["x"])).await.err().unwrap(), ErrorKind::NotFound);
     assert_eq!((detail.operation.as_str(), detail.subject.as_str()), ("process.spawn", "/no/such/program"));
-    let cwd = |path: &Path| Exec { cwd: Some(path.into()), ..Exec::new("/bin/true", Vec::<String>::new()) };
+    let cwd = |path: &Path| Exec { cwd: Some(path.into()), ..Exec::new("true", Vec::<String>::new()) };
     assert_eq!(refusal(h.client.spawn(cwd(&missing)).await.err().unwrap(), ErrorKind::NotFound).operation, "process.cwd");
     let file = h.dir.path().join("file");
     std::fs::write(&file, "x").unwrap();
     refusal(h.client.spawn(cwd(&file)).await.err().unwrap(), ErrorKind::NotADirectory);
     for (key, value) in [("", "x"), ("A=B", "x"), ("A\0", "x"), ("A", "x\0")] {
-        let request = Exec { environment: [(key.into(), value.into())].into(), ..Exec::new("/bin/true", Vec::<String>::new()) };
+        let request = Exec { environment: [(key.into(), value.into())].into(), ..Exec::new("true", Vec::<String>::new()) };
         let detail = refusal(h.client.spawn(request).await.err().unwrap(), ErrorKind::InvalidInput);
         assert!(detail.message.contains("environment"), "{detail}");
     }
@@ -413,7 +414,7 @@ async fn processes_are_listed_and_removed() {
     let (id, pid) = (running.id().to_owned(), running.pid().to_string());
     running.remove().await.unwrap();
     refusal(h.client.process(&id).await.err().unwrap(), ErrorKind::NotFound);
-    eventually("the removed process to be killed and reaped", async || (!Path::new(&format!("/proc/{pid}")).exists()).then_some(())).await;
+    eventually("the removed process to be killed and reaped", async || reaped(&pid).then_some(())).await;
     finished.remove().await.unwrap();
     assert_eq!(h.client.processes().await.unwrap(), vec![]);
 }
