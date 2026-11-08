@@ -326,7 +326,9 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
 }
 
 /// `row`, with what it doesn't state taken from `held`: its label, granted
-/// size, platform and the vendor's tags.
+/// size, platform and the vendor's tags. Absent means not stated, so a list
+/// cannot clear one of these; only a value it states replaces the held one.
+/// Tags are taken whole: a list that states any tags states them all.
 fn merge(row: &mut Environment, held: &Environment) {
     row.label = row.label.take().or_else(|| held.label.clone());
     row.granted_size = row.granted_size.take().or_else(|| held.granted_size.clone());
@@ -353,9 +355,9 @@ fn reconcile(
         // What a listed row doesn't state keeps what drydockd holds of it, as
         // with a delivery.
         let log = instance.events.shared.log.recover();
-        let inventory = log.inventories.get(&instance.name);
+        let inventory: BTreeMap<_, _> = log.inventories.get(&instance.name).into_iter().flatten().map(|r| (&r.id, r)).collect();
         for (id, row) in &mut current {
-            if let Some(held) = inventory.and_then(|rows| rows.iter().find(|r| &r.id == id)).or_else(|| seen.get(id)) {
+            if let Some(held) = inventory.get(id).copied().or_else(|| seen.get(id)) {
                 merge(row, held);
             }
         }
