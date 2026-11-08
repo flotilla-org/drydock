@@ -213,6 +213,12 @@ mod tests {
         }
         assert_eq!(ErrorKind::from_status(418), ErrorKind::Other);
     }
+    // A name the filesystem refuses is the caller's input, not the agent's fault.
+    #[test]
+    fn a_refused_name_is_invalid_input() {
+        let error = AgentError::io("file.write", "/x", io::Error::from_raw_os_error(libc::EILSEQ));
+        assert_eq!((error.kind, error.status), (ErrorKind::InvalidInput, 400));
+    }
     // The cause chain survives: an OS error names its errno, and a wrapped
     // error lists the inner error after the outer message.
     #[test]

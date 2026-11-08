@@ -506,8 +506,8 @@ async fn unusual_names_round_trip() {
     let mut kept = Vec::new();
     for name in &names {
         let path = root.join(OsStr::from_bytes(name));
-        if std::fs::write(probe.join(OsStr::from_bytes(name)), b"").is_err() {
-            assert!(std::str::from_utf8(name).is_err(), "{path:?} is refused only for not being UTF-8");
+        if let Err(error) = std::fs::write(probe.join(OsStr::from_bytes(name)), b"") {
+            assert_eq!(error.raw_os_error(), Some(libc::EILSEQ), "{path:?}: {error}");
             let error = h.client.write_bytes(&path, name.to_vec(), &FileOptions::default()).await.unwrap_err();
             assert_eq!(kind(&error), ErrorKind::InvalidInput, "{error}");
             continue;
