@@ -46,6 +46,9 @@ webpki-root-certs = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["event"] }
+
 [dev-dependencies]
 # The WebSocket dialer, for the tunnel_check example only.
 drydock-transport = { path = "../drydock-transport", features = ["websocket"] }
