@@ -31,10 +31,9 @@ use reqwest::{
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    net::Ipv4Addr,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU16,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -43,8 +42,6 @@ const TENSORLAKE: Vendor = Vendor("Tensorlake");
 const TUNNEL_FRAME: usize = 64 << 10;
 const DISK_MB: std::ops::RangeInclusive<u64> = 10_240..=102_400;
 const MEMORY_MB_PER_CPU: std::ops::RangeInclusive<u64> = 1024..=8192;
-const TOKEN_FILE: &str = "/run/drydock/tcp-token";
-const AGENT: &str = "/opt/drydock/drydock-agent";
 // Tensorlake says neither whose a suspension or a termination was: its
 // outcome and reason, reported beside the state, say what it knows.
 // `resume_failed` is not classed: its state is reported as Tensorlake gives it.
@@ -238,7 +235,7 @@ impl Module for TensorlakeModule {
                  max_cpus, max_memory, poll_interval_ms, build_poll_seconds, build_polls and upload_seconds",
             ));
         }
-        Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone(), tokens: Mutex::default() }))
+        Ok(Arc::new(Tensorlake { name: name.to_owned(), settings, api, dialer: self.dialer.clone() }))
     }
 }
 
@@ -247,7 +244,6 @@ pub struct Tensorlake {
     settings: Settings,
     api: Api,
     dialer: Arc<dyn WebSocketDialer>,
-    tokens: Mutex<HashMap<String, Token>>,
 }
 
 // Guest-plane and Image Service refusals carry `error`; plan limits are 400s
@@ -270,9 +266,6 @@ const fn paging(rows: &'static str) -> Paging {
 }
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
-}
-fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Tensorlake {
@@ -334,19 +327,6 @@ impl Tensorlake {
             timestamp: None,
             vendor: Some(VendorState { state: v.status.into(), reason: reason(v.outcome, v.termination_reason), tags }),
         })
-    }
-    async fn token(&self, id: &str, c: &Credentials) -> Result<Token> {
-        if let Some(token) = locked(&self.tokens).get(id) {
-            return Ok(token.clone());
-        }
-        let output = self.run(id, &format!("{AGENT} --print-token --tcp-token-file {TOKEN_FILE}"), BTreeMap::new(), c).await?;
-        let stdout = String::from_utf8_lossy(&output.success(TENSORLAKE)?.stdout()).into_owned();
-        let token =
-            stdout.lines().find_map(|line| line.strip_prefix("drydock-tcp-token ")).and_then(|line| Token::parse(line).ok()).ok_or_else(
-                || ProtocolError::Internal { reason: "the agent's TCP token was not read back".into(), provider_error: String::new() },
-            )?;
-        locked(&self.tokens).insert(id.to_owned(), token.clone());
-        Ok(token)
     }
     // The SDK reads a 400 from the name lookup as "not registered", as it does a 404.
     async fn image_exists(&self, name: &str, c: &Credentials) -> Result<bool> {
@@ -508,19 +488,13 @@ impl Policy {
         for destination in direct {
             match destination {
                 Destination::HostPort { .. } => return Err(refused("Tensorlake egress rules cannot restrict ports")),
+                Destination::Cidr { cidr } if ipv6(cidr.as_str()) => return Err(refused("Tensorlake egress takes IPv4 CIDRs only")),
+                Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("Tensorlake egress takes no IPv6 destinations")),
                 Destination::Cidr { cidr } => {
-                    addresses.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("Tensorlake egress takes IPv4 CIDRs only"))?);
+                    addresses.insert(cidr.as_str().to_owned());
                 }
                 Destination::Host { host } => {
-                    let host = normal_host(host.as_str());
-                    if ipv6(&host) {
-                        return Err(refused("Tensorlake egress takes no IPv6 destinations"));
-                    }
-                    if host.parse::<Ipv4Addr>().is_ok() {
-                        addresses.insert(host)
-                    } else {
-                        names.insert(host)
-                    };
+                    names.insert(host.as_str().to_owned());
                 }
             }
         }
@@ -577,7 +551,7 @@ fn sandbox_name(instance: &str, label: &str) -> String {
     {
         return format!("{prefix}r-{label}");
     }
-    let encoded = base32(label.as_bytes());
+    let encoded = base32().encode(label.as_bytes());
     if !label.is_empty() && encoded.len() <= room {
         return format!("{prefix}b-{encoded}");
     }
@@ -600,7 +574,7 @@ fn label_of(prefix: &str, name: &str) -> Option<String> {
     if let Some(label) = rest.strip_prefix("r-") {
         return Some(label.to_owned());
     }
-    String::from_utf8(unbase32(rest.strip_prefix("b-")?)?).ok()
+    String::from_utf8(base32().decode(rest.strip_prefix("b-")?.as_bytes()).ok()?).ok()
 }
 fn name_valid(name: &str) -> bool {
     !name.is_empty()
@@ -608,35 +582,14 @@ fn name_valid(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.ends_with('-')
 }
-const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-fn base32(bytes: &[u8]) -> String {
-    let mut text = String::new();
-    let (mut buffer, mut bits) = (0u32, 0);
-    for byte in bytes {
-        buffer = buffer << 8 | u32::from(*byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            text.push(BASE32[(buffer >> bits & 31) as usize] as char);
-        }
-    }
-    if bits > 0 {
-        text.push(BASE32[(buffer << (5 - bits) & 31) as usize] as char);
-    }
-    text
-}
-fn unbase32(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let (mut buffer, mut bits) = (0u32, 0);
-    for c in text.bytes() {
-        buffer = buffer << 5 | BASE32.iter().position(|b| *b == c)? as u32;
-        bits += 5;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((buffer >> bits & 0xff) as u8);
-        }
-    }
-    (buffer & ((1 << bits) - 1) == 0).then_some(bytes)
+/// RFC 4648 base32 in lowercase, unpadded: sandbox names allow no capitals.
+fn base32() -> &'static data_encoding::Encoding {
+    static BASE32: std::sync::LazyLock<data_encoding::Encoding> = std::sync::LazyLock::new(|| {
+        let mut spec = data_encoding::Specification::new();
+        spec.symbols.push_str("abcdefghijklmnopqrstuvwxyz234567");
+        spec.encoding().expect("a base32 alphabet")
+    });
+    &BASE32
 }
 fn image_name(image: &str, platform: &Platform) -> String {
     content_name("dd-", 40, &[image, &platform.to_string()])
@@ -794,7 +747,6 @@ impl Provider for Tensorlake {
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
         let deleted = self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["sandboxes", id])?, Body::None, c).await;
         let deleted = absent_on_not_found(deleted)?;
-        locked(&self.tokens).remove(id);
         for snapshot in self.snapshots(id, c).await? {
             if snapshot.status.as_deref() == Some("deleting") {
                 continue;
@@ -816,25 +768,18 @@ impl Provider for Tensorlake {
         let host = url.host_str().ok_or_else(|| TENSORLAKE.bad_response())?;
         let url = format!("wss://{host}{}?port={}", url.path(), self.settings.tunnel_port);
         let headers = HeaderMap::from_iter([(http::header::AUTHORIZATION, self.api.key(c)?)]);
-        let (url, headers) = (&url, &headers);
-        let connect = |token: Token| async move {
-            let socket = self.dialer.dial(url, headers.clone()).await.map_err(|error| match error {
-                DialError::Refused { status, body } => {
-                    classify(&Failure { vendor: TENSORLAKE, operation: "tunnel", status, body: body.as_bytes(), retry_after: None })
-                }
-                DialError::Io(error) => ProtocolError::Unavailable {
-                    reason: "Tensorlake tunnel transport failed".into(),
-                    retry_after: None,
-                    provider_error: Some(error.to_string()),
-                },
-            })?;
-            Ok::<_, ProtocolError>(tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await)
-        };
-        let mut connected = connect(self.token(id, c).await?).await?;
-        if connected.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied) {
-            locked(&self.tokens).remove(id);
-            connected = connect(self.token(id, c).await?).await?;
-        }
+        let token = Token::parse(self.agent_token(id, c).await?.expose()).map_err(|_| TENSORLAKE.bad_response())?;
+        let socket = self.dialer.dial(&url, headers).await.map_err(|error| match error {
+            DialError::Refused { status, body } => {
+                classify(&Failure { vendor: TENSORLAKE, operation: "tunnel", status, body: body.as_bytes(), retry_after: None })
+            }
+            DialError::Io(error) => ProtocolError::Unavailable {
+                reason: "Tensorlake tunnel transport failed".into(),
+                retry_after: None,
+                provider_error: Some(error.to_string()),
+            },
+        })?;
+        let connected = tcp::connect(websocket::stream(socket, TUNNEL_FRAME), &token).await;
         connected.map(|stream| Box::new(stream) as ByteStream).map_err(|error| ProtocolError::Unavailable {
             reason: "the agent's TCP listener did not accept the tunnel".into(),
             retry_after: None,
@@ -851,7 +796,6 @@ impl SuspendResume for Tensorlake {
         Ok(ResumeToken { token: Secret::new(id) })
     }
     async fn resume(&self, id: &str, _: ResumeToken, c: &Credentials) -> Result<()> {
-        locked(&self.tokens).remove(id);
         self.api.call::<IgnoredAny>(Method::POST, self.api.url(&["sandboxes", id, "resume"])?, Body::None, c).await.map(drop)
     }
 }
@@ -957,6 +901,7 @@ impl GuestFiles for Tensorlake {
 mod tests {
     use super::*;
     use rigging_http_client::ChannelLabel;
+    use std::sync::Mutex;
 
     /// Answers each request with the next scripted (status, body), keeping
     /// each request's method and path.
@@ -968,9 +913,9 @@ mod tests {
     #[async_trait]
     impl HttpClient for Script {
         async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
-            locked(&self.asked).push((request.method().to_string(), request.url().path().to_owned()));
+            self.asked.lock().unwrap().push((request.method().to_string(), request.url().path().to_owned()));
             let (status, body) = {
-                let mut answers = locked(&self.answers);
+                let mut answers = self.answers.lock().unwrap();
                 assert!(!answers.is_empty(), "unscripted request {} {}", request.method(), request.url());
                 answers.remove(0)
             };
@@ -1063,7 +1008,7 @@ mod tests {
         assert_eq!((vendor.state.as_str(), vendor.tags), ("pending", tags("lab", &sandbox_name("lab", "crew-1"))));
         let refused = provider.provision(request, &credentials()).await;
         assert!(matches!(&refused, Err(ProtocolError::Refused { reason }) if reason.contains("already exists")), "{refused:?}");
-        assert_eq!(*locked(&script.asked), [("POST".into(), "/sandboxes".into()), ("POST".into(), "/sandboxes".into())]);
+        assert_eq!(*script.asked.lock().unwrap(), [("POST".into(), "/sandboxes".into()), ("POST".into(), "/sandboxes".into())]);
     }
     // Destroy deletes, then sweeps the snapshots the delete leaves. A retry
     // once Tensorlake has forgotten the sandbox still sweeps, then answers not found.
@@ -1079,7 +1024,7 @@ mod tests {
             ("GET".into(), "/sandboxes/sbx1/snapshots".into()),
             ("DELETE".into(), "/snapshots/snap1".into()),
         ];
-        assert_eq!(*locked(&script.asked), [sweep.clone(), sweep].concat());
+        assert_eq!(*script.asked.lock().unwrap(), [sweep.clone(), sweep].concat());
     }
 
     // Output lines keep their stream; a signal is 128 plus its number, and an

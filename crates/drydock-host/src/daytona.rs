@@ -412,11 +412,7 @@ fn allowlist(request: EgressRequest) -> Result<Policy> {
                         if host.as_str().contains(':') {
                             return Err(refused("Daytona does not support IPv6 destinations"));
                         }
-                        if host.as_str().parse::<std::net::Ipv4Addr>().is_ok() {
-                            cidrs.insert(format!("{}/32", host.as_str()));
-                        } else {
-                            hosts.insert(kit::egress::normal_host(host.as_str()));
-                        }
+                        hosts.insert(host.as_str().to_owned());
                     }
                 }
             }
@@ -802,9 +798,10 @@ mod tests {
         let host = |h: &str| Destination::Host { host: serde_json::from_value(json!(h)).unwrap() };
         let deny = |direct| allowlist(EgressRequest::DenyAll { direct }).unwrap();
         assert_eq!(deny(vec![]), Policy { network_block_all: Some(true), ..Policy::default() });
-        assert_eq!(deny(vec![host("Example.COM."), host("a.test")]).domain_allow_list.as_deref(), Some("a.test,example.com"));
-        assert_eq!(deny(vec![host("192.0.2.5")]).network_allow_list.as_deref(), Some("192.0.2.5/32"));
-        assert!(allowlist(EgressRequest::DenyAll { direct: vec![host("a.test"), host("192.0.2.5")] }).is_err());
+        let cidr = Destination::Cidr { cidr: "192.0.2.5/32".parse().unwrap() };
+        assert_eq!(deny(vec![host("example.com"), host("a.test")]).domain_allow_list.as_deref(), Some("a.test,example.com"));
+        assert_eq!(deny(vec![cidr.clone()]).network_allow_list.as_deref(), Some("192.0.2.5/32"));
+        assert!(allowlist(EgressRequest::DenyAll { direct: vec![host("a.test"), cidr] }).is_err());
     }
     // Retry headers use named throttlers; reset fallback applies only to an
     // exhausted bucket. Reset is a duration, not a Unix epoch.

@@ -250,7 +250,7 @@ test("provision is one create and the agent service", async () => {
     );
     const egress: Types["EgressRequest"] = {
       mode: "deny_all",
-      direct: [{ kind: "host", host: "Example.com." }],
+      direct: [{ kind: "host", host: "example.com" }],
     };
     const prepared = await provider.prepare(request, context);
     const calls = standIn.calls.length;
@@ -359,7 +359,6 @@ test("egress maps to a network policy or is refused", () => {
       mode: "deny_all",
       direct: [
         { kind: "host", host: "b.example" },
-        { kind: "host", host: "A.example." },
         { kind: "host", host: "a.example" },
       ],
     }),

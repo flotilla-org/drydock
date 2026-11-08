@@ -26,6 +26,11 @@ export interface Provider {
     request: Types["PrepareRequest"],
     context: Context,
   ): Promise<Types["Prepared"]>;
+  /**
+   * drydockd hands over deny-all destinations in normal form: host names
+   * lowercase with no final dot, an IPv4 literal host as its /32 CIDR, and
+   * IPv4 CIDRs with their host bits cleared.
+   */
   provision(
     request: Types["ProvisionRequest"],
     context: Context,

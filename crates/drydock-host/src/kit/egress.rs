@@ -1,24 +1,9 @@
 //! Destinations and addresses as every vendor's rules need them: CIDRs and
-//! names in one normal form (so a policy read back compares equal to the
-//! request), private addresses no public builder or proxy reaches, and
-//! registry hosts on them.
+//! names in one normal form, private addresses no public builder or proxy
+//! reaches, and registry hosts on them.
+pub use crate::module::egress::{normal_cidr, normal_host};
 use async_trait::async_trait;
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
-
-/// An IPv4 address or CIDR as `a.b.c.d/bits`, host bits cleared.
-pub fn normal_cidr(cidr: &str) -> Option<String> {
-    let (ip, bits) = cidr.split_once('/').unwrap_or((cidr, "32"));
-    let (ip, bits) = (ip.parse::<Ipv4Addr>().ok()?, bits.parse::<u32>().ok().filter(|b| *b <= 32)?);
-    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
-    Some(format!("{}/{bits}", Ipv4Addr::from(u32::from(ip) & mask)))
-}
-/// A host name as vendors compare them: lowercase, no final dot.
-pub fn normal_host(host: &str) -> String {
-    host.trim_end_matches('.').to_ascii_lowercase()
-}
+use std::{net::IpAddr, time::Duration};
 /// Whether a host is an IPv6 literal (bare or bracketed).
 pub fn ipv6(host: &str) -> bool {
     host.contains(':') || host.starts_with('[')
@@ -163,16 +148,12 @@ mod tests {
     }
 
     #[test]
-    fn private_hosts_and_normal_forms() {
+    fn private_hosts() {
         for host in ["192.168.1.31:3000", "localhost:5000", "registry:5000", "forgejo.lab.internal", "[::1]:5000", "x.test"] {
             assert!(private_host(host).is_some(), "{host}");
         }
         for host in ["ghcr.io", "registry.example.com:443", "203.0.113.5", "2606:4700::1111", "[2606:4700::1111]:443"] {
             assert!(private_host(host).is_none(), "{host}");
         }
-        assert_eq!(normal_cidr("10.0.0.12/24").as_deref(), Some("10.0.0.0/24"));
-        assert_eq!(normal_cidr("192.0.2.5").as_deref(), Some("192.0.2.5/32"));
-        assert_eq!(normal_cidr("2001:db8::/32"), None);
-        assert_eq!(normal_host("GitHub.com."), "github.com");
     }
 }

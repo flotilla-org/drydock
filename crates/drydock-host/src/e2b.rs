@@ -32,8 +32,6 @@ use std::{
 const E2B: Vendor = Vendor("E2B");
 const ENVD_PORT: u16 = 49983;
 const AGENT_PORT: u16 = 7811;
-const PRINT_TOKEN: &str = "/opt/drydock/drydock-agent --print-token --tcp-token-file /run/drydock/tcp-token";
-const TOKEN_LINE: &str = "drydock-tcp-token ";
 const TRAFFIC_HEADER: &str = "e2b-traffic-access-token";
 /// E2B's largest page of sandboxes.
 const SANDBOX_PAGE_LIMIT: &str = "100";
@@ -503,16 +501,6 @@ impl E2b {
         }
         Ok(response)
     }
-    async fn agent_token(&self, id: &str, c: &Credentials) -> Result<String> {
-        let run = self.run(id, PRINT_TOKEN, BTreeMap::new(), c).await?.success(E2B)?;
-        let stdout = String::from_utf8_lossy(&run.stdout()).into_owned();
-        stdout.lines().find_map(|line| line.strip_prefix(TOKEN_LINE)).filter(|t| !t.is_empty()).map(str::to_owned).ok_or_else(|| {
-            ProtocolError::Internal {
-                reason: "the agent's TCP token was not read back".into(),
-                provider_error: format!("no {TOKEN_LINE:?} line in the agent's output"),
-            }
-        })
-    }
 }
 
 #[async_trait]
@@ -586,13 +574,13 @@ fn network(request: &EgressRequest) -> Result<Network> {
     for destination in direct {
         match destination {
             Destination::HostPort { .. } => return Err(refused("E2B egress rules cannot restrict ports")),
-            Destination::Cidr { cidr } => {
-                allow.insert(normal_cidr(cidr.as_str()).ok_or_else(|| refused("E2B egress takes IPv4 CIDRs only"))?);
-            }
+            Destination::Cidr { cidr } if ipv6(cidr.as_str()) => return Err(refused("E2B egress takes IPv4 CIDRs only")),
             Destination::Host { host } if ipv6(host.as_str()) => return Err(refused("E2B egress takes no IPv6 destinations")),
+            Destination::Cidr { cidr } => {
+                allow.insert(cidr.as_str().to_owned());
+            }
             Destination::Host { host } => {
-                let host = normal_host(host.as_str());
-                allow.insert(normal_cidr(&host).unwrap_or(host));
+                allow.insert(host.as_str().to_owned());
             }
         }
     }
@@ -788,7 +776,7 @@ impl Provider for E2b {
         let expires_at = v.end_at.ok_or_else(|| E2B.bad_response())?;
         Ok(Reach::Dial {
             url: self.port_url(id, AGENT_PORT, CONNECT_PATH)?.to_string(),
-            token: Secret::new(token),
+            token,
             headers,
             expires_at: Some(expires_at.into()),
         })
@@ -1021,7 +1009,8 @@ mod tests {
         let host = |h: &str| Destination::Host { host: serde_json::from_value(serde_json::json!(h)).unwrap() };
         let open = network(&EgressRequest::Open).unwrap();
         assert_eq!(serde_json::to_value(&open).unwrap(), serde_json::json!({"allowPublicTraffic": false}));
-        let deny = network(&EgressRequest::DenyAll { direct: vec![host("Example.COM."), host("192.0.2.5")] }).unwrap();
+        let cidr = Destination::Cidr { cidr: "192.0.2.5/32".parse().unwrap() };
+        let deny = network(&EgressRequest::DenyAll { direct: vec![host("example.com"), cidr] }).unwrap();
         assert_eq!(
             serde_json::to_value(&deny).unwrap(),
             serde_json::json!({"allowPublicTraffic": false, "denyOut": ["0.0.0.0/0"], "allowOut": ["192.0.2.5/32", "example.com"]})

@@ -3,12 +3,6 @@
 //! recorded from the live relay on 2026-11-06, and the E2B module reads them;
 //! the vendor behind the module's list is a stand-in the test sets.
 #![cfg(unix)]
-use drydock::{
-    HostConnection,
-    config::Config,
-    daemon::{Daemon, HostOption, ProviderApi, Seams},
-};
-use drydock_host::module::{ByteStream, Credentials, HttpClient, Module, Operations, Provider, Provisioned, Result as ModuleResult};
 use drydock_protocol::*;
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -20,7 +14,10 @@ use std::{
 };
 #[path = "support/relay.rs"]
 mod relay;
-use relay::{Digests, Relay, TOKEN, cursor};
+#[path = "support/webhooks.rs"]
+mod webhooks;
+use relay::Relay;
+use webhooks::{Recorded, delivery, events, held, subscribe};
 
 /// The team the recorded sandboxes ran in.
 const TEAM: &str = "01b5d4bb-e26c-4351-900e-23195a681302";
@@ -39,68 +36,6 @@ fn lifecycle() -> Vec<Value> {
 }
 fn body_id(frame: &Value) -> Option<&str> {
     frame["body"]["id"].as_str()
-}
-
-/// E2B's own module reads the deliveries and declares E2B's ways in, for the
-/// team the test names; the list answers from the stand-in's rows.
-struct Recorded {
-    team: &'static str,
-    rows: Arc<Mutex<Vec<Environment>>>,
-}
-#[async_trait::async_trait]
-impl Module for Recorded {
-    fn version(&self) -> &str {
-        "test"
-    }
-    async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> ModuleResult<Arc<dyn Provider>> {
-        let e2b = ProviderConfiguration {
-            module: "e2b".into(),
-            settings: serde_json::from_value(json!({"team_id": self.team})).unwrap(),
-            ..config.clone()
-        };
-        let e2b = drydock_host::e2b::E2bModule::new().configure(name, &e2b, http).await?;
-        Ok(Arc::new(RecordedProvider { e2b, rows: self.rows.clone() }))
-    }
-}
-struct RecordedProvider {
-    e2b: Arc<dyn Provider>,
-    rows: Arc<Mutex<Vec<Environment>>>,
-}
-#[async_trait::async_trait]
-impl Provider for RecordedProvider {
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
-    }
-    fn ways_in(&self) -> Vec<WayIn> {
-        self.e2b.ways_in()
-    }
-    fn operations(&self) -> Operations<'_> {
-        Operations { events: self.e2b.operations().events, ..Operations::default() }
-    }
-    fn readiness(&self, _: &Credentials) -> Readiness {
-        Readiness::Ready
-    }
-    async fn prepare(&self, _: PrepareRequest, _: &Credentials) -> ModuleResult<Prepared> {
-        unimplemented!()
-    }
-    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ModuleResult<Provisioned> {
-        unimplemented!()
-    }
-    async fn list(&self, _: &Credentials) -> ModuleResult<Vec<Environment>> {
-        Ok(self.rows.lock().unwrap().clone())
-    }
-    async fn inspect(&self, _: &str, _: &Credentials) -> ModuleResult<Environment> {
-        unimplemented!()
-    }
-    async fn destroy(&self, _: &str, _: &Credentials) -> ModuleResult<()> {
-        unimplemented!()
-    }
-    async fn reach(&self, _: &str, _: &Credentials) -> ModuleResult<Reach> {
-        unimplemented!()
-    }
-    async fn relay(&self, _: &str, _: &Credentials) -> ModuleResult<ByteStream> {
-        unimplemented!()
-    }
 }
 
 /// The second sandbox as a list reads it: running, with tags of its own.
@@ -122,86 +57,22 @@ fn listed() -> Environment {
 }
 
 /// drydockd with the `e2b` instance reading the relay at `url` on an owned
-/// account, listing only at start: every later observation comes from the relay.
-async fn drydockd(dir: &Path, url: &str, team: &'static str, rows: Vec<Environment>) -> Arc<Daemon> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = dir.join("host.sock");
-    let module = Arc::new(Recorded { team, rows: Arc::new(Mutex::new(rows)) }) as Arc<dyn Module>;
-    let host = drydock_host::Host::new([("recorded-e2b".to_owned(), module)].into());
-    let served = socket.clone();
-    tokio::spawn(async move { host.serve_unix(served, std::future::pending()).await.unwrap() });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !socket.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    std::fs::write(dir.join("relay.token"), format!("{TOKEN}\n")).unwrap();
-    let text = format!(
-        "[providers.e2b]\nmodule = 'recorded-e2b'\nownership = 'owned_account'\n\
-         [providers.e2b.events]\nrelay = '{url}'\nsource = 'e2b'\ntoken = {{ file = '{}' }}\npoll_seconds = 3600\n",
-        dir.join("relay.token").display()
-    );
-    let run = dir.join("run");
-    let option = HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: socket } };
-    Daemon::start_with_seams(Config::parse(&text).unwrap(), &run, run.join("keys"), vec![option], Seams::new(Arc::new(Digests)))
-        .await
-        .unwrap()
-}
-
-/// Waits for drydockd's first list, then its stream past the first snapshot:
-/// what follows is new.
-async fn subscribe(relay: &Relay, dir: &Path, daemon: &Daemon) -> drydock::api::ObservationStream {
-    relay.readied(1).await;
-    taken(dir, None).await;
-    let mut stream = ProviderApi::observe(daemon, None).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(20), stream.next()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(first, ObserveRecord::Snapshot { .. }), "{first:?}");
-    stream
-}
-/// Waits until drydockd stores a relay cursor, `frame`'s when given: it has
-/// read every delivery up to it.
-async fn taken(dir: &Path, frame: Option<&Value>) {
-    let file = dir.join("run/events/e2b.cursor");
-    let want = frame.map(|f| cursor(f).to_string());
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !std::fs::read_to_string(&file).is_ok_and(|c| want.as_ref().is_none_or(|w| c.trim() == w)) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-}
-/// Events until `until` holds of one.
-async fn events(stream: &mut drydock::api::ObservationStream, until: impl Fn(&Event) -> bool) -> Vec<Event> {
-    let mut events = vec![];
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(record) = stream.next().await {
-            if let ObserveRecord::Event { event } = record.unwrap() {
-                let done = until(&event);
-                events.push(event);
-                if done {
-                    return;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("events so far: {events:#?}"));
-    events
-}
-/// The row drydockd holds of `id`, as a new stream's snapshot gives it.
-async fn held(daemon: &Daemon, id: &str) -> Option<Environment> {
-    let mut stream = ProviderApi::observe(daemon, None).await.unwrap();
-    match tokio::time::timeout(Duration::from_secs(20), stream.next()).await.unwrap().unwrap().unwrap() {
-        ObserveRecord::Snapshot { environments, .. } => environments.into_iter().find(|e| e.id == id),
-        other => panic!("{other:?}"),
-    }
-}
-fn delivery(event: &Event) -> Option<&str> {
-    event.observed.as_ref().and_then(|o| o.delivery_id.as_deref())
+/// account for `team`, listing `rows` only at start; past its first list,
+/// its stream is read past the first snapshot.
+async fn drydockd(
+    dir: &Path,
+    relay: &Relay,
+    url: &str,
+    team: &str,
+    rows: Vec<Environment>,
+) -> (Arc<drydock::daemon::Daemon>, drydock::api::ObservationStream) {
+    let module = Arc::new(drydock_host::e2b::E2bModule::new());
+    let settings = json!({"team_id": team});
+    webhooks::host(dir, "e2b", Arc::new(Recorded { module, module_name: "e2b", settings, stand_in: Arc::new(Mutex::new(rows)) })).await;
+    let daemon = webhooks::drydockd(dir, "e2b", url, "owned_account").await;
+    webhooks::caught_up(relay, dir, "e2b").await;
+    let stream = subscribe(&daemon).await;
+    (daemon, stream)
 }
 
 // Each lifecycle type arrives as an event: created is the sandbox's creation
@@ -214,8 +85,7 @@ async fn each_lifecycle_type_arrives_as_an_event_with_the_vendor_state() {
     let dir = tempfile::tempdir().unwrap();
     let frames = lifecycle();
     let (relay, url) = Relay::serving(frames.clone()).await;
-    let daemon = drydockd(dir.path(), &url, TEAM, vec![]).await;
-    let mut stream = subscribe(&relay, dir.path(), &daemon).await;
+    let (_daemon, mut stream) = drydockd(dir.path(), &relay, &url, TEAM, vec![]).await;
     relay.publish(frames.len());
     let events = events(&mut stream, |e| matches!(e.event, EventKind::Gone { .. })).await;
     let kinds: Vec<_> = events.iter().map(|e| (e.event.clone(), e.vendor.as_ref().unwrap().state.as_str(), delivery(e))).collect();
@@ -246,8 +116,7 @@ async fn a_kill_carries_its_reason_and_no_cause() {
     let dir = tempfile::tempdir().unwrap();
     let frames: Vec<_> = recorded().into_iter().filter(|f| f["body"]["sandbox_id"] == KILLED).collect();
     let (relay, url) = Relay::serving(frames.clone()).await;
-    let daemon = drydockd(dir.path(), &url, TEAM, vec![]).await;
-    let mut stream = subscribe(&relay, dir.path(), &daemon).await;
+    let (_daemon, mut stream) = drydockd(dir.path(), &relay, &url, TEAM, vec![]).await;
     relay.publish(1);
     let events = events(&mut stream, |e| matches!(e.event, EventKind::Gone { .. })).await;
     let killed = events.last().unwrap();
@@ -268,8 +137,7 @@ async fn a_delivery_without_metadata_keeps_the_held_tags() {
     let mut paused = frames[1].clone();
     paused["body"]["event_data"].as_object_mut().unwrap().remove("sandbox_metadata").unwrap();
     let (relay, url) = Relay::serving(vec![frames[0].clone(), paused.clone()]).await;
-    let daemon = drydockd(dir.path(), &url, TEAM, vec![listed()]).await;
-    let mut stream = subscribe(&relay, dir.path(), &daemon).await;
+    let (daemon, mut stream) = drydockd(dir.path(), &relay, &url, TEAM, vec![listed()]).await;
     let stated: BTreeMap<String, String> = serde_json::from_value(frames[0]["body"]["event_data"]["sandbox_metadata"].clone()).unwrap();
     assert_ne!(listed().vendor.unwrap().tags.as_ref(), Some(&stated));
     relay.publish(1);
@@ -292,10 +160,9 @@ async fn another_teams_delivery_emits_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let frames = recorded();
     let (relay, url) = Relay::serving(frames.clone()).await;
-    let daemon = drydockd(dir.path(), &url, "another-team", vec![]).await;
-    let mut stream = subscribe(&relay, dir.path(), &daemon).await;
+    let (daemon, mut stream) = drydockd(dir.path(), &relay, &url, "another-team", vec![]).await;
     relay.publish(frames.len());
-    taken(dir.path(), frames.last()).await;
+    webhooks::taken(dir.path(), "e2b", frames.last()).await;
     let next = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
     assert!(!matches!(next, Ok(Some(Ok(ObserveRecord::Event { .. })))), "{next:?}");
     assert_eq!((held(&daemon, SANDBOX).await, held(&daemon, KILLED).await), (None, None));

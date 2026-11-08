@@ -135,11 +135,9 @@ function networkFields(egress: Types["EgressRequest"] | undefined): Network {
       cidrs.add(entry.cidr);
       continue;
     }
-    const host = entry.host.replace(/\.$/, "").toLowerCase();
-    if (isIPv4(host)) cidrs.add(`${host}/32`);
-    else if (host.includes(":") || host.startsWith("["))
+    if (entry.host.includes(":") || entry.host.startsWith("["))
       refused("Modal egress policies cannot allow IPv6");
-    else domains.add(host);
+    domains.add(entry.host);
   }
   if (!cidrs.size && !domains.size) return { outboundCidrAllowlist: [] };
   return {

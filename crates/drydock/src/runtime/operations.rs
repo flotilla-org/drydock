@@ -4,8 +4,33 @@ use crate::{
     api::{ConfigUpdate, ObservationStream, ProviderApi, Provisioned},
     client::Error,
 };
-use module::{ByteStream, prepare_for_platform};
+use module::{
+    ByteStream,
+    egress::{normal_cidr, normal_host},
+    prepare_for_platform,
+};
 type ApiResult<T> = std::result::Result<T, Error>;
+
+/// A request's destinations as every module receives them: host names
+/// lowercase with no final dot, an IPv4 literal host as its /32, and IPv4
+/// CIDRs with their host bits cleared.
+fn normal(egress: &EgressRequest) -> EgressRequest {
+    let EgressRequest::DenyAll { direct } = egress else { return egress.clone() };
+    let host = |host: &HostAddress| -> HostAddress { normal_host(host.as_str()).parse().expect("a host stays one in lowercase") };
+    let cidr = |cidr: &str| normal_cidr(cidr).map(|cidr| cidr.parse::<Cidr>().expect("an IPv4 CIDR"));
+    let direct = direct
+        .iter()
+        .map(|destination| match destination {
+            Destination::Host { host: name } => {
+                let name = host(name);
+                cidr(name.as_str()).map_or(Destination::Host { host: name }, |cidr| Destination::Cidr { cidr })
+            }
+            Destination::HostPort { host: name, port } => Destination::HostPort { host: host(name), port: *port },
+            Destination::Cidr { cidr: given } => Destination::Cidr { cidr: cidr(given.as_str()).unwrap_or(given.clone()) },
+        })
+        .collect();
+    EgressRequest::DenyAll { direct }
+}
 
 impl Runtime {
     fn declaration(&self, name: &str, i: &Instance, masker: &DiagnosticMasker) -> ProviderDeclaration {
@@ -76,7 +101,7 @@ impl ProviderApi for Runtime {
         }
         let instance = self.instance(p).await?;
         let generation = *instance.observation_generation.recover();
-        let r = r.clone();
+        let r = ProvisionRequest { egress: normal(&r.egress), ..r.clone() };
         let result = instance.call(Gate::Provision, self.credential.clone(), |p, c| async move { p.provision(r, &c).await }).await?;
         let (Provisioned::Created(row) | Provisioned::Existing(row)) = &result;
         cache_observation(&instance, row, generation);

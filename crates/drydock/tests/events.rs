@@ -3,14 +3,9 @@
 //! the live relay on 2026-11-05, and the Daytona module reads them; the vendor
 //! behind the module's list and provision is a stand-in the test sets.
 #![cfg(unix)]
-use drydock::{
-    HostConnection,
-    config::Config,
-    daemon::{Daemon, HostOption, ProviderApi, Seams},
-};
-use drydock_host::module::{ByteStream, Credentials, HttpClient, Module, Operations, Provider, Provisioned, Result as ModuleResult};
+use drydock::daemon::{Daemon, ProviderApi};
+use drydock_host::module::Provisioned;
 use drydock_protocol::*;
-use futures::StreamExt;
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -22,7 +17,10 @@ use std::{
 };
 #[path = "support/relay.rs"]
 mod relay;
-use relay::{Digests, Relay, TOKEN, cursor};
+#[path = "support/webhooks.rs"]
+mod webhooks;
+use relay::{Relay, cursor};
+use webhooks::{Recorded, delivery, events, subscribe, taken};
 
 const ORGANIZATION: &str = "9f88ac62-7a81-4056-8477-a477ab86f0f2";
 /// The first recorded run's sandbox: created, stopped, deleted.
@@ -50,29 +48,6 @@ struct Vendor {
     held: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
 }
-/// Daytona's own module reads the deliveries and declares Daytona's ways in;
-/// everything that would call Daytona answers from the vendor stand-in.
-struct Recorded(Arc<Vendor>);
-#[async_trait::async_trait]
-impl Module for Recorded {
-    fn version(&self) -> &str {
-        "test"
-    }
-    async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> ModuleResult<Arc<dyn Provider>> {
-        let daytona = ProviderConfiguration {
-            module: "daytona".into(),
-            settings: serde_json::from_value(json!({"organization_id": ORGANIZATION, "ssh_host_key": "unused"})).unwrap(),
-            ..config.clone()
-        };
-        let daytona = drydock_host::daytona::DaytonaModule.configure(name, &daytona, http).await?;
-        Ok(Arc::new(RecordedProvider { name: name.into(), daytona, vendor: self.0.clone() }))
-    }
-}
-struct RecordedProvider {
-    name: String,
-    daytona: Arc<dyn Provider>,
-    vendor: Arc<Vendor>,
-}
 fn sandbox(provider: &str, state: Observation, vendor: &str) -> Environment {
     Environment {
         id: SANDBOX.into(),
@@ -89,111 +64,39 @@ fn sandbox(provider: &str, state: Observation, vendor: &str) -> Environment {
     }
 }
 #[async_trait::async_trait]
-impl Provider for RecordedProvider {
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
-    }
-    fn ways_in(&self) -> Vec<WayIn> {
-        self.daytona.ways_in()
-    }
-    fn operations(&self) -> Operations<'_> {
-        Operations { events: self.daytona.operations().events, ..Operations::default() }
-    }
-    fn readiness(&self, _: &Credentials) -> Readiness {
-        Readiness::Ready
-    }
-    async fn prepare(&self, _: PrepareRequest, _: &Credentials) -> ModuleResult<Prepared> {
-        unimplemented!()
+impl webhooks::Vendor for Vendor {
+    async fn list(&self) -> Vec<Environment> {
+        self.lists.fetch_add(1, SeqCst);
+        self.rows.lock().unwrap().clone()
     }
     /// Daytona answers a create while the sandbox is still being made.
-    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ModuleResult<Provisioned> {
-        if self.vendor.held.load(SeqCst) {
-            self.vendor.release.notified().await;
+    async fn provision(&self, instance: &str) -> Provisioned {
+        if self.held.load(SeqCst) {
+            self.release.notified().await;
         }
         let preparing = Observation::Transitioning { phase: TransitionPhase::Preparing };
-        let mut made = sandbox(&self.name, preparing, "creating");
-        made.id = self.vendor.made.lock().unwrap().clone().unwrap_or(made.id);
-        Ok(Provisioned::Created(made))
-    }
-    async fn list(&self, _: &Credentials) -> ModuleResult<Vec<Environment>> {
-        self.vendor.lists.fetch_add(1, SeqCst);
-        Ok(self.vendor.rows.lock().unwrap().clone())
-    }
-    async fn inspect(&self, _: &str, _: &Credentials) -> ModuleResult<Environment> {
-        unimplemented!()
-    }
-    async fn destroy(&self, _: &str, _: &Credentials) -> ModuleResult<()> {
-        unimplemented!()
-    }
-    async fn reach(&self, _: &str, _: &Credentials) -> ModuleResult<Reach> {
-        unimplemented!()
-    }
-    async fn relay(&self, _: &str, _: &Credentials) -> ModuleResult<ByteStream> {
-        unimplemented!()
+        let mut made = sandbox(instance, preparing, "creating");
+        made.id = self.made.lock().unwrap().clone().unwrap_or(made.id);
+        Provisioned::Created(made)
     }
 }
 
-/// A host serving the module, once per test directory.
+/// A host serving Daytona's module over `vendor`, once per test directory.
 async fn host(dir: &Path, vendor: &Arc<Vendor>) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = dir.join("host.sock");
-    let module = Arc::new(Recorded(vendor.clone())) as Arc<dyn Module>;
-    let host = drydock_host::Host::new([("recorded-daytona".to_owned(), module)].into());
-    let served = socket.clone();
-    tokio::spawn(async move { host.serve_unix(served, std::future::pending()).await.unwrap() });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !socket.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    std::fs::write(dir.join("relay.token"), format!("{TOKEN}\n")).unwrap();
+    let module = Arc::new(drydock_host::daytona::DaytonaModule);
+    let settings = json!({"organization_id": ORGANIZATION, "ssh_host_key": "unused"});
+    webhooks::host(dir, "daytona", Arc::new(Recorded { module, module_name: "daytona", settings, stand_in: vendor.clone() })).await;
 }
-/// drydockd with the `daytona` instance reading the relay at `url`, listing
-/// only at start: every later observation comes from the relay.
+/// drydockd with the `daytona` instance reading the relay at `url`.
 async fn drydockd(dir: &Path, url: &str, ownership: &str) -> Arc<Daemon> {
-    let text = format!(
-        "[providers.daytona]\nmodule = 'recorded-daytona'\nownership = '{ownership}'\n\
-         [providers.daytona.events]\nrelay = '{url}'\nsource = 'daytona'\ntoken = {{ file = '{}' }}\npoll_seconds = 3600\n",
-        dir.join("relay.token").display()
-    );
-    let run = dir.join("run");
-    let option =
-        HostOption { optional: false, name: "rust".into(), connection: HostConnection::ExternalUnix { path: dir.join("host.sock") } };
-    Daemon::start_with_seams(Config::parse(&text).unwrap(), &run, run.join("keys"), vec![option], Seams::new(Arc::new(Digests)))
-        .await
-        .unwrap()
+    webhooks::drydockd(dir, "daytona", url, ownership).await
 }
-
-/// Waits for drydockd's first list after a start with no stored cursor: the
-/// relay's `ready` then gets a cursor stored once that list is in.
 async fn caught_up(relay: &Relay, dir: &Path) {
-    relay.readied(1).await;
-    let cursor = dir.join("run/events/daytona.cursor");
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while !cursor.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    webhooks::caught_up(relay, dir, "daytona").await
 }
-/// drydockd's event stream, read past its first snapshot: what follows is new.
-async fn subscribe(daemon: &Daemon) -> drydock::api::ObservationStream {
-    let mut stream = ProviderApi::observe(daemon, None).await.unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(20), stream.next()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(first, ObserveRecord::Snapshot { .. }), "{first:?}");
-    stream
-}
-/// The row drydockd holds of the recorded sandbox, as a new stream's snapshot gives it.
+/// The row drydockd holds of the recorded sandbox.
 async fn held(daemon: &Daemon) -> Option<Environment> {
-    let mut stream = ProviderApi::observe(daemon, None).await.unwrap();
-    match tokio::time::timeout(Duration::from_secs(20), stream.next()).await.unwrap().unwrap().unwrap() {
-        ObserveRecord::Snapshot { environments, .. } => environments.into_iter().find(|e| e.id == SANDBOX),
-        other => panic!("{other:?}"),
-    }
+    webhooks::held(daemon, SANDBOX).await
 }
 /// A provision of the `vessel` label, answered once the settling wait ends.
 fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned, drydock::client::Error>> {
@@ -214,30 +117,6 @@ fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned
     let daemon = daemon.clone();
     tokio::spawn(async move { ProviderApi::provision(&*daemon, "daytona", &request).await })
 }
-/// Events about the recorded sandboxes, until `until` holds of one.
-async fn events(stream: &mut drydock::api::ObservationStream, until: impl Fn(&Event) -> bool) -> Vec<Event> {
-    let mut events = vec![];
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while let Some(record) = stream.next().await {
-            if let ObserveRecord::Event { event } = record.unwrap()
-                && [SANDBOX, CREATING].contains(&event.id.as_str())
-            {
-                let done = until(&event);
-                events.push(event);
-                if done {
-                    return;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("events so far: {events:#?}"));
-    events
-}
-fn delivery(event: &Event) -> Option<&str> {
-    event.observed.as_ref().and_then(|o| o.delivery_id.as_deref())
-}
-
 // Every state change Daytona reports arrives as its own event, the
 // transitional ones included, each with Daytona's own state, its timestamp,
 // and the delivery it came in. The first update for a sandbox drydockd does
@@ -448,15 +327,7 @@ async fn deliveries_before_a_provision_returns_count_once_it_does() {
     let mut stream = subscribe(&daemon).await;
     let provision = provision(&daemon);
     relay.publish(2);
-    let cursor_file = dir.path().join("run/events/daytona.cursor");
-    let taken = cursor(&frames[1]).to_string();
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while std::fs::read_to_string(&cursor_file).unwrap() != taken {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    taken(dir.path(), "daytona", Some(&frames[1])).await;
     vendor.release.notify_one();
     relay.publish(3);
     let events = events(&mut stream, |e| matches!(e.event, EventKind::Running { .. })).await;
