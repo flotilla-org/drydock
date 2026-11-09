@@ -439,7 +439,13 @@ async fn supervise_provisions_and_prints_the_token() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), format!("drydock-tcp-token {}\n", supplied.secret()));
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o600);
     assert_eq!(read_token(&file).unwrap(), supplied);
-    hello(&socket).await;
+    // `--supervise` returns only once the agent serves: no retry here.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        drydock_agent::Client::connect(Box::new(stream), "hello-only").await.unwrap();
+    })
+    .await
+    .unwrap();
     let read_back =
         Command::new(env!("CARGO_BIN_EXE_drydock-agent")).args(["--print-token", "--tcp-token-file"]).arg(&file).output().unwrap();
     assert!(read_back.status.success());

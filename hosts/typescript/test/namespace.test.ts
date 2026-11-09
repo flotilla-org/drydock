@@ -538,7 +538,8 @@ test("relay runs the agent bridge", async () => {
 });
 
 // Egress is enforced only when the operator's probe proves it as root on a
-// running, restricted devbox. A probe that fails or prints no proof fails the
+// running, restricted devbox; the probe runs as its own argv, and a proof from
+// another user reads as advisory. A probe that fails or prints no proof fails the
 // inspect rather than reading as unmeasured.
 test("egress is enforced only on a passing probe", async () => {
   const { standIn, provider, context, provision } = await setup({
@@ -557,7 +558,11 @@ test("egress is enforced only on a passing probe", async () => {
     const row = await provider.inspect(deny.id, context);
     assert.deepEqual([row.egress, row.egress_measured], [egress, true]);
   }
-  assert.ok(standIn.calls.some((c) => c.includes("DRYDOCK_PROBE_DENY_ALL=1")));
+  assert.ok(
+    standIn.calls.includes(
+      "exec DRYDOCK_PROBE_DENY_ALL=1 /opt/drydock/egress-probe",
+    ),
+  );
   for (const [exit, stdout] of [
     [1, JSON.stringify(pass)],
     [0, "not json"],

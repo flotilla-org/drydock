@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { BlockList, isIP, isIPv4, isIPv6 } from "node:net";
 import {
@@ -40,19 +39,18 @@ const PLATFORM: Types["Platform"] = { os: "linux", architecture: "amd64" };
 // drydockd cannot start the agent here: its upload bootstrap needs the files
 // and exec ports, which this host does not offer, and listens on loopback,
 // which Modal's connect-token edge (https://modal.com/docs/guide/sandbox-networking)
-// was seen not to reach. So the module starts it, listening on all addresses,
-// and waits up to `agent_wait_seconds` for its socket. That setting is
-// interpolated into the script, so its schema must keep it an integer.
-const ensureAgent = (waitSeconds: number) =>
-  [
-    "t=$(head -c 256)",
-    "umask 077",
-    "mkdir -p /run/drydock",
-    `if [ ! -s ${TOKEN_FILE} ]; then printf %s "$t" > ${TOKEN_FILE}.$$ && ln ${TOKEN_FILE}.$$ ${TOKEN_FILE} 2>/dev/null; rm -f ${TOKEN_FILE}.$$; fi`,
-    `${AGENT} --supervise --tcp 0.0.0.0:${PORT} --tcp-token-file ${TOKEN_FILE} --socket ${SOCKET} || exit 1`,
-    `for i in $(seq ${waitSeconds * 10}); do [ -S ${SOCKET} ] && exec cat ${TOKEN_FILE}; sleep 0.1; done`,
-    "exit 1",
-  ].join("\n");
+// was seen not to reach. So the module starts it, listening on all addresses.
+const AGENT_START = [
+  AGENT,
+  "--supervise",
+  "--tcp",
+  `0.0.0.0:${PORT}`,
+  "--tcp-token-file",
+  TOKEN_FILE,
+  "--print-token",
+  "--socket",
+  SOCKET,
+];
 
 export type Token = { token_id: string; token_secret: string };
 type Settings = {
@@ -63,15 +61,12 @@ type Settings = {
   lifetime_seconds: number;
   /** How many tag reads list runs at once (see `list`). */
   list_concurrency: number;
-  /** How long provision and reach wait for the agent's socket. */
-  agent_wait_seconds: number;
 };
 const DEFAULTS: Settings = {
   app: "drydock",
   runtime: "vm",
   lifetime_seconds: 86_400,
   list_concurrency: 8,
-  agent_wait_seconds: 10,
 };
 const objectName = "^[A-Za-z0-9._-]{1,63}$";
 const settingsValid = compile({
@@ -84,7 +79,6 @@ const settingsValid = compile({
     // Modal's sandbox timeout is at most 24 hours.
     lifetime_seconds: { type: "integer", minimum: 1, maximum: 86_400 },
     list_concurrency: { type: "integer", minimum: 1, maximum: 64 },
-    agent_wait_seconds: { type: "integer", minimum: 1, maximum: 600 },
   },
 });
 
@@ -542,28 +536,18 @@ class Modal implements Provider {
 
   private async ensureAgent(sandbox: Sandbox) {
     const process = await call(() =>
-      sandbox.exec(
-        ["sh", "-c", ensureAgent(this.settings.agent_wait_seconds)],
-        {
-          mode: "binary",
-          stdout: "pipe",
-          stderr: "ignore",
-        },
-      ),
+      sandbox.exec(AGENT_START, {
+        mode: "binary",
+        stdout: "pipe",
+        stderr: "ignore",
+      }),
     );
-    const stdin = process.stdin.getWriter();
-    await call(() =>
-      stdin.write(
-        new TextEncoder().encode(randomBytes(32).toString("base64url")),
-      ),
-    );
-    await call(() => stdin.close());
     const [stdout, code] = await Promise.all([
       new Response(process.stdout as ReadableStream).text(),
       call(() => process.wait()),
     ]);
-    const token = stdout.trim();
-    if (code !== 0 || !/^[A-Za-z0-9_-]{43,}$/.test(token))
+    const token = /^drydock-tcp-token ([A-Za-z0-9_-]{43,})$/m.exec(stdout)?.[1];
+    if (code !== 0 || !token)
       throw new ProtocolFailure({
         kind: "internal",
         reason: "drydock's agent did not start in the Modal sandbox",

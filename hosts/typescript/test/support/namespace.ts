@@ -96,8 +96,14 @@ export class StandIn implements Vendor {
           return target.services.at(-1)!;
         },
       },
-      async exec(argv: readonly string[]) {
-        standIn.calls.push(`exec ${argv.join(" ")}`);
+      async exec(
+        argv: readonly string[],
+        options?: { env?: Record<string, string> },
+      ) {
+        const env = Object.entries(options?.env ?? {}).map(
+          ([name, value]) => `${name}=${value} `,
+        );
+        standIn.calls.push(`exec ${env.join("")}${argv.join(" ")}`);
         return {
           exitCode: standIn.execExit,
           signal: null,

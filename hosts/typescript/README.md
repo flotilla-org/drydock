@@ -95,7 +95,7 @@ drydockd's, as the instance's `semantics` and `ownership` ask. Settings:
 `repository` (default `drydock-vessel`), `site` (default the SDK's `iad`),
 `push_chunk_bytes` (default 64 MiB), `poll_interval_ms` (default 30000),
 `list_refreshes` (concurrent refreshes while listing, default 8) and
-`egress_probe` (`{command: [...]}`, run as root on inspect). The credential is
+`egress_probe` (`{command: [...]}`, run on inspect with `DRYDOCK_PROBE_DENY_ALL` set). The credential is
 `{"bearer_token": …}`, handed to the SDK through a TokenSource, never its
 defaults or token files, and used as the `nscr.io` push password (user `token`)
 without touching any docker configuration. It needs the grants `devbox *`,
@@ -139,8 +139,8 @@ wait`, `ingress access` and `containerregistry *`,
   refuses CIDR, port and address entries; an absent request is deny all. The
   capability declares Namespace's documented egress model (`EGRESS_MODEL`),
   never a verification; an environment reports enforced only when
-  `egress_probe` passes as root, and a probe that fails or prints no proof
-  fails the inspect.
+  `egress_probe` proves it as root (a proof from another user reads as
+  advisory), and a probe that fails or prints no proof fails the inspect.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
   platform class) as Namespace gives it: a class without stated use has no row.
   The grants above do not cover it: without its grant quota is refused and the
@@ -163,8 +163,7 @@ The built-in `modal` module drives Modal sandboxes through the JavaScript SDK
 `drydock`: the one app holding every sandbox of the instance, created if
 missing), `environment`, `runtime` (`vm`, the default, or `gvisor`),
 `lifetime_seconds` (Modal's timeout for each sandbox; default 86400, Modal's
-longest), `list_concurrency` (tag reads list runs at once; default 8, at most 64) and
-`agent_wait_seconds` (how long the agent's socket is waited for; default 10).
+longest) and `list_concurrency` (tag reads list runs at once; default 8, at most 64).
 `concurrency_limit` is gone with quota: a configuration that still sets it is
 refused, as any unknown key is. The credential is
 `{"token_id": …, "token_secret": …}`, handed to the SDK client directly, never
@@ -196,12 +195,11 @@ and sandbox backend from those, so run the host without them.
   fixed and cannot be sized, so a requested disk is accepted and not applied.
   Modal answers a create with the sandbox's id alone, so the row's state is
   unknown. A refused create is refused in Modal's words.
-  The module then starts the agent by a root exec that gets a
-  fresh TCP token on stdin: it keeps the token already in
-  `/run/drydock/tcp.token` (0600) or writes this one, runs
-  `--supervise --tcp 0.0.0.0:7811 --tcp-token-file … --socket …`
-  (idempotent; all addresses, since Modal's edge cannot reach loopback), waits up
-  to `agent_wait_seconds` for the socket and prints the token in use, which the
+  The module then starts the agent by one argv exec, as root:
+  `--supervise --tcp 0.0.0.0:7811 --tcp-token-file /run/drydock/tcp.token`
+  `--print-token --socket …` (idempotent; all addresses, since Modal's edge
+  cannot reach loopback). The agent keeps the token file or writes a fresh
+  token, returns once it is serving, and prints the token in use, which the
   module remembers. The token is never on an argv, in the environment or in
   Modal's configuration. drydockd cannot start the agent itself: its upload
   bootstrap needs the files and exec ports this host does not offer, and
