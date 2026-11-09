@@ -1,13 +1,15 @@
 //! What every Rust provider module needs and none should write again: the
 //! vendor's HTTP API with typed bodies and answers ([`api`]), commands run
 //! in a guest ([`guest`]), destinations and addresses ([`egress`]),
-//! prepared-form names and prepare's checks ([`image`]), and sizes, waits,
+//! prepared-form names and prepare's checks ([`image`]), a relay over a
+//! JSON-framed process stream ([`relay`]), and sizes, waits,
 //! lifecycle state tables and ownership tags (here). A module keeps only
 //! what differs: its endpoints, its wire types, its states, its quirks.
 pub mod api;
 pub mod egress;
 pub mod guest;
 pub mod image;
+pub mod relay;
 
 use crate::module::{Result, refused};
 use drydock_protocol::*;

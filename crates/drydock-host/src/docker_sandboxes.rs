@@ -11,6 +11,7 @@ use crate::{
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, cut, operation},
         guest::{Guest, GuestOutput},
         image::{check_prepare, check_prepared},
+        relay::{Frame, Framing, relay},
     },
     module::*,
 };
@@ -27,7 +28,7 @@ use drydock_transport::websocket::{
         http::{HeaderMap, HeaderValue, header},
     },
 };
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use reqwest::Method;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
@@ -36,14 +37,11 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 const DOCKER: Vendor = Vendor("Docker Sandboxes");
 const DOCKER_HUB: Vendor = Vendor("Docker Hub");
 const AGENT: &str = "/opt/drydock/drydock-agent";
 const SUBPROTOCOL: &str = "sandboxes.v1";
-/// The most stdin bytes one interact frame carries.
-const STDIN_FRAME: usize = 32 << 10;
 /// How long before an exchanged access token expires a new one is asked for.
 const RENEW_MARGIN: Duration = Duration::from_secs(60);
 
@@ -137,8 +135,6 @@ struct Executed {
 struct Process {
     name: Text,
 }
-/// One server frame on an interact stream: output, its end, a heartbeat, or
-/// the error that ends it.
 #[derive(Deserialize)]
 struct Output {
     chunk: Option<Chunk>,
@@ -553,11 +549,7 @@ impl Provider for DockerSandboxes {
         let process: Process = endpoint.call(Method::POST, endpoint.url(&["v1", "processes"])?, Body::json(&body)?, &scoped).await?;
         let pid = process.name.strip_prefix("processes/").filter(|p| !p.is_empty()).ok_or_else(|| DOCKER.bad_response())?;
         match self.attach(&endpoint, &scoped, &process.name, pid).await {
-            Ok(socket) => {
-                let (near, far) = tokio::io::duplex(1 << 16);
-                tokio::spawn(interact(socket, far));
-                Ok(Box::new(near))
-            }
+            Ok(socket) => Ok(relay(socket, FRAMING)),
             Err(error) => {
                 // The bridge would wait on stdin for good: end it, as far as Docker lets.
                 let url = endpoint.url(&["v1", "processes", pid, "signal"])?;
@@ -600,62 +592,24 @@ impl DockerSandboxes {
     }
 }
 
-/// Carries `local`'s bytes to the process's stdin, closing it at their end,
-/// and its stdout back, until the process exits, Docker ends the stream, or
-/// either side fails.
-async fn interact(socket: WebSocket, local: DuplexStream) {
-    let (mut frames_out, mut frames_in) = socket.split();
-    let (mut reader, mut writer) = tokio::io::split(local);
-    let input = async {
-        let mut buffer = vec![0; STDIN_FRAME];
-        loop {
-            // Reading the local end of a duplex does not fail; if it did, its
-            // end would be stdin's end all the same.
-            let read = reader.read(&mut buffer).await.unwrap_or(0);
-            let frame = if read == 0 { json!({"closeStdin": true}) } else { json!({"stdin": STANDARD.encode(&buffer[..read])}) };
-            if frames_out.send(Message::text(frame.to_string())).await.is_err() || read == 0 {
-                break;
-            }
+/// Docker's interact frames: stdin out in base64, closed by its own frame;
+/// back come output, its end, a heartbeat, or the error that ends it.
+const FRAMING: Framing<Output> = Framing {
+    vendor: DOCKER,
+    stdin: |bytes| if bytes.is_empty() { json!({"closeStdin": true}) } else { json!({"stdin": STANDARD.encode(bytes)}) },
+    output: |frame| {
+        if frame.code.is_some() {
+            tracing::debug!("Docker Sandboxes interact ended with an error frame");
         }
-        std::future::pending::<()>().await
-    };
-    let output = async {
-        while let Some(Ok(message)) = frames_in.next().await {
-            let text = match message {
-                Message::Text(text) => text,
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => break,
-                _ => {
-                    tracing::debug!("Docker Sandboxes interact sent a frame that is not text; the relay ends");
-                    break;
-                }
-            };
-            let Ok(frame) = serde_json::from_str::<Output>(text.as_str()) else {
-                tracing::debug!("Docker Sandboxes interact sent a frame that is not its output; the relay ends");
-                break;
-            };
-            if frame.code.is_some() {
-                tracing::debug!("Docker Sandboxes interact ended with an error frame");
-            }
-            if frame.exited.is_some() || frame.code.is_some() {
-                break;
-            }
-            let Some(chunk) = frame.chunk.filter(|c| c.stream.as_deref() == Some("stdout")) else { continue };
-            let Ok(bytes) = STANDARD.decode(chunk.data.unwrap_or_default()) else {
-                tracing::debug!("Docker Sandboxes interact sent output that is not base64; the relay ends");
-                break;
-            };
-            if writer.write_all(&bytes).await.is_err() {
-                break;
-            }
+        if frame.exited.is_some() || frame.code.is_some() {
+            return Some(Frame::End);
         }
-        let _ = writer.shutdown().await;
-    };
-    tokio::select! {
-        () = input => {}
-        () = output => {}
-    }
-}
+        match frame.chunk.filter(|c| c.stream.as_deref() == Some("stdout")) {
+            Some(chunk) => STANDARD.decode(chunk.data.unwrap_or_default()).ok().map(Frame::Stdout),
+            None => Some(Frame::Other),
+        }
+    },
+};
 
 /// Stop and start. Docker starts a sandbox by id alone, so the token is the id.
 #[async_trait]

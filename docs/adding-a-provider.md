@@ -143,7 +143,8 @@ does:
   loopback for a dial reach (E2B, Runtime). Without one, reach is a relay:
   `reach` returns `Reach::relay(name, id)` and `relay` returns a byte stream
   to the agent's socket. Docker's relay runs `drydock-agent --bridge` as a
-  process and carries its stdin and stdout over Docker's interact WebSocket.
+  process and carries its stdin and stdout over Docker's interact WebSocket,
+  through `kit::relay` given Docker's `Framing`.
 - **Platforms and image routes.** `platforms` lists what the vendor runs,
   first preferred. `image_routes` says how an image gets in. Docker takes a
   public image by digest: `RegistryPull` with `Anonymous` auth, credential
