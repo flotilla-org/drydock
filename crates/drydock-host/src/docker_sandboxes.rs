@@ -224,7 +224,8 @@ impl Module for DockerSandboxesModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 }
+        let (_, cpus, mib) = SHAPES[0];
+        Size { cpus: cpus as f64, memory_bytes: mib * MIB, disk_bytes: 0 }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
@@ -298,14 +299,15 @@ fn expiry(token: &str) -> Option<SystemTime> {
 }
 
 impl DockerSandboxes {
-    /// The bearer for management calls: the credential itself, or, for a
-    /// personal access token and its owner, the access token Docker Hub
-    /// exchanges it for, held until shortly before it expires.
+    /// The bearer for management calls: the access token Docker Hub exchanges
+    /// the personal access token and its owner for, held until shortly before
+    /// it expires.
     async fn access(&self, c: &Credentials) -> Result<Credentials> {
-        let Some(credential) = c.token().filter(|t| t.expose().trim_start().starts_with('{')) else { return Ok(c.clone()) };
-        let pat: Pat = serde_json::from_str(credential.expose()).map_err(|_| ProtocolError::CredentialRejected {
-            reason: r#"a Docker Sandboxes credential is a token or {"username": …, "personal_access_token": …}"#.into(),
-        })?;
+        let rejected = || ProtocolError::CredentialRejected {
+            reason: r#"a Docker Sandboxes credential is {"username": …, "personal_access_token": …}"#.into(),
+        };
+        let credential = c.token().ok_or_else(rejected)?;
+        let pat: Pat = serde_json::from_str(credential.expose()).map_err(|_| rejected())?;
         let digest = kit::digest(credential.expose());
         let held = self
             .held
@@ -397,13 +399,18 @@ impl DockerSandboxes {
     }
 }
 
-/// Docker sizes CPUs and memory; it takes no disk size.
+/// Docker's sandbox shapes: a name, whole vCPUs and MiB of memory. Docker
+/// takes no disk size.
+const SHAPES: &[(&str, u64, u64)] = &[("Micro", 1, 2048), ("Small", 2, 4096), ("Medium", 4, 8192), ("Large", 8, 16384), ("XL", 16, 32768)];
+
+/// The size as Docker's resources, when it is one of Docker's shapes.
 fn resources(size: &Size) -> Result<Value> {
-    let cpus = size.cpus.is_finite() && size.cpus >= 1.0 && size.cpus.fract() == 0.0;
-    if !cpus || size.memory_bytes == 0 || !size.memory_bytes.is_multiple_of(MIB) || size.disk_bytes != 0 {
-        return Err(refused("Docker Sandboxes sizes whole vCPUs and memory in whole MiB, and no disk: ask for a disk of 0"));
-    }
-    Ok(json!({"cpus": size.cpus as u64, "memoryMib": size.memory_bytes / MIB}))
+    let shape = SHAPES.iter().find(|(_, cpus, mib)| size.cpus == *cpus as f64 && size.memory_bytes == mib * MIB && size.disk_bytes == 0);
+    let Some((_, cpus, mib)) = shape else {
+        let shapes: Vec<_> = SHAPES.iter().map(|(name, cpus, mib)| format!("{name} ({cpus} CPU / {mib} MiB)")).collect();
+        return Err(refused(format!("Docker Sandboxes' supported shapes are {}, with a disk of 0", shapes.join(", "))));
+    };
+    Ok(json!({"cpus": cpus, "memoryMib": mib}))
 }
 /// A deny-all request is the sandbox's own policy document; an open one sends
 /// none.
@@ -543,13 +550,19 @@ impl Provider for DockerSandboxes {
             }
         }
     }
-    /// The sandbox and its installed network policy. Egress is enforced when
-    /// Docker states a deny-all policy that holds the sandbox's own
-    /// (`attached`) document: an account's default alone has been seen not to
-    /// apply to a sandbox without one.
+    /// The sandbox and, while it runs, its installed network policy. Egress is
+    /// enforced when Docker states a deny-all policy that holds the sandbox's
+    /// own (`attached`) document: an account's default alone has been seen not
+    /// to apply to a sandbox without one. Docker states a policy only for a
+    /// running sandbox; in any other state egress is not stated.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         let c = &self.access(c).await?;
-        let mut environment = self.environment(self.sandbox(id, c).await?);
+        let sandbox = self.sandbox(id, c).await?;
+        let running = &*sandbox.core.status == "running";
+        let mut environment = self.environment(sandbox);
+        if !running {
+            return Ok(environment);
+        }
         let policies: Policies = self.api.get(self.sandbox_url(id, &["network-policies"])?, c).await?;
         let own = policies.exact.nodes.iter().any(|n| n.source.as_ref().is_some_and(|s| s.origin == "attached"));
         if &*policies.effective.mode == "denyAll" && own {
@@ -739,16 +752,22 @@ mod tests {
             serde_json::from_slice(&self.body).unwrap_or_default()
         }
     }
-    /// Answers each request with the next scripted (status, body).
+    /// Answers each request with the next scripted (status, body). With an
+    /// access token, Docker Hub's exchanges are answered with it and not
+    /// recorded.
     #[derive(Default)]
     struct Script {
         answers: Mutex<Vec<(u16, String)>>,
         asked: Mutex<Vec<Asked>>,
+        access_token: Option<&'static str>,
     }
     #[async_trait]
     impl HttpClient for Script {
         async fn execute(&self, request: reqwest::Request, _: &ChannelLabel) -> std::result::Result<http::Response<Bytes>, String> {
             let url = request.url();
+            if let Some(token) = self.access_token.filter(|_| url.host_str() == Some("hub.docker.com")) {
+                return Ok(http::Response::new(Bytes::from(format!(r#"{{"access_token":"{token}"}}"#))));
+            }
             let query = url.query().map(|q| format!("?{q}")).unwrap_or_default();
             let header = |name| request.headers().get(name).map(|v: &HeaderValue| v.to_str().unwrap().to_owned());
             self.asked.lock().unwrap().push(Asked {
@@ -780,13 +799,20 @@ mod tests {
         let config = ProviderConfiguration { module: "docker_sandboxes".into(), settings, ownership, ..Default::default() };
         DockerSandboxesModule::with_dialer(dialer).configure("ds", &config, script).await
     }
+    /// A script whose Docker Hub exchanges answer the access token `k`.
+    fn script(answers: &[(u16, &str)]) -> Arc<Script> {
+        let answers = answers.iter().map(|(status, body)| (*status, (*body).to_owned())).collect();
+        Arc::new(Script { answers: Mutex::new(answers), access_token: Some("k"), ..Script::default() })
+    }
     async fn docker(ownership: Ownership, answers: Vec<(u16, &str)>) -> (Arc<dyn Provider>, Arc<Script>) {
-        let answers = answers.into_iter().map(|(status, body)| (status, body.to_owned())).collect();
-        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        let script = script(&answers);
         (configure(ownership, json!({}), script.clone(), Arc::new(drydock_transport::memory().0)).await.unwrap(), script)
     }
+    fn pat(username: &str) -> Credentials {
+        Credentials::new(Some(Secret::new(format!(r#"{{"username":"{username}","personal_access_token":"dckr_pat_x"}}"#))))
+    }
     fn key() -> Credentials {
-        Credentials::new(Some(Secret::new("k")))
+        pat("u")
     }
     const ID: &str = "sb1";
     const API: &str = "connect.docker.com/sandboxes/v1";
@@ -844,18 +870,13 @@ mod tests {
     }
 
     // What Docker cannot hold is refused in its terms before any call: a port
-    // in a policy, a disk size, a fractional CPU, a private registry's credential.
+    // in a policy, a private registry's credential.
     #[tokio::test]
     async fn requests_docker_cannot_hold_are_refused_before_any_call() {
         let (docker, script) = docker(Ownership::SharedAccount, vec![]).await;
         let port = Destination::HostPort { host: "db.example".parse().unwrap(), port: serde_json::from_value(json!(5432)).unwrap() };
-        for request in [
-            request(EgressRequest::DenyAll { direct: vec![port] }, size()),
-            request(EgressRequest::Open, Size { disk_bytes: 1 << 30, ..size() }),
-            request(EgressRequest::Open, Size { cpus: 1.5, ..size() }),
-        ] {
-            assert!(matches!(docker.provision(request, &key()).await, Err(ProtocolError::Refused { .. })));
-        }
+        let denied = docker.provision(request(EgressRequest::DenyAll { direct: vec![port] }, size()), &key()).await;
+        assert!(matches!(denied, Err(ProtocolError::Refused { .. })));
         let prepare = PrepareRequest {
             size: size(),
             platform: Some(platform()),
@@ -867,6 +888,32 @@ mod tests {
         assert!(matches!(docker.prepare(prepare.clone(), &key()).await, Err(ProtocolError::Refused { .. })));
         assert_eq!(docker.prepare(PrepareRequest { image_pull: None, ..prepare }, &key()).await.unwrap().id, DIGEST);
         assert!(script.lines().is_empty());
+    }
+
+    // A size is one of Docker's shapes, the smallest being Micro, and is sent
+    // as its CPUs and MiB. Any other size, or any disk, is refused naming the
+    // shapes before any call.
+    #[tokio::test]
+    async fn sizes_are_dockers_shapes() {
+        let shapes = [(1, 2048), (2, 4096), (4, 8192), (8, 16384), (16, 32768)];
+        let (docker, script) = docker(Ownership::OwnedAccount, vec![(202, CREATING); shapes.len()]).await;
+        for (cpus, mib) in shapes {
+            let size = Size { cpus: cpus as f64, memory_bytes: mib * MIB, disk_bytes: 0 };
+            docker.provision(request(EgressRequest::Open, size), &key()).await.unwrap();
+        }
+        let sent: Vec<_> = script.asked.lock().unwrap().iter().map(|a| a.json()["resources"].clone()).collect();
+        assert_eq!(sent, shapes.map(|(cpus, mib)| json!({"cpus": cpus, "memoryMib": mib})));
+        for size in
+            [Size { cpus: 1.0, memory_bytes: 1 << 30, ..size() }, Size { cpus: 1.5, ..size() }, Size { disk_bytes: 1 << 30, ..size() }]
+        {
+            let Err(ProtocolError::Refused { reason }) = docker.provision(request(EgressRequest::Open, size), &key()).await else {
+                panic!("not refused")
+            };
+            assert!(reason.contains("Micro (1 CPU / 2048 MiB), Small (2 CPU / 4096 MiB)"), "{reason}");
+        }
+        assert_eq!(script.lines().len(), shapes.len());
+        let smallest = DockerSandboxesModule::with_dialer(Arc::new(drydock_transport::memory().0)).smallest_size();
+        assert_eq!(smallest, Size { cpus: 1.0, memory_bytes: 2048 * MIB, disk_bytes: 0 });
     }
 
     // List follows every page; a page without sandboxes holds none, as
@@ -924,6 +971,17 @@ mod tests {
             ]
         );
         assert_eq!(script.lines()[..2], [format!("GET {API}/sandboxes/{ID}"), format!("GET {API}/sandboxes/{ID}/network-policies")]);
+    }
+
+    // Docker states a sandbox's policy only while it runs: inspect of a
+    // sandbox in any other state reads the sandbox alone and states no egress.
+    #[tokio::test]
+    async fn inspect_states_no_egress_for_a_sandbox_not_running() {
+        let stopped = RUNNING.replace(r#""status":"running""#, r#""status":"stopped""#);
+        let (docker, script) = docker(Ownership::OwnedAccount, vec![(200, &stopped)]).await;
+        let e = docker.inspect(ID, &key()).await.unwrap();
+        assert_eq!((e.state, e.egress, e.egress_policy), (Observation::Stopped { cause: None }, Enforcement::Advisory, None));
+        assert_eq!(script.lines(), [format!("GET {API}/sandboxes/{ID}")]);
     }
 
     // Destroy, stop and start each read the sandbox for its etag and send it
@@ -1015,10 +1073,11 @@ mod tests {
         assert_eq!((content.body.as_slice(), content.bearer.as_deref()), (&b"agent"[..], Some("Bearer scoped")));
     }
 
-    // A token is the bearer as it is. A personal access token and its owner
-    // are exchanged at Docker Hub, without the API's bearer, for an access
-    // token that is used until shortly before it expires; one that states no
-    // expiry is exchanged again for each call. Docker Hub's 401 rejects it.
+    // A personal access token and its owner are exchanged at Docker Hub,
+    // without the API's bearer, for an access token that is used until shortly
+    // before it expires; one that states no expiry is exchanged again for each
+    // call. Docker Hub's 401 rejects it, and a bare token, which Docker's API
+    // does not take as a bearer, is rejected before any call.
     #[tokio::test]
     async fn personal_access_tokens_are_exchanged_until_their_token_expires() {
         let jwt = |claims: Value| format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims.to_string()));
@@ -1027,9 +1086,10 @@ mod tests {
         let (first, second) = (exchanged(&lasting), exchanged(&unstated));
         let answers =
             vec![(200, &*first), (200, "{}"), (200, "{}"), (200, &*second), (200, "{}"), (200, &*second), (200, "{}"), (401, "{}")];
-        let (exchanging, script) = docker(Ownership::OwnedAccount, answers).await;
-        let pat =
-            |user: &str| Credentials::new(Some(Secret::new(format!(r#"{{"username":"{user}","personal_access_token":"dckr_pat_x"}}"#))));
+        let answers = answers.into_iter().map(|(status, body)| (status, body.to_owned())).collect();
+        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        let exchanging =
+            configure(Ownership::OwnedAccount, json!({}), script.clone(), Arc::new(drydock_transport::memory().0)).await.unwrap();
         for credential in [pat("a"), pat("a"), pat("b"), pat("b")] {
             exchanging.list(&credential).await.unwrap();
         }
@@ -1039,10 +1099,9 @@ mod tests {
         let list = |token: &str| (format!("GET {API}/sandboxes"), Some(format!("Bearer {token}")));
         assert_eq!(seen, [hub.clone(), list(&lasting), list(&lasting), hub.clone(), list(&unstated), hub.clone(), list(&unstated), hub]);
         assert_eq!(script.asked.lock().unwrap()[0].json(), json!({"identifier": "a", "secret": "dckr_pat_x"}));
-        let (plain, script) = docker(Ownership::OwnedAccount, vec![(200, "{}")]).await;
-        plain.list(&key()).await.unwrap();
-        assert_eq!(script.lines(), [format!("GET {API}/sandboxes")]);
-        assert_eq!(script.asked.lock().unwrap()[0].bearer.as_deref(), Some("Bearer k"));
+        let bare = Credentials::new(Some(Secret::new("dckr_pat_x")));
+        assert!(matches!(exchanging.list(&bare).await, Err(ProtocolError::CredentialRejected { .. })));
+        assert_eq!(script.asked.lock().unwrap().len(), 8);
     }
 
     // The relay starts the agent's bridge, attaches to it over Docker's
@@ -1054,9 +1113,7 @@ mod tests {
     async fn relays_carry_the_bridges_stdin_and_stdout() {
         let (dialer, mut listener) = drydock_transport::memory();
         let process = r#"{"name":"processes/p1","label":"l"}"#;
-        let answers = vec![(200, RUNNING), (200, ISSUED), (201, process)];
-        let answers = answers.into_iter().map(|(status, body)| (status, body.to_owned())).collect();
-        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        let script = script(&[(200, RUNNING), (200, ISSUED), (201, process)]);
         let docker = configure(Ownership::OwnedAccount, json!({}), script.clone(), Arc::new(dialer)).await.unwrap();
         let server = tokio::spawn(async move {
             #[allow(clippy::result_large_err)]
@@ -1099,9 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn a_refused_relay_ends_its_bridge() {
         let (dialer, mut listener) = drydock_transport::memory();
-        let answers = [(200, RUNNING), (200, ISSUED), (201, r#"{"name":"processes/p1","label":"l"}"#), (200, "{}")];
-        let answers = answers.into_iter().map(|(status, body)| (status, body.to_owned())).collect();
-        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        let script = script(&[(200, RUNNING), (200, ISSUED), (201, r#"{"name":"processes/p1","label":"l"}"#), (200, "{}")]);
         let docker = configure(Ownership::OwnedAccount, json!({}), script.clone(), Arc::new(dialer)).await.unwrap();
         tokio::spawn(async move {
             #[allow(clippy::result_large_err)]

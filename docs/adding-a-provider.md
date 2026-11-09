@@ -91,8 +91,10 @@ Register the module in two places: `pub mod` in
   sandbox. Docker does not, so `stopped` has no cause.
 - **Refusals in the vendor's terms**, before any call, for what the vendor
   cannot express. For example: *"Docker Sandboxes' network policies allow host
-  names and CIDRs, with no port"*. Never widen a request to something the
-  vendor can express.
+  names and CIDRs, with no port"*. A vendor that sizes in fixed shapes gets
+  them as a table in the module, and a size outside them is refused naming
+  them; `smallest_size` is the smallest shape. Never widen a request to
+  something the vendor can express, and never round a size to a shape.
 - **The vendor's errors**, through `Api::classify`. Start from
   `Failure::standard` (401 rejects the credential, 403 is a refusal, 404 not
   found, 429 rate limited, 5xx unavailable) and override only what the vendor
@@ -148,7 +150,11 @@ does:
   row is `Enforcement::Advisory` unless `inspect` reads the vendor's own
   per-sandbox statement that the policy is in force. Docker's `inspect` reports
   `Enforced` only when the sandbox's installed policy is deny-all and holds the
-  sandbox's own (`attached`) document. An account's default policy alone is not
+  sandbox's own (`attached`) document. Docker states that policy only for a
+  running sandbox (it answers 409 otherwise), so inspect reads it only then; in
+  any other state egress is not stated: `Advisory`, with no `egress_policy`.
+  A call that fails for a state the sandbox can be in breaks suspend, destroy
+  and cleanup, which inspect between steps. An account's default policy alone is not
   enough: a trial saw it not apply. `egress_policy` is the vendor's identity
   for the installed policy (Docker's `revision`), or a digest of the rules the
   vendor states.
@@ -175,10 +181,12 @@ token file, an environment variable, or a JSON file). A JSON object without
 `Auth::Bearer` or `Auth::Header(name)` to send it. Never put a secret in
 settings.
 
-Docker takes either a token as it is, or `{"username": …,
-"personal_access_token": …}`. For the second, the module asks Docker Hub for an
-access token, as Docker's SDK does, and keeps it until a minute before the
-token says it expires. This is the only state the module keeps.
+Docker takes `{"username": …, "personal_access_token": …}`: the module asks
+Docker Hub for an access token, as Docker's SDK does, and keeps it until a
+minute before the token says it expires. This is the only state the module
+keeps. Docker's API rejects a personal access token sent as the bearer, so the
+module rejects any other credential form before a call. Offer only the forms a
+live run has shown the vendor takes.
 
 Commands and files go to each sandbox's own endpoint (`core.endpoint.uri`) with
 a short-lived credential the management API issues for that sandbox. The
@@ -257,7 +265,7 @@ takes, for example:
 module = "docker_sandboxes"
 credential = { file = "~/.config/flotilla/credentials/docker-sandboxes.json" }
 image = "ubuntu@sha256:…"
-size = { cpus = 1, memory = "1GiB" }   # no disk: Docker takes none
+size = { cpus = 1, memory = "2GiB" }   # Docker's Micro shape; no disk: Docker takes none
 egress = "open"
 semantics = { settle = true, idempotent = true }
 ```
