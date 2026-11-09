@@ -75,7 +75,7 @@ const settingsValid = compile({
     poll_interval_ms: { type: "integer", minimum: 1 },
     /** Concurrent `refresh` calls while listing. */
     list_refreshes: { type: "integer", minimum: 1 },
-    /** Operator-supplied egress conformance command, run as root on inspect. */
+    /** Operator-supplied egress conformance command, run on inspect. */
     egress_probe: {
       type: "object",
       additionalProperties: false,
@@ -599,8 +599,9 @@ class Namespace implements Provider {
 
   /**
    * The row, measuring a restricted running devbox's egress with the
-   * operator's probe. Enforced only when the probe proves it as root; a probe
-   * that fails, or whose output is not a proof, fails the inspect.
+   * operator's probe. Enforced only when the probe's proof says it ran as
+   * root; a proof from another user reads as advisory. A probe that fails, or
+   * whose output is not a proof, fails the inspect.
    */
   private async observe(
     box: Box,
@@ -616,16 +617,10 @@ class Namespace implements Provider {
       return row;
     const deny = policy.startsWith("deny-") ? "1" : "0";
     const result = await call(() =>
-      box.exec(
-        [
-          "sh",
-          "-c",
-          `test "$(id -u)" = 0 && DRYDOCK_PROBE_DENY_ALL=${deny} exec "$@"`,
-          "probe",
-          ...probe.command,
-        ],
-        { signal },
-      ),
+      box.exec(probe.command, {
+        env: { DRYDOCK_PROBE_DENY_ALL: deny },
+        signal,
+      }),
     );
     const failed = (reason: string): never => {
       throw new ProtocolFailure({

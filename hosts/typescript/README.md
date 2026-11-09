@@ -95,7 +95,7 @@ drydockd's, as the instance's `semantics` and `ownership` ask. Settings:
 `repository` (default `drydock-vessel`), `site` (default the SDK's `iad`),
 `push_chunk_bytes` (default 64 MiB), `poll_interval_ms` (default 30000),
 `list_refreshes` (concurrent refreshes while listing, default 8) and
-`egress_probe` (`{command: [...]}`, run as root on inspect). The credential is
+`egress_probe` (`{command: [...]}`, run on inspect with `DRYDOCK_PROBE_DENY_ALL` set). The credential is
 `{"bearer_token": …}`, handed to the SDK through a TokenSource, never its
 defaults or token files, and used as the `nscr.io` push password (user `token`)
 without touching any docker configuration. It needs the grants `devbox *`,
@@ -139,8 +139,8 @@ wait`, `ingress access` and `containerregistry *`,
   refuses CIDR, port and address entries; an absent request is deny all. The
   capability declares Namespace's documented egress model (`EGRESS_MODEL`),
   never a verification; an environment reports enforced only when
-  `egress_probe` passes as root, and a probe that fails or prints no proof
-  fails the inspect.
+  `egress_probe` proves it as root (a proof from another user reads as
+  advisory), and a probe that fails or prints no proof fails the inspect.
 - Quota reads `UsageService/GetConcurrency` (CPU, memory and instances per
   platform class) as Namespace gives it: a class without stated use has no row.
   The grants above do not cover it: without its grant quota is refused and the
