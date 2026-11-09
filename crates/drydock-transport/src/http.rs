@@ -13,7 +13,11 @@ use hyper_util::{
     server::conn::auto,
     service::TowerToHyperService,
 };
-use std::{io, time::Duration};
+use std::{
+    io,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 pub type Client<B = Full<Bytes>> = http2::SendRequest<B>;
 
@@ -54,6 +58,37 @@ where
     Ok((sender, tokio::spawn(connection)))
 }
 
+/// When the server accepted a request, among every request this process
+/// serves: one that compares greater was accepted later. A connection's
+/// requests are accepted in the order the peer sent them, but handled
+/// concurrently, so a handler can run before that of a request that arrived
+/// earlier. Every request [`serve`] hands its router carries one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Arrival(u64);
+impl Arrival {
+    /// An arrival later than every one before it.
+    pub fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+type Accepted = hyper::Request<hyper::body::Incoming>;
+type Routed = TowerToHyperService<Router>;
+/// Stamps each request with its [`Arrival`] as hyper accepts it, before the
+/// request's handler is spawned.
+#[derive(Clone)]
+struct Stamped(Routed);
+impl hyper::service::Service<Accepted> for Stamped {
+    type Response = <Routed as hyper::service::Service<Accepted>>::Response;
+    type Error = <Routed as hyper::service::Service<Accepted>>::Error;
+    type Future = <Routed as hyper::service::Service<Accepted>>::Future;
+    fn call(&self, mut request: Accepted) -> Self::Future {
+        request.extensions_mut().insert(Arrival::next());
+        self.0.call(request)
+    }
+}
+
 /// Serve `router` for the connection's lifetime, HTTP/1.1 or HTTP/2 as the
 /// peer's first bytes say, with upgrades and extended CONNECT enabled.
 pub async fn serve(stream: ByteStream, router: Router) -> io::Result<()> {
@@ -66,7 +101,7 @@ pub async fn serve(stream: ByteStream, router: Router) -> io::Result<()> {
         .keep_alive_interval(Duration::from_secs(15))
         .keep_alive_timeout(Duration::from_secs(30))
         .enable_connect_protocol();
-    builder.serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(router)).await.map_err(io::Error::other)
+    builder.serve_connection_with_upgrades(TokioIo::new(stream), Stamped(TowerToHyperService::new(router))).await.map_err(io::Error::other)
 }
 
 /// The byte stream of an upgraded request or response.

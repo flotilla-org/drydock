@@ -122,7 +122,7 @@ pub(crate) async fn activate(installed: &Path, store: &crate::store::Store, sha2
     let written = match crate::files::write(OP, &path, crate::files::Source::File(blob), &options).await {
         Ok((written, _)) => written,
         Err(error) if error.kind == ErrorKind::DigestMismatch => {
-            let _ = store.remove_blob(sha256).await;
+            let _ = store.remove_blob(sha256, None).await;
             return Err(error);
         }
         Err(error) => return Err(error),

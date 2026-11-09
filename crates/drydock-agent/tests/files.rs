@@ -608,48 +608,56 @@ fn interrupted_uploads_resume_from_the_offset(tc: hegel::TestCase) {
     // Past the agent's 256 KiB write buffer, stored bytes appear while the
     // request is still streaming, so the failure can wait for them.
     let wait = cut >= 600_000;
-    runtime().block_on(async {
-        let h = agent().await;
-        let root = h.vessel();
-        let content = pattern(size as u64 ^ cut as u64, size);
-        let digest = sha256(&content);
-        let length = size as u64;
-        let (open, gate) = tokio::sync::oneshot::channel();
-        let source = FailAtEnd { inner: Cursor::new(content[..cut].to_vec()), gate: wait.then_some(gate) };
-        let watch = async {
-            if wait {
-                let deadline = Instant::now() + Duration::from_secs(20);
-                while stored(&h, &digest) == 0 {
-                    assert!(Instant::now() < deadline, "no bytes were stored");
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+    let case = format!("{size} bytes cut at {cut}, {}", if seekable { "seekable" } else { "not seekable" });
+    reported(&case, || {
+        runtime().block_on(async {
+            let h = agent().await;
+            let root = h.vessel();
+            let content = pattern(size as u64 ^ cut as u64, size);
+            let digest = sha256(&content);
+            let length = size as u64;
+            let (open, gate) = tokio::sync::oneshot::channel();
+            let source = FailAtEnd { inner: Cursor::new(content[..cut].to_vec()), gate: wait.then_some(gate) };
+            let watch = async {
+                if wait {
+                    let deadline = Instant::now() + Duration::from_secs(20);
+                    while stored(&h, &digest) == 0 {
+                        assert!(Instant::now() < deadline, "no bytes were stored");
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
                 }
-            }
-            let _ = open.send(());
-        };
-        let (interrupted, ()) = tokio::join!(h.client.create_upload(&digest, Some(length), source, true), watch);
-        let error = interrupted.unwrap_err();
-        let (offset, complete) = h.client.upload_offset(&digest).await.unwrap();
-        assert!(!complete);
-        assert!(offset <= cut as u64, "offset {offset} after sending {cut} of {size}: {error}");
-        assert!(!wait || offset > 0, "stored bytes were lost: sent {cut} of {size}: {error}");
+                let _ = open.send(());
+            };
+            let (interrupted, ()) = tokio::join!(h.client.create_upload(&digest, Some(length), source, true), watch);
+            let error = interrupted.unwrap_err();
+            let (offset, complete) = h.client.upload_offset(&digest).await.unwrap();
+            assert!(!complete);
+            assert!(offset <= cut as u64, "offset {offset} after sending {cut} of {size}: {error}");
+            assert!(!wait || offset > 0, "stored bytes were lost: sent {cut} of {size}: {error}");
 
-        let (offset, complete) = if seekable {
-            let source = root.join("source");
-            std::fs::write(&source, &content).unwrap();
-            h.client.resume_upload(&digest, length, tokio::fs::File::open(&source).await.unwrap()).await.unwrap()
-        } else {
-            h.client.append_upload(&digest, offset, Cursor::new(content[offset as usize..].to_vec()), true).await.unwrap()
-        };
-        assert_eq!((offset, complete), (length, true));
-        assert_eq!(h.client.upload_offset(&digest).await.unwrap(), (length, true));
-        assert_eq!(h.client.blob_size(&digest).await.unwrap(), Some(length));
+            let (offset, complete) = if seekable {
+                let source = root.join("source");
+                std::fs::write(&source, &content).unwrap();
+                h.client.resume_upload(&digest, length, tokio::fs::File::open(&source).await.unwrap()).await.unwrap()
+            } else if offset == 0 {
+                // With nothing held, the interrupted creation left an empty
+                // upload or, refused as superseded by the offset request, none.
+                let _ = h.client.remove_upload(&digest).await;
+                h.client.create_upload(&digest, Some(length), Cursor::new(content.clone()), true).await.unwrap()
+            } else {
+                h.client.append_upload(&digest, offset, Cursor::new(content[offset as usize..].to_vec()), true).await.unwrap()
+            };
+            assert_eq!((offset, complete), (length, true));
+            assert_eq!(h.client.upload_offset(&digest).await.unwrap(), (length, true));
+            assert_eq!(h.client.blob_size(&digest).await.unwrap(), Some(length));
 
-        let installed = root.join("installed");
-        let written =
-            h.client.install_blob(&installed, &digest, &FileOptions { mode: Some(0o640), ..FileOptions::default() }).await.unwrap();
-        assert_eq!(written, Written { sha256: digest.clone(), size: length });
-        assert_eq!(sha256(&std::fs::read(&installed).unwrap()), digest);
-        assert_eq!(mode_of(&installed), 0o640);
+            let installed = root.join("installed");
+            let written =
+                h.client.install_blob(&installed, &digest, &FileOptions { mode: Some(0o640), ..FileOptions::default() }).await.unwrap();
+            assert_eq!(written, Written { sha256: digest.clone(), size: length });
+            assert_eq!(sha256(&std::fs::read(&installed).unwrap()), digest);
+            assert_eq!(mode_of(&installed), 0o640);
+        })
     });
 }
 

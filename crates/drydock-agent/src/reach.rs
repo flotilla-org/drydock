@@ -150,14 +150,11 @@ pub async fn attempt(request: &Attempt) -> Result<Attempts, AgentError> {
 
 async fn try_one(target: Target, timeout: Duration) -> Attempted {
     let started = Instant::now();
-    let work = async {
-        match &target {
-            Target::Tcp { host, port } => connect(host, *port, timeout).await,
-            Target::Dns { name, resolver: None } => system_lookup(name).await,
-            Target::Dns { name, resolver: Some(resolver) } => resolver_lookup(name, *resolver).await,
-        }
+    let found = match &target {
+        Target::Tcp { host, port } => connect(host, *port, timeout).await,
+        Target::Dns { name, resolver: None } => within(timeout, system_lookup(name)).await,
+        Target::Dns { name, resolver: Some(resolver) } => within(timeout, resolver_lookup(name, *resolver)).await,
     };
-    let found = tokio::time::timeout(timeout, work).await.unwrap_or_else(|_| Found::of(Outcome::TimedOut, None, None));
     Attempted {
         target,
         outcome: found.outcome,
@@ -165,6 +162,11 @@ async fn try_one(target: Target, timeout: Duration) -> Attempted {
         address: found.address,
         detail: found.detail,
     }
+}
+
+/// What `work` found, or a timeout once `timeout` has passed.
+async fn within(timeout: Duration, work: impl Future<Output = Found>) -> Found {
+    tokio::time::timeout(timeout, work).await.unwrap_or_else(|_| Found::of(Outcome::TimedOut, None, None))
 }
 
 struct Found {
@@ -256,12 +258,15 @@ async fn lookup(host: &str, port: u16) -> Result<Vec<SocketAddr>, LookupError> {
 }
 
 /// Each address gets an equal share of what is left of `budget`, so an
-/// address that black-holes does not starve the ones after it.
+/// address that black-holes does not starve the ones after it. The connect
+/// keeps to `budget` itself, lookup included: a timeout around it would end
+/// it without the address it was trying.
 async fn connect(host: &str, port: u16, budget: Duration) -> Found {
     let deadline = Instant::now() + budget;
-    let addresses: Vec<SocketAddr> = match lookup(host, port).await {
-        Ok(addresses) => addresses,
-        Err(error) => return lookup_failure(error),
+    let addresses: Vec<SocketAddr> = match tokio::time::timeout_at(deadline.into(), lookup(host, port)).await {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => return lookup_failure(error),
+        Err(_) => return Found::of(Outcome::TimedOut, None, None),
     };
     let mut last = Found::of(Outcome::NameNotResolved, None, Some("no addresses".into()));
     for (index, address) in addresses.iter().enumerate() {

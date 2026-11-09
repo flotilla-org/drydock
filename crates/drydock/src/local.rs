@@ -278,7 +278,9 @@ mod tests {
         assert!(!run.join("drydock.log").exists());
         let contender = lock(&socket_lock_path(&socket, ".startup.lock")).unwrap();
         assert!(matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
-        drop(incumbent);
+        // Not a drop: a process another test is starting holds a copy of the
+        // incumbent's file until it execs, and the lock with it.
+        incumbent.unlock().unwrap();
         contender.try_lock().unwrap();
     }
     // Restart rotation preserves the previous run, starts a fresh log and

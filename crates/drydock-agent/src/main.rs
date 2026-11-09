@@ -223,21 +223,17 @@ fn replace_image(path: &std::path::Path, args: &[std::ffi::OsString]) -> io::Err
     io::Error::last_os_error()
 }
 
+// execve hands the children of every thread to the thread that called it,
+// which takes the process's ID. Listing every thread's children instead
+// skips the threads listed after one that exits during the listing.
 #[cfg(target_os = "linux")]
 fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
-    Ok(children_of_tasks(std::path::Path::new("/proc/self/task")))
+    Ok(task_children(std::path::Path::new(&format!("/proc/self/task/{}/children", std::process::id()))))
 }
+// Missing CONFIG_PROC_CHILDREN must not bar startup.
 #[cfg(target_os = "linux")]
-fn children_of_tasks(root: &std::path::Path) -> Vec<libc::pid_t> {
-    let mut children = std::collections::HashSet::new();
-    if let Ok(tasks) = std::fs::read_dir(root) {
-        for task in tasks.flatten() {
-            if let Ok(pids) = std::fs::read_to_string(task.path().join("children")) {
-                children.extend(pids.split_whitespace().filter_map(|pid| pid.parse::<libc::pid_t>().ok()));
-            }
-        }
-    }
-    children.into_iter().collect()
+fn task_children(children: &std::path::Path) -> Vec<libc::pid_t> {
+    std::fs::read_to_string(children).map(|pids| pids.split_whitespace().filter_map(|pid| pid.parse().ok()).collect()).unwrap_or_default()
 }
 #[cfg(target_os = "macos")]
 fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
@@ -270,33 +266,32 @@ fn inherited_children() -> io::Result<Vec<libc::pid_t>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Fake procfs boundary: child lists can belong to any thread, overlap, or
-    // disappear while scanning. Missing CONFIG_PROC_CHILDREN must not bar startup.
     #[cfg(target_os = "linux")]
     #[test]
-    fn proc_children_scan_all_threads_and_tolerate_missing_files() {
+    fn task_children_are_read_from_procfs_and_a_missing_list_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        for (thread, pids) in [("main", "11 22"), ("worker", "22 33"), ("vanished", "")] {
-            std::fs::create_dir(dir.path().join(thread)).unwrap();
-            if !pids.is_empty() {
-                std::fs::write(dir.path().join(thread).join("children"), pids).unwrap();
-            }
-        }
-        let mut pids = children_of_tasks(dir.path());
-        pids.sort();
-        assert_eq!(pids, vec![11, 22, 33]);
-        assert!(children_of_tasks(&dir.path().join("missing")).is_empty());
+        std::fs::write(dir.path().join("children"), "11 22 ").unwrap();
+        assert_eq!(task_children(&dir.path().join("children")), vec![11, 22]);
+        assert!(task_children(&dir.path().join("missing")).is_empty());
+    }
+    // Linux lists children per thread, and a test does not run on the thread
+    // whose children inherited_children reads.
+    fn own_children() -> Vec<libc::pid_t> {
+        #[cfg(target_os = "linux")]
+        return task_children(std::path::Path::new("/proc/thread-self/children"));
+        #[cfg(not(target_os = "linux"))]
+        return inherited_children().unwrap();
     }
     // A child that exited before the startup scan is still listed while
     // unreaped, so it is reaped afterwards; once reaped it is not listed.
     #[test]
-    fn inherited_children_include_exited_unreaped_ones() {
+    fn exited_unreaped_children_are_listed() {
         use rustix::process::{WaitId, WaitIdOptions, waitid};
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id() as libc::pid_t;
         waitid(WaitId::Pid(rustix::process::Pid::from_raw(pid).unwrap()), WaitIdOptions::EXITED | WaitIdOptions::NOWAIT).unwrap();
-        assert!(inherited_children().unwrap().contains(&pid));
+        assert!(own_children().contains(&pid));
         child.wait().unwrap();
-        assert!(!inherited_children().unwrap().contains(&pid));
+        assert!(!own_children().contains(&pid));
     }
 }
