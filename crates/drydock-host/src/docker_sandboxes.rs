@@ -8,7 +8,7 @@
 use crate::{
     kit::{
         self, LABEL_TAG, MIB, StateTable, Vendor,
-        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, MAX_PAGES, Text, cut, operation},
+        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, cut, operation},
         guest::GuestOutput,
         image::{check_prepare, check_prepared},
     },
@@ -32,7 +32,7 @@ use reqwest::Method;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -86,13 +86,6 @@ struct WirePlatform {
 #[derive(Deserialize)]
 struct Endpoint {
     uri: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Page {
-    #[serde(default)]
-    sandboxes: Vec<Sandbox>,
-    next_page_token: Option<String>,
 }
 /// One sandbox's network policy as Docker installed it.
 #[derive(Deserialize)]
@@ -529,21 +522,10 @@ impl Provider for DockerSandboxes {
     /// Every sandbox the credential's owner has, every page: Docker filters by
     /// no label, so drydockd applies ownership to the tags.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
+        const PAGED: Paging = Paging { rows: Some("sandboxes"), cursor: "pageToken", next: Next::Body(&["nextPageToken"]) };
         let c = &self.access(c).await?;
-        let (mut rows, mut cursor, mut seen) = (Vec::new(), None::<String>, BTreeSet::new());
-        loop {
-            let mut url = self.api.url(&["v1", "sandboxes"])?;
-            if let Some(cursor) = &cursor {
-                url.query_pairs_mut().append_pair("pageToken", cursor);
-            }
-            let page: Page = self.api.get(url, c).await?;
-            rows.extend(page.sandboxes.into_iter().map(|v| self.environment(v)));
-            match page.next_page_token.filter(|t| !t.is_empty()) {
-                None => return Ok(rows),
-                Some(next) if seen.len() + 1 < MAX_PAGES && seen.insert(next.clone()) => cursor = Some(next),
-                Some(_) => return Err(DOCKER.bad_response()),
-            }
-        }
+        let url = self.api.url(&["v1", "sandboxes"])?;
+        Ok(self.api.paged::<Sandbox>(url, &PAGED, c).await?.into_iter().map(|v| self.environment(v)).collect())
     }
     /// The sandbox and, while it runs, its installed network policy. Egress is
     /// enforced when Docker states a deny-all policy that holds the sandbox's

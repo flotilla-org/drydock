@@ -104,8 +104,8 @@ Register the module in two places: `pub mod` in
   says differently. Docker overrides two things: a `QuotaFailure` detail is
   exhausted quota, and 412 (the etag moved on) is unavailable.
 - **Quirks of the wire format.** Docker answers in protobuf's JSON form, which
-  leaves out empty lists and zero numbers. A list page without `sandboxes`
-  holds none, and an exec answer without `exitCode` exited 0.
+  leaves out empty lists and zero numbers. `Api::paged` reads a page without
+  its rows key as no rows. An exec answer without `exitCode` exited 0.
 
 ### What the module leaves to drydockd
 

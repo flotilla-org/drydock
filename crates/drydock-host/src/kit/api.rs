@@ -145,9 +145,8 @@ impl TryFrom<f64> for Amount {
 /// Where a page's rows and the next cursor are.
 pub struct Paging {
     /// The rows' key in the page, or None when the page is the array (whose
-    /// cursor then can only travel in a header). A page missing the key is
-    /// incomplete, never empty: a vendor that omits an empty list needs its
-    /// own read.
+    /// cursor then can only travel in a header). A page missing the key has
+    /// no rows, as protobuf's JSON form leaves out an empty list.
     pub rows: Option<&'static str>,
     /// The query parameter the cursor goes back in.
     pub cursor: &'static str,
@@ -332,13 +331,8 @@ impl Api {
             let operation = operation(&Method::GET, &page_url);
             let response = self.send(Method::GET, page_url, Body::None, c, true, &[]).await?;
             let mut page: Value = self.answer(&operation, &response)?;
-            let page_rows = match paging.rows {
-                Some(key) => page.get_mut(key).map(Value::take),
-                None => Some(page.take()),
-            };
-            let page_rows: Vec<T> =
-                serde_json::from_value(page_rows.unwrap_or_default()).map_err(|_| self.vendor.incomplete(&operation))?;
-            rows.extend(page_rows);
+            let page_rows = take_rows(&mut page, paging.rows).ok_or_else(|| self.vendor.incomplete(&operation))?;
+            rows.extend(serde_json::from_value::<Vec<T>>(page_rows).map_err(|_| self.vendor.incomplete(&operation))?);
             let next = match &paging.next {
                 Next::Body(keys) => match keys.iter().find_map(|key| page.get(*key).filter(|v| !v.is_null())) {
                     Some(value) => Some(value.as_str().ok_or_else(|| self.vendor.bad_response())?.to_owned()),
@@ -360,6 +354,15 @@ impl Api {
 
 /// The most pages one list follows.
 pub const MAX_PAGES: usize = 1000;
+
+/// A page's rows: the page itself, or its object's `key`, an absent key
+/// read as no rows. None when the page is not an object holding them.
+fn take_rows(page: &mut Value, key: Option<&str>) -> Option<Value> {
+    match key {
+        Some(key) => Some(page.as_object_mut()?.remove(key).unwrap_or(Value::Array(vec![]))),
+        None => Some(page.take()),
+    }
+}
 
 /// `METHOD /path`, as reasons name an operation.
 pub fn operation(method: &Method, url: &Url) -> String {
@@ -488,32 +491,37 @@ mod tests {
         assert_eq!(script.asked.lock().unwrap().len(), MAX_PAGES);
     }
 
-    // A body cursor is followed from the page beside its rows; a page
-    // without its rows key is incomplete; a caller's header never replaces
-    // the key.
+    // A body cursor is followed from the page beside its rows; a caller's
+    // header never replaces the key.
     #[tokio::test]
-    async fn body_cursors_missing_rows_and_the_key_wins() {
+    async fn body_cursors_and_the_key_wins() {
         let paging = Paging { rows: Some("items"), cursor: "cursor", next: Next::Body(&["next"]) };
         let (api, script) = api(
             Auth::Bearer,
             vec![
                 (200, vec![], r#"{"items":[1],"next":"c1"}"#),
                 (200, vec![], r#"{"items":[2],"next":""}"#),
-                (200, vec![], r#"{"next":"c2"}"#),
                 (200, vec![], r#"{"items":[1],"next":7}"#),
                 (200, vec![], "null"),
             ],
         );
         let url = api.url(&["rows"]).unwrap();
         assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap(), [1, 2]);
-        assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").incomplete("GET /v1/rows"));
         // A cursor that is not text is never read as the last page.
         assert_eq!(api.paged::<u8>(url.clone(), &paging, &key()).await.unwrap_err(), Vendor("Test").bad_response());
         let forged = [(AUTHORIZATION, HeaderValue::from_static("Bearer forged"))];
         api.call_with::<Value>(Method::GET, url, Body::None, &key(), &forged).await.unwrap();
         let asked = script.asked.lock().unwrap();
         assert_eq!(asked[1].url().query(), Some("cursor=c1"));
-        assert_eq!(asked[4].headers()[AUTHORIZATION], "Bearer k");
+        assert_eq!(asked[3].headers()[AUTHORIZATION], "Bearer k");
+    }
+
+    // A page without its rows key has none; a page that is not an object has
+    // no rows to read.
+    #[test]
+    fn missing_rows_are_none() {
+        assert_eq!(take_rows(&mut serde_json::json!({"next": "c"}), Some("items")), Some(serde_json::json!([])));
+        assert_eq!(take_rows(&mut Value::Null, Some("items")), None);
     }
 
     #[derive(Debug, PartialEq, Deserialize)]
