@@ -92,6 +92,11 @@ async fn a_released_agent_is_upgraded_from_hello_through_confirm() {
     child.wait().await.unwrap();
 }
 
+/// A process that touches `done` once `gate` exists.
+fn gated(gate: &Path, done: &Path) -> Exec {
+    shell(&format!("while test ! -f '{}'; do sleep 0.01; done; touch '{}'", gate.display(), done.display()))
+}
+
 // Activation drains: the agent starts no more processes and waits for the
 // running ones to exit before it re-execs, up to the limit the request
 // gives. One that outlives the limit is named in the reply, and keeps running
@@ -106,9 +111,8 @@ async fn drain_waits_for_running_processes_and_reports_those_past_the_limit() {
     candidate.extend_from_slice(b"drained candidate");
     let digest = sha256(&candidate);
     client.upload(&digest, candidate.len() as u64, std::io::Cursor::new(candidate.clone())).await.unwrap();
-    let marker = dir.path().join("finished");
-    let started = Instant::now();
-    let short = client.spawn(shell(&format!("sleep 1; touch '{}'", marker.display()))).await.unwrap();
+    let (gate, marker) = (dir.path().join("gate"), dir.path().join("finished"));
+    let short = client.spawn(gated(&gate, &marker)).await.unwrap();
     let observer = connect(&socket, &sha256(&binary)).await;
     let activation = tokio::spawn(async move { client.activate_upgrade_draining(&digest, Duration::from_secs(20)).await });
     // While draining, the agent refuses to start anything new.
@@ -127,8 +131,9 @@ async fn drain_waits_for_running_processes_and_reports_those_past_the_limit() {
     .expect("a draining agent must refuse new processes");
     assert_eq!(kind(&refused), ErrorKind::Conflict, "{refused}");
     assert!(observer.process(short.id()).await.unwrap().info().await.unwrap().state == ProcessState::Running);
+    assert!(!activation.is_finished(), "the reply waits for the running process");
+    std::fs::write(&gate, []).unwrap();
     let activated = activation.await.unwrap().unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(900), "the reply waited for the running process");
     assert!(marker.exists(), "the process ran to its end before the re-exec");
     assert_eq!(activated.running, vec![]);
     drop(observer);
@@ -138,17 +143,21 @@ async fn drain_waits_for_running_processes_and_reports_those_past_the_limit() {
     newer.extend_from_slice(b"past the limit");
     let digest = sha256(&newer);
     upgraded.upload(&digest, newer.len() as u64, std::io::Cursor::new(newer.clone())).await.unwrap();
-    let survivor = dir.path().join("survivor");
-    let long = upgraded.spawn(shell(&format!("sleep 2; touch '{}'", survivor.display()))).await.unwrap();
+    let (release, survivor) = (dir.path().join("release"), dir.path().join("survivor"));
+    let long = upgraded.spawn(gated(&release, &survivor)).await.unwrap();
     let started = Instant::now();
-    let activated = upgraded.activate_upgrade_draining(&digest, Duration::from_millis(300)).await.unwrap();
-    assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
+    let activated = tokio::time::timeout(Duration::from_secs(20), upgraded.activate_upgrade_draining(&digest, Duration::from_millis(300)))
+        .await
+        .expect("the drain ends at its limit")
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(300));
     assert_eq!(activated.sha256, digest);
     assert_eq!(activated.running.len(), 1, "{activated:?}");
     assert_eq!((activated.running[0].id.as_str(), activated.running[0].program.as_str()), (long.id(), "/bin/sh"));
     drop(upgraded);
     let newest = connect_compatible(&socket, &sha256(&newer)).await;
     assert!(newest.processes().await.unwrap().is_empty(), "handles end with the agent that held them");
+    std::fs::write(&release, []).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         while !survivor.exists() {
             tokio::time::sleep(Duration::from_millis(20)).await;
