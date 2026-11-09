@@ -278,6 +278,9 @@ drydock --config drydock.toml conformance --provider docker --options docker-pro
 - `reach_probe` is an executable that takes the reach recipe on stdin and
   round-trips bytes with the agent. `tools/recipe-probe.py` speaks only the CI
   echo fixture's protocol, so it cannot be used here.
+- A deny-all request ends enforced or refused: a module that accepts one
+  and reports the environment `Advisory` fails `enforced_egress`. A module
+  that cannot enforce deny-all refuses it, as Docker does.
 - The egress check runs only for an environment reported `Enforced`. It needs
   a deny-all request with exactly one destination, and `tools/egress-probe.py`
   in the guest, run through exec as root. Docker takes open egress only, so

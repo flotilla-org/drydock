@@ -65,7 +65,8 @@ async fn reference_binary_passes_conformance() {
             label: "conformance".into(),
             prepared,
             size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
-            egress: EgressRequest::default(),
+            // The reference module enforces no egress.
+            egress: EgressRequest::Open,
             ssh_public_key: None,
         },
         // Policy scenarios run on the server-owned endpoint; TCP adapter
@@ -178,7 +179,7 @@ async fn python_report_selection(
                 tools_digest: "tools".into(),
             },
             size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
-            egress: EgressRequest::default(),
+            egress: EgressRequest::Open,
             ssh_public_key: None,
         },
         scenarios,

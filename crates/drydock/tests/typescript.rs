@@ -100,7 +100,7 @@ settings = {{ seed_unlabelled = true }}
                 tools_digest: "tools".into(),
             },
             size,
-            egress: EgressRequest::default(),
+            egress: EgressRequest::Open,
             ssh_public_key: None,
         },
         // Managed private UDS is filesystem-authorized; network authentication is
