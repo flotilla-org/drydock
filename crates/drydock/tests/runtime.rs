@@ -1031,6 +1031,26 @@ async fn a_size_first_stated_on_a_running_row_reports_the_size_and_not_running()
     assert_eq!(next().await, EventKind::SizeChanged { granted_size: size });
 }
 
+// A list that omits a running row's size keeps the size held: when a later
+// list states the same size again, nothing changed and nothing is reported.
+#[tokio::test]
+async fn a_size_a_list_omits_is_kept() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
+    let (_h, control, mut next) = running_row(Some(size.clone())).await;
+    assert_eq!(next().await, EventKind::Created);
+    assert_eq!(next().await, EventKind::Running { granted_size: Some(size.clone()) });
+    for granted_size in [None, Some(size)] {
+        control.vendor.lock().unwrap().row.as_mut().unwrap().granted_size = granted_size;
+        // A list in flight may have read the row before it changed; the one
+        // after it reads the change, and the list after that starts once
+        // drydockd has committed it.
+        control.wait_lists(control.list_calls.load(SeqCst) + 2).await;
+    }
+    control.vendor.lock().unwrap().row.as_mut().unwrap().state = Observation::Stopped { cause: None };
+    assert_eq!(next().await, EventKind::Stopped { cause: None });
+}
+
 /// A provider whose vendor lists one running row of `granted_size`, and a
 /// reader of the events that follow.
 async fn running_row(granted_size: Option<Size>) -> (Harness, std::sync::Arc<Control>, impl AsyncFnMut() -> EventKind) {

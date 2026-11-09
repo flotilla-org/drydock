@@ -186,7 +186,8 @@ async fn deliver(
 /// What deliveries said of environments no list has shown yet. A list clears it.
 #[derive(Default)]
 struct Pushed {
-    /// The last delivery for each environment drydockd holds no row of.
+    /// The last delivery for each environment drydockd holds no row of, with
+    /// the last stable state it stated.
     announced: BTreeMap<String, VendorObservation>,
     /// Deliveries that may be about another instance's environments, in order,
     /// until this instance's provision returns the id.
@@ -255,6 +256,16 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
         }
         let events = pending(None, transitions(known, v.state.as_ref(), None, confirmed, true));
         instance.events.update(None, events, observed);
+        // As a held row does, keep the last stable state through a transition.
+        // The vendor state and time stay the delivery's own: a redelivery or
+        // an older delivery is judged against the newest one.
+        let mut v = v;
+        if matches!(v.state, Some(Observation::Transitioning { .. }))
+            && let Some(stable) = pushed.announced.get(&v.id).and_then(|a| a.state.clone())
+            && !matches!(stable, Observation::Transitioning { .. })
+        {
+            v.state = Some(stable);
+        }
         pushed.announced.insert(v.id.clone(), v);
         return;
     };
@@ -325,6 +336,21 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
     kinds
 }
 
+/// `row`, with what it doesn't state taken from `held`: its label, granted
+/// size, platform and the vendor's tags. Absent means not stated, so a list
+/// cannot clear one of these; only a value it states replaces the held one.
+/// Tags are taken whole: a list that states any tags states them all.
+fn merge(row: &mut Environment, held: &Environment) {
+    row.label = row.label.take().or_else(|| held.label.clone());
+    row.granted_size = row.granted_size.take().or_else(|| held.granted_size.clone());
+    row.platform = row.platform.take().or_else(|| held.platform.clone());
+    if let Some(vendor) = &mut row.vendor
+        && vendor.tags.is_none()
+    {
+        vendor.tags = held.vendor.as_ref().and_then(|h| h.tags.clone());
+    }
+}
+
 fn reconcile(
     instance: &Instance,
     seen: &mut BTreeMap<String, Environment>,
@@ -336,6 +362,19 @@ fn reconcile(
     carry_egress(instance, &mut rows, generation);
     let mut pending = vec![];
     let mut current: BTreeMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+    {
+        // What a listed row doesn't state keeps what drydockd holds of it, as
+        // with a delivery, which reads the same rows first. The inventory row
+        // is never older than `seen`, which keeps a stable row through a
+        // transition; `seen` serves only before the first list's inventory.
+        let log = instance.events.shared.log.recover();
+        let inventory: BTreeMap<_, _> = log.inventories.get(&instance.name).into_iter().flatten().map(|r| (&r.id, r)).collect();
+        for (id, row) in &mut current {
+            if let Some(held) = inventory.get(id).copied().or_else(|| seen.get(id)) {
+                merge(row, held);
+            }
+        }
+    }
     {
         let inspected = instance.inspected.recover();
         for (id, row) in &mut current {
