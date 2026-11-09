@@ -643,6 +643,8 @@ async fn interact(socket: WebSocket, local: DuplexStream) {
     let input = async {
         let mut buffer = vec![0; STDIN_FRAME];
         loop {
+            // Reading the local end of a duplex does not fail; if it did, its
+            // end would be stdin's end all the same.
             let read = reader.read(&mut buffer).await.unwrap_or(0);
             let frame = if read == 0 { json!({"closeStdin": true}) } else { json!({"stdin": STANDARD.encode(&buffer[..read])}) };
             if frames_out.send(Message::text(frame.to_string())).await.is_err() || read == 0 {
