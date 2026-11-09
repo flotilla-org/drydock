@@ -16,10 +16,7 @@ use crate::{
     module::*,
 };
 use async_trait::async_trait;
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use drydock_protocol::*;
 use drydock_transport::websocket::{
     DialError, TlsDialer, WebSocket, WebSocketDialer,
@@ -32,18 +29,12 @@ use futures::SinkExt;
 use reqwest::Method;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 const DOCKER: Vendor = Vendor("Docker Sandboxes");
 const DOCKER_HUB: Vendor = Vendor("Docker Hub");
 const AGENT: &str = "/opt/drydock/drydock-agent";
 const SUBPROTOCOL: &str = "sandboxes.v1";
-/// How long before an exchanged access token expires a new one is asked for.
-const RENEW_MARGIN: Duration = Duration::from_secs(60);
 
 /// Docker does not say who stopped a sandbox; a failed one carries its error
 /// beside the state, and a degraded one is Docker's own word that it has lost
@@ -173,10 +164,6 @@ struct Pat {
 struct Exchanged {
     access_token: Text,
 }
-#[derive(Deserialize)]
-struct Claims {
-    exp: Option<u64>,
-}
 
 pub struct DockerSandboxesModule {
     dialer: Arc<dyn WebSocketDialer>,
@@ -243,7 +230,7 @@ impl Module for DockerSandboxesModule {
             api,
             hub,
             dialer: self.dialer.clone(),
-            held: Mutex::default(),
+            held: Default::default(),
         }))
     }
 }
@@ -256,12 +243,7 @@ pub struct DockerSandboxes {
     hub: Api,
     dialer: Arc<dyn WebSocketDialer>,
     /// The access token last exchanged, for the credential it came from.
-    held: Mutex<Option<Held>>,
-}
-struct Held {
-    credential: String,
-    token: Secret,
-    renew_at: SystemTime,
+    held: kit::exchange::Exchanged,
 }
 
 /// Docker's errors carry a stable code, and Google's typed details: a quota
@@ -290,11 +272,6 @@ fn seconds(duration: &str) -> Option<u64> {
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
 }
-/// When a JWT says it expires, if it does.
-fn expiry(token: &str) -> Option<SystemTime> {
-    let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(serde_json::from_slice::<Claims>(&payload).ok()?.exp?))
-}
 
 impl DockerSandboxes {
     /// The bearer for management calls: the access token Docker Hub exchanges
@@ -306,28 +283,15 @@ impl DockerSandboxes {
         };
         let credential = c.token().ok_or_else(rejected)?;
         let pat: Pat = serde_json::from_str(credential.expose()).map_err(|_| rejected())?;
-        let digest = kit::digest(credential.expose());
-        let held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(|held| (held.credential == digest && SystemTime::now() < held.renew_at).then(|| held.token.clone()));
-        if let Some(token) = held {
-            return Ok(Credentials::new(Some(token)));
-        }
-        let body = json!({"identifier": pat.username, "secret": pat.personal_access_token});
-        let url = self.hub.url(&[])?;
-        let operation = operation(&Method::POST, &url);
-        let response = self.hub.send(Method::POST, url, Body::json(&body)?, c, false, &[]).await?;
-        let exchanged: Exchanged = self.hub.answer(&operation, &response)?;
-        let token = Secret::new(String::from(exchanged.access_token));
-        if let Some(expires) = expiry(token.expose()) {
-            let renew_at = expires.checked_sub(RENEW_MARGIN).unwrap_or(UNIX_EPOCH);
-            let fresh = Held { credential: digest, token: token.clone(), renew_at };
-            *self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);
-        }
-        Ok(Credentials::new(Some(token)))
+        let exchange = async {
+            let body = json!({"identifier": pat.username, "secret": pat.personal_access_token});
+            let url = self.hub.url(&[])?;
+            let operation = operation(&Method::POST, &url);
+            let response = self.hub.send(Method::POST, url, Body::json(&body)?, c, false, &[]).await?;
+            let exchanged: Exchanged = self.hub.answer(&operation, &response)?;
+            Ok(Secret::new(String::from(exchanged.access_token)))
+        };
+        Ok(Credentials::new(Some(self.held.token(credential, exchange).await?)))
     }
     fn sandbox_url(&self, id: &str, rest: &[&str]) -> Result<reqwest::Url> {
         if id.is_empty() || id == "." || id == ".." {

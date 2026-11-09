@@ -191,11 +191,11 @@ token file, an environment variable, or a JSON file). A JSON object without
 settings.
 
 Docker takes `{"username": …, "personal_access_token": …}`: the module asks
-Docker Hub for an access token, as Docker's SDK does, and keeps it until a
-minute before the token says it expires. This is the only state the module
-keeps. Docker's API rejects a personal access token sent as the bearer, so the
-module rejects any other credential form before a call. Offer only the forms a
-live run has shown the vendor takes.
+Docker Hub for an access token, as Docker's SDK does, and
+`kit::exchange::Exchanged` holds it until a minute before it expires. This is
+the only state the module keeps. Docker's API rejects a personal access token
+sent as the bearer, so the module rejects any other credential form before a
+call. Offer only the forms a live run has shown the vendor takes.
 
 Commands and files go to each sandbox's own endpoint (`core.endpoint.uri`) with
 a short-lived credential the management API issues for that sandbox. The
