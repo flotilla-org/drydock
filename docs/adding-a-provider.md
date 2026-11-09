@@ -105,7 +105,9 @@ Register the module in two places: `pub mod` in
   exhausted quota, and 412 (the etag moved on) is unavailable.
 - **Quirks of the wire format.** Docker answers in protobuf's JSON form, which
   leaves out empty lists and zero numbers. `Api::paged` reads a page without
-  its rows key as no rows. An exec answer without `exitCode` exited 0.
+  its rows key as no rows. A field that can be zero takes `#[serde(default)]`
+  (an exec answer without `exitCode` exited 0), and a 64-bit integer, a
+  string in protobuf, is a `kit::api::IntText`.
 
 ### What the module leaves to drydockd
 

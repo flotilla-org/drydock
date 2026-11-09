@@ -13,9 +13,9 @@ use reqwest::{
     Method, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
+use std::{collections::BTreeSet, fmt, ops::Deref, str::FromStr, sync::Arc};
 
 /// How the API key travels.
 #[derive(Clone)]
@@ -139,6 +139,17 @@ impl TryFrom<f64> for Amount {
     type Error = &'static str;
     fn try_from(n: f64) -> std::result::Result<Self, Self::Error> {
         if n.is_finite() && n >= 0.0 { Ok(Self(n)) } else { Err("not a finite, non-negative number") }
+    }
+}
+
+/// An integer sent as a decimal string, as protobuf's JSON form sends a
+/// 64-bit one. Protobuf leaves a zero value out, so a field that can be zero
+/// is read with `#[serde(default)]`, its absence as zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntText<T>(pub T);
+impl<'de, T: FromStr> Deserialize<'de> for IntText<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer)?.parse().map(Self).map_err(|_| serde::de::Error::custom("not a decimal integer"))
     }
 }
 
@@ -514,6 +525,13 @@ mod tests {
         let asked = script.asked.lock().unwrap();
         assert_eq!(asked[1].url().query(), Some("cursor=c1"));
         assert_eq!(asked[3].headers()[AUTHORIZATION], "Bearer k");
+    }
+
+    // An integer sent as text reads as itself; a JSON number is not one.
+    #[test]
+    fn integers_as_text() {
+        assert_eq!(serde_json::from_str::<IntText<u64>>(r#""18446744073709551615""#).unwrap(), IntText(u64::MAX));
+        assert!(serde_json::from_str::<IntText<u64>>("7").is_err());
     }
 
     // A page without its rows key has none; a page that is not an object has

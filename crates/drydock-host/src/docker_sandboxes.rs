@@ -126,7 +126,8 @@ struct Issued {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Executed {
-    exit_code: Option<i32>,
+    #[serde(default)]
+    exit_code: i32,
     stdout: Option<String>,
     stderr: Option<String>,
     #[serde(default)]
@@ -395,8 +396,7 @@ impl DockerSandboxes {
         let bytes = |text: Option<String>| STANDARD.decode(text.unwrap_or_default()).map_err(|_| DOCKER.bad_response());
         let chunks = [(false, bytes(v.stdout)?), (true, bytes(v.stderr)?)].into_iter().filter(|(_, b)| !b.is_empty()).collect();
         let note = v.incomplete.then(|| "Docker Sandboxes kept only part of the command's output".to_owned());
-        // A zero exit status is left out, as protobuf leaves out every zero.
-        Ok(GuestOutput { chunks, exit: Some(v.exit_code.unwrap_or(0)), timed_out: false, note })
+        Ok(GuestOutput { chunks, exit: Some(v.exit_code), timed_out: false, note })
     }
 }
 

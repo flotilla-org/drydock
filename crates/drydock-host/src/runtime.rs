@@ -6,7 +6,7 @@
 use crate::{
     kit::{
         self, GIB, LABEL_TAG, MIB, SizeLimits, StateTable, Vendor,
-        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
+        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, IntText, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         guest::{Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile},
     },
@@ -110,7 +110,7 @@ struct Limit {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Credit {
-    available_micros: Micros,
+    available_micros: IntText<u128>,
 }
 /// Runtime states all four, `exitCode` null after a timeout.
 #[derive(Deserialize)]
@@ -149,15 +149,6 @@ struct ErrorDetail {
     message: Option<String>,
     hint: Option<String>,
     retry_after_ms: Option<u64>,
-}
-#[derive(Clone, Copy, Deserialize)]
-#[serde(try_from = "String")]
-struct Micros(u128);
-impl TryFrom<String> for Micros {
-    type Error = std::num::ParseIntError;
-    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
-        text.parse().map(Self)
-    }
 }
 
 pub struct RuntimeModule;
