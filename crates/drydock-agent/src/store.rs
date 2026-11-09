@@ -18,6 +18,7 @@ use crate::{
     files::{Copy, copy_body, hash_file},
 };
 use axum::body::Body;
+use drydock_transport::http::Arrival;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -34,32 +35,42 @@ pub(crate) const ABANDONED: Duration = Duration::from_secs(7 * 24 * 3600);
 /// One digest's upload, used by one request at a time. A new request ends
 /// the one before it (draft section 4.6, the recommended approach): it
 /// cancels the holder, then waits for the holder's last write to land.
+/// Requests are handled concurrently, so a request can reach the upload
+/// after one that arrived later: a creation the client gave up on before the
+/// agent started it, say, and the offset request the client sent next. It is
+/// refused then, rather than moving the offset that request reported.
 struct Slot {
     lock: Arc<tokio::sync::Mutex<()>>,
     holder: CancellationToken,
-    generation: u64,
+    /// The latest arrival to have taken the upload.
+    taken: Option<Arrival>,
 }
+impl Slot {
+    fn in_use(&self) -> bool {
+        Arc::strong_count(&self.lock) > 1
+    }
+}
+/// Slots outlive their use, to remember the latest arrival to take each
+/// upload, until there are this many.
+const KEPT_SLOTS: usize = 1024;
 #[derive(Clone)]
 pub(crate) struct Store {
     root: PathBuf,
     slots: Arc<Mutex<HashMap<String, Slot>>>,
 }
+/// How a request uses a digest's upload.
+enum Use {
+    /// Take it, ending the request using it: for a request that arrived
+    /// then, or without an arrival for the agent itself.
+    Take(Option<Arrival>),
+    /// Wait for the request using it to finish.
+    Wait,
+}
 /// The use of one digest's upload, ended early when `superseded` fires.
 pub(crate) struct Held {
-    slots: Arc<Mutex<HashMap<String, Slot>>>,
-    digest: String,
-    generation: u64,
     superseded: CancellationToken,
     _guard: tokio::sync::OwnedMutexGuard<()>,
     _shared: std::fs::File,
-}
-impl Drop for Held {
-    fn drop(&mut self) {
-        let mut slots = self.slots.lock().unwrap();
-        if slots.get(&self.digest).is_some_and(|slot| slot.generation == self.generation) {
-            slots.remove(&self.digest);
-        }
-    }
 }
 /// An upload's state as the protocol reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,6 +92,8 @@ pub(crate) struct Append {
     pub complete: bool,
     /// A declared representation length.
     pub length: Option<u64>,
+    /// When the request arrived.
+    pub arrival: Arrival,
 }
 /// Bytes available to an unprivileged writer on the filesystem holding `path`.
 pub(crate) fn free_space(path: &Path) -> Option<u64> {
@@ -110,7 +123,7 @@ impl Store {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 let digest = name.split('.').next().unwrap_or_default().to_owned();
                 let stale = entry.metadata()?.modified()?.elapsed().is_ok_and(|elapsed| elapsed >= age);
-                if !stale || self.slots.lock().unwrap().contains_key(&digest) {
+                if !stale || self.slots.lock().unwrap().get(&digest).is_some_and(Slot::in_use) {
                     return Ok(false);
                 }
                 std::fs::remove_file(entry.path())?;
@@ -159,30 +172,41 @@ impl Store {
     pub(crate) fn blob(&self, digest: &str) -> io::Result<PathBuf> {
         Ok(self.directory("blobs")?.join(digest))
     }
-    /// Take the digest's upload, ending any request still using it.
-    async fn take(&self, operation: &str, digest: &str) -> Result<Held, AgentError> {
-        self.hold(operation, digest, true).await
+    /// Take the digest's upload for a request that arrived at `arrival`,
+    /// ending any request still using it. Without an arrival, the agent
+    /// takes it for itself.
+    async fn take(&self, operation: &str, digest: &str, arrival: Option<Arrival>) -> Result<Held, AgentError> {
+        self.hold(operation, digest, Use::Take(arrival)).await
     }
     /// Use the digest after whatever is using it now has finished, without
     /// ending it: a fetch neither ends nor is ended by another request.
     pub(crate) async fn wait_for(&self, operation: &str, digest: &str) -> Result<Held, AgentError> {
-        self.hold(operation, digest, false).await
+        self.hold(operation, digest, Use::Wait).await
     }
-    async fn hold(&self, operation: &str, digest: &str, supersede: bool) -> Result<Held, AgentError> {
+    async fn hold(&self, operation: &str, digest: &str, how: Use) -> Result<Held, AgentError> {
         check_sha256(digest).map_err(|e| AgentError::io(operation, digest, e))?;
         let superseded = CancellationToken::new();
-        let (lock, generation) = {
+        let lock = {
             let mut slots = self.slots.lock().unwrap();
+            if slots.len() >= KEPT_SLOTS && !slots.contains_key(digest) {
+                slots.retain(|_, slot| slot.in_use());
+            }
             let slot = slots.entry(digest.to_owned()).or_insert_with(|| Slot {
                 lock: Arc::default(),
                 holder: CancellationToken::new(),
-                generation: 0,
+                taken: None,
             });
-            if supersede {
+            if let Use::Take(arrival) = how {
+                if let Some(arrival) = arrival {
+                    if slot.taken.is_some_and(|taken| arrival < taken) {
+                        let message = "a request that arrived after this one has already used the upload";
+                        return Err(AgentError::new(operation, digest, ErrorKind::Conflict, message));
+                    }
+                    slot.taken = Some(arrival);
+                }
                 std::mem::replace(&mut slot.holder, superseded.clone()).cancel();
             }
-            slot.generation += 1;
-            (slot.lock.clone(), slot.generation)
+            slot.lock.clone()
         };
         let guard = lock.lock_owned().await;
         // Another agent sharing the store may hold the digest; this one
@@ -198,7 +222,7 @@ impl Store {
         .await
         .map_err(|e| AgentError::new(operation, digest, ErrorKind::Other, "lock task failed").with_cause(e))?
         .map_err(|e| AgentError::io(operation, digest, e))?;
-        Ok(Held { slots: self.slots.clone(), digest: digest.to_owned(), generation, superseded, _guard: guard, _shared: shared })
+        Ok(Held { superseded, _guard: guard, _shared: shared })
     }
     /// A completed blob's size, if the store holds one.
     pub(crate) async fn blob_size(&self, digest: &str) -> Result<Option<u64>, AgentError> {
@@ -238,8 +262,8 @@ impl Store {
     }
     /// Offset retrieval: the state once any request using the upload has
     /// been ended, so the offset reported is the one the next append needs.
-    pub(crate) async fn offset(&self, digest: &str) -> Result<Option<Progress>, AgentError> {
-        let _held = self.take("upload.stat", digest).await?;
+    pub(crate) async fn offset(&self, digest: &str, arrival: Option<Arrival>) -> Result<Option<Progress>, AgentError> {
+        let _held = self.take("upload.stat", digest, arrival).await?;
         self.state(digest).await
     }
     /// Upload creation or append: continue from exactly `offset`, and when
@@ -261,8 +285,8 @@ impl Store {
     }
     async fn append_whole(&self, append: Append, body: Body) -> Result<Progress, AgentError> {
         const OP: &str = "upload.append";
-        let Append { ref digest, create, offset, complete, length } = append;
-        let held = self.take(OP, digest).await?;
+        let Append { ref digest, create, offset, complete, length, arrival } = append;
+        let held = self.take(OP, digest, Some(arrival)).await?;
         let at = |e| AgentError::io(OP, digest, e);
         let current = self.state(digest).await?;
         if let Some(blob) = current.filter(|state| state.complete) {
@@ -375,9 +399,9 @@ impl Store {
         forget(self.declared(digest)).await;
     }
     /// Upload cancellation: end any request using it, then remove it.
-    pub(crate) async fn cancel(&self, digest: &str) -> Result<(), AgentError> {
+    pub(crate) async fn cancel(&self, digest: &str, arrival: Option<Arrival>) -> Result<(), AgentError> {
         const OP: &str = "upload.remove";
-        let _held = self.take(OP, digest).await?;
+        let _held = self.take(OP, digest, arrival).await?;
         match self.state(digest).await? {
             Some(state) if !state.complete => {
                 self.discard(digest).await;
@@ -388,9 +412,9 @@ impl Store {
     }
     /// Installs from a blob (`?blob=`) do not take its slot: a removal that
     /// wins the race leaves them a NotFound when they open it.
-    pub(crate) async fn remove_blob(&self, digest: &str) -> Result<(), AgentError> {
+    pub(crate) async fn remove_blob(&self, digest: &str, arrival: Option<Arrival>) -> Result<(), AgentError> {
         const OP: &str = "blob.remove";
-        let _held = self.take(OP, digest).await?;
+        let _held = self.take(OP, digest, arrival).await?;
         let path = self.blob(digest).map_err(|e| AgentError::io(OP, digest, e))?;
         tokio::fs::remove_file(&path).await.map_err(|e| AgentError::io(OP, digest, e))
     }
@@ -431,10 +455,29 @@ mod tests {
                 std::fs::File::options().write(true).open(path).unwrap().set_modified(long_ago).unwrap();
             }
         }
-        let _in_use = store.take("upload.append", &busy).await.unwrap();
+        let _in_use = store.take("upload.append", &busy, None).await.unwrap();
         assert_eq!(store.sweep(ABANDONED).unwrap(), 1);
         assert!(!store.partial(&old).unwrap().exists() && !store.declared(&old).unwrap().exists());
         assert!(store.partial(&busy).unwrap().exists());
         assert!(store.partial(&recent).unwrap().exists());
+    }
+    // A request that reaches an upload after one that arrived later has taken
+    // it is refused, whether that one still holds it or has finished, and
+    // ends nothing. The agent's own use is not ordered, and a later arrival
+    // takes the upload as before.
+    #[tokio::test]
+    async fn a_request_that_arrived_before_the_upload_was_last_taken_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("store"));
+        let digest = "a".repeat(64);
+        let (earlier, later) = (Arrival::next(), Arrival::next());
+        let held = store.take("upload.stat", &digest, Some(later)).await.unwrap();
+        let refused = store.take("upload.append", &digest, Some(earlier)).await.err().unwrap();
+        assert_eq!((refused.operation.as_str(), refused.kind), ("upload.append", ErrorKind::Conflict));
+        assert!(!held.superseded.is_cancelled());
+        drop(held);
+        assert_eq!(store.take("upload.append", &digest, Some(earlier)).await.err().unwrap().kind, ErrorKind::Conflict);
+        drop(store.take("blob.remove", &digest, None).await.unwrap());
+        store.take("upload.append", &digest, Some(Arrival::next())).await.unwrap();
     }
 }

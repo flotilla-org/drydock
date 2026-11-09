@@ -6,12 +6,15 @@ use crate::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, head, post, put},
 };
-use drydock_transport::{Listener as Connections, http};
+use drydock_transport::{
+    Listener as Connections,
+    http::{self, Arrival},
+};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -709,9 +712,13 @@ async fn upload_reply(s: &Shared, digest: &str, status: StatusCode, result: Refu
     response
 }
 /// Offset retrieval (draft section 4.3).
-async fn upload_offset(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<Response> {
+async fn upload_offset(
+    State(s): State<Arc<Shared>>,
+    Path(digest): Path<String>,
+    Extension(arrival): Extension<Arrival>,
+) -> Refusal<Response> {
     let missing = || AgentError::new("upload.stat", &digest, ErrorKind::NotFound, "no upload of this digest");
-    let progress = s.store.offset(&digest).await?.ok_or_else(missing)?;
+    let progress = s.store.offset(&digest, Some(arrival)).await?.ok_or_else(missing)?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     upload_headers(&mut response, &progress);
     response.headers_mut().insert(header::CACHE_CONTROL, header_value("no-store"));
@@ -719,30 +726,46 @@ async fn upload_offset(State(s): State<Arc<Shared>>, Path(digest): Path<String>)
 }
 /// Upload creation (draft section 4.2), targeting the blob the bytes become.
 /// Without `Upload-Complete` it is a conventional upload of the whole blob.
-async fn create_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>, headers: HeaderMap, body: Body) -> Refusal<Response> {
+async fn create_upload(
+    State(s): State<Arc<Shared>>,
+    Path(digest): Path<String>,
+    Extension(arrival): Extension<Arrival>,
+    headers: HeaderMap,
+    body: Body,
+) -> Refusal<Response> {
     const OP: &str = "upload.create";
     crate::files::require_octet_stream(OP, std::path::Path::new(&digest), &headers, &["application/octet-stream"])?;
     let complete = sf_boolean(&headers, "upload-complete").unwrap_or(true);
-    let append =
-        crate::store::Append { digest: digest.clone(), create: true, offset: 0, complete, length: sf_integer(&headers, "upload-length") };
+    let length = sf_integer(&headers, "upload-length");
+    let append = crate::store::Append { digest: digest.clone(), create: true, offset: 0, complete, length, arrival };
     let result = s.store.append(append, body).await;
     Ok(upload_reply(&s, &digest, StatusCode::CREATED, result).await)
 }
 /// Upload append (draft section 4.4).
-async fn append_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>, headers: HeaderMap, body: Body) -> Refusal<Response> {
+async fn append_upload(
+    State(s): State<Arc<Shared>>,
+    Path(digest): Path<String>,
+    Extension(arrival): Extension<Arrival>,
+    headers: HeaderMap,
+    body: Body,
+) -> Refusal<Response> {
     const OP: &str = "upload.append";
     crate::files::require_octet_stream(OP, std::path::Path::new(&digest), &headers, &["application/partial-upload"])?;
     let required = |name| AgentError::new(OP, &digest, ErrorKind::InvalidInput, format!("{name} is required"));
     let offset = sf_integer(&headers, "upload-offset").ok_or_else(|| required("Upload-Offset"))?;
     let complete = sf_boolean(&headers, "upload-complete").ok_or_else(|| required("Upload-Complete"))?;
-    let append =
-        crate::store::Append { digest: digest.clone(), create: false, offset, complete, length: sf_integer(&headers, "upload-length") };
+    let length = sf_integer(&headers, "upload-length");
+    let append = crate::store::Append { digest: digest.clone(), create: false, offset, complete, length, arrival };
     let result = s.store.append(append, body).await;
     Ok(upload_reply(&s, &digest, StatusCode::NO_CONTENT, result).await)
 }
 /// Upload cancellation (draft section 4.5).
-async fn remove_upload(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<StatusCode> {
-    s.store.cancel(&digest).await?;
+async fn remove_upload(
+    State(s): State<Arc<Shared>>,
+    Path(digest): Path<String>,
+    Extension(arrival): Extension<Arrival>,
+) -> Refusal<StatusCode> {
+    s.store.cancel(&digest, Some(arrival)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn blob_size(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<Response> {
@@ -752,8 +775,12 @@ async fn blob_size(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> 
     response.headers_mut().insert(header::CONTENT_LENGTH, header_value(size));
     Ok(response)
 }
-async fn remove_blob(State(s): State<Arc<Shared>>, Path(digest): Path<String>) -> Refusal<StatusCode> {
-    s.store.remove_blob(&digest).await?;
+async fn remove_blob(
+    State(s): State<Arc<Shared>>,
+    Path(digest): Path<String>,
+    Extension(arrival): Extension<Arrival>,
+) -> Refusal<StatusCode> {
+    s.store.remove_blob(&digest, Some(arrival)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

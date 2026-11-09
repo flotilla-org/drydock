@@ -92,6 +92,16 @@ pub async fn harness_with(unix: bool, expected: &str, agent: impl FnOnce(Box<dyn
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
 }
+/// Run `body`, the work of the Hegel case `case`, printing how it failed.
+/// Hegel prints a failure's message only from a replay of the case, so a
+/// failure that no replay repeats would otherwise leave none.
+pub fn reported<T>(case: &str, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|panic| {
+        let message = panic.downcast_ref::<String>().map(String::as_str).or_else(|| panic.downcast_ref::<&str>().copied());
+        eprintln!("{case} failed: {}", message.unwrap_or("a panic without a message"));
+        std::panic::resume_unwind(panic)
+    })
+}
 
 /// Send a request the typed client would not, and return status, headers and body.
 pub async fn raw(
