@@ -286,6 +286,8 @@ fn seconds(duration: &str) -> Option<u64> {
     let seconds: f64 = duration.strip_suffix('s')?.parse().ok()?;
     (seconds.is_finite() && seconds >= 0.0).then(|| seconds.ceil() as u64)
 }
+/// Docker's spec lists no platforms; create asks for this one, and Docker
+/// refuses what it cannot place.
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
 }
@@ -571,10 +573,32 @@ impl Provider for DockerSandboxes {
         let body = json!({"cmd": [AGENT, "--bridge"], "user": "root"});
         let process: Process = endpoint.call(Method::POST, endpoint.url(&["v1", "processes"])?, Body::json(&body)?, &scoped).await?;
         let pid = process.name.strip_prefix("processes/").filter(|p| !p.is_empty()).ok_or_else(|| DOCKER.bad_response())?;
+        match self.attach(&endpoint, &scoped, &process.name, pid).await {
+            Ok(socket) => {
+                let (near, far) = tokio::io::duplex(1 << 16);
+                tokio::spawn(interact(socket, far));
+                Ok(Box::new(near))
+            }
+            Err(error) => {
+                // The bridge would wait on stdin for good: end it, as far as Docker lets.
+                let url = endpoint.url(&["v1", "processes", pid, "signal"])?;
+                let kill = Body::json(&json!({"signal": "kill"}))?;
+                if let Err(failed) = endpoint.call::<IgnoredAny>(Method::POST, url, kill, &scoped).await {
+                    tracing::debug!(error = failed.class(), "the bridge of a failed relay was not ended");
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+impl DockerSandboxes {
+    /// The interact WebSocket to process `name`, attached from its first output.
+    async fn attach(&self, endpoint: &Api, scoped: &Credentials, name: &str, pid: &str) -> Result<WebSocket> {
         let mut url = endpoint.url(&["v1", "processes", pid, "interact"])?;
         url.set_scheme("wss").map_err(|_| DOCKER.bad_response())?;
         let headers = HeaderMap::from_iter([
-            (header::AUTHORIZATION, endpoint.key(&scoped)?),
+            (header::AUTHORIZATION, endpoint.key(scoped)?),
             (header::SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static(SUBPROTOCOL)),
         ]);
         let mut socket = self.dialer.dial(url.as_str(), headers).await.map_err(|error| match error {
@@ -587,15 +611,13 @@ impl Provider for DockerSandboxes {
                 provider_error: Some(error.to_string()),
             },
         })?;
-        let attach = json!({"attach": {"name": &*process.name, "resumeFrom": 0}});
+        let attach = json!({"attach": {"name": name, "resumeFrom": 0}});
         socket.send(Message::text(attach.to_string())).await.map_err(|error| ProtocolError::Unavailable {
             reason: "Docker Sandboxes interact attach failed".into(),
             retry_after: None,
             provider_error: Some(error.to_string()),
         })?;
-        let (near, far) = tokio::io::duplex(1 << 16);
-        tokio::spawn(interact(socket, far));
-        Ok(Box::new(near))
+        Ok(socket)
     }
 }
 
@@ -621,14 +643,27 @@ async fn interact(socket: WebSocket, local: DuplexStream) {
             let text = match message {
                 Message::Text(text) => text,
                 Message::Ping(_) | Message::Pong(_) => continue,
-                _ => break,
+                Message::Close(_) => break,
+                _ => {
+                    tracing::debug!("Docker Sandboxes interact sent a frame that is not text; the relay ends");
+                    break;
+                }
             };
-            let Ok(frame) = serde_json::from_str::<Output>(text.as_str()) else { break };
+            let Ok(frame) = serde_json::from_str::<Output>(text.as_str()) else {
+                tracing::debug!("Docker Sandboxes interact sent a frame that is not its output; the relay ends");
+                break;
+            };
+            if frame.code.is_some() {
+                tracing::debug!("Docker Sandboxes interact ended with an error frame");
+            }
             if frame.exited.is_some() || frame.code.is_some() {
                 break;
             }
             let Some(chunk) = frame.chunk.filter(|c| c.stream.as_deref() == Some("stdout")) else { continue };
-            let Ok(bytes) = STANDARD.decode(chunk.data.unwrap_or_default()) else { break };
+            let Ok(bytes) = STANDARD.decode(chunk.data.unwrap_or_default()) else {
+                tracing::debug!("Docker Sandboxes interact sent output that is not base64; the relay ends");
+                break;
+            };
             if writer.write_all(&bytes).await.is_err() {
                 break;
             }
@@ -671,6 +706,7 @@ impl GuestFiles for DockerSandboxes {
         let directory = Body::json(&json!({"path": parent, "parents": true}))?;
         endpoint.call::<IgnoredAny>(Method::PUT, endpoint.url(&["v1", "files", "directories"])?, directory, &scoped).await?;
         let mut url = endpoint.url(&["v1", "files", "content"])?;
+        // The mode is an integer of permission bits, as JSON numbers are: 0o755 goes as 493.
         url.query_pairs_mut().append_pair("path", &file.path).append_pair("mode", &file.mode.to_string());
         let deadline = Duration::from_secs(self.settings.upload_seconds);
         let content = Body::Bytes(bytes, "application/octet-stream");
@@ -928,18 +964,28 @@ mod tests {
 
     // Exec runs the argv as given, unshelled, as root, at the sandbox's own
     // endpoint with a credential the management API issued for it. A zero
-    // exit status Docker leaves out is success; another is a failed command.
+    // exit status Docker leaves out is success; another is a failed command,
+    // which says when Docker kept only part of its output.
     #[tokio::test]
     async fn exec_runs_the_argv_at_the_sandbox_endpoint() {
-        let answers =
-            vec![(200, RUNNING), (200, ISSUED), (200, r#"{"stdout":"aGk="}"#), (200, RUNNING), (200, ISSUED), (200, r#"{"exitCode":3}"#)];
+        let answers = vec![
+            (200, RUNNING),
+            (200, ISSUED),
+            (200, r#"{"stdout":"aGk="}"#),
+            (200, RUNNING),
+            (200, ISSUED),
+            (200, r#"{"exitCode":3,"stderr":"Ym9v","incomplete":true}"#),
+        ];
         let (docker, script) = docker(Ownership::OwnedAccount, answers).await;
         let exec = docker.operations().exec.unwrap();
         let mut output = String::new();
         let command = ExecRequest { command: vec!["echo".into(), "it's $HOME".into()] };
         exec.exec(ID, command.clone(), &key()).await.unwrap().read_to_string(&mut output).await.unwrap();
         assert_eq!(output, "hi");
-        assert!(matches!(exec.exec(ID, command, &key()).await, Err(ProtocolError::CommandFailed { exit_code: 3, .. })));
+        let Err(ProtocolError::CommandFailed { exit_code: 3, output, .. }) = exec.exec(ID, command, &key()).await else {
+            panic!("not failed")
+        };
+        assert_eq!(output.expose(), "boo\nDocker Sandboxes kept only part of the command's output");
         let asked = script.asked.lock().unwrap();
         let seen: Vec<_> = asked[..3].iter().map(|a| (a.line.as_str(), a.bearer.as_deref())).collect();
         let (issue, run) = (format!("POST {API}/sandboxes/{ID}/endpoint-credentials"), format!("POST {ENDPOINT}/processes/exec"));
@@ -1046,6 +1092,32 @@ mod tests {
         assert!(rest.is_empty());
         server.await.unwrap();
         assert_eq!(script.asked.lock().unwrap()[2].json(), json!({"cmd": [AGENT, "--bridge"], "user": "root"}));
+    }
+
+    // A relay whose interact upgrade Docker refuses fails with Docker's answer,
+    // and the bridge it started is killed rather than left waiting on stdin.
+    #[tokio::test]
+    async fn a_refused_relay_ends_its_bridge() {
+        let (dialer, mut listener) = drydock_transport::memory();
+        let answers = [(200, RUNNING), (200, ISSUED), (201, r#"{"name":"processes/p1","label":"l"}"#), (200, "{}")];
+        let answers = answers.into_iter().map(|(status, body)| (status, body.to_owned())).collect();
+        let script = Arc::new(Script { answers: Mutex::new(answers), ..Script::default() });
+        let docker = configure(Ownership::OwnedAccount, json!({}), script.clone(), Arc::new(dialer)).await.unwrap();
+        tokio::spawn(async move {
+            #[allow(clippy::result_large_err)]
+            let refuse = |_: &Request, _: Response| -> std::result::Result<Response, ErrorResponse> {
+                let mut refusal = ErrorResponse::new(Some(r#"{"code":"permissionDenied","message":"no exec"}"#.into()));
+                *refusal.status_mut() = http::StatusCode::FORBIDDEN;
+                Err(refusal)
+            };
+            let _ = accept_hdr_async(listener.accept().await.unwrap(), refuse).await;
+        });
+        let Err(ProtocolError::Refused { reason }) = docker.relay(ID, &key()).await else { panic!("not refused") };
+        assert!(reason.contains("permissionDenied: no exec"), "{reason}");
+        let asked = script.asked.lock().unwrap();
+        let kill = &asked[3];
+        assert_eq!((kill.line.as_str(), kill.bearer.as_deref()), (&*format!("POST {ENDPOINT}/processes/p1/signal"), Some("Bearer scoped")));
+        assert_eq!(kill.json(), json!({"signal": "kill"}));
     }
 
     /// The next text frame, past the client's answers to pings.
