@@ -19,6 +19,38 @@ Leave the rest off.
 
 Known problem (2026-10-30): `GET /sandbox` returned an empty list for our key while sandboxes were live, so drydock couldn't see the sandboxes it made, including leaked ones. Read on sandboxes is always granted, so the key's permissions aren't the cause; it is not yet understood. Fetching one sandbox by ID or name works.
 
+## Docker Sandboxes (`docker_sandboxes`, Rust host)
+
+Credential: a Docker personal access token and its owner, as JSON, `{"username": …, "personal_access_token": …}`. It is exchanged at Docker Hub (`token_exchange_url`, default `https://hub.docker.com/v2/auth/token`) for a short-lived access token, as Docker's SDK does; the module keeps that token in memory until a minute before it expires, and exchanges again after. An access token that states no expiry is not kept, so each verb then costs an extra Docker Hub call. Docker's API rejects a bare personal access token as the Bearer, so the module rejects a plain token file before any call.
+
+Create the token on Docker Hub (Account settings → Personal access tokens), for an account with Cloud Sandboxes access. The API is experimental: Docker says features and behaviour may change. The module translates: provision, list, inspect, destroy, suspend and resume are Docker's own operations, and rows carry Docker's `status`, its `failure` message and the sandbox's labels in `vendor`. On a `shared_account` (the default) it labels what it makes with `drydock.provider`, and drydockd lists, destroys, suspends and resumes only sandboxes that carry it; Docker's list filters by no label, so the module lists the whole account. On an `owned_account` nothing is labelled or filtered, so use an account that holds only drydock's sandboxes. The client's label is the `flotilla.label` label; provisioning a label twice makes two sandboxes.
+
+| Call | Used for |
+|---|---|
+| `POST /v1/sandboxes` | provision |
+| `GET /v1/sandboxes` (every page) | list |
+| `GET /v1/sandboxes/{id}`, and `GET /v1/sandboxes/{id}/network-policies` while it is running | inspect |
+| `GET /v1/sandboxes/{id}`, then `DELETE /v1/sandboxes/{id}` | destroy |
+| `GET /v1/sandboxes/{id}`, then `POST /v1/sandboxes/{id}/stop` or `/start` | suspend, resume (the resume token is the id) |
+| `POST /v1/sandboxes/{id}/endpoint-credentials` | a five-minute credential for the sandbox's endpoint, for each exec, upload and relay |
+| endpoint `POST /v1/processes/exec` | exec |
+| endpoint `PUT /v1/files/directories`, `PUT /v1/files/content` | the agent's upload |
+| endpoint `POST /v1/processes`, then the `interact` WebSocket | relay (reach) |
+
+Docker's spec names the permission each call needs: `sandboxesRead`, `sandboxesCreate`, `sandboxesDelete`, `sandboxesLifecycle`, `sandboxesCredential` and `networkPoliciesRead`, and `sandboxesExec` and `sandboxesFilesWrite` on the endpoint credential. It does not say how a personal access token's scopes map to them; the live run uses a token that can do all of these.
+
+- Every change of a sandbox (delete, stop, start) needs the etag of its last read, so each is a read and the change. A sandbox that changed in between is Docker's 412, reported as unavailable.
+- Images: Docker runs a public image by digest (`imageRef`). Its API takes no credential for a private registry, so prepare refuses one, and a private image needs a staging registry (`pull_from`) that Docker can pull from anonymously. Prepare makes nothing at Docker.
+- Sizes are Docker's fixed shapes: Micro (1 CPU / 2048 MiB), Small (2 / 4096), Medium (4 / 8192), Large (8 / 16384) and XL (16 / 32768). Any other size is refused before the call. Docker takes no disk size, so ask for a disk of 0; rows report no granted size, since Docker states no disk.
+- drydockd uploads the agent (upload bootstrap) through the sandbox's file API and starts it through exec. Docker's PID 1 is its own init, not the image's entrypoint, and a process started through exec keeps running between execs and across stop and start.
+- Reach is a relay: a process running `drydock-agent --bridge`, its stdin and stdout carried over the interact WebSocket with the endpoint credential. The endpoint credential lasts at most five minutes; whether Docker closes an interact stream when it expires is for the live run to show.
+- Egress: open only. Docker's create takes a sandbox's own policy (`networkPolicies`), but installs it beside the account's default layer, which allows every network: a live deny-all create left the sandbox open (effective `allowNetworks` `**` from layer `default`, no `attached` document installed). The spec states no way for a sandbox's own policy to narrow egress below that default, so the module refuses deny-all in those terms and sends no policy. Restricting egress is the account's governance (org or owner layers), outside this API. Inspect still reports what Docker states: `enforced` only when, for that sandbox, a deny-all policy holds its own (`attached`) document and every effective allowed network comes from that document. The policy identity is Docker's `revision`. Docker states a sandbox's policy only while it runs (otherwise 409 `failedPrecondition`), so inspect of a stopped or starting sandbox states no egress.
+- Platform: `linux/amd64` only. Docker's spec lists no platforms, so the module declares the one it asks for at create, and prepare refuses any other (for example `linux/arm64`).
+- Docker's stop keeps memory and disk, and start resumes in about two seconds. Docker does not say who stopped a sandbox, so a stopped row has no cause. Docker caps a sandbox at 24 hours.
+- The module declares no usage (Docker has no usage API) and no quota. Docker's quota refusals carry a `QuotaFailure` detail and are reported as exhausted quota.
+- drydockd observes sandboxes by listing them every `poll_seconds` (default 30). An exec may run `exec_seconds` (default 60), and the agent's upload `upload_seconds` (default 300).
+- The personal access token goes to `token_exchange_url` only, and the access token it is exchanged for as a Bearer header to `api_url` (default `https://connect.docker.com/sandboxes`). Endpoint calls carry only the sandbox's short-lived credential. Change those settings only to hosts you trust with the token.
+
 ## Namespace (`namespace`, TypeScript host)
 
 Credential: a revocable token as JSON, `{"bearer_token": …}`. The same token is the `nscr.io` push password (user `token`).
