@@ -656,40 +656,55 @@ mod operation_tests {
 mod semantics_layer {
     use super::module::*;
     use super::*;
+    use crate::api::ProviderApi;
+    use futures::StreamExt;
 
     // A vendor that declares no guarantees of its own, so drydockd adds them.
-    // Its inspect reports `inspected` and its list `listed`, each unavailable
-    // when `None`; mutations are recorded and succeed.
-    #[derive(Clone, Default)]
+    // It lists `rows`, or answers unavailable while `failing`; suspend stops a
+    // row, resume runs it, and destroy removes it. Reach, relay, exec, put and
+    // export answer unavailable, and so does inspect: an operation that read
+    // the vendor's row first would fail before reaching it. Every by-id call
+    // but inspect is recorded.
+    #[derive(Default)]
     struct Vendor {
-        inspected: Option<Environment>,
-        listed: Option<Vec<Environment>>,
-        calls: Arc<Mutex<Vec<&'static str>>>,
+        rows: Mutex<Vec<Environment>>,
+        failing: std::sync::atomic::AtomicBool,
+        calls: Mutex<Vec<&'static str>>,
     }
-    struct Configured(Arc<dyn Provider>, Vendor);
+    impl Vendor {
+        fn call<T>(&self, name: &'static str) -> Result<T> {
+            self.calls.recover().push(name);
+            Err(ProtocolError::unavailable("vendor stand-in", None))
+        }
+        fn set(&self, id: &str, state: Observation) {
+            self.rows.recover().iter_mut().filter(|e| e.id == id && e.live()).for_each(|e| e.state = state.clone());
+        }
+    }
+    struct Module(Arc<Vendor>);
+    struct Configured(Arc<dyn Provider>, Arc<Vendor>);
     #[async_trait::async_trait]
-    impl Module for Vendor {
+    impl module::Module for Module {
         fn version(&self) -> &str {
             "test"
         }
         async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-            Ok(Arc::new(Configured(reference::ReferenceModule.configure(name, config, http).await?, self.clone())))
+            Ok(Arc::new(Configured(reference::ReferenceModule.configure(name, config, http).await?, self.0.clone())))
         }
     }
     #[async_trait::async_trait]
     impl Provider for Configured {
         fn operations(&self) -> Operations<'_> {
-            Operations { suspend_resume: Some(self), ..Default::default() }
+            Operations { suspend_resume: Some(self), exec: Some(self), files: Some(self), export: Some(self), ..Default::default() }
         }
         fn ways_in(&self) -> Vec<WayIn> {
-            self.0.ways_in()
+            vec![WayIn::Poll { interval_ms: 10 }]
         }
         fn capabilities(&self) -> Capabilities {
             let mut c = self.0.capabilities();
             c.semantics = Semantics::default();
-            c.fallback_runner = false;
+            c.fallback_runner = true;
             c.suspend_resume = true;
-            c.export = false;
+            c.export = true;
             c.usage = false;
             c.quota = false;
             c
@@ -697,61 +712,78 @@ mod semantics_layer {
         async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
             self.0.prepare(r, c).await
         }
-        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-            self.0.provision(r, c).await
+        // A create answer with no vendor row, so no tags, as E2B's is.
+        async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
+            let made = Environment { label: Some(r.label), vendor: None, ..environment("a", serde_json::json!({"state": "running"})) };
+            self.1.rows.recover().push(tagged("a"));
+            Ok(Provisioned::Created(made))
         }
         async fn list(&self, _: &Credentials) -> Result<Vec<Environment>> {
-            self.1.listed.clone().ok_or_else(|| ProtocolError::unavailable("vendor list rate limited", None))
+            if self.1.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ProtocolError::unavailable("vendor list rate limited", None));
+            }
+            Ok(self.1.rows.recover().clone())
         }
         async fn inspect(&self, _: &str, _: &Credentials) -> Result<Environment> {
-            self.1.inspected.clone().ok_or_else(|| ProtocolError::unavailable("vendor rate limited", None))
+            Err(ProtocolError::unavailable("vendor stand-in", None))
         }
-        async fn destroy(&self, _: &str, _: &Credentials) -> Result<()> {
+        async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
             self.1.calls.recover().push("destroy");
+            self.1.rows.recover().retain(|e| e.id != id);
             Ok(())
         }
-        async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
-            self.0.reach(id, c).await
+        async fn reach(&self, _: &str, _: &Credentials) -> Result<Reach> {
+            self.1.call("reach")
         }
-        async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-            self.0.relay(id, c).await
+        async fn relay(&self, _: &str, _: &Credentials) -> Result<ByteStream> {
+            self.1.call("relay")
         }
     }
     #[async_trait::async_trait]
     impl SuspendResume for Configured {
         async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
             self.1.calls.recover().push("suspend");
+            self.1.set(id, Observation::Stopped { cause: None });
             Ok(ResumeToken { token: Secret::new(id) })
         }
-        async fn resume(&self, _: &str, _: ResumeToken, _: &Credentials) -> Result<()> {
+        async fn resume(&self, id: &str, _: ResumeToken, _: &Credentials) -> Result<()> {
             self.1.calls.recover().push("resume");
+            self.1.set(id, Observation::Running);
             Ok(())
         }
     }
+    #[async_trait::async_trait]
+    impl Exec for Configured {
+        async fn exec(&self, _: &str, _: ExecRequest, _: &Credentials) -> Result<ByteStream> {
+            self.1.call("exec")
+        }
+    }
+    #[async_trait::async_trait]
+    impl GuestFiles for Configured {
+        async fn put(&self, _: &str, _: GuestFile, _: bytes::Bytes, _: &Credentials) -> Result<()> {
+            self.1.call("put")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ExportOperation for Configured {
+        async fn export(&self, _: &str, _: &Credentials) -> Result<Export> {
+            self.1.call("export")
+        }
+    }
 
-    // The provider instance "a" serves for `vendor`, configured with
-    // `instance` beside its module, and the host keeping its observer
-    // running when `observe`.
-    async fn serve(vendor: Vendor, instance: serde_json::Value, observe: bool) -> (Arc<dyn Provider>, Runtime) {
-        let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(vendor) as Arc<dyn Module>)]));
+    // drydockd serving instance "a" over `vendor`, configured with `instance`
+    // beside its module and holding a credential, once its observer holds
+    // what the vendor first lists.
+    async fn serve(vendor: &Arc<Vendor>, instance: serde_json::Value) -> Runtime {
+        let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(Module(vendor.clone())) as Arc<dyn module::Module>)]));
         let mut a = serde_json::json!({"module": "vendor", "settings": {}});
         a.as_object_mut().unwrap().extend(instance.as_object().unwrap().clone());
         let request = serde_json::from_value(serde_json::json!({"providers": {"a": a}})).unwrap();
         host.configure(ConfigUpdate::Replace(request)).await.unwrap();
-        if !observe {
-            for task in host.tasks.recover().drain(..) {
-                task.abort();
-            }
-        }
         host.credential("a", Secret::new("token")).await.unwrap();
-        (host.instance("a").await.unwrap().provider.clone(), host)
-    }
-    // The provider an instance on a shared account (the default) serves, with
-    // `inspected` as the vendor's inspect answer.
-    async fn shared(inspected: Option<Environment>) -> (Arc<dyn Provider>, Arc<Mutex<Vec<&'static str>>>) {
-        let vendor = Vendor { inspected, listed: Some(vec![]), ..Default::default() };
-        let calls = vendor.calls.clone();
-        (serve(vendor, serde_json::json!({}), false).await.0, calls)
+        let mut records = ProviderApi::observe(&host, None).await.unwrap();
+        assert!(matches!(records.next().await, Some(Ok(ObserveRecord::Snapshot { .. }))));
+        host
     }
     fn environment(owner: &str, state: serde_json::Value) -> Environment {
         serde_json::from_value(serde_json::json!({
@@ -763,35 +795,92 @@ mod semantics_layer {
     fn tagged(owner: &str) -> Environment {
         environment(owner, serde_json::json!({"state": "running"}))
     }
-
-    // ADR 0070: on a shared account a destroy whose ownership the vendor
-    // cannot confirm fails closed, without reaching the vendor's destroy.
-    #[tokio::test]
-    async fn destroy_fails_closed_when_ownership_cannot_be_read() {
-        let (provider, calls) = shared(None).await;
-        let result = provider.destroy("e", &Credentials::default()).await;
-        assert!(matches!(result, Err(ProtocolError::Unavailable { .. })), "{result:?}");
-        assert!(calls.recover().is_empty());
+    fn calls(vendor: &Vendor) -> Vec<&'static str> {
+        std::mem::take(&mut *vendor.calls.recover())
+    }
+    // Every operation that acts on an environment by id, as a client calls it.
+    async fn by_id(host: &Runtime) -> Vec<std::result::Result<(), crate::client::Error>> {
+        let token = ResumeToken { token: Secret::new("e") };
+        let file = GuestFile { path: "/f".into(), mode: 0o644 };
+        let exec = ExecRequest { command: vec!["true".into()] };
+        vec![
+            ProviderApi::reach(host, "a", "e").await.map(drop),
+            ProviderApi::relay(host, "a", "e").await.map(drop),
+            ProviderApi::exec(host, "a", "e", &exec).await.map(drop),
+            ProviderApi::put_file(host, "a", "e", &file, bytes::Bytes::new()).await,
+            ProviderApi::export(host, "a", "e").await.map(drop),
+            ProviderApi::suspend(host, "a", "e").await.map(drop),
+            ProviderApi::resume(host, "a", "e", &token).await,
+            ProviderApi::destroy(host, "a", "e").await,
+        ]
+    }
+    fn refused(result: &std::result::Result<(), crate::client::Error>) -> bool {
+        matches!(result, Err(crate::client::Error::Protocol(ProtocolError::Refused { .. })))
     }
 
-    // ADR 0070: on a shared account destroy, suspend and resume refuse an
-    // environment another instance made, or one whose vendor row states no
-    // tags or no vendor row at all, without calling the vendor.
+    // On a shared account, every by-id operation on an environment the
+    // observer does not hold as this instance's is refused without reaching
+    // the vendor: here one the vendor lists under another instance's tag.
     #[tokio::test]
-    async fn mutations_refuse_another_instances_environment() {
-        let mut untagged = tagged("a");
-        untagged.vendor.as_mut().unwrap().tags = None;
-        let unstated = Environment { vendor: None, ..tagged("a") };
-        for row in [tagged("other"), untagged, unstated] {
-            let (provider, calls) = shared(Some(row)).await;
-            let c = Credentials::default();
-            let port = provider.operations().suspend_resume.unwrap();
-            assert!(matches!(provider.destroy("e", &c).await, Err(ProtocolError::Refused { .. })));
-            assert!(matches!(port.suspend("e", &c).await, Err(ProtocolError::Refused { .. })));
-            let token = ResumeToken { token: Secret::new("e") };
-            assert!(matches!(port.resume("e", token, &c).await, Err(ProtocolError::Refused { .. })));
-            assert!(calls.recover().is_empty());
-        }
+    async fn by_id_operations_refuse_what_the_observer_does_not_hold() {
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("other")]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({})).await;
+        assert!(by_id(&host).await.iter().all(refused));
+        assert_eq!(calls(&vendor), Vec::<&str>::new());
+    }
+
+    // On a shared account, every by-id operation on an environment the
+    // observer holds with this instance's tag reaches the vendor without first
+    // reading the vendor's row.
+    #[tokio::test]
+    async fn by_id_operations_reach_the_vendor_for_a_held_environment() {
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("a")]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({"semantics": {"settle": false, "idempotent": false}})).await;
+        assert!(!by_id(&host).await.iter().any(refused));
+        assert_eq!(calls(&vendor), ["reach", "relay", "exec", "put", "export", "suspend", "resume", "destroy"]);
+    }
+
+    // What this instance provisioned is its own from the provision's answer,
+    // before any list shows it and though the answer states no tags.
+    #[tokio::test]
+    async fn a_provisioned_environment_is_held_before_a_list() {
+        let vendor = Arc::new(Vendor::default());
+        let host = serve(&vendor, serde_json::json!({"semantics": {"settle": false}, "events": {"poll_seconds": 3600}})).await;
+        let prepared = ProviderApi::prepare(
+            &host,
+            "a",
+            &PrepareRequest {
+                platform: Some(Platform::new("linux", "amd64")),
+                route: None,
+                image_pull: None,
+                size: drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 },
+                image_digest: "image".into(),
+                tools_digest: "tools".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = ProvisionRequest {
+            label: "vessel".into(),
+            prepared,
+            size: drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 },
+            egress: EgressRequest::Open,
+            ssh_public_key: None,
+        };
+        ProviderApi::provision(&host, "a", &request).await.unwrap();
+        let exec = ExecRequest { command: vec!["true".into()] };
+        assert!(!refused(&ProviderApi::exec(&host, "a", "e", &exec).await.map(drop)));
+        assert_eq!(calls(&vendor), ["exec"]);
+    }
+
+    // An idempotent resume of an environment the observer holds running
+    // answers without a vendor call.
+    #[tokio::test]
+    async fn idempotent_resume_of_a_held_running_environment_calls_nothing() {
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("a")]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({})).await;
+        ProviderApi::resume(&host, "a", "e", &ResumeToken { token: Secret::new("e") }).await.unwrap();
+        assert_eq!(calls(&vendor), Vec::<&str>::new());
     }
 
     // An idempotent suspend of a stopped environment still asks the vendor
@@ -800,23 +889,21 @@ mod semantics_layer {
     #[tokio::test]
     async fn idempotent_suspend_asks_vendor_for_a_token_that_is_not_the_id() {
         let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
-        let vendor = Vendor { inspected: Some(stopped), listed: Some(vec![]), ..Default::default() };
-        let calls = vendor.calls.clone();
-        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"settle": false}}), false).await;
-        provider.operations().suspend_resume.unwrap().suspend("e", &Credentials::default()).await.unwrap();
-        assert_eq!(*calls.recover(), vec!["suspend"]);
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![stopped]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({"semantics": {"settle": false}})).await;
+        ProviderApi::suspend(&host, "a", "e").await.unwrap();
+        assert_eq!(calls(&vendor), ["suspend"]);
     }
 
     // A settling wait whose observer polls keep failing answers unavailable
     // at its deadline, naming the poll's error.
     #[tokio::test]
     async fn settle_timeout_names_the_failing_poll() {
-        let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
-        let vendor = Vendor { inspected: Some(stopped), listed: None, ..Default::default() };
-        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"wait_seconds": 1}}), true).await;
-        let token = ResumeToken { token: Secret::new("e") };
-        let result = provider.operations().suspend_resume.unwrap().resume("e", token, &Credentials::default()).await;
-        let Err(ProtocolError::Unavailable { reason, .. }) = result else { panic!("{result:?}") };
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("a")]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({"semantics": {"wait_seconds": 1}})).await;
+        vendor.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = ProviderApi::suspend(&host, "a", "e").await;
+        let Err(crate::client::Error::Protocol(ProtocolError::Unavailable { reason, .. })) = result else { panic!("{result:?}") };
         assert!(reason.contains("the last poll failed") && reason.contains("vendor list rate limited"), "{reason}");
     }
 
@@ -824,18 +911,14 @@ mod semantics_layer {
     // environment gone, rather than waiting out its deadline.
     #[tokio::test]
     async fn settle_ends_early_on_gone() {
-        let stopped = environment("a", serde_json::json!({"state": "stopped", "cause": "suspended_by_request"}));
         let gone = environment("a", serde_json::json!({"state": "gone", "cause": {"kind": "destroyed_at_provider"}}));
-        let vendor = Vendor { inspected: Some(stopped), listed: Some(vec![gone]), ..Default::default() };
-        let (provider, _host) = serve(vendor, serde_json::json!({"semantics": {"wait_seconds": 60}}), true).await;
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![gone]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({"semantics": {"wait_seconds": 60}})).await;
         let token = ResumeToken { token: Secret::new("e") };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            provider.operations().suspend_resume.unwrap().resume("e", token, &Credentials::default()),
-        )
-        .await
-        .expect("the wait ends before its deadline");
-        assert!(matches!(result, Err(ProtocolError::Refused { .. })), "{result:?}");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), ProviderApi::resume(&host, "a", "e", &token))
+            .await
+            .expect("the wait ends before its deadline");
+        assert!(refused(&result), "{result:?}");
     }
 
     // An owned account is refused for a module that checks ownership itself.
