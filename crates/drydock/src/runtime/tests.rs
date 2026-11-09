@@ -775,15 +775,34 @@ mod semantics_layer {
     // beside its module and holding a credential, once its observer holds
     // what the vendor first lists.
     async fn serve(vendor: &Arc<Vendor>, instance: serde_json::Value) -> Runtime {
+        let host = configured(vendor, instance).await;
+        host.credential("a", Secret::new("token")).await.unwrap();
+        let mut records = ProviderApi::observe(&host, None).await.unwrap();
+        assert!(matches!(records.next().await, Some(Ok(ObserveRecord::Snapshot { .. }))));
+        host
+    }
+    // drydockd serving instance "a" over `vendor`, holding no credential.
+    async fn configured(vendor: &Arc<Vendor>, instance: serde_json::Value) -> Runtime {
         let host = Runtime::new(Registry::from([("vendor".into(), Arc::new(Module(vendor.clone())) as Arc<dyn module::Module>)]));
         let mut a = serde_json::json!({"module": "vendor", "settings": {}});
         a.as_object_mut().unwrap().extend(instance.as_object().unwrap().clone());
         let request = serde_json::from_value(serde_json::json!({"providers": {"a": a}})).unwrap();
         host.configure(ConfigUpdate::Replace(request)).await.unwrap();
-        host.credential("a", Secret::new("token")).await.unwrap();
-        let mut records = ProviderApi::observe(&host, None).await.unwrap();
-        assert!(matches!(records.next().await, Some(Ok(ObserveRecord::Snapshot { .. }))));
         host
+    }
+    // A provision request of the `vessel` label, prepared through `api`.
+    async fn vessel(api: &dyn ProviderApi) -> ProvisionRequest {
+        let size = drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 };
+        let prepare = PrepareRequest {
+            platform: Some(Platform::new("linux", "amd64")),
+            route: None,
+            image_pull: None,
+            size: size.clone(),
+            image_digest: "image".into(),
+            tools_digest: "tools".into(),
+        };
+        let prepared = api.prepare("a", &prepare).await.unwrap();
+        ProvisionRequest { label: "vessel".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None }
     }
     fn environment(owner: &str, state: serde_json::Value) -> Environment {
         serde_json::from_value(serde_json::json!({
@@ -846,27 +865,7 @@ mod semantics_layer {
     async fn a_provisioned_environment_is_held_before_a_list() {
         let vendor = Arc::new(Vendor::default());
         let host = serve(&vendor, serde_json::json!({"semantics": {"settle": false}, "events": {"poll_seconds": 3600}})).await;
-        let prepared = ProviderApi::prepare(
-            &host,
-            "a",
-            &PrepareRequest {
-                platform: Some(Platform::new("linux", "amd64")),
-                route: None,
-                image_pull: None,
-                size: drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 },
-                image_digest: "image".into(),
-                tools_digest: "tools".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let request = ProvisionRequest {
-            label: "vessel".into(),
-            prepared,
-            size: drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 },
-            egress: EgressRequest::Open,
-            ssh_public_key: None,
-        };
+        let request = vessel(&host).await;
         ProviderApi::provision(&host, "a", &request).await.unwrap();
         let exec = ExecRequest { command: vec!["true".into()] };
         assert!(!refused(&ProviderApi::exec(&host, "a", "e", &exec).await.map(drop)));
@@ -919,6 +918,22 @@ mod semantics_layer {
             .await
             .expect("the wait ends before its deadline");
         assert!(refused(&result), "{result:?}");
+    }
+
+    // A settling wait answers at once, naming the cause, when the observer
+    // cannot see the provider: drydockd holds no credential for it and no
+    // vendor events reach it. The request's own credential does not poll.
+    #[tokio::test]
+    async fn settle_answers_at_once_when_the_observer_cannot_see_the_provider() {
+        let vendor = Arc::new(Vendor::default());
+        let host = configured(&vendor, serde_json::json!({"semantics": {"wait_seconds": 60}})).await;
+        let caller = ProviderApi::with_credential(&host, Secret::new("request"));
+        let request = vessel(&*caller).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), caller.provision("a", &request))
+            .await
+            .expect("the wait answers before its deadline");
+        let Err(crate::client::Error::Protocol(ProtocolError::Unavailable { reason, .. })) = result else { panic!("{result:?}") };
+        assert!(reason.contains("cannot confirm environment e is running") && reason.contains("missing credential"), "{reason}");
     }
 
     // An owned account is refused for a module that checks ownership itself.

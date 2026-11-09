@@ -695,9 +695,11 @@ The values shown are the defaults.
   without a push way in it asks for one poll at once, then follows the
   observer's polls, so it can take up to one observation interval after the
   vendor got there; with a relay it waits for the vendor's event. It makes no
-  vendor calls of its own. It needs the
-  credential drydockd holds for the instance, since that is what the observer
-  polls with. A wait ends early, refused, when the environment is gone or its
+  vendor calls of its own. Without a relay it needs the credential drydockd
+  holds for the instance, since that is what the observer polls with: when
+  drydockd holds none, or the vendor rejected it, a wait answers unavailable
+  at once, naming the cause, and never polls with the request's credential.
+  A wait ends early, refused, when the environment is gone or its
   state unknown, and unavailable at its deadline, naming the last poll's
   error if the observer's polls were failing. A provision whose wait fails has
   still made its environment: the error names its id, and `list` shows it

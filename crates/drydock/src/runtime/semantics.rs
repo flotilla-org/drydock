@@ -28,9 +28,12 @@ pub(super) struct Observed {
     /// What this instance provisioned and no list has shown yet: its first
     /// vendor event starts from this row, and it is this instance's own.
     pub(super) claimed: Mutex<BTreeMap<String, Environment>>,
+    /// The credential drydockd holds for the provider, which the observer
+    /// lists with.
+    auth: Arc<Mutex<Authentication>>,
 }
 impl Observed {
-    pub(super) fn new(log: &EventLog, provider: &str, pushed: bool) -> Arc<Self> {
+    pub(super) fn new(log: &EventLog, provider: &str, pushed: bool, auth: Arc<Mutex<Authentication>>) -> Arc<Self> {
         Arc::new(Self {
             log: log.clone(),
             provider: provider.to_owned(),
@@ -39,6 +42,7 @@ impl Observed {
             poll_now: Notify::new(),
             claimed_now: Notify::new(),
             claimed: Mutex::default(),
+            auth,
         })
     }
     pub(super) fn row(&self, id: &str) -> Option<Environment> {
@@ -103,8 +107,18 @@ impl Added {
     /// The environment once the observer sees it `what`. A wait ends early
     /// when the observer sees it gone or in an unknown state, and as
     /// unavailable at the deadline, naming the last poll's error if the
-    /// observer's polls were failing.
+    /// observer's polls were failing. It answers at once, unavailable, when
+    /// the observer cannot see the provider.
     async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool) -> Result<Environment> {
+        if let Some(readiness) = self.blind() {
+            return Err(ProtocolError::unavailable(
+                format!(
+                    "drydockd cannot confirm environment {id} is {what}: it hears of no vendor events for provider {}, and cannot list it with the credential it holds ({readiness})",
+                    self.observed.provider
+                ),
+                None,
+            ));
+        }
         let mut changes = self.observed.log.changed.subscribe();
         if !self.observed.pushed {
             // When the observer is mid-poll this stores a permit, so it polls
@@ -151,6 +165,16 @@ impl Added {
             Some(_) => Err(refused(format!("environment {id} does not carry this instance's {OWNER_TAG} tag"))),
             None => Err(refused(format!("environment {id} is unknown to this instance"))),
         }
+    }
+    /// Why the observer cannot see the provider now, when it cannot: no
+    /// vendor events reach it, and it may not list with the credential
+    /// drydockd holds.
+    fn blind(&self) -> Option<Readiness> {
+        if self.observed.pushed {
+            return None;
+        }
+        let availability = availability(&*self.inner, &self.observed.auth.recover());
+        (!availability.may_call).then_some(availability.readiness)
     }
     /// Whether the observer last saw `id` in a state `skip` accepts.
     fn already(&self, id: &str, skip: fn(&Observation) -> bool) -> bool {
