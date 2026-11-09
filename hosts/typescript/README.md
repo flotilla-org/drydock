@@ -163,8 +163,7 @@ The built-in `modal` module drives Modal sandboxes through the JavaScript SDK
 `drydock`: the one app holding every sandbox of the instance, created if
 missing), `environment`, `runtime` (`vm`, the default, or `gvisor`),
 `lifetime_seconds` (Modal's timeout for each sandbox; default 86400, Modal's
-longest), `list_concurrency` (tag reads list runs at once; default 8, at most 64) and
-`agent_wait_seconds` (how long the agent's socket is waited for; default 10).
+longest) and `list_concurrency` (tag reads list runs at once; default 8, at most 64).
 `concurrency_limit` is gone with quota: a configuration that still sets it is
 refused, as any unknown key is. The credential is
 `{"token_id": …, "token_secret": …}`, handed to the SDK client directly, never
@@ -196,12 +195,11 @@ and sandbox backend from those, so run the host without them.
   fixed and cannot be sized, so a requested disk is accepted and not applied.
   Modal answers a create with the sandbox's id alone, so the row's state is
   unknown. A refused create is refused in Modal's words.
-  The module then starts the agent by a root exec that gets a
-  fresh TCP token on stdin: it keeps the token already in
-  `/run/drydock/tcp.token` (0600) or writes this one, runs
-  `--supervise --tcp 0.0.0.0:7811 --tcp-token-file … --socket …`
-  (idempotent; all addresses, since Modal's edge cannot reach loopback), waits up
-  to `agent_wait_seconds` for the socket and prints the token in use, which the
+  The module then starts the agent by one argv exec, as root:
+  `--supervise --tcp 0.0.0.0:7811 --tcp-token-file /run/drydock/tcp.token`
+  `--print-token --socket …` (idempotent; all addresses, since Modal's edge
+  cannot reach loopback). The agent keeps the token file or writes a fresh
+  token, returns once it is serving, and prints the token in use, which the
   module remembers. The token is never on an argv, in the environment or in
   Modal's configuration. drydockd cannot start the agent itself: its upload
   bootstrap needs the files and exec ports this host does not offer, and

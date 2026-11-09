@@ -7,6 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const SERVE_WAIT: Duration = Duration::from_secs(10);
+
 /// Refuses a TCP listener the agent would refuse, before detaching, so the
 /// provider's bootstrap hears of it rather than a supervisor that restarts
 /// a failing agent for ever. The token file's own state is [`provision`]'s.
@@ -104,8 +106,31 @@ pub fn start(args: &[OsString]) -> io::Result<()> {
     // Its own process group, outside the toolbox exec session's foreground
     // group, without depending on nohup or an image init.
     command.process_group(0);
-    command.spawn()?;
-    Ok(())
+    let mut supervisor = command.spawn()?;
+    serving(&path, &mut supervisor)
+}
+
+/// Returns once the agent accepts on `socket`, so every caller of `--supervise`
+/// may use it on return; fails if the supervisor exits unsuccessfully, or the
+/// agent does not serve within [`SERVE_WAIT`].
+fn serving(socket: &std::path::Path, supervisor: &mut std::process::Child) -> io::Result<()> {
+    let deadline = Instant::now() + SERVE_WAIT;
+    loop {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = supervisor.try_wait()?.filter(|status| !status.success()) {
+            return Err(io::Error::other(format!("the supervisor exited with {status}; see supervisor.log beside {}", socket.display())));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "the agent is not serving on {} after {}s (the supervisor is still running or exited cleanly); see supervisor.log beside it",
+                socket.display(),
+                SERVE_WAIT.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub async fn run(args: &[OsString]) -> io::Result<()> {

@@ -19,9 +19,9 @@ type Row = {
 export class StandIn {
   rows = new Map<string, Row>();
   calls: string[] = [];
-  scripts: string[] = [];
-  /** What the agent script prints, and how it exits. */
-  agentOutput = AGENT_TOKEN;
+  argvs: string[][] = [];
+  /** What `--print-token` prints, and how it exits. */
+  agentOutput = `drydock-tcp-token ${AGENT_TOKEN}\n`;
   agentExit = 0;
   /** A message Modal refuses the next create with. */
   refuseCreate: string | undefined;
@@ -63,7 +63,7 @@ export class StandIn {
         // The SDK's answer when the sandbox ended before exec found its task.
         if (standIn.row(id).exit !== null)
           throw new ConflictError(`Sandbox ${id} has already finished`);
-        standIn.scripts.push(argv[2]);
+        standIn.argvs.push(argv);
         const output = new TextEncoder().encode(standIn.agentOutput);
         return {
           stdin: new WritableStream(),

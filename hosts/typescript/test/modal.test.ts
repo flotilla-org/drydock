@@ -74,7 +74,7 @@ test("settings outside their bounds are refused", async () => {
     { lifetime_seconds: 86_401 },
     { list_concurrency: 0 },
     { list_concurrency: 65 },
-    { agent_wait_seconds: 0 },
+    { agent_wait_seconds: 10 },
     { concurrency_limit: 4 },
   ])
     await assert.rejects(setup(settings), kind("refused"));
@@ -119,10 +119,7 @@ test("prepare refuses a registry on a private address", async () => {
 });
 
 test("provision is one unnamed create tagged with the label and owner, then the agent's start", async () => {
-  const { standIn, provision } = await setup({
-    lifetime_seconds: 3600,
-    agent_wait_seconds: 5,
-  });
+  const { standIn, provision } = await setup({ lifetime_seconds: 3600 });
   const { created, environment } = await provision("work", {
     mode: "deny_all",
     direct: [
@@ -149,7 +146,19 @@ test("provision is one unnamed create tagged with the label and owner, then the 
   assert.deepEqual(params.outboundCidrAllowlist, ["192.0.2.0/24"]);
   assert.deepEqual(params.outboundDomainAllowlist, ["example.com"]);
   assert.deepEqual(standIn.calls, ["create", "exec sb-1"]);
-  assert.match(standIn.scripts[0], /seq 50\b/);
+  assert.deepEqual(standIn.argvs, [
+    [
+      "/opt/drydock/drydock-agent",
+      "--supervise",
+      "--tcp",
+      "0.0.0.0:7811",
+      "--tcp-token-file",
+      "/run/drydock/tcp.token",
+      "--print-token",
+      "--socket",
+      "/run/drydock/agent.sock",
+    ],
+  ]);
 });
 
 test("on an owned account a sandbox carries the label alone", async () => {
