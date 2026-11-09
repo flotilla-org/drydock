@@ -669,6 +669,7 @@ mod semantics_layer {
     struct Vendor {
         rows: Mutex<Vec<Environment>>,
         failing: std::sync::atomic::AtomicBool,
+        refuse_suspend: std::sync::atomic::AtomicBool,
         calls: Mutex<Vec<&'static str>>,
     }
     impl Vendor {
@@ -743,6 +744,9 @@ mod semantics_layer {
     impl SuspendResume for Configured {
         async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
             self.1.calls.recover().push("suspend");
+            if self.1.refuse_suspend.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(module::refused("vendor refused the suspend"));
+            }
             self.1.set(id, Observation::Stopped { cause: None });
             Ok(ResumeToken { token: Secret::new(id) })
         }
@@ -934,6 +938,46 @@ mod semantics_layer {
             .expect("the wait answers before its deadline");
         let Err(crate::client::Error::Protocol(ProtocolError::Unavailable { reason, .. })) = result else { panic!("{result:?}") };
         assert!(reason.contains("cannot confirm environment e is running") && reason.contains("missing credential"), "{reason}");
+    }
+
+    // A stop drydockd asked for is attributed to the request, though the
+    // vendor states no cause; a stop after a resume, which it did not ask
+    // for, carries none.
+    #[tokio::test]
+    async fn the_observer_attributes_its_own_suspends() {
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("a")]), ..Default::default() });
+        let host = serve(&vendor, serde_json::json!({})).await;
+        let mut records = ProviderApi::observe(&host, None).await.unwrap();
+        ProviderApi::suspend(&host, "a", "e").await.unwrap();
+        ProviderApi::resume(&host, "a", "e", &ResumeToken { token: Secret::new("e") }).await.unwrap();
+        vendor.set("e", Observation::Stopped { cause: None });
+        let mut stops = vec![];
+        while stops.len() < 2 {
+            let record = tokio::time::timeout(std::time::Duration::from_secs(10), records.next()).await.unwrap().unwrap().unwrap();
+            if let ObserveRecord::Event { event: Event { event: EventKind::Stopped { cause }, .. } } = record {
+                stops.push(cause);
+            }
+        }
+        assert_eq!(stops, [Some(StopCause::SuspendedByRequest), None]);
+    }
+
+    // A suspend the vendor refused is not this instance's: a stop that
+    // follows carries only the vendor's cause.
+    #[tokio::test]
+    async fn a_failed_suspend_is_not_attributed() {
+        let vendor = Arc::new(Vendor { rows: Mutex::new(vec![tagged("a")]), ..Default::default() });
+        vendor.refuse_suspend.store(true, std::sync::atomic::Ordering::SeqCst);
+        let host = serve(&vendor, serde_json::json!({})).await;
+        let mut records = ProviderApi::observe(&host, None).await.unwrap();
+        assert!(ProviderApi::suspend(&host, "a", "e").await.is_err());
+        vendor.set("e", Observation::Stopped { cause: None });
+        loop {
+            let record = tokio::time::timeout(std::time::Duration::from_secs(10), records.next()).await.unwrap().unwrap().unwrap();
+            if let ObserveRecord::Event { event: Event { event: EventKind::Stopped { cause }, .. } } = record {
+                assert_eq!(cause, None);
+                break;
+            }
+        }
     }
 
     // An owned account is refused for a module that checks ownership itself.

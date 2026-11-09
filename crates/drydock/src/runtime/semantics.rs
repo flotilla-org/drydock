@@ -28,6 +28,9 @@ pub(super) struct Observed {
     /// What this instance provisioned and no list has shown yet: its first
     /// vendor event starts from this row, and it is this instance's own.
     pub(super) claimed: Mutex<BTreeMap<String, Environment>>,
+    /// What this instance asked to suspend. Held in memory only: after a
+    /// restart, a stop states only the cause the vendor gives.
+    pub(super) suspended: Mutex<BTreeMap<String, Suspend>>,
     /// The credential drydockd holds for the provider, which the observer
     /// lists with.
     auth: Arc<Mutex<Authentication>>,
@@ -42,6 +45,7 @@ impl Observed {
             poll_now: Notify::new(),
             claimed_now: Notify::new(),
             claimed: Mutex::default(),
+            suspended: Mutex::default(),
             auth,
         })
     }
@@ -53,6 +57,13 @@ impl Observed {
     fn held(&self, id: &str) -> Option<Environment> {
         self.row(id).or_else(|| self.claimed.recover().get(id).cloned())
     }
+}
+
+/// How far the observer has seen a suspend this instance asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Suspend {
+    Asked,
+    Stopped,
 }
 
 /// `provider`, with what `config` asks for and its module does not declare.
@@ -308,7 +319,18 @@ impl SuspendResume for Added {
             && self.already(id, |s| {
                 matches!(s, Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping })
             });
-        let token = if skip { ResumeToken { token: Secret::new(id) } } else { port.suspend(id, c).await? };
+        let token = if skip {
+            ResumeToken { token: Secret::new(id) }
+        } else {
+            // Marked before the call: the vendor's event can arrive before its answer.
+            self.observed.suspended.recover().entry(id.to_owned()).or_insert(Suspend::Asked);
+            port.suspend(id, c).await.inspect_err(|_| {
+                let mut suspended = self.observed.suspended.recover();
+                if suspended.get(id) == Some(&Suspend::Asked) {
+                    suspended.remove(id);
+                }
+            })?
+        };
         if self.settle {
             self.until(id, "stopped", |s| matches!(s, Observation::Stopped { .. })).await?;
         }
@@ -320,6 +342,7 @@ impl SuspendResume for Added {
         if !self.already(id, |s| matches!(s, Observation::Running | Observation::Transitioning { phase: TransitionPhase::Starting })) {
             port.resume(id, token, c).await?;
         }
+        self.observed.suspended.recover().remove(id);
         if self.settle {
             self.running(id).await?;
         }

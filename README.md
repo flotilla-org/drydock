@@ -461,7 +461,10 @@ Paused is an explicit billing transition; Stopped is the general stopped event
 and observation, whose `PausedByProvider` cause is valid under ADR 0058. Consumers
 must count both as non-running rather than infer loss. `MissingOnList` records
 absence from an authoritative complete list; `DestroyedByRequest` records a
-confirmed client deletion, matching ADR 0058's loss vocabulary.
+confirmed client deletion, matching ADR 0058's loss vocabulary. A stop of an
+environment drydockd itself suspended is `SuspendedByRequest` when the vendor
+states no cause. drydockd keeps that record in memory only: after a restart,
+such a stop carries only the cause the vendor states.
 
 Relay and exec clients send `Connection: Upgrade` and respectively
 `Upgrade: drydock-relay` or `Upgrade: drydock-stream`;
@@ -753,7 +756,8 @@ to change the listing interval. With a relay drydockd still lists, every
 observed (`observed.way`: `webhook` with its `delivery_id`, `poll`, or
 `reconstruction`) and carries the vendor's state verbatim (`vendor`, without
 tags). What a delivery does not state stays absent: Daytona's body gives no
-cause for a stop or a destruction (`cause` is then absent), and no labels or
+cause for a stop or a destruction (`cause` is then absent, unless drydockd
+asked for the change), and no labels or
 size; E2B's names its change (`sandbox.lifecycle.paused` is the vendor state)
 and gives a kill's `kill_reason` as the vendor reason, but no cause.
 Transitional states arrive as `transitioning` events. drydockd stores the
