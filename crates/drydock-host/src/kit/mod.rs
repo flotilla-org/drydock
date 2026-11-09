@@ -138,6 +138,23 @@ pub fn granted(
     Ok(Some(Size { cpus: cpus as f64, memory_bytes: bytes(memory, memory_unit)?, disk_bytes: bytes(disk, disk_unit)? }))
 }
 
+/// What a remote sandbox declares unless its vendor differs: a frozen
+/// material cloned in the vessel under `/workspace`, the fallback runner,
+/// egress denied, through a proxy or open under `model`, and the agent, which
+/// carries outward exposures since the sandbox has no network of drydockd's.
+pub fn remote_sandbox(model: EgressModel) -> Capabilities {
+    Capabilities {
+        material_modes: vec![MaterialMode::Frozen],
+        checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
+        workspace_root: "/workspace".into(),
+        egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open], model },
+        fallback_runner: true,
+        agent: true,
+        reach_ways: vec![ReachWay::OutwardExposure],
+        ..Capabilities::default()
+    }
+}
+
 /// Lifecycle states as a table: the vendor's state name, and the observation.
 pub type StateTable = &'static [(&'static str, Observation)];
 /// The observation `state` maps to, or ProviderStateUnknown.

@@ -392,20 +392,14 @@ fn egress_model() -> EgressModel {
 #[async_trait]
 impl Provider for DockerSandboxes {
     fn capabilities(&self) -> Capabilities {
+        let remote = kit::remote_sandbox(egress_model());
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             // Docker's stop hibernates a sandbox whose backend preserves memory,
             // and its sandboxes have resumed with their processes running.
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability { routes: vec![EgressRoute::ExplicitProxy, EgressRoute::Open], model: egress_model() },
-            fallback_runner: true,
+            egress: EgressCapability { routes: vec![EgressRoute::ExplicitProxy, EgressRoute::Open], ..remote.egress },
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
-            agent_tcp_port: None,
             platforms: vec![platform()],
             // Docker pulls a public image by digest; its API takes no
             // credential for a private registry.
@@ -415,16 +409,11 @@ impl Provider for DockerSandboxes {
                 digest_references: true,
                 tools_layer: ToolsLayer::Upload,
             }],
-            usage: false,
-            quota: false,
-            host_filesystem: false,
-            host_processes: false,
-            exclusive_label: false,
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, stop and start answer once Docker accepts them; a repeated
             // one is Docker's to answer; list and delete reach the whole
             // account; and Docker starts a sandbox by id alone.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..remote
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {

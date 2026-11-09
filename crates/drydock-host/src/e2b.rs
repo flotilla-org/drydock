@@ -640,19 +640,9 @@ fn egress_model() -> EgressModel {
 impl Provider for E2b {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
-            fallback_runner: true,
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
             platforms: vec![platform()],
             image_routes: vec![ImageRoute::RegistryPull {
                 auth: RegistryAuthKind::Basic,
@@ -664,16 +654,12 @@ impl Provider for E2b {
             // Usage cannot carry as given (drydock#257); no figure is derived.
             usage: false,
             quota: true,
-            host_filesystem: false,
-            host_processes: false,
             agent_tcp_port: std::num::NonZeroU16::new(AGENT_PORT),
-            exclusive_label: false,
-            // The agent carries outward exposures; the sandbox has no network of drydockd's.
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create and pause answer once E2B accepted them, a second pause
             // is E2B's conflict, list and kill reach the whole team, and
             // connect resumes by id alone.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..kit::remote_sandbox(egress_model())
         }
     }
     /// E2B's webhooks are registered in its dashboard or through its API.

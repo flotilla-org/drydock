@@ -132,8 +132,9 @@ Register the module in two places: `pub mod` in
 
 ## 3. Capabilities, `Semantics` and ways in
 
-`capabilities()` is the module's declaration. State only what the vendor
-does:
+`capabilities()` is the module's declaration: `kit::remote_sandbox`'s
+defaults, and only what the vendor does differently. Docker cannot deny
+egress, so its routes lack `None`.
 
 - **Lifecycle.** `suspend_resume` when the vendor can stop and start a
   sandbox; `suspend_preserves_memory` when its stop keeps memory. Docker's

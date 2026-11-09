@@ -453,19 +453,9 @@ impl Guest for Runtime {
 impl Provider for Runtime {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
-            fallback_runner: true,
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
             agent_tcp_port: Some(self.settings.agent_port),
             platforms: vec![platform()],
             image_routes: vec![ImageRoute::RegistryPull {
@@ -478,17 +468,14 @@ impl Provider for Runtime {
             // collected as Runtime gives them (drydock#257); no figure is derived.
             usage: false,
             quota: true,
-            host_filesystem: false,
-            host_processes: false,
             // A second provision of a label is Runtime's refusal of the name,
             // not the sandbox that holds it.
             exclusive_label: false,
-            // The agent carries outward exposures; the sandbox has no network of drydockd's.
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, pause, wake and restart answer at Runtime's wait, settled
             // or not; a repeated one is Runtime's to answer; list and delete
             // reach the whole account; and Runtime resumes by id alone.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..kit::remote_sandbox(egress_model())
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {
