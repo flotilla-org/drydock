@@ -26,8 +26,9 @@ pub struct GuestOutput {
 }
 impl GuestOutput {
     /// An exit status outside i32 reads as -1, as an unreported one does.
-    pub fn from_text(stdout: &str, stderr: &str, exit: Option<i64>) -> Self {
-        let chunks = [(false, stdout), (true, stderr)].into_iter().filter(|(_, s)| !s.is_empty()).map(|(e, s)| (e, s.into())).collect();
+    pub fn from_text(stdout: impl AsRef<[u8]>, stderr: impl AsRef<[u8]>, exit: Option<i64>) -> Self {
+        let streams = [(false, stdout.as_ref()), (true, stderr.as_ref())];
+        let chunks = streams.into_iter().filter(|(_, s)| !s.is_empty()).map(|(e, s)| (e, s.to_vec())).collect();
         Self { chunks, exit: exit.map(|c| i32::try_from(c).unwrap_or(-1)), ..Self::default() }
     }
     pub fn bytes(&self, stderr: Option<bool>) -> Vec<u8> {
@@ -71,9 +72,14 @@ impl GuestOutput {
 pub trait Guest: Send + Sync {
     fn vendor(&self) -> Vendor;
     async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput>;
+    /// Runs `argv` as [`Self::run`] does: through `sh -c` and its quoting,
+    /// unless the vendor's exec takes an argv as given.
+    async fn run_argv(&self, id: &str, argv: &[String], env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        self.run(id, &shell_command(argv), env, c).await
+    }
     /// A user's command, as the exec port runs it.
     async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream> {
-        Ok(self.run(id, &shell_command(&request.command), BTreeMap::new(), c).await?.success(self.vendor())?.into_stream())
+        Ok(self.run_argv(id, &request.command, BTreeMap::new(), c).await?.success(self.vendor())?.into_stream())
     }
     /// The token the guest's agent serves its TCP listener with.
     async fn agent_token(&self, id: &str, c: &Credentials) -> Result<Secret> {

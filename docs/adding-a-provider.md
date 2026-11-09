@@ -20,7 +20,9 @@ There are two hosts:
   compiled in and share the [`kit`](../crates/drydock-host/src/kit/mod.rs): an
   HTTP client for the vendor's API with typed answers and a status table
   ([`kit::api`](../crates/drydock-host/src/kit/api.rs)), lifecycle state
-  tables, prepare's checks, guest command output, and a WebSocket dialer
+  tables, prepare's checks, guest commands (`kit::guest::Guest`, its
+  `run_argv` overridden where the exec takes an argv, as Docker's does), and a
+  WebSocket dialer
   ([`drydock_transport::websocket`](../crates/drydock-transport/src/websocket.rs)).
 - **TypeScript**, in [`hosts/typescript`](../hosts/typescript). Each module is
   a thin bridge over the vendor's TypeScript SDK. Read its

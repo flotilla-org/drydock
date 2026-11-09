@@ -9,7 +9,7 @@ use crate::{
     kit::{
         self, LABEL_TAG, MIB, StateTable, Vendor,
         api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, cut, operation},
-        guest::GuestOutput,
+        guest::{Guest, GuestOutput},
         image::{check_prepare, check_prepared},
     },
     module::*,
@@ -385,19 +385,6 @@ impl DockerSandboxes {
             }),
         }
     }
-    /// One command, its argv as given, run as root to its end.
-    async fn run(&self, id: &str, argv: &[String], c: &Credentials) -> Result<GuestOutput> {
-        let c = &self.access(c).await?;
-        let (endpoint, scoped) = self.endpoint(id, &["sandboxesExec"], c).await?;
-        let body = json!({"cmd": argv, "user": "root"});
-        let url = endpoint.url(&["v1", "processes", "exec"])?;
-        let deadline = Duration::from_secs(self.settings.exec_seconds);
-        let v: Executed = endpoint.call_within(Method::POST, url, Body::json(&body)?, &scoped, deadline).await?;
-        let bytes = |text: Option<String>| STANDARD.decode(text.unwrap_or_default()).map_err(|_| DOCKER.bad_response());
-        let chunks = [(false, bytes(v.stdout)?), (true, bytes(v.stderr)?)].into_iter().filter(|(_, b)| !b.is_empty()).collect();
-        let note = v.incomplete.then(|| "Docker Sandboxes kept only part of the command's output".to_owned());
-        Ok(GuestOutput { chunks, exit: Some(v.exit_code), timed_out: false, note })
-    }
 }
 
 /// Docker's sandbox shapes: a name, whole vCPUs and MiB of memory. Docker
@@ -682,10 +669,34 @@ impl SuspendResume for DockerSandboxes {
     }
 }
 
+/// Docker's exec takes an argv, and runs it as root to its end.
+#[async_trait]
+impl Guest for DockerSandboxes {
+    fn vendor(&self) -> Vendor {
+        DOCKER
+    }
+    async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        self.run_argv(id, &["sh".into(), "-c".into(), script.into()], env, c).await
+    }
+    async fn run_argv(&self, id: &str, argv: &[String], env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        let c = &self.access(c).await?;
+        let (endpoint, scoped) = self.endpoint(id, &["sandboxesExec"], c).await?;
+        let mut body = json!({"cmd": argv, "user": "root"});
+        if !env.is_empty() {
+            body["env"] = json!(env);
+        }
+        let url = endpoint.url(&["v1", "processes", "exec"])?;
+        let deadline = Duration::from_secs(self.settings.exec_seconds);
+        let v: Executed = endpoint.call_within(Method::POST, url, Body::json(&body)?, &scoped, deadline).await?;
+        let bytes = |text: Option<String>| STANDARD.decode(text.unwrap_or_default()).map_err(|_| DOCKER.bad_response());
+        let note = v.incomplete.then(|| "Docker Sandboxes kept only part of the command's output".to_owned());
+        Ok(GuestOutput { note, ..GuestOutput::from_text(bytes(v.stdout)?, bytes(v.stderr)?, Some(v.exit_code.into())) })
+    }
+}
 #[async_trait]
 impl Exec for DockerSandboxes {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
-        Ok(self.run(id, &r.command, c).await?.success(DOCKER)?.into_stream())
+        Guest::exec(self, id, r, c).await
     }
 }
 
