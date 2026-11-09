@@ -19,7 +19,16 @@ async fn main() -> io::Result<()> {
             Some([flag, path]) if flag == "--socket" => path.into(),
             _ => return Err(io::Error::other("usage: drydock-agent --bridge [--socket PATH]")),
         };
-        return drydock_agent::socket::bridge(&socket, tokio::io::stdin(), tokio::io::stdout()).await;
+        let bridged = drydock_agent::socket::bridge(&socket, tokio::io::stdin(), tokio::io::stdout()).await;
+        // Tokio reads stdin on a blocking thread that cannot be cancelled, and
+        // dropping the runtime waits for it: with the channel's input still
+        // open, returning would leave the process, and so its stdout, open
+        // after the agent closed. Exit instead, so the channel sees the end.
+        if let Err(error) = &bridged {
+            // As std prints an `Err` returned from `main`.
+            eprintln!("Error: {error:?}");
+        }
+        std::process::exit(i32::from(bridged.is_err()));
     }
     if args.first().is_some_and(|a| a == "--supervise") {
         return supervisor::start(&args[1..]);
