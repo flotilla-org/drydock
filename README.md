@@ -461,7 +461,10 @@ Paused is an explicit billing transition; Stopped is the general stopped event
 and observation, whose `PausedByProvider` cause is valid under ADR 0058. Consumers
 must count both as non-running rather than infer loss. `MissingOnList` records
 absence from an authoritative complete list; `DestroyedByRequest` records a
-confirmed client deletion, matching ADR 0058's loss vocabulary.
+confirmed client deletion, matching ADR 0058's loss vocabulary. A stop of an
+environment drydockd itself suspended is `SuspendedByRequest` when the vendor
+states no cause. drydockd keeps that record in memory only: after a restart,
+such a stop carries only the cause the vendor states.
 
 Relay and exec clients send `Connection: Upgrade` and respectively
 `Upgrade: drydock-relay` or `Upgrade: drydock-stream`;
@@ -695,28 +698,37 @@ The values shown are the defaults.
   without a push way in it asks for one poll at once, then follows the
   observer's polls, so it can take up to one observation interval after the
   vendor got there; with a relay it waits for the vendor's event. It makes no
-  vendor calls of its own. It needs the
-  credential drydockd holds for the instance, since that is what the observer
-  polls with. A wait ends early, refused, when the environment is gone or its
+  vendor calls of its own. Without a relay it needs the credential drydockd
+  holds for the instance, since that is what the observer polls with: when
+  drydockd holds none, or the vendor rejected it, a wait answers unavailable
+  at once, naming the cause, and never polls with the request's credential.
+  A wait ends early, refused, when the environment is gone or its
   state unknown, and unavailable at its deadline, naming the last poll's
   error if the observer's polls were failing. A provision whose wait fails has
   still made its environment: the error names its id, and `list` shows it
   under the client's label for the client to use or destroy. Prepare is not
   waited on: a module may answer unavailable while a form is built, and the
   client asks again.
-- `idempotent`: resume of a running or starting environment makes no vendor
-  call, nor does suspend of a stopped or stopping one when the module's resume
-  token is the environment id (`token_is_id`); otherwise suspend asks the
-  vendor for the token. Without `settle`, a skipped call can answer while the
-  transition is still under way. Destroy of an absent environment, or of one
-  already being destroyed, succeeds.
+- `idempotent`: resume of an environment the observer holds running or
+  starting makes no vendor call, nor does suspend of one it holds stopped or
+  stopping when the module's resume token is the environment id
+  (`token_is_id`); otherwise suspend asks the vendor for the token. The
+  observer's view can lag the vendor by up to one observation interval, so a
+  skip can answer for a state changed out of band since. Without `settle`, a
+  skipped call can answer while the transition is still under way. Destroy of
+  an environment absent at the vendor, or of one already being destroyed,
+  succeeds; on a `shared_account` an id the observer does not hold is still
+  refused (see `ownership`).
 - `ownership`: on a `shared_account`, what the instance makes carries
-  `drydock.provider=<instance>`, and drydockd lists only what carries it and
-  refuses to destroy, suspend or resume anything else, or anything whose tag
-  the vendor cannot report at the time. The check and the operation are two
-  vendor calls, not one atomic step. Inspect, reach and relay are not checked,
-  so a client can open a path into another tool's environment by its id
-  ([#276](https://github.com/flotilla-org/drydock/issues/276)). On an
+  `drydock.provider=<instance>`, and drydockd lists only what carries it.
+  Destroy, suspend, resume, reach, relay, exec, file upload and export act
+  only on an environment drydockd's observer holds as the instance's: one its
+  own provision returned, or one it holds with the tag. The check reads what
+  the observer holds and makes no vendor call. An id the observer holds
+  nothing of is refused as unknown, so just after drydockd starts, before its
+  first list, a call on one of its own environments is refused and may be
+  retried; so is a repeated destroy once a list no longer shows the
+  environment. Inspect is not checked: it changes nothing. On an
   `owned_account` nothing is tagged, filtered or refused. Only a module that leaves ownership to drydockd (does
   not declare `owner_scoped`) takes `owned_account`.
 
@@ -744,7 +756,8 @@ to change the listing interval. With a relay drydockd still lists, every
 observed (`observed.way`: `webhook` with its `delivery_id`, `poll`, or
 `reconstruction`) and carries the vendor's state verbatim (`vendor`, without
 tags). What a delivery does not state stays absent: Daytona's body gives no
-cause for a stop or a destruction (`cause` is then absent), and no labels or
+cause for a stop or a destruction (`cause` is then absent, unless drydockd
+asked for the change), and no labels or
 size; E2B's names its change (`sandbox.lifecycle.paused` is the vendor state)
 and gives a kill's `kill_reason` as the vendor reason, but no cause.
 Transitional states arrive as `transitioning` events. drydockd stores the

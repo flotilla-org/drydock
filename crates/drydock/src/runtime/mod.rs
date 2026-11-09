@@ -183,12 +183,13 @@ impl Runtime {
                     error
                 })?,
             };
-            let observed = Observed::new(&self.events, name, relay.is_some());
+            let credentials = Credentials::default();
+            let (credential_changes, _) = watch::channel(credentials.clone());
+            let auth = Arc::new(Mutex::new(Authentication { credentials, rejected: false, rejection_error: None, generation: 0 }));
+            let observed = Observed::new(&self.events, name, relay.is_some(), auth.clone());
             let declared = provider.capabilities().semantics;
             let foreign_possible = p.ownership == Ownership::SharedAccount && !declared.owner_scoped;
             let provider = semantics::apply(p, observed.clone(), provider)?;
-            let credentials = Credentials::default();
-            let (credential_changes, _) = watch::channel(credentials.clone());
             let capabilities = provider.capabilities();
             let ports = provider.operations();
             if capabilities.fallback_runner != ports.exec.is_some()
@@ -216,7 +217,7 @@ impl Runtime {
                     config: p.clone(),
                     diagnostic_secrets: self.diagnostic_secrets.clone(),
                     provider,
-                    auth: Mutex::new(Authentication { credentials, rejected: false, rejection_error: None, generation: 0 }),
+                    auth,
                     capabilities,
                     rate_limits,
                     events: sink,

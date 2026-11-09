@@ -15,7 +15,7 @@ pub(super) struct Instance {
     pub(super) config: ProviderConfiguration,
     pub(super) provider: Arc<dyn Provider>,
     // Synchronous metadata access only; never hold this guard across await.
-    pub(super) auth: Mutex<Authentication>,
+    pub(super) auth: Arc<Mutex<Authentication>>,
     pub(super) capabilities: Capabilities,
     pub(super) rate_limits: Vec<RateLimit>,
     pub(super) poll_waiting: Mutex<BTreeSet<String>>,
@@ -147,16 +147,20 @@ pub(super) struct Availability {
     pub(super) readiness: Readiness,
     pub(super) may_call: bool,
 }
+/// Whether `provider` may be called with the credential drydockd holds.
+pub(super) fn availability(provider: &dyn Provider, auth: &Authentication) -> Availability {
+    if auth.rejected {
+        let reason = auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into());
+        return Availability { readiness: Readiness::MissingCredential { reason }, may_call: false };
+    }
+    let readiness = provider.readiness(&auth.credentials);
+    Availability { may_call: matches!(readiness, Readiness::Ready), readiness }
+}
 impl Instance {
     // All callers, hello and refresh use this single derivation. Rejection is
     // sticky until a new credential generation.
     pub(super) fn availability(&self, auth: &Authentication) -> Availability {
-        if auth.rejected {
-            let reason = auth.rejection_error.as_ref().map(ToString::to_string).unwrap_or_else(|| "credential rejected".into());
-            return Availability { readiness: Readiness::MissingCredential { reason }, may_call: false };
-        }
-        let readiness = self.provider.readiness(&auth.credentials);
-        Availability { may_call: matches!(readiness, Readiness::Ready), readiness }
+        availability(&*self.provider, auth)
     }
     pub(super) fn readiness(&self, auth: &Authentication) -> Readiness {
         self.availability(auth).readiness

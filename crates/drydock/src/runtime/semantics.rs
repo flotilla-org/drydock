@@ -8,7 +8,7 @@
 //! changes only by listing, it asks the observer to poll once. It makes no
 //! vendor calls of its own.
 use super::*;
-use module::{ByteStream, Operations, Provisioned, SuspendResume};
+use module::{ByteStream, Exec, ExportOperation, GuestFiles, Operations, Provisioned, SuspendResume};
 use std::time::Duration;
 use tokio::{sync::Notify, time::Instant};
 
@@ -28,9 +28,15 @@ pub(super) struct Observed {
     /// What this instance provisioned and no list has shown yet: its first
     /// vendor event starts from this row, and it is this instance's own.
     pub(super) claimed: Mutex<BTreeMap<String, Environment>>,
+    /// What this instance asked to suspend. Held in memory only: after a
+    /// restart, a stop states only the cause the vendor gives.
+    pub(super) suspended: Mutex<BTreeMap<String, Suspend>>,
+    /// The credential drydockd holds for the provider, which the observer
+    /// lists with.
+    auth: Arc<Mutex<Authentication>>,
 }
 impl Observed {
-    pub(super) fn new(log: &EventLog, provider: &str, pushed: bool) -> Arc<Self> {
+    pub(super) fn new(log: &EventLog, provider: &str, pushed: bool, auth: Arc<Mutex<Authentication>>) -> Arc<Self> {
         Arc::new(Self {
             log: log.clone(),
             provider: provider.to_owned(),
@@ -39,11 +45,25 @@ impl Observed {
             poll_now: Notify::new(),
             claimed_now: Notify::new(),
             claimed: Mutex::default(),
+            suspended: Mutex::default(),
+            auth,
         })
     }
     pub(super) fn row(&self, id: &str) -> Option<Environment> {
         self.log.log.recover().inventories.get(&self.provider)?.iter().find(|row| row.id == id).cloned()
     }
+    /// What the observer holds of `id`: its row, or what this instance's
+    /// provision returned of it before any list showed it.
+    fn held(&self, id: &str) -> Option<Environment> {
+        self.row(id).or_else(|| self.claimed.recover().get(id).cloned())
+    }
+}
+
+/// How far the observer has seen a suspend this instance asked for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Suspend {
+    Asked,
+    Stopped,
 }
 
 /// `provider`, with what `config` asks for and its module does not declare.
@@ -73,8 +93,8 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
 
 struct Added {
     inner: Arc<dyn Provider>,
-    /// The instance whose tag marks what it may list, destroy, suspend and
-    /// resume, on a shared account.
+    /// The instance whose tag marks what it may list and act on by id, on a
+    /// shared account.
     owner: Option<String>,
     settle: bool,
     idempotent: bool,
@@ -98,8 +118,18 @@ impl Added {
     /// The environment once the observer sees it `what`. A wait ends early
     /// when the observer sees it gone or in an unknown state, and as
     /// unavailable at the deadline, naming the last poll's error if the
-    /// observer's polls were failing.
+    /// observer's polls were failing. It answers at once, unavailable, when
+    /// the observer cannot see the provider.
     async fn until(&self, id: &str, what: &str, done: fn(&Observation) -> bool) -> Result<Environment> {
+        if let Some(readiness) = self.blind() {
+            return Err(ProtocolError::unavailable(
+                format!(
+                    "drydockd cannot confirm environment {id} is {what}: it hears of no vendor events for provider {}, and cannot list it with the credential it holds ({readiness})",
+                    self.observed.provider
+                ),
+                None,
+            ));
+        }
         let mut changes = self.observed.log.changed.subscribe();
         if !self.observed.pushed {
             // When the observer is mid-poll this stores a permit, so it polls
@@ -134,28 +164,32 @@ impl Added {
             }
         }
     }
-    /// On a shared account, the environment as the vendor reports it, refused
-    /// unless it carries this instance's tag. Fails closed: any inspect error
-    /// is returned rather than acting on what cannot be verified. `None` on an
-    /// owned account, where nothing is checked. The check and the operation
-    /// that follows are two vendor calls, not one atomic step; drydockd does
-    /// not lock through the vendor to close that gap.
-    async fn guard(&self, id: &str, c: &Credentials) -> Result<Option<Environment>> {
-        if self.owner.is_none() {
-            return Ok(None);
+    /// On a shared account, refuses `id` unless the observer holds it as this
+    /// instance's: provisioned here, or held with this instance's tag. An id
+    /// the observer holds nothing of is refused, never assumed to be ours.
+    fn guard(&self, id: &str) -> Result<()> {
+        if self.owner.is_none() || self.observed.claimed.recover().contains_key(id) {
+            return Ok(());
         }
-        let e = self.inner.inspect(id, c).await?;
-        if !self.ours(&e) {
-            return Err(refused(format!("environment {id} does not carry this instance's {OWNER_TAG} tag")));
+        match self.observed.row(id) {
+            Some(e) if self.ours(&e) => Ok(()),
+            Some(_) => Err(refused(format!("environment {id} does not carry this instance's {OWNER_TAG} tag"))),
+            None => Err(refused(format!("environment {id} is unknown to this instance"))),
         }
-        Ok(Some(e))
     }
-    /// The vendor's state of `id`, reusing what [`Self::guard`] read.
-    async fn state(&self, id: &str, guarded: Option<Environment>, c: &Credentials) -> Result<Observation> {
-        Ok(match guarded {
-            Some(e) => e.state,
-            None => self.inner.inspect(id, c).await?.state,
-        })
+    /// Why the observer cannot see the provider now, when it cannot: no
+    /// vendor events reach it, and it may not list with the credential
+    /// drydockd holds.
+    fn blind(&self) -> Option<Readiness> {
+        if self.observed.pushed {
+            return None;
+        }
+        let availability = availability(&*self.inner, &self.observed.auth.recover());
+        (!availability.may_call).then_some(availability.readiness)
+    }
+    /// Whether the observer last saw `id` in a state `skip` accepts.
+    fn already(&self, id: &str, skip: fn(&Observation) -> bool) -> bool {
+        self.idempotent && self.observed.held(id).is_some_and(|e| skip(&e.state))
     }
     async fn running(&self, id: &str) -> Result<Environment> {
         self.until(id, "running", |s| matches!(s, Observation::Running)).await
@@ -168,6 +202,15 @@ impl Provider for Added {
         let mut ops = self.inner.operations();
         if ops.suspend_resume.is_some() {
             ops.suspend_resume = Some(self);
+        }
+        if ops.exec.is_some() {
+            ops.exec = Some(self);
+        }
+        if ops.files.is_some() {
+            ops.files = Some(self);
+        }
+        if ops.export.is_some() {
+            ops.export = Some(self);
         }
         ops
     }
@@ -208,22 +251,16 @@ impl Provider for Added {
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         Ok(self.inner.list(c).await?.into_iter().filter(|e| self.ours(e)).collect())
     }
-    // Inspect, reach and relay are not owner-checked: they change nothing at
-    // the vendor, and the observer inspects whatever a client asks about. The
-    // guard covers the operations that change vendor state. Reach and relay
-    // do open the guest to the client; whether they take the guard too is
-    // flotilla-org/drydock#276.
+    // Inspect is not owner-checked: it changes nothing, and the observer
+    // inspects whatever a client asks about.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         self.inner.inspect(id, c).await
     }
-    /// On a shared account, refuses an environment another instance or tool
-    /// made, or one the vendor cannot say is ours. Idempotent: absent, or
-    /// already being destroyed, is destroyed.
+    /// Idempotent: absent at the vendor, or already being destroyed, is
+    /// destroyed. An id the observer does not hold is still refused on a
+    /// shared account.
     async fn destroy(&self, id: &str, c: &Credentials) -> Result<()> {
-        match self.guard(id, c).await {
-            Err(ProtocolError::NotFound { .. }) if self.idempotent => return Ok(()),
-            guarded => guarded?,
-        };
+        self.guard(id)?;
         match self.inner.destroy(id, c).await {
             Err(ProtocolError::NotFound { .. }) if self.idempotent => Ok(()),
             Err(busy @ ProtocolError::Unavailable { .. }) if self.idempotent => match self.inner.inspect(id, c).await {
@@ -237,10 +274,39 @@ impl Provider for Added {
         }
     }
     async fn reach(&self, id: &str, c: &Credentials) -> Result<Reach> {
+        self.guard(id)?;
         self.inner.reach(id, c).await
     }
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
+        self.guard(id)?;
         self.inner.relay(id, c).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Exec for Added {
+    async fn exec(&self, id: &str, request: ExecRequest, c: &Credentials) -> Result<ByteStream> {
+        let port = self.inner.operations().exec.ok_or_else(|| refused("exec is not supported"))?;
+        self.guard(id)?;
+        port.exec(id, request, c).await
+    }
+}
+
+#[async_trait::async_trait]
+impl GuestFiles for Added {
+    async fn put(&self, id: &str, file: GuestFile, bytes: bytes::Bytes, c: &Credentials) -> Result<()> {
+        let port = self.inner.operations().files.ok_or_else(|| refused("file upload is not supported"))?;
+        self.guard(id)?;
+        port.put(id, file, bytes, c).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ExportOperation for Added {
+    async fn export(&self, id: &str, c: &Credentials) -> Result<Export> {
+        let port = self.inner.operations().export.ok_or_else(|| refused("export is not supported"))?;
+        self.guard(id)?;
+        port.export(id, c).await
     }
 }
 
@@ -248,14 +314,23 @@ impl Provider for Added {
 impl SuspendResume for Added {
     async fn suspend(&self, id: &str, c: &Credentials) -> Result<ResumeToken> {
         let port = self.inner.operations().suspend_resume.ok_or_else(|| refused("suspend is not supported"))?;
-        let guarded = self.guard(id, c).await?;
-        let skip = self.idempotent
-            && self.token_is_id
-            && matches!(
-                self.state(id, guarded, c).await?,
-                Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping }
-            );
-        let token = if skip { ResumeToken { token: Secret::new(id) } } else { port.suspend(id, c).await? };
+        self.guard(id)?;
+        let skip = self.token_is_id
+            && self.already(id, |s| {
+                matches!(s, Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping })
+            });
+        let token = if skip {
+            ResumeToken { token: Secret::new(id) }
+        } else {
+            // Marked before the call: the vendor's event can arrive before its answer.
+            self.observed.suspended.recover().entry(id.to_owned()).or_insert(Suspend::Asked);
+            port.suspend(id, c).await.inspect_err(|_| {
+                let mut suspended = self.observed.suspended.recover();
+                if suspended.get(id) == Some(&Suspend::Asked) {
+                    suspended.remove(id);
+                }
+            })?
+        };
         if self.settle {
             self.until(id, "stopped", |s| matches!(s, Observation::Stopped { .. })).await?;
         }
@@ -263,15 +338,11 @@ impl SuspendResume for Added {
     }
     async fn resume(&self, id: &str, token: ResumeToken, c: &Credentials) -> Result<()> {
         let port = self.inner.operations().suspend_resume.ok_or_else(|| refused("resume is not supported"))?;
-        let guarded = self.guard(id, c).await?;
-        let skip = self.idempotent
-            && matches!(
-                self.state(id, guarded, c).await?,
-                Observation::Running | Observation::Transitioning { phase: TransitionPhase::Starting }
-            );
-        if !skip {
+        self.guard(id)?;
+        if !self.already(id, |s| matches!(s, Observation::Running | Observation::Transitioning { phase: TransitionPhase::Starting })) {
             port.resume(id, token, c).await?;
         }
+        self.observed.suspended.recover().remove(id);
         if self.settle {
             self.running(id).await?;
         }

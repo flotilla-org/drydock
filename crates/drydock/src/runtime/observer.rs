@@ -236,6 +236,7 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
     }
     let held = row.or_else(|| instance.observed.claimed.recover().remove(&v.id));
     let confirmed = instance.destroyed.recover().get(&v.id).is_some_and(|s| s.confirmed);
+    let suspended = v.state.as_ref().is_some_and(|state| suspended(instance, &v.id, state));
     let known = seen.get(&v.id).map(last).or_else(|| pushed.announced.get(&v.id).map(|a| (a.state.as_ref(), None)));
     let pending = |label: Option<String>, kinds: Vec<EventKind>| -> Vec<Pending> {
         kinds
@@ -254,7 +255,7 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
             pushed.unclaimed.entry(v.id.clone()).or_default().push((v, observed.clone()));
             return;
         }
-        let events = pending(None, transitions(known, v.state.as_ref(), None, confirmed, true));
+        let events = pending(None, transitions(known, v.state.as_ref(), None, confirmed, suspended, true));
         instance.events.update(None, events, observed);
         // As a held row does, keep the last stable state through a transition.
         // The vendor state and time stay the delivery's own: a redelivery or
@@ -269,7 +270,7 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
         pushed.announced.insert(v.id.clone(), v);
         return;
     };
-    let events = pending(held.label.clone(), transitions(known, v.state.as_ref(), held.granted_size.as_ref(), confirmed, true));
+    let events = pending(held.label.clone(), transitions(known, v.state.as_ref(), held.granted_size.as_ref(), confirmed, suspended, true));
     let tags = v.vendor.tags.clone().or_else(|| held.vendor.as_ref().and_then(|h| h.tags.clone()));
     let vendor = VendorState { tags, ..v.vendor.clone() };
     let state = v.state.clone().unwrap_or_else(|| held.state.clone());
@@ -282,6 +283,28 @@ fn apply(instance: &Instance, seen: &mut BTreeMap<String, Environment>, pushed: 
     instance.events.update(Some(row), events, observed);
 }
 
+/// Whether `id`, now in `state`, is stopped because this instance suspended
+/// it. Its suspend stays its own until the observer sees the environment
+/// running again after the stop, or gone. A stop that follows a run the
+/// observer never saw, such as a resume and a stop between two lists, is
+/// still taken as the suspend's.
+fn suspended(instance: &Instance, id: &str, state: &Observation) -> bool {
+    use semantics::Suspend;
+    let mut suspended = instance.observed.suspended.recover();
+    let Some(suspend) = suspended.get_mut(id) else { return false };
+    match state {
+        Observation::Stopped { .. } => *suspend = Suspend::Stopped,
+        Observation::Running if *suspend == Suspend::Stopped => {
+            suspended.remove(id);
+        }
+        Observation::Gone { .. } => {
+            suspended.remove(id);
+        }
+        _ => {}
+    }
+    matches!(state, Observation::Stopped { .. })
+}
+
 /// What drydockd last held of an environment: its state when stated, and its
 /// granted size when known.
 type Last<'a> = (Option<&'a Observation>, Option<&'a Size>);
@@ -292,7 +315,14 @@ fn last(row: &Environment) -> Last<'_> {
 /// What `state` is a transition to from `old`, the last stable state. A list
 /// reports changes; a `pushed` vendor event reports its state every time,
 /// transitional states included.
-fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Size>, confirmed: bool, pushed: bool) -> Vec<EventKind> {
+fn transitions(
+    old: Option<Last>,
+    state: Option<&Observation>,
+    size: Option<&Size>,
+    confirmed: bool,
+    suspended: bool,
+    pushed: bool,
+) -> Vec<EventKind> {
     let mut kinds = vec![];
     if old.is_none() {
         kinds.push(EventKind::Created);
@@ -317,6 +347,10 @@ fn transitions(old: Option<Last>, state: Option<&Observation>, size: Option<&Siz
             }
         }
         Observation::Stopped { cause } if changed => {
+            let cause = match cause {
+                None if suspended => &Some(StopCause::SuspendedByRequest),
+                cause => cause,
+            };
             kinds.push(match cause {
                 Some(StopCause::PausedByProvider) => EventKind::Paused { cause: StopCause::PausedByProvider },
                 cause => EventKind::Stopped { cause: cause.clone() },
@@ -387,7 +421,8 @@ fn reconcile(
     let confirmed: BTreeSet<String> = instance.destroyed.recover().iter().filter(|(_, s)| s.confirmed).map(|(id, _)| id.clone()).collect();
     for (id, row) in &current {
         let old = seen.get(id).map(last).or_else(|| pushed.announced.get(id).map(|a| (a.state.as_ref(), None)));
-        for kind in transitions(old, Some(&row.state), row.granted_size.as_ref(), confirmed.contains(id), false) {
+        let suspended = suspended(instance, id, &row.state);
+        for kind in transitions(old, Some(&row.state), row.granted_size.as_ref(), confirmed.contains(id), suspended, false) {
             pending.push(Pending {
                 id: id.clone(),
                 label: row.label.clone(),
@@ -420,7 +455,10 @@ fn reconcile(
         }
     }
     destroyed.retain(|id, state| state.pending > 0 || current.get(id).is_some_and(|row| !matches!(row.state, Observation::Gone { .. })));
-    instance.observed.claimed.recover().retain(|id, _| !current.contains_key(id));
+    let mut claimed = instance.observed.claimed.recover();
+    claimed.retain(|id, _| !current.contains_key(id));
+    instance.observed.suspended.recover().retain(|id, _| current.contains_key(id) || claimed.contains_key(id));
+    drop(claimed);
     *pushed = Pushed::default();
     // Snapshot inventory stays authoritative while only the pending billing diff
     // retains an absent row awaiting a concurrent deletion outcome.

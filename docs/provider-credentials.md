@@ -35,7 +35,7 @@ containerregistry *  containerregistry/repository *  containerregistry/image *
 - Without `ingress access`, every SDK gateway call returns 403.
 - Quota (`UsageService/GetConcurrency`) needs a grant beyond these, not yet identified. Without it quota is refused and the provider stays ready.
 - Image optimize is refused for every grant a revocable token can carry; the module doesn't call it.
-- The module translates: provision is one create (then the agent service), and inspect, suspend, resume and destroy are one SDK call each; rows carry Namespace's state word and the devbox's labels in `vendor`. On a `shared_account` (the default) it tags what it makes with the `drydock.provider` label and lists only devboxes carrying it, and drydockd destroys, suspends and resumes only what does. On an `owned_account` nothing is tagged or filtered, so use a workspace that holds only drydock's devboxes. Devboxes made before this tag existed carry none, so a shared-account instance no longer lists or acts on them.
+- The module translates: provision is one create (then the agent service), and inspect, suspend, resume and destroy are one SDK call each; rows carry Namespace's state word and the devbox's labels in `vendor`. On a `shared_account` (the default) it tags what it makes with the `drydock.provider` label and lists only devboxes carrying it, and drydockd acts by id only on what does. On an `owned_account` nothing is tagged or filtered, so use a workspace that holds only drydock's devboxes. Devboxes made before this tag existed carry none, so a shared-account instance no longer lists or acts on them.
 
 ## Modal (`modal`, TypeScript host)
 
@@ -52,14 +52,14 @@ Use a service user scoped to one environment that holds only drydock's app (Work
 - A token that can't see the app lists nothing rather than failing.
 - DNS resolution is never filtered, whatever the egress policy, so it remains a covert channel.
 - The module declares no quota: Modal has none to report.
-- On a `shared_account` (the default) the module tags each sandbox `drydock.provider` with the instance, and drydockd lists and destroys only sandboxes that carry it. On an `owned_account` nothing is tagged or filtered, so the environment must hold only drydock's app. The label is the `flotilla.label` tag; provisioning a label twice makes two sandboxes.
+- On a `shared_account` (the default) the module tags each sandbox `drydock.provider` with the instance, and drydockd lists and acts by id only on sandboxes that carry it. On an `owned_account` nothing is tagged or filtered, so the environment must hold only drydock's app. The label is the `flotilla.label` tag; provisioning a label twice makes two sandboxes.
 - The agent is reached through Modal's connect-token edge, where TLS ends: Modal sees the connect token and the agent's TCP token (`Authorization`) in transit, and every byte to and from the agent. The agent listens on all addresses in the sandbox, since the edge cannot reach loopback, so its token is the only gate on that port. drydockd masks both credentials in its errors and log.
 
 ## Runtime (`runtime`, Rust host)
 
 Credential: an API key (`rtcloud_…`), as a plain token file.
 
-Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Runtime keys are full or read-only, and see only what they made (`reach: agent`, the default) or the whole account. The module translates: provision, list, destroy and suspend are Runtime's own operations, and rows carry Runtime's state name, its `stopReason` and the sandbox's labels in `vendor`. On a `shared_account` (the default) it labels what it makes with `drydock.provider`, lists with Runtime's `label=` filter, and drydockd destroys, suspends and resumes only sandboxes that carry the label. On an `owned_account` nothing is tagged or filtered. The client's label is the `flotilla.label` label; the sandbox's Runtime name comes from the instance and the label, so a second provision of a live label is Runtime's refusal of the name.
+Create it on the Runtime website (Account → Keys) or with `POST /v1/keys`. Runtime keys are full or read-only, and see only what they made (`reach: agent`, the default) or the whole account. The module translates: provision, list, destroy and suspend are Runtime's own operations, and rows carry Runtime's state name, its `stopReason` and the sandbox's labels in `vendor`. On a `shared_account` (the default) it labels what it makes with `drydock.provider`, lists with Runtime's `label=` filter, and drydockd acts by id only on sandboxes that carry the label. On an `owned_account` nothing is tagged or filtered. The client's label is the `flotilla.label` label; the sandbox's Runtime name comes from the instance and the label, so a second provision of a live label is Runtime's refusal of the name.
 
 | Setting | Why |
 |---|---|
@@ -96,7 +96,7 @@ Credential: a project API key (`tl_apiKey_…`), as a plain token file. Reading 
 
 Create the key in the Tensorlake dashboard (project → API Keys). The key sees and controls every sandbox, snapshot and image in its project. The module translates: provision, list, inspect, suspend and resume are one Tensorlake call each, and destroy is the delete and the sweep of the sandbox's snapshots. Rows carry Tensorlake's `status` in `vendor`, and its `outcome`/`outcome_reason` or `termination_reason` as the reason. An environment's id is Tensorlake's sandbox id.
 
-Sandboxes carry no labels or metadata, so the sandbox's name holds them: `dd-<digest of the instance>-r-<label>` (or `-b-` with the label in base32, or `-h-` with a digest when it does not fit). The module reports `drydock.provider` and `flotilla.label`, decoded from a name with this instance's prefix, as `vendor.tags`. On a `shared_account` (the default) drydockd lists, destroys, suspends and resumes only sandboxes carrying that tag. On an `owned_account` nothing is filtered, so use a project that holds only drydock's sandboxes. Names are unique in a project: provisioning a label that already names a sandbox is refused with Tensorlake's 409.
+Sandboxes carry no labels or metadata, so the sandbox's name holds them: `dd-<digest of the instance>-r-<label>` (or `-b-` with the label in base32, or `-h-` with a digest when it does not fit). The module reports `drydock.provider` and `flotilla.label`, decoded from a name with this instance's prefix, as `vendor.tags`. On a `shared_account` (the default) drydockd lists and acts by id only on sandboxes carrying that tag. On an `owned_account` nothing is filtered, so use a project that holds only drydock's sandboxes. Names are unique in a project: provisioning a label that already names a sandbox is refused with Tensorlake's 409.
 
 | Call | Used for |
 |---|---|
@@ -124,7 +124,7 @@ Sandboxes carry no labels or metadata, so the sandbox's name holds them: `dd-<di
 
 Credential: a team API key (`e2b_…`), as a plain token file, sent as `X-API-Key`. Configuration also needs `team_id`.
 
-Create it in the E2B dashboard (Team → API Keys). Keys have no scopes: a key can build and delete every template and kill every sandbox in the team. The module translates: provision, list, inspect, destroy, suspend and resume are one E2B call each, and rows carry E2B's state name and the sandbox's metadata in `vendor`. On a `shared_account` (the default) it tags what it makes with `drydock.provider` metadata, and drydockd lists, destroys, suspends and resumes only sandboxes that carry the tag. On an `owned_account` nothing is tagged or filtered, so use a team that holds only drydock's sandboxes. The label is `flotilla.label` metadata; provisioning a label twice makes two sandboxes.
+Create it in the E2B dashboard (Team → API Keys). Keys have no scopes: a key can build and delete every template and kill every sandbox in the team. The module translates: provision, list, inspect, destroy, suspend and resume are one E2B call each, and rows carry E2B's state name and the sandbox's metadata in `vendor`. On a `shared_account` (the default) it tags what it makes with `drydock.provider` metadata, and drydockd lists and acts by id only on sandboxes that carry the tag. On an `owned_account` nothing is tagged or filtered, so use a team that holds only drydock's sandboxes. The label is `flotilla.label` metadata; provisioning a label twice makes two sandboxes.
 
 | Call | Used for |
 |---|---|

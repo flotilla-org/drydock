@@ -107,8 +107,8 @@ pub const OWNER_TAG: &str = "drydock.provider";
 #[serde(rename_all = "snake_case")]
 pub enum Ownership {
     /// Others use the account too: what the instance makes carries
-    /// [`OWNER_TAG`], and the instance lists, destroys, suspends and resumes
-    /// only what does.
+    /// [`OWNER_TAG`], and the instance lists and acts by id only on what
+    /// does.
     #[default]
     SharedAccount,
     /// Drydock owns the whole account: nothing is tagged, filtered or refused.
