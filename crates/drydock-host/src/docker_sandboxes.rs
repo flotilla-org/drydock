@@ -101,8 +101,16 @@ struct Policies {
     exact: Exact,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Effective {
     mode: Text,
+    #[serde(default)]
+    allow_networks: Vec<Rule>,
+}
+/// An allowed network, and the policy layer that allowed it.
+#[derive(Deserialize)]
+struct Rule {
+    layer: Option<String>,
 }
 #[derive(Deserialize)]
 struct Exact {
@@ -412,40 +420,32 @@ fn resources(size: &Size) -> Result<Value> {
     };
     Ok(json!({"cpus": cpus, "memoryMib": mib}))
 }
-/// A deny-all request is the sandbox's own policy document; an open one sends
-/// none.
-fn network_policy(request: &EgressRequest) -> Result<Option<Value>> {
-    let EgressRequest::DenyAll { direct } = request else { return Ok(None) };
-    let mut allow = Vec::new();
-    for destination in direct {
-        allow.push(match destination {
-            Destination::Host { host } => host.as_str().to_owned(),
-            Destination::Cidr { cidr } => cidr.as_str().to_owned(),
-            Destination::HostPort { .. } => {
-                return Err(refused("Docker Sandboxes' network policies allow host names and CIDRs, with no port"));
-            }
-        });
+/// Docker's create takes a sandbox's own policy document, but installs it
+/// beside the account's default layer, which allows every network: a live
+/// deny-all document left the sandbox open. Its spec states no way to narrow
+/// egress below that default, so only an open request is taken.
+fn check_egress(request: &EgressRequest) -> Result<()> {
+    match request {
+        EgressRequest::Open => Ok(()),
+        EgressRequest::DenyAll { .. } => Err(refused(
+            "Docker Sandboxes installs a sandbox's own network policy beside the account's default layer, which allows every \
+             network, so it cannot deny egress: ask for open egress",
+        )),
     }
-    Ok(Some(json!({"mode": "denyAll", "allowNetworks": allow})))
 }
 
 fn egress_model() -> EgressModel {
-    use EgressShape::*;
     EgressModel {
-        shapes: vec![Open, DenyAll, AllowAddresses, AllowDomains],
-        enforced: EnforcementSite::OutsideGuest,
         side_effects: vec![EgressSideEffect {
-            shapes: vec![Open],
+            shapes: vec![EgressShape::Open],
             opens: vec![],
-            note: "A sandbox with no policy of its own is left to the account's governance layers, which have been seen not to \
-                   apply to it."
-                .into(),
+            note: "Docker's default policy layer allows every network.".into(),
         }],
-        mutable_while_running: false,
         sources: vec![
             "https://docs.docker.com/reference/api/sandboxes/api.yaml#/components/schemas/NetworkPolicy".into(),
             "https://docs.docker.com/reference/api/sandboxes/api.yaml#/components/schemas/PolicyLayer".into(),
         ],
+        ..EgressModel::unfiltered()
     }
 }
 
@@ -461,10 +461,7 @@ impl Provider for DockerSandboxes {
             // and its sandboxes have resumed with their processes running.
             suspend_preserves_memory: Some(true),
             export: false,
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
+            egress: EgressCapability { routes: vec![EgressRoute::ExplicitProxy, EgressRoute::Open], model: egress_model() },
             fallback_runner: true,
             bootstrap: BootstrapRoute::Upload,
             agent: true,
@@ -511,22 +508,20 @@ impl Provider for DockerSandboxes {
         })
     }
     /// One create, answered with Docker's row. The owner tag goes on only on a
-    /// shared account.
+    /// shared account; no policy goes on, since only open egress is taken.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         check_prepared(DOCKER, &self.name, &r.prepared, &r.prepared.image_digest)?;
+        check_egress(&r.egress)?;
         let mut labels = BTreeMap::from([(LABEL_TAG, r.label.as_str())]);
         if self.ownership == Ownership::SharedAccount {
             labels.insert(OWNER_TAG, &self.name);
         }
-        let mut body = json!({
+        let body = json!({
             "imageRef": r.prepared.image_digest,
             "platform": {"os": r.prepared.platform.os, "architecture": r.prepared.platform.architecture},
             "resources": resources(&r.size)?,
             "labels": labels,
         });
-        if let Some(policy) = network_policy(&r.egress)? {
-            body["networkPolicies"] = json!([policy]);
-        }
         let c = &self.access(c).await?;
         let created: Sandbox = self.api.call(Method::POST, self.api.url(&["v1", "sandboxes"])?, Body::json(&body)?, c).await?;
         Ok(Provisioned::Created(self.environment(created)))
@@ -552,9 +547,10 @@ impl Provider for DockerSandboxes {
     }
     /// The sandbox and, while it runs, its installed network policy. Egress is
     /// enforced when Docker states a deny-all policy that holds the sandbox's
-    /// own (`attached`) document: an account's default alone has been seen not
-    /// to apply to a sandbox without one. Docker states a policy only for a
-    /// running sandbox; in any other state egress is not stated.
+    /// own (`attached`) document and allows nothing that document did not: a
+    /// deny-all mode alone has been seen beside a default layer allowing every
+    /// network. Docker states a policy only for a running sandbox; in any other
+    /// state egress is not stated.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         let c = &self.access(c).await?;
         let sandbox = self.sandbox(id, c).await?;
@@ -565,7 +561,8 @@ impl Provider for DockerSandboxes {
         }
         let policies: Policies = self.api.get(self.sandbox_url(id, &["network-policies"])?, c).await?;
         let own = policies.exact.nodes.iter().any(|n| n.source.as_ref().is_some_and(|s| s.origin == "attached"));
-        if &*policies.effective.mode == "denyAll" && own {
+        let only_own = policies.effective.allow_networks.iter().all(|rule| rule.layer.as_deref() == Some("attached"));
+        if &*policies.effective.mode == "denyAll" && own && only_own {
             environment.egress = Enforcement::Enforced;
         }
         environment.egress_policy = Some(policies.exact.revision.into());
@@ -845,40 +842,37 @@ mod tests {
 
     // Provision is one create of the image by digest on the prepared
     // platform, answered with Docker's row as it stands. The owner tag goes on
-    // only on a shared account; a deny-all request is the sandbox's own
-    // policy, an open one sends none.
+    // only on a shared account, and no network policy goes on.
     #[tokio::test]
     async fn provision_is_one_create_tagged_by_ownership() {
-        let deny = EgressRequest::DenyAll {
-            direct: vec![
-                Destination::Host { host: "example.com".parse().unwrap() },
-                Destination::Cidr { cidr: "192.0.2.0/24".parse().unwrap() },
-            ],
-        };
-        for (ownership, egress, tags, policies) in [
-            (Ownership::SharedAccount, deny, 2, json!([{"mode": "denyAll", "allowNetworks": ["example.com", "192.0.2.0/24"]}])),
-            (Ownership::OwnedAccount, EgressRequest::Open, 1, Value::Null),
-        ] {
+        for (ownership, tags) in [(Ownership::SharedAccount, 2), (Ownership::OwnedAccount, 1)] {
             let (docker, script) = docker(ownership, vec![(202, CREATING)]).await;
-            let Provisioned::Created(e) = docker.provision(request(egress, size()), &key()).await.unwrap() else { panic!("not created") };
+            let created = docker.provision(request(EgressRequest::Open, size()), &key()).await.unwrap();
+            let Provisioned::Created(e) = created else { panic!("not created") };
             assert_eq!((e.id.as_str(), &e.state, e.vendor.unwrap().state.as_str()), (ID, &STATES[0].1, "creating"));
             assert_eq!(script.lines(), [format!("POST {API}/sandboxes")]);
             let body = script.asked.lock().unwrap()[0].json();
             assert_eq!((&body["imageRef"], &body["platform"]), (&json!(DIGEST), &json!({"os": "linux", "architecture": "amd64"})));
             assert_eq!(body["resources"], json!({"cpus": 2, "memoryMib": 4096}));
             assert_eq!((body["labels"].as_object().unwrap().len(), &body["labels"][LABEL_TAG]), (tags, &json!("crew-1")));
-            assert_eq!(body["networkPolicies"], policies);
+            assert_eq!(body.get("networkPolicies"), None);
         }
     }
 
-    // What Docker cannot hold is refused in its terms before any call: a port
-    // in a policy, a private registry's credential.
+    // What Docker cannot hold is refused in its terms before any call: denied
+    // egress, which its default policy layer opens whatever the sandbox's own
+    // policy says, and a private registry's credential.
     #[tokio::test]
     async fn requests_docker_cannot_hold_are_refused_before_any_call() {
         let (docker, script) = docker(Ownership::SharedAccount, vec![]).await;
-        let port = Destination::HostPort { host: "db.example".parse().unwrap(), port: serde_json::from_value(json!(5432)).unwrap() };
-        let denied = docker.provision(request(EgressRequest::DenyAll { direct: vec![port] }, size()), &key()).await;
-        assert!(matches!(denied, Err(ProtocolError::Refused { .. })));
+        let host = Destination::Host { host: "example.com".parse().unwrap() };
+        for direct in [vec![], vec![host]] {
+            let Err(ProtocolError::Refused { reason }) = docker.provision(request(EgressRequest::DenyAll { direct }, size()), &key()).await
+            else {
+                panic!("deny-all not refused")
+            };
+            assert!(reason.contains("default layer, which allows every network"), "{reason}");
+        }
         let prepare = PrepareRequest {
             size: size(),
             platform: Some(platform()),
@@ -945,22 +939,34 @@ mod tests {
     }
 
     // Inspect reads the sandbox and its installed policy: egress is enforced
-    // only when Docker states deny-all holding the sandbox's own document,
-    // never from an owner's or account's layer alone. The policy identity is
-    // Docker's revision.
+    // only when Docker states deny-all holding the sandbox's own document and
+    // allowing only what it allows, never from an owner's or account's layer
+    // alone, nor beside a default layer that opens every network. The policy
+    // identity is Docker's revision.
     #[tokio::test]
     async fn inspect_reports_enforcement_from_the_sandboxs_own_policy() {
-        let policy = |mode: &str, origin: &str| {
+        let policy = |mode: &str, origin: &str, allowed: &str| {
             format!(
-                r#"{{"effective":{{"mode":"{mode}"}},"exact":{{"revision":"r-{origin}","selectorVersion":"destination.v1",
-                "nodes":[{{"source":{{"origin":"{origin}","id":"p"}},"constant":"false"}}]}}}}"#
+                r#"{{"effective":{{"mode":"{mode}","allowNetworks":[{allowed}]}},"exact":{{"revision":"r-{origin}",
+                "selectorVersion":"destination.v1","nodes":[{{"source":{{"origin":"{origin}","id":"p"}},"constant":"false"}}]}}}}"#
             )
         };
-        let (own, owner, open) = (policy("denyAll", "attached"), policy("denyAll", "owner"), policy("allowAll", "attached"));
-        let answers = vec![(200, RUNNING), (200, &*own), (200, RUNNING), (200, &*owner), (200, RUNNING), (200, &*open)];
+        let own = policy("denyAll", "attached", r#"{"layer":"attached","network":"example.com"}"#);
+        let (owner, open) = (policy("denyAll", "owner", ""), policy("allowAll", "attached", ""));
+        let defaulted = policy("denyAll", "attached", r#"{"layer":"default","network":"**"}"#);
+        let answers = vec![
+            (200, RUNNING),
+            (200, &*own),
+            (200, RUNNING),
+            (200, &*owner),
+            (200, RUNNING),
+            (200, &*open),
+            (200, RUNNING),
+            (200, &*defaulted),
+        ];
         let (docker, script) = docker(Ownership::OwnedAccount, answers).await;
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let e = docker.inspect(ID, &key()).await.unwrap();
             seen.push((e.egress, e.egress_policy.unwrap()));
         }
@@ -969,6 +975,7 @@ mod tests {
             [
                 (Enforcement::Enforced, "r-attached".to_owned()),
                 (Enforcement::Advisory, "r-owner".to_owned()),
+                (Enforcement::Advisory, "r-attached".to_owned()),
                 (Enforcement::Advisory, "r-attached".to_owned())
             ]
         );

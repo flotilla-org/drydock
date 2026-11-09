@@ -90,8 +90,11 @@ Register the module in two places: `pub mod` in
   the state. A stop cause goes on only when the vendor says who stopped the
   sandbox. Docker does not, so `stopped` has no cause.
 - **Refusals in the vendor's terms**, before any call, for what the vendor
-  cannot express. For example: *"Docker Sandboxes' network policies allow host
-  names and CIDRs, with no port"*. A vendor that sizes in fixed shapes gets
+  cannot express. For example: *"Docker Sandboxes installs a sandbox's own
+  network policy beside the account's default layer, which allows every
+  network, so it cannot deny egress"*. A policy field the vendor accepts is not
+  proof that it applies: check what the vendor reports as installed before
+  declaring a shape. A vendor that sizes in fixed shapes gets
   them as a table in the module, and a size outside them is refused naming
   them; `smallest_size` is the smallest shape. Never widen a request to
   something the vendor can express, and never round a size to a shape.
@@ -149,8 +152,9 @@ does:
   `mutable_while_running`, and the documentation it rests on (`sources`). A
   row is `Enforcement::Advisory` unless `inspect` reads the vendor's own
   per-sandbox statement that the policy is in force. Docker's `inspect` reports
-  `Enforced` only when the sandbox's installed policy is deny-all and holds the
-  sandbox's own (`attached`) document. Docker states that policy only for a
+  `Enforced` only when the sandbox's installed policy is deny-all, holds the
+  sandbox's own (`attached`) document, and allows nothing from another layer: a
+  deny-all mode has been seen beside a default layer allowing `**`. Docker states that policy only for a
   running sandbox (it answers 409 otherwise), so inspect reads it only then; in
   any other state egress is not stated: `Advisory`, with no `egress_policy`.
   A call that fails for a state the sandbox can be in breaks suspend, destroy
@@ -282,7 +286,9 @@ drydock --config drydock.toml conformance --provider docker --options docker-pro
   echo fixture's protocol, so it cannot be used here.
 - The egress check runs only for an environment reported `Enforced`. It needs
   a deny-all request with exactly one destination, and `tools/egress-probe.py`
-  in the guest, run through exec as root.
+  in the guest, run through exec as root. Docker takes open egress only, so
+  its runs report the check not applicable; whether a deny-all request was
+  really applied needs a hand check of the vendor's installed policy.
 - Use a unique `label` and an idle account. Check the report's `cleanup`
   verdict. A failed cleanup means a sandbox may still be running and billing.
 
