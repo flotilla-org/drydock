@@ -209,29 +209,18 @@ module makes, and the vendor's quirks an operator will meet.
 
 ## 5. Tests
 
-Tests live in the module's own `#[cfg(test)] mod tests`, in the style of the
-other modules:
+A vendor module ships without tests of its vendor calls. A hand-written
+stand-in of the vendor (a scripted `HttpClient`, an in-process WebSocket
+server) and the module encode the same assumptions twice and check them
+against each other, so they prove nothing about the vendor. Don't write one.
 
-- **One test per behaviour, through the module's public interface**
-  (`Provider` and its ports, from `Module::configure`). A comment above each
-  test states the behaviour it proves.
-- **A scripted vendor.** A small `HttpClient` answers each request with the
-  next scripted status and body, and records what it was asked: method, host
-  and path, headers that matter (bearer, precondition) and body. Assert on
-  the calls made and on the rows returned.
-- **WebSockets in process.** `drydock_transport::memory()` gives a dialer and
-  a listener. The test serves the vendor's side with `tokio_tungstenite`'s
-  `accept_hdr_async`, checks the upgrade's headers, and exchanges frames.
-
-Docker's module has one test each for: provision's create and tags, refusals
-before any call, list paging and rows, inspect's enforcement, the etag on each
-change, error classification, exec, files, the token exchange, the relay and
-settings.
+The module's check is the operator's live `drydock conformance` run (§6).
+Tests of how drydock talks to a vendor will replay interactions recorded
+against the real vendor, once that facility is designed; until then, none.
 
 Run what CI runs:
 
 ```sh
-cargo test -p drydock-host --lib docker_sandboxes
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
@@ -256,9 +245,8 @@ module = "reference"
 drydock --config drydock.toml conformance --provider reference --options probe.json
 ```
 
-A vendor module cannot run against a stand-in of its vendor: there is no fake
-vendor server, and `Api::new` refuses a non-HTTPS endpoint. Before a live run,
-the module's unit tests are the only check of its vendor calls.
+A vendor module does not run against a stand-in of its vendor. The live run
+is its check.
 
 **Live.** This runs on the operator's account and costs money. It needs
 `--live`. Configure the instance with its credential and a size the vendor
@@ -297,7 +285,7 @@ drydock --config drydock.toml conformance --provider docker --options docker-pro
 - **The host language and why.**
 - **The verb-to-call table**, and the vendor's documentation it rests on.
 - **What the module declares**, and what it refuses, in the vendor's words.
-- **The module's line count** without its tests, beside the other modules'.
+- **The module's line count**, beside the other modules'.
 - **Findings from following this guide**: boilerplate, shared gaps and
   unclear steps, listed and left for their own changes.
 - **What only a live run can settle**: anything the documentation leaves
