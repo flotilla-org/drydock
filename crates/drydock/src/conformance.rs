@@ -421,10 +421,14 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
             target.refusal(&mut report, &mut owned_ids).await;
         }
         if options.selected(Scenario::Egress) {
-            if environment.egress == Enforcement::Enforced {
-                report.record("enforced_egress", egress(client, provider, environment, &options).await);
-            } else {
-                report.not_applicable("enforced_egress", "the environment is not enforced");
+            // A module may state enforcement only where it reads the
+            // environment's network, which inspect does and provision need not.
+            match client.inspect(provider, &environment.id).await {
+                Ok(inspected) if environment.egress == Enforcement::Enforced || inspected.egress == Enforcement::Enforced => {
+                    report.record("enforced_egress", egress(client, provider, &inspected, &options).await)
+                }
+                Ok(_) => report.not_applicable("enforced_egress", "the environment is not enforced"),
+                Err(error) => report.record("enforced_egress", Err(SafeError::category(error))),
             }
         }
         if options.selected(Scenario::HostFixtures) {

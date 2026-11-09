@@ -12,7 +12,7 @@ pub mod image;
 use crate::module::{Result, refused};
 use drydock_protocol::*;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt, future::Future, time::Duration};
+use std::{fmt, future::Future, time::Duration};
 
 pub const MIB: u64 = 1 << 20;
 pub const GIB: u64 = 1 << 30;
@@ -45,18 +45,6 @@ impl Vendor {
             reason: format!("incomplete {self} response to {operation}"),
             provider_error: "required field missing or invalid".into(),
         }
-    }
-    /// A deterministic continuation marker binding instance and environment.
-    /// It is not a credential: every resume still needs the key.
-    pub fn resume_marker(self, prefix: &str, instance: &str, id: &str) -> ResumeToken {
-        ResumeToken { token: Secret::new(format!("{prefix}{}", &digest(&format!("{instance}\0{id}"))[..40])) }
-    }
-    /// Refuses a resume token minted for another environment.
-    pub fn check_resume(self, prefix: &str, instance: &str, id: &str, token: &ResumeToken) -> Result<()> {
-        if token.token.expose() != self.resume_marker(prefix, instance, id).token.expose() {
-            return Err(refused("resume token belongs to another environment"));
-        }
-        Ok(())
     }
 }
 
@@ -165,12 +153,6 @@ pub const fn stopped(cause: StopCause) -> Observation {
     Observation::Stopped { cause: Some(cause) }
 }
 
-/// Whether a resource's tags name this instance, and the label they hold.
-/// A resource is ours only with both (drydock#168).
-pub fn ours(tags: &BTreeMap<String, String>, instance: &str) -> Option<String> {
-    (tags.get(PROVIDER_TAG).map(String::as_str) == Some(instance)).then(|| tags.get(LABEL_TAG).cloned()).flatten()
-}
-
 /// `argv` as one POSIX shell command line.
 pub fn shell_command(argv: &[String]) -> String {
     argv.iter().map(|s| format!("'{}'", s.replace('\'', "'\\''"))).collect::<Vec<_>>().join(" ")
@@ -188,18 +170,8 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "it's|a b|$HOME||");
     }
 
-    // A resource is ours only when both tags are there and name us.
     #[test]
-    fn ownership_needs_both_tags() {
-        let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
-        assert_eq!(ours(&tags(&[(PROVIDER_TAG, "a"), (LABEL_TAG, "l")]), "a").as_deref(), Some("l"));
-        for other in [tags(&[(PROVIDER_TAG, "b"), (LABEL_TAG, "l")]), tags(&[(PROVIDER_TAG, "a")]), tags(&[(LABEL_TAG, "l")])] {
-            assert_eq!(ours(&other, "a"), None, "{other:?}");
-        }
-    }
-
-    #[test]
-    fn size_limits_and_markers() {
+    fn size_limits() {
         let limits = SizeLimits { cpus: (1, 4), memory: (GIB, 8 * GIB), memory_step: GIB, disk: (GIB, 10 * GIB), disk_step: GIB };
         let v = Vendor("Test");
         assert!(limits.check(v, &Size { cpus: 2.0, memory_bytes: 4 * GIB, disk_bytes: 10 * GIB }).is_ok());
@@ -211,8 +183,5 @@ mod tests {
         ] {
             assert!(limits.check(v, &bad).is_err(), "{bad:?}");
         }
-        let marker = v.resume_marker("t-", "a", "x");
-        assert!(v.check_resume("t-", "a", "x", &marker).is_ok());
-        assert!(v.check_resume("t-", "a", "y", &marker).is_err());
     }
 }
