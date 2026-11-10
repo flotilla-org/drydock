@@ -619,19 +619,9 @@ fn egress_model() -> EgressModel {
 impl Provider for Tensorlake {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
-            fallback_runner: true,
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
             agent_tcp_port: Some(self.settings.tunnel_port),
             // A name Tensorlake already holds is refused, not returned.
             exclusive_label: false,
@@ -644,15 +634,11 @@ impl Provider for Tensorlake {
             }],
             // Usage is to be read as Tensorlake gives it (drydock#257).
             usage: false,
-            quota: false,
-            host_filesystem: false,
-            host_processes: false,
-            // The agent carries outward exposures; the sandbox has no network of drydockd's.
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, suspend and resume answer once Tensorlake accepted them,
             // a second create of a name is refused (409), list and delete
             // reach the whole project, and resume needs only the id.
             semantics: Semantics { settles: false, idempotent: false, owner_scoped: false, token_is_id: true },
+            ..kit::remote_sandbox(egress_model())
         }
     }
     /// Tensorlake's webhooks are registered in its dashboard, per project, and

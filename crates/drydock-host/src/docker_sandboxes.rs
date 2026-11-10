@@ -8,17 +8,15 @@
 use crate::{
     kit::{
         self, LABEL_TAG, MIB, StateTable, Vendor,
-        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, MAX_PAGES, Text, cut, operation},
-        guest::GuestOutput,
+        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, cut, operation},
+        guest::{Guest, GuestOutput},
         image::{check_prepare, check_prepared},
+        relay::{Frame, Framing, relay},
     },
     module::*,
 };
 use async_trait::async_trait;
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use drydock_protocol::*;
 use drydock_transport::websocket::{
     DialError, TlsDialer, WebSocket, WebSocketDialer,
@@ -27,25 +25,16 @@ use drydock_transport::websocket::{
         http::{HeaderMap, HeaderValue, header},
     },
 };
-use futures::{SinkExt, StreamExt};
+use futures::SinkExt;
 use reqwest::Method;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 const DOCKER: Vendor = Vendor("Docker Sandboxes");
 const DOCKER_HUB: Vendor = Vendor("Docker Hub");
 const AGENT: &str = "/opt/drydock/drydock-agent";
 const SUBPROTOCOL: &str = "sandboxes.v1";
-/// The most stdin bytes one interact frame carries.
-const STDIN_FRAME: usize = 32 << 10;
-/// How long before an exchanged access token expires a new one is asked for.
-const RENEW_MARGIN: Duration = Duration::from_secs(60);
 
 /// Docker does not say who stopped a sandbox; a failed one carries its error
 /// beside the state, and a degraded one is Docker's own word that it has lost
@@ -87,13 +76,6 @@ struct WirePlatform {
 struct Endpoint {
     uri: Option<String>,
 }
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Page {
-    #[serde(default)]
-    sandboxes: Vec<Sandbox>,
-    next_page_token: Option<String>,
-}
 /// One sandbox's network policy as Docker installed it.
 #[derive(Deserialize)]
 struct Policies {
@@ -133,7 +115,8 @@ struct Issued {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Executed {
-    exit_code: Option<i32>,
+    #[serde(default)]
+    exit_code: i32,
     stdout: Option<String>,
     stderr: Option<String>,
     #[serde(default)]
@@ -143,8 +126,6 @@ struct Executed {
 struct Process {
     name: Text,
 }
-/// One server frame on an interact stream: output, its end, a heartbeat, or
-/// the error that ends it.
 #[derive(Deserialize)]
 struct Output {
     chunk: Option<Chunk>,
@@ -182,10 +163,6 @@ struct Pat {
 #[derive(Deserialize)]
 struct Exchanged {
     access_token: Text,
-}
-#[derive(Deserialize)]
-struct Claims {
-    exp: Option<u64>,
 }
 
 pub struct DockerSandboxesModule {
@@ -253,7 +230,7 @@ impl Module for DockerSandboxesModule {
             api,
             hub,
             dialer: self.dialer.clone(),
-            held: Mutex::default(),
+            held: Default::default(),
         }))
     }
 }
@@ -266,12 +243,7 @@ pub struct DockerSandboxes {
     hub: Api,
     dialer: Arc<dyn WebSocketDialer>,
     /// The access token last exchanged, for the credential it came from.
-    held: Mutex<Option<Held>>,
-}
-struct Held {
-    credential: String,
-    token: Secret,
-    renew_at: SystemTime,
+    held: kit::exchange::Exchanged,
 }
 
 /// Docker's errors carry a stable code, and Google's typed details: a quota
@@ -300,11 +272,6 @@ fn seconds(duration: &str) -> Option<u64> {
 fn platform() -> Platform {
     Platform::new("linux", "amd64")
 }
-/// When a JWT says it expires, if it does.
-fn expiry(token: &str) -> Option<SystemTime> {
-    let payload = URL_SAFE_NO_PAD.decode(token.split('.').nth(1)?).ok()?;
-    Some(UNIX_EPOCH + Duration::from_secs(serde_json::from_slice::<Claims>(&payload).ok()?.exp?))
-}
 
 impl DockerSandboxes {
     /// The bearer for management calls: the access token Docker Hub exchanges
@@ -316,28 +283,15 @@ impl DockerSandboxes {
         };
         let credential = c.token().ok_or_else(rejected)?;
         let pat: Pat = serde_json::from_str(credential.expose()).map_err(|_| rejected())?;
-        let digest = kit::digest(credential.expose());
-        let held = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .and_then(|held| (held.credential == digest && SystemTime::now() < held.renew_at).then(|| held.token.clone()));
-        if let Some(token) = held {
-            return Ok(Credentials::new(Some(token)));
-        }
-        let body = json!({"identifier": pat.username, "secret": pat.personal_access_token});
-        let url = self.hub.url(&[])?;
-        let operation = operation(&Method::POST, &url);
-        let response = self.hub.send(Method::POST, url, Body::json(&body)?, c, false, &[]).await?;
-        let exchanged: Exchanged = self.hub.answer(&operation, &response)?;
-        let token = Secret::new(String::from(exchanged.access_token));
-        if let Some(expires) = expiry(token.expose()) {
-            let renew_at = expires.checked_sub(RENEW_MARGIN).unwrap_or(UNIX_EPOCH);
-            let fresh = Held { credential: digest, token: token.clone(), renew_at };
-            *self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);
-        }
-        Ok(Credentials::new(Some(token)))
+        let exchange = async {
+            let body = json!({"identifier": pat.username, "secret": pat.personal_access_token});
+            let url = self.hub.url(&[])?;
+            let operation = operation(&Method::POST, &url);
+            let response = self.hub.send(Method::POST, url, Body::json(&body)?, c, false, &[]).await?;
+            let exchanged: Exchanged = self.hub.answer(&operation, &response)?;
+            Ok(Secret::new(String::from(exchanged.access_token)))
+        };
+        Ok(Credentials::new(Some(self.held.token(credential, exchange).await?)))
     }
     fn sandbox_url(&self, id: &str, rest: &[&str]) -> Result<reqwest::Url> {
         if id.is_empty() || id == "." || id == ".." {
@@ -391,20 +345,6 @@ impl DockerSandboxes {
             }),
         }
     }
-    /// One command, its argv as given, run as root to its end.
-    async fn run(&self, id: &str, argv: &[String], c: &Credentials) -> Result<GuestOutput> {
-        let c = &self.access(c).await?;
-        let (endpoint, scoped) = self.endpoint(id, &["sandboxesExec"], c).await?;
-        let body = json!({"cmd": argv, "user": "root"});
-        let url = endpoint.url(&["v1", "processes", "exec"])?;
-        let deadline = Duration::from_secs(self.settings.exec_seconds);
-        let v: Executed = endpoint.call_within(Method::POST, url, Body::json(&body)?, &scoped, deadline).await?;
-        let bytes = |text: Option<String>| STANDARD.decode(text.unwrap_or_default()).map_err(|_| DOCKER.bad_response());
-        let chunks = [(false, bytes(v.stdout)?), (true, bytes(v.stderr)?)].into_iter().filter(|(_, b)| !b.is_empty()).collect();
-        let note = v.incomplete.then(|| "Docker Sandboxes kept only part of the command's output".to_owned());
-        // A zero exit status is left out, as protobuf leaves out every zero.
-        Ok(GuestOutput { chunks, exit: Some(v.exit_code.unwrap_or(0)), timed_out: false, note })
-    }
 }
 
 /// Docker's sandbox shapes: a name, whole vCPUs and MiB of memory. Docker
@@ -452,20 +392,14 @@ fn egress_model() -> EgressModel {
 #[async_trait]
 impl Provider for DockerSandboxes {
     fn capabilities(&self) -> Capabilities {
+        let remote = kit::remote_sandbox(egress_model());
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             // Docker's stop hibernates a sandbox whose backend preserves memory,
             // and its sandboxes have resumed with their processes running.
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability { routes: vec![EgressRoute::ExplicitProxy, EgressRoute::Open], model: egress_model() },
-            fallback_runner: true,
+            egress: EgressCapability { routes: vec![EgressRoute::ExplicitProxy, EgressRoute::Open], ..remote.egress },
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
-            agent_tcp_port: None,
             platforms: vec![platform()],
             // Docker pulls a public image by digest; its API takes no
             // credential for a private registry.
@@ -475,16 +409,11 @@ impl Provider for DockerSandboxes {
                 digest_references: true,
                 tools_layer: ToolsLayer::Upload,
             }],
-            usage: false,
-            quota: false,
-            host_filesystem: false,
-            host_processes: false,
-            exclusive_label: false,
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, stop and start answer once Docker accepts them; a repeated
             // one is Docker's to answer; list and delete reach the whole
             // account; and Docker starts a sandbox by id alone.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..remote
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {
@@ -529,21 +458,10 @@ impl Provider for DockerSandboxes {
     /// Every sandbox the credential's owner has, every page: Docker filters by
     /// no label, so drydockd applies ownership to the tags.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
+        const PAGED: Paging = Paging { rows: Some("sandboxes"), cursor: "pageToken", next: Next::Body(&["nextPageToken"]) };
         let c = &self.access(c).await?;
-        let (mut rows, mut cursor, mut seen) = (Vec::new(), None::<String>, BTreeSet::new());
-        loop {
-            let mut url = self.api.url(&["v1", "sandboxes"])?;
-            if let Some(cursor) = &cursor {
-                url.query_pairs_mut().append_pair("pageToken", cursor);
-            }
-            let page: Page = self.api.get(url, c).await?;
-            rows.extend(page.sandboxes.into_iter().map(|v| self.environment(v)));
-            match page.next_page_token.filter(|t| !t.is_empty()) {
-                None => return Ok(rows),
-                Some(next) if seen.len() + 1 < MAX_PAGES && seen.insert(next.clone()) => cursor = Some(next),
-                Some(_) => return Err(DOCKER.bad_response()),
-            }
-        }
+        let url = self.api.url(&["v1", "sandboxes"])?;
+        Ok(self.api.paged::<Sandbox>(url, &PAGED, c).await?.into_iter().map(|v| self.environment(v)).collect())
     }
     /// The sandbox and, while it runs, its installed network policy. Egress is
     /// enforced when Docker states a deny-all policy that holds the sandbox's
@@ -584,11 +502,7 @@ impl Provider for DockerSandboxes {
         let process: Process = endpoint.call(Method::POST, endpoint.url(&["v1", "processes"])?, Body::json(&body)?, &scoped).await?;
         let pid = process.name.strip_prefix("processes/").filter(|p| !p.is_empty()).ok_or_else(|| DOCKER.bad_response())?;
         match self.attach(&endpoint, &scoped, &process.name, pid).await {
-            Ok(socket) => {
-                let (near, far) = tokio::io::duplex(1 << 16);
-                tokio::spawn(interact(socket, far));
-                Ok(Box::new(near))
-            }
+            Ok(socket) => Ok(relay(socket, FRAMING)),
             Err(error) => {
                 // The bridge would wait on stdin for good: end it, as far as Docker lets.
                 let url = endpoint.url(&["v1", "processes", pid, "signal"])?;
@@ -631,62 +545,24 @@ impl DockerSandboxes {
     }
 }
 
-/// Carries `local`'s bytes to the process's stdin, closing it at their end,
-/// and its stdout back, until the process exits, Docker ends the stream, or
-/// either side fails.
-async fn interact(socket: WebSocket, local: DuplexStream) {
-    let (mut frames_out, mut frames_in) = socket.split();
-    let (mut reader, mut writer) = tokio::io::split(local);
-    let input = async {
-        let mut buffer = vec![0; STDIN_FRAME];
-        loop {
-            // Reading the local end of a duplex does not fail; if it did, its
-            // end would be stdin's end all the same.
-            let read = reader.read(&mut buffer).await.unwrap_or(0);
-            let frame = if read == 0 { json!({"closeStdin": true}) } else { json!({"stdin": STANDARD.encode(&buffer[..read])}) };
-            if frames_out.send(Message::text(frame.to_string())).await.is_err() || read == 0 {
-                break;
-            }
+/// Docker's interact frames: stdin out in base64, closed by its own frame;
+/// back come output, its end, a heartbeat, or the error that ends it.
+const FRAMING: Framing<Output> = Framing {
+    vendor: DOCKER,
+    stdin: |bytes| if bytes.is_empty() { json!({"closeStdin": true}) } else { json!({"stdin": STANDARD.encode(bytes)}) },
+    output: |frame| {
+        if frame.code.is_some() {
+            tracing::debug!("Docker Sandboxes interact ended with an error frame");
         }
-        std::future::pending::<()>().await
-    };
-    let output = async {
-        while let Some(Ok(message)) = frames_in.next().await {
-            let text = match message {
-                Message::Text(text) => text,
-                Message::Ping(_) | Message::Pong(_) => continue,
-                Message::Close(_) => break,
-                _ => {
-                    tracing::debug!("Docker Sandboxes interact sent a frame that is not text; the relay ends");
-                    break;
-                }
-            };
-            let Ok(frame) = serde_json::from_str::<Output>(text.as_str()) else {
-                tracing::debug!("Docker Sandboxes interact sent a frame that is not its output; the relay ends");
-                break;
-            };
-            if frame.code.is_some() {
-                tracing::debug!("Docker Sandboxes interact ended with an error frame");
-            }
-            if frame.exited.is_some() || frame.code.is_some() {
-                break;
-            }
-            let Some(chunk) = frame.chunk.filter(|c| c.stream.as_deref() == Some("stdout")) else { continue };
-            let Ok(bytes) = STANDARD.decode(chunk.data.unwrap_or_default()) else {
-                tracing::debug!("Docker Sandboxes interact sent output that is not base64; the relay ends");
-                break;
-            };
-            if writer.write_all(&bytes).await.is_err() {
-                break;
-            }
+        if frame.exited.is_some() || frame.code.is_some() {
+            return Some(Frame::End);
         }
-        let _ = writer.shutdown().await;
-    };
-    tokio::select! {
-        () = input => {}
-        () = output => {}
-    }
-}
+        match frame.chunk.filter(|c| c.stream.as_deref() == Some("stdout")) {
+            Some(chunk) => STANDARD.decode(chunk.data.unwrap_or_default()).ok().map(Frame::Stdout),
+            None => Some(Frame::Other),
+        }
+    },
+};
 
 /// Stop and start. Docker starts a sandbox by id alone, so the token is the id.
 #[async_trait]
@@ -700,10 +576,34 @@ impl SuspendResume for DockerSandboxes {
     }
 }
 
+/// Docker's exec takes an argv, and runs it as root to its end.
+#[async_trait]
+impl Guest for DockerSandboxes {
+    fn vendor(&self) -> Vendor {
+        DOCKER
+    }
+    async fn run(&self, id: &str, script: &str, env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        self.run_argv(id, &["sh".into(), "-c".into(), script.into()], env, c).await
+    }
+    async fn run_argv(&self, id: &str, argv: &[String], env: BTreeMap<&str, String>, c: &Credentials) -> Result<GuestOutput> {
+        let c = &self.access(c).await?;
+        let (endpoint, scoped) = self.endpoint(id, &["sandboxesExec"], c).await?;
+        let mut body = json!({"cmd": argv, "user": "root"});
+        if !env.is_empty() {
+            body["env"] = json!(env);
+        }
+        let url = endpoint.url(&["v1", "processes", "exec"])?;
+        let deadline = Duration::from_secs(self.settings.exec_seconds);
+        let v: Executed = endpoint.call_within(Method::POST, url, Body::json(&body)?, &scoped, deadline).await?;
+        let bytes = |text: Option<String>| STANDARD.decode(text.unwrap_or_default()).map_err(|_| DOCKER.bad_response());
+        let note = v.incomplete.then(|| "Docker Sandboxes kept only part of the command's output".to_owned());
+        Ok(GuestOutput { note, ..GuestOutput::from_text(bytes(v.stdout)?, bytes(v.stderr)?, Some(v.exit_code.into())) })
+    }
+}
 #[async_trait]
 impl Exec for DockerSandboxes {
     async fn exec(&self, id: &str, r: ExecRequest, c: &Credentials) -> Result<ByteStream> {
-        Ok(self.run(id, &r.command, c).await?.success(DOCKER)?.into_stream())
+        Guest::exec(self, id, r, c).await
     }
 }
 

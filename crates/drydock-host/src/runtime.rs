@@ -6,7 +6,7 @@
 use crate::{
     kit::{
         self, GIB, LABEL_TAG, MIB, SizeLimits, StateTable, Vendor,
-        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, Next, Paging, Text, absent_on_not_found, cut, sensitive},
+        api::{Api, Auth, Body, EXPLANATION_CHARS, Failure, IntText, Next, Paging, Text, absent_on_not_found, cut, sensitive},
         guest::{Guest, GuestOutput},
         image::{check_prepare, check_prepared, content_name, platform_dockerfile},
     },
@@ -110,7 +110,7 @@ struct Limit {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Credit {
-    available_micros: Micros,
+    available_micros: IntText<u128>,
 }
 /// Runtime states all four, `exitCode` null after a timeout.
 #[derive(Deserialize)]
@@ -149,15 +149,6 @@ struct ErrorDetail {
     message: Option<String>,
     hint: Option<String>,
     retry_after_ms: Option<u64>,
-}
-#[derive(Clone, Copy, Deserialize)]
-#[serde(try_from = "String")]
-struct Micros(u128);
-impl TryFrom<String> for Micros {
-    type Error = std::num::ParseIntError;
-    fn try_from(text: String) -> std::result::Result<Self, Self::Error> {
-        text.parse().map(Self)
-    }
 }
 
 pub struct RuntimeModule;
@@ -462,19 +453,9 @@ impl Guest for Runtime {
 impl Provider for Runtime {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(true),
-            export: false,
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
-            fallback_runner: true,
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
             agent_tcp_port: Some(self.settings.agent_port),
             platforms: vec![platform()],
             image_routes: vec![ImageRoute::RegistryPull {
@@ -487,17 +468,14 @@ impl Provider for Runtime {
             // collected as Runtime gives them (drydock#257); no figure is derived.
             usage: false,
             quota: true,
-            host_filesystem: false,
-            host_processes: false,
             // A second provision of a label is Runtime's refusal of the name,
             // not the sandbox that holds it.
             exclusive_label: false,
-            // The agent carries outward exposures; the sandbox has no network of drydockd's.
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, pause, wake and restart answer at Runtime's wait, settled
             // or not; a repeated one is Runtime's to answer; list and delete
             // reach the whole account; and Runtime resumes by id alone.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
+            ..kit::remote_sandbox(egress_model())
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {

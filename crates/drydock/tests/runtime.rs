@@ -201,6 +201,20 @@ async fn concurrent_provision_and_event_resume() {
     assert!(report.passed(), "{report:?}");
 }
 
+// A deny-all request the reference module accepts and reports advisory fails
+// conformance.
+#[tokio::test]
+async fn advisory_deny_all_fails_conformance() {
+    let h = Harness::start().await;
+    h.normal().await;
+    let prepared = h.prepared("a").await;
+    let client = drydock::client::Client::unix(&h.path).unwrap();
+    let options: drydock::conformance::Options =
+        serde_json::from_value(json!({"request":request("deny-all", &prepared),"scenarios":["prepare","egress"]})).unwrap();
+    let report = drydock::conformance::run(&client, "a", &options).await;
+    assert!(report.checks.iter().any(|check| check.name == "enforced_egress" && !check.passed), "{report:?}");
+}
+
 // Every typed module error retains its class and agreed status, retry hints, and
 // CredentialRejected changes hello readiness until an explicit credential refresh.
 #[tokio::test]

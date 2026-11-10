@@ -1,13 +1,17 @@
 //! What every Rust provider module needs and none should write again: the
 //! vendor's HTTP API with typed bodies and answers ([`api`]), commands run
 //! in a guest ([`guest`]), destinations and addresses ([`egress`]),
-//! prepared-form names and prepare's checks ([`image`]), and sizes, waits,
+//! prepared-form names and prepare's checks ([`image`]), a relay over a
+//! JSON-framed process stream ([`relay`]), credentials exchanged for
+//! short-lived tokens ([`exchange`]), and sizes, waits,
 //! lifecycle state tables and ownership tags (here). A module keeps only
 //! what differs: its endpoints, its wire types, its states, its quirks.
 pub mod api;
 pub mod egress;
+pub mod exchange;
 pub mod guest;
 pub mod image;
+pub mod relay;
 
 use crate::module::{Result, refused};
 use drydock_protocol::*;
@@ -132,6 +136,23 @@ pub fn granted(
     };
     let bytes = |n: u64, unit: u64| n.checked_mul(unit).ok_or_else(|| vendor.bad_response());
     Ok(Some(Size { cpus: cpus as f64, memory_bytes: bytes(memory, memory_unit)?, disk_bytes: bytes(disk, disk_unit)? }))
+}
+
+/// What a remote sandbox declares unless its vendor differs: a frozen
+/// material cloned in the vessel under `/workspace`, the fallback runner,
+/// egress denied, through a proxy or open under `model`, and the agent, which
+/// carries outward exposures since the sandbox has no network of drydockd's.
+pub fn remote_sandbox(model: EgressModel) -> Capabilities {
+    Capabilities {
+        material_modes: vec![MaterialMode::Frozen],
+        checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
+        workspace_root: "/workspace".into(),
+        egress: EgressCapability { routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open], model },
+        fallback_runner: true,
+        agent: true,
+        reach_ways: vec![ReachWay::OutwardExposure],
+        ..Capabilities::default()
+    }
 }
 
 /// Lifecycle states as a table: the vendor's state name, and the observation.

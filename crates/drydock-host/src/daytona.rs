@@ -466,19 +466,10 @@ fn egress_model() -> EgressModel {
 impl Provider for Daytona {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            material_modes: vec![MaterialMode::Frozen],
-            checkout_strategies: vec![CheckoutStrategy::CloneInVessel],
-            workspace_root: "/workspace".into(),
             suspend_resume: true,
             suspend_preserves_memory: Some(false),
-            egress: EgressCapability {
-                routes: vec![EgressRoute::None, EgressRoute::ExplicitProxy, EgressRoute::Open],
-                model: egress_model(),
-            },
-            fallback_runner: true,
             // The toolbox writes files, so drydock puts the agent in each sandbox.
             bootstrap: BootstrapRoute::Upload,
-            agent: true,
             platforms: vec![platform()],
             image_routes: vec![
                 // Default: our own images live in registries Daytona cannot
@@ -501,13 +492,11 @@ impl Provider for Daytona {
             ],
             usage: true,
             quota: true,
-            // The agent carries outward exposures; the sandbox has no network of drydockd's.
-            reach_ways: vec![ReachWay::OutwardExposure],
             // Create, start and stop answer once Daytona accepted them; a second
             // stop is refused (400), a delete mid-change conflicts (409), list
             // and delete reach the whole account, and start needs no token.
             semantics: Semantics { token_is_id: true, ..Semantics::default() },
-            ..Capabilities::default()
+            ..kit::remote_sandbox(egress_model())
         }
     }
     /// Daytona's webhooks are registered in its dashboard, through Svix.

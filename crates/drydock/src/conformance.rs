@@ -423,9 +423,13 @@ pub async fn run(client: &Client, provider: &str, options: &Options) -> Report {
         if options.selected(Scenario::Egress) {
             // A module may state enforcement only where it reads the
             // environment's network, which inspect does and provision need not.
+            // A deny-all request ends enforced or refused, never advisory.
             match client.inspect(provider, &environment.id).await {
                 Ok(inspected) if environment.egress == Enforcement::Enforced || inspected.egress == Enforcement::Enforced => {
                     report.record("enforced_egress", egress(client, provider, &inspected, &options).await)
+                }
+                Ok(_) if matches!(options.request.egress, EgressRequest::DenyAll { .. }) => {
+                    report.record("enforced_egress", Err("deny-all accepted, but the environment is advisory".into()))
                 }
                 Ok(_) => report.not_applicable("enforced_egress", "the environment is not enforced"),
                 Err(error) => report.record("enforced_egress", Err(SafeError::category(error))),

@@ -20,7 +20,9 @@ There are two hosts:
   compiled in and share the [`kit`](../crates/drydock-host/src/kit/mod.rs): an
   HTTP client for the vendor's API with typed answers and a status table
   ([`kit::api`](../crates/drydock-host/src/kit/api.rs)), lifecycle state
-  tables, prepare's checks, guest command output, and a WebSocket dialer
+  tables, prepare's checks, guest commands (`kit::guest::Guest`, its
+  `run_argv` overridden where the exec takes an argv, as Docker's does), and a
+  WebSocket dialer
   ([`drydock_transport::websocket`](../crates/drydock-transport/src/websocket.rs)).
 - **TypeScript**, in [`hosts/typescript`](../hosts/typescript). Each module is
   a thin bridge over the vendor's TypeScript SDK. Read its
@@ -104,8 +106,10 @@ Register the module in two places: `pub mod` in
   says differently. Docker overrides two things: a `QuotaFailure` detail is
   exhausted quota, and 412 (the etag moved on) is unavailable.
 - **Quirks of the wire format.** Docker answers in protobuf's JSON form, which
-  leaves out empty lists and zero numbers. A list page without `sandboxes`
-  holds none, and an exec answer without `exitCode` exited 0.
+  leaves out empty lists and zero numbers. `Api::paged` reads a page without
+  its rows key as no rows. A field that can be zero takes `#[serde(default)]`
+  (an exec answer without `exitCode` exited 0), and a 64-bit integer, a
+  string in protobuf, is a `kit::api::IntText`.
 
 ### What the module leaves to drydockd
 
@@ -128,8 +132,9 @@ Register the module in two places: `pub mod` in
 
 ## 3. Capabilities, `Semantics` and ways in
 
-`capabilities()` is the module's declaration. State only what the vendor
-does:
+`capabilities()` is the module's declaration: `kit::remote_sandbox`'s
+defaults, and only what the vendor does differently. Docker cannot deny
+egress, so its routes lack `None`.
 
 - **Lifecycle.** `suspend_resume` when the vendor can stop and start a
   sandbox; `suspend_preserves_memory` when its stop keeps memory. Docker's
@@ -139,7 +144,8 @@ does:
   loopback for a dial reach (E2B, Runtime). Without one, reach is a relay:
   `reach` returns `Reach::relay(name, id)` and `relay` returns a byte stream
   to the agent's socket. Docker's relay runs `drydock-agent --bridge` as a
-  process and carries its stdin and stdout over Docker's interact WebSocket.
+  process and carries its stdin and stdout over Docker's interact WebSocket,
+  through `kit::relay` given Docker's `Framing`.
 - **Platforms and image routes.** `platforms` lists what the vendor runs,
   first preferred. `image_routes` says how an image gets in. Docker takes a
   public image by digest: `RegistryPull` with `Anonymous` auth, credential
@@ -186,11 +192,11 @@ token file, an environment variable, or a JSON file). A JSON object without
 settings.
 
 Docker takes `{"username": …, "personal_access_token": …}`: the module asks
-Docker Hub for an access token, as Docker's SDK does, and keeps it until a
-minute before the token says it expires. This is the only state the module
-keeps. Docker's API rejects a personal access token sent as the bearer, so the
-module rejects any other credential form before a call. Offer only the forms a
-live run has shown the vendor takes.
+Docker Hub for an access token, as Docker's SDK does, and
+`kit::exchange::Exchanged` holds it until a minute before it expires. This is
+the only state the module keeps. Docker's API rejects a personal access token
+sent as the bearer, so the module rejects any other credential form before a
+call. Offer only the forms a live run has shown the vendor takes.
 
 Commands and files go to each sandbox's own endpoint (`core.endpoint.uri`) with
 a short-lived credential the management API issues for that sandbox. The
@@ -272,6 +278,9 @@ drydock --config drydock.toml conformance --provider docker --options docker-pro
 - `reach_probe` is an executable that takes the reach recipe on stdin and
   round-trips bytes with the agent. `tools/recipe-probe.py` speaks only the CI
   echo fixture's protocol, so it cannot be used here.
+- A deny-all request ends enforced or refused: a module that accepts one
+  and reports the environment `Advisory` fails `enforced_egress`. A module
+  that cannot enforce deny-all refuses it, as Docker does.
 - The egress check runs only for an environment reported `Enforced`. It needs
   a deny-all request with exactly one destination, and `tools/egress-probe.py`
   in the guest, run through exec as root. Docker takes open egress only, so
