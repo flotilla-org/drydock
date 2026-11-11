@@ -9,6 +9,7 @@ async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut registry = reference::registry();
     registry.insert("daytona".into(), std::sync::Arc::new(drydock_host::daytona::DaytonaModule));
+    registry.insert("docker_engine".into(), std::sync::Arc::new(drydock_host::docker_engine::DockerEngineModule));
     registry.insert("docker_sandboxes".into(), std::sync::Arc::new(drydock_host::docker_sandboxes::DockerSandboxesModule::new()?));
     registry.insert("e2b".into(), std::sync::Arc::new(drydock_host::e2b::E2bModule::new()));
     registry.insert("local".into(), std::sync::Arc::new(drydock_host::local::LocalModule));
