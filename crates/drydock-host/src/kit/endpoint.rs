@@ -115,6 +115,7 @@ impl Endpoint {
         let request = builder.body(Full::new(body)).map_err(|e| e.to_string())?;
         let stream = self.connect().await.map_err(|e| e.to_string())?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
+        // The connection ends when the server closes it or `sender` is dropped.
         tokio::spawn(connection.with_upgrades());
         sender.send_request(request).await.map_err(|e| e.to_string())
     }

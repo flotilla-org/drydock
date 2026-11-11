@@ -38,6 +38,8 @@ const AGENT: &str = "/opt/drydock/drydock-agent";
 /// How long the engine may take to answer an exec start; the process's own
 /// time is bounded apart.
 const HANDSHAKE: Duration = Duration::from_secs(30);
+/// How many times an exec's exit is asked for once its stream ends.
+const EXIT_POLLS: usize = 10;
 
 /// The engine says nothing of who stopped a container, nor whether a paused
 /// one will be unpaused; a created one will not start by itself.
@@ -552,8 +554,15 @@ impl Guest for DockerEngine {
             output.note = Some("Docker Engine has no exec timeout: the command may still be running".into());
             return Ok(output);
         }
-        let state: ExecState = self.api.get(self.url(&["exec", &exec, "json"])?, c).await?;
-        output.exit = state.exit_code.filter(|_| !state.running).map(|code| i32::try_from(code).unwrap_or(-1));
+        // The engine may close the stream a moment before it records the exit.
+        for _ in 0..EXIT_POLLS {
+            let state: ExecState = self.api.get(self.url(&["exec", &exec, "json"])?, c).await?;
+            if !state.running {
+                output.exit = state.exit_code.map(|code| i32::try_from(code).unwrap_or(-1));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         Ok(output)
     }
 }
