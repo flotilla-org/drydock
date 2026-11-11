@@ -226,8 +226,10 @@ a short-lived credential the management API issues for that sandbox. The
 module builds an `Api` for that endpoint per call.
 
 **Settings** are a struct with `#[serde(default, deny_unknown_fields)]` and
-a `Default` impl. Every key has a default. `configure` refuses zeroes where a
-zero makes no sense. Endpoints are settings, so a test or a self-hosted
+a `Default` impl. A key has a default unless no value is right for every
+operator, as a self-dialled endpoint is not: that key is an `Option`, and
+`configure` refuses its absence with a reason that shows what to write.
+`configure` refuses zeroes where a zero makes no sense. Endpoints are settings, so a test or a self-hosted
 vendor can change them; `Api::new` accepts HTTPS URLs only. Docker's
 settings are `api_url`, `token_exchange_url`, `poll_seconds`, `exec_seconds`
 and `upload_seconds`. An endpoint drydock dials itself is a

@@ -139,12 +139,12 @@ struct ErrorDetail {
 
 pub struct DockerEngineModule;
 
-/// Every key has a default.
+/// Every key but `endpoint` has a default.
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     /// `unix://` and a path, or `tcp://host:port` with `tls`.
-    endpoint: String,
+    endpoint: Option<String>,
     tls: Option<TlsFiles>,
     /// How often drydockd lists containers.
     poll_seconds: u64,
@@ -157,14 +157,7 @@ struct Settings {
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self {
-            endpoint: "unix:///var/run/docker.sock".into(),
-            tls: None,
-            poll_seconds: 30,
-            pull_seconds: 600,
-            exec_seconds: 60,
-            upload_seconds: 300,
-        }
+        Self { endpoint: None, tls: None, poll_seconds: 30, pull_seconds: 600, exec_seconds: 60, upload_seconds: 300 }
     }
 }
 
@@ -184,7 +177,12 @@ impl Module for DockerEngineModule {
         if [settings.poll_seconds, settings.pull_seconds, settings.exec_seconds, settings.upload_seconds].contains(&0) {
             return Err(refused("Docker Engine's poll, pull, exec and upload settings must be positive"));
         }
-        let endpoint = Arc::new(Endpoint::new(ENGINE, &settings.endpoint, settings.tls.as_ref())?);
+        let Some(address) = settings.endpoint.as_deref() else {
+            return Err(refused(
+                "Docker Engine needs an endpoint in its settings: endpoint = \"unix:///var/run/docker.sock\", or \"tcp://host:2376\" with tls = { ca, cert, key }",
+            ));
+        };
+        let endpoint = Arc::new(Endpoint::new(ENGINE, address, settings.tls.as_ref())?);
         let base = kit::api::join(endpoint.base(), &[API_VERSION, ""])?;
         let api = Api::over(ENGINE, base, Auth::None, endpoint.clone());
         Ok(Arc::new(DockerEngine {
@@ -336,6 +334,14 @@ impl DockerEngine {
         Ok(made.id.into())
     }
     /// Starts the process, the engine taking the connection over for its streams.
+    /// `failure`, after removing the container it left; when the removal
+    /// fails too, the reason says the container may still be there.
+    async fn removed(&self, id: &str, doing: &str, failure: ProtocolError, c: &Credentials) -> ProtocolError {
+        match self.destroy(id, c).await {
+            Ok(()) => failure.context(&format!("{doing}, so it was removed")),
+            Err(e) => failure.context(&format!("{doing}; container {id} may be left on the engine, as removing it failed ({e})")),
+        }
+    }
     async fn exec_start(&self, exec: &str, deadline: Duration) -> Result<ByteStream> {
         let url = self.url(&["exec", exec, "start"])?;
         let operation = operation(&Method::POST, &url);
@@ -464,11 +470,19 @@ impl Provider for DockerEngine {
         let made: Made = self.api.call(Method::POST, url, Body::json(&body)?, c).await?;
         // The engine discards a limit it cannot apply and warns.
         if let Some(warnings) = made.warnings.filter(|w| !w.is_empty()) {
-            self.destroy(&made.id, c).await?;
-            return Err(refused(format!("Docker Engine warned at create, so the container was removed: {}", warnings.join("; "))));
+            let warned = refused(format!("Docker Engine warned: {}", warnings.join("; ")));
+            return Err(self.removed(&made.id, "creating the container", warned, c).await);
         }
-        self.api.call::<IgnoredAny>(Method::POST, self.container_url(&made.id, &["start"])?, Body::None, c).await?;
-        Ok(Provisioned::Created(self.inspected(self.container(&made.id, c).await?)))
+        let start = self.container_url(&made.id, &["start"])?;
+        if let Err(e) = self.api.call::<IgnoredAny>(Method::POST, start, Body::None, c).await {
+            return Err(self.removed(&made.id, "starting the container", e, c).await);
+        }
+        // An error answer leaves drydockd without the id, so a container kept
+        // here would be one nothing records.
+        match self.container(&made.id, c).await {
+            Ok(container) => Ok(Provisioned::Created(self.inspected(container))),
+            Err(e) => Err(self.removed(&made.id, "inspecting the started container", e, c).await),
+        }
     }
     /// Every container, stopped ones included; on a shared account only those
     /// carrying this instance's label, by the engine's own filter.

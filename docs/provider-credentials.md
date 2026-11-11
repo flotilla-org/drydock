@@ -55,7 +55,7 @@ Docker's spec names the permission each call needs: `sandboxesRead`, `sandboxesC
 
 Credential: none. The engine has no authentication of its own: whoever can open its socket, or holds a client certificate its TLS endpoint trusts, controls it, and with it the engine's machine (a container can be made with any host path mounted, as root). Leave the instance's `credential` unset. The module reads its access from settings, and a request never carries it.
 
-The endpoint is a Unix socket on drydock's machine:
+`endpoint` is required: an instance without one is refused when it is configured. It is a Unix socket on drydock's machine:
 
 ```toml
 [providers.engine]
@@ -88,7 +88,7 @@ The module speaks Engine API v1.44 (Engine 25 and later): every request path sta
 |---|---|
 | `GET /version` | readiness, and the platform the module declares (the engine's `Os` and `Arch`) |
 | `POST /images/create` (`fromImage` by digest, `platform`, the registry credential in `X-Registry-Auth`), read to the end of its progress stream; then `GET /images/{reference}/json` | prepare |
-| `GET /info`; `POST /containers/create`; `POST /containers/{id}/start`; `GET /containers/{id}/json` | provision (`DELETE /containers/{id}` when create warns) |
+| `GET /info`; `POST /containers/create`; `POST /containers/{id}/start`; `GET /containers/{id}/json` | provision (`DELETE /containers/{id}` when create warns, or start or the inspect after it fails) |
 | `GET /containers/json?all=1`, filtered by the `drydock.provider` label on a `shared_account` | list |
 | `GET /containers/{id}/json` | inspect |
 | `DELETE /containers/{id}?force=1&v=1` | destroy |
@@ -99,7 +99,7 @@ The module speaks Engine API v1.44 (Engine 25 and later): every request path sta
 - Control is the Engine API alone: the module runs no command on the engine's machine, assumes no shared user id and mounts nothing. The checkout is a clone inside the vessel.
 - Images: the engine pulls by digest, for the platform the engine states, with the prepare request's registry credential sent in that pull alone. Nothing is stored on the engine's machine, and pulled images stay there (drydock does not remove them).
 - Sizes: CPUs as `NanoCpus`, memory as `Memory` (and `MemorySwap` the same, when the engine states it can limit swap). A provision is refused, with the engine's own words, when `/info` does not state that it enforces memory limits and CPU quotas (rootless Docker without cgroups is one such engine), and a container whose create answers with warnings is removed and refused with them: the engine discards a limit it cannot apply and warns. The engine sets no per-container disk, so ask for a disk of 0; rows report no granted size.
-- Each container runs `sleep infinity` under the engine's init (`Init`), with the image's entrypoint replaced, so the image needs `sleep` and `sh`. drydockd uploads the agent after start and runs it through exec.
+- Each container runs `sleep infinity` under the engine's init (`Init`), with the image's entrypoint replaced, so the image needs `sleep` and `sh`. drydockd uploads the agent after start and runs it through exec. When start fails (an image without `sleep`, for instance), or the inspect after it does, the container is removed and the provision answers with that failure; if the removal fails too, the reason names the container and says it may be left on the engine.
 - Reach is a relay: a process running `drydock-agent --bridge` through exec, its stdin and stdout carried over the connection the engine takes over. The engine has no port or socket forwarding.
 - Egress: open, or deny-all with no destinations, which is `NetworkMode: none`: the container has no network at all, and exec and the file calls still work. Inspect and list report egress enforced when the container's `NetworkMode` is `none`. Deny-all with destinations is refused: the engine has no allow-list.
 - On a `shared_account` (the default) the module labels what it makes with `drydock.provider` and lists with the engine's label filter; drydockd acts by id only on containers that carry it. On an `owned_account` nothing is labelled or filtered, so use an engine that runs only drydock's containers. The client's label is the `flotilla.label` label; provisioning a label twice makes two containers.
