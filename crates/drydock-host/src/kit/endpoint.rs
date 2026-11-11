@@ -7,8 +7,6 @@ use super::Vendor;
 use crate::module::{ByteStream, HttpClient, Result, refused};
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(test)]
-use drydock_protocol::ProtocolError;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
@@ -152,17 +150,19 @@ impl HttpClient for Endpoint {
 
 /// The server is checked against `ca` alone, and the client presents `cert`.
 fn tls_config(vendor: Vendor, files: &TlsFiles) -> Result<rustls::ClientConfig> {
-    let unreadable = |what: &str, path: &PathBuf| refused(format!("{vendor} cannot read the TLS {what} file {}", path.display()));
+    let unreadable = |what: &str, path: &PathBuf, error: &dyn std::fmt::Display| {
+        refused(format!("{vendor} cannot read the TLS {what} file {}: {error}", path.display()))
+    };
     let certificates = |path: &PathBuf, what: &str| -> Result<Vec<CertificateDer<'static>>> {
-        let certificates: Vec<_> = CertificateDer::pem_file_iter(path).and_then(|i| i.collect()).map_err(|_| unreadable(what, path))?;
-        if certificates.is_empty() { Err(unreadable(what, path)) } else { Ok(certificates) }
+        let certificates: Vec<_> = CertificateDer::pem_file_iter(path).and_then(|i| i.collect()).map_err(|e| unreadable(what, path, &e))?;
+        if certificates.is_empty() { Err(unreadable(what, path, &"it holds no certificate")) } else { Ok(certificates) }
     };
     let mut roots = rustls::RootCertStore::empty();
     for certificate in certificates(&files.ca, "CA")? {
-        roots.add(certificate).map_err(|_| unreadable("CA", &files.ca))?;
+        roots.add(certificate).map_err(|e| unreadable("CA", &files.ca, &e))?;
     }
     let chain = certificates(&files.cert, "certificate")?;
-    let key = PrivateKeyDer::from_pem_file(&files.key).map_err(|_| unreadable("key", &files.key))?;
+    let key = PrivateKeyDer::from_pem_file(&files.key).map_err(|e| unreadable("key", &files.key, &e))?;
     let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
         .map_err(|e| refused(format!("{vendor} TLS: {e}")))?
@@ -176,6 +176,7 @@ fn tls_config(vendor: Vendor, files: &TlsFiles) -> Result<rustls::ClientConfig> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use drydock_protocol::ProtocolError;
 
     // A socket takes no TLS, TCP takes nothing without it, and anything
     // else is not an endpoint.
@@ -191,6 +192,8 @@ mod tests {
             ("tcp://engine.test:2376", None),
             ("tcp://engine.test", None),
             ("http://engine.test:2375", None),
+            // TLS files that cannot be read.
+            ("tcp://engine.test:2376", Some(&files)),
         ] {
             assert!(matches!(Endpoint::new(v, endpoint, tls), Err(ProtocolError::Refused { .. })), "{endpoint}");
         }

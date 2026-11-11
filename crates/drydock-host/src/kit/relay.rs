@@ -104,16 +104,21 @@ pub fn frame_header(header: [u8; 8]) -> Option<(Stream, usize)> {
     let [_, 0, 0, 0, a, b, c, d] = header else { return None };
     Some((stream, u32::from_be_bytes([a, b, c, d]) as usize))
 }
-/// The next frame, or None at the stream's end between frames.
+/// The largest frame read; a server writes far smaller ones.
+const FRAME_LIMIT: usize = 16 << 20;
+/// The next frame, or None at the stream's end between frames. A stream
+/// that ends inside a frame is an error.
 async fn read_frame(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<Option<(Stream, Vec<u8>)>> {
     let mut header = [0; 8];
-    match reader.read_exact(&mut header).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
+    if reader.read(&mut header[..1]).await? == 0 {
+        return Ok(None);
     }
-    let (stream, length) =
-        frame_header(header).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "not a stream frame"))?;
+    reader.read_exact(&mut header[1..]).await?;
+    let invalid = |what| std::io::Error::new(std::io::ErrorKind::InvalidData, what);
+    let (stream, length) = frame_header(header).ok_or_else(|| invalid("not a stream frame"))?;
+    if length > FRAME_LIMIT {
+        return Err(invalid("a stream frame over 16 MiB"));
+    }
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes).await?;
     Ok(Some((stream, bytes)))
@@ -152,8 +157,16 @@ pub fn multiplexed(vendor: Vendor, connection: ByteStream) -> ByteStream {
                 Ok(Some((Stream::Stdout, bytes))) if writer.write_all(&bytes).await.is_ok() => {}
                 Ok(Some((Stream::Stderr | Stream::Stdin, _))) => {}
                 Ok(None) => break,
-                Ok(Some(_)) | Err(_) => {
-                    tracing::debug!("{vendor} ended the process stream with an error; the relay ends");
+                Ok(Some((Stream::System, bytes))) => {
+                    tracing::warn!(
+                        "{vendor} ended the process stream with an error, so the relay ends: {}",
+                        String::from_utf8_lossy(&bytes)
+                    );
+                    break;
+                }
+                Ok(Some((Stream::Stdout, _))) => break,
+                Err(error) => {
+                    tracing::warn!("{vendor} process stream failed, so the relay ends: {error}");
                     break;
                 }
             }
@@ -181,5 +194,17 @@ mod tests {
         // Anything else is not a frame: a fourth stream, or padding that isn't zero.
         assert_eq!(frame_header([4, 0, 0, 0, 0, 0, 0, 1]), None);
         assert_eq!(frame_header([1, 0, 1, 0, 0, 0, 0, 1]), None);
+    }
+
+    // Only an end between frames is the stream's end; an end inside a frame,
+    // or a frame over the limit, is an error.
+    #[tokio::test]
+    async fn frame_reads() {
+        let mut whole: &[u8] = &[1, 0, 0, 0, 0, 0, 0, 2, b'h', b'i'];
+        assert_eq!(read_frame(&mut whole).await.unwrap(), Some((Stream::Stdout, b"hi".to_vec())));
+        assert_eq!(read_frame(&mut whole).await.unwrap(), None);
+        for mut cut in [&[1, 0, 0][..], &[1, 0, 0, 0, 0, 0, 0, 2, b'h'], &[1, 0, 0, 0, 2, 0, 0, 0]] {
+            assert!(read_frame(&mut cut).await.is_err(), "{cut:?}");
+        }
     }
 }

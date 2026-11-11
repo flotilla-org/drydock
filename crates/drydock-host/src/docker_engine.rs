@@ -35,6 +35,9 @@ const ENGINE: Vendor = Vendor("Docker Engine");
 /// The API version every request names: Engine 25 and later.
 const API_VERSION: &str = "v1.44";
 const AGENT: &str = "/opt/drydock/drydock-agent";
+/// How long the engine may take to answer an exec start; the process's own
+/// time is bounded apart.
+const HANDSHAKE: Duration = Duration::from_secs(30);
 
 /// The engine says nothing of who stopped a container, nor whether a paused
 /// one will be unpaused; a created one will not start by itself.
@@ -333,7 +336,6 @@ impl DockerEngine {
         let made: Made = self.api.call(Method::POST, self.container_url(id, &["exec"])?, Body::json(&body)?, c).await?;
         Ok(made.id.into())
     }
-    /// Starts the process, the engine taking the connection over for its streams.
     /// `failure`, after removing the container it left; when the removal
     /// fails too, the reason says the container may still be there.
     async fn removed(&self, id: &str, doing: &str, failure: ProtocolError, c: &Credentials) -> ProtocolError {
@@ -342,11 +344,12 @@ impl DockerEngine {
             Err(e) => failure.context(&format!("{doing}; container {id} may be left on the engine, as removing it failed ({e})")),
         }
     }
-    async fn exec_start(&self, exec: &str, deadline: Duration) -> Result<ByteStream> {
+    /// Starts the process, the engine taking the connection over for its streams.
+    async fn exec_start(&self, exec: &str) -> Result<ByteStream> {
         let url = self.url(&["exec", exec, "start"])?;
         let operation = operation(&Method::POST, &url);
         let mut request = reqwest::Request::new(Method::POST, url);
-        *request.timeout_mut() = Some(deadline);
+        *request.timeout_mut() = Some(HANDSHAKE);
         request.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         *request.body_mut() = Some(json!({"Detach": false, "Tty": false}).to_string().into());
         match self.endpoint.upgrade(request, "tcp").await {
@@ -414,6 +417,7 @@ impl Provider for DockerEngine {
             headers.push((HeaderName::from_static("x-registry-auth"), value));
         }
         let operation = operation(&Method::POST, &url);
+        // The engine answers once the pull ends, its progress held whole.
         let deadline = Some(Duration::from_secs(self.settings.pull_seconds));
         let response = self.api.send_within(Method::POST, url, Body::None, c, true, &headers, deadline).await?;
         if !response.status().is_success() {
@@ -515,7 +519,7 @@ impl Provider for DockerEngine {
     /// stdout carried over the connection the engine takes over.
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
         let exec = self.exec_create(id, &[AGENT.into(), "--bridge".into()], BTreeMap::new(), true, c).await?;
-        Ok(multiplexed(ENGINE, self.exec_start(&exec, Duration::from_secs(30)).await?))
+        Ok(multiplexed(ENGINE, self.exec_start(&exec).await?))
     }
 }
 
@@ -534,7 +538,7 @@ impl Guest for DockerEngine {
         let deadline = Duration::from_secs(self.settings.exec_seconds);
         let mut output = GuestOutput::default();
         let read = async {
-            let stream = self.exec_start(&exec, deadline).await?;
+            let stream = self.exec_start(&exec).await?;
             read_output(stream, &mut output.chunks).await.map_err(|error| ProtocolError::Unavailable {
                 reason: "Docker Engine exec stream failed".into(),
                 retry_after: None,
@@ -564,6 +568,9 @@ impl Exec for DockerEngine {
 impl GuestFiles for DockerEngine {
     async fn put(&self, id: &str, file: GuestFile, bytes: Bytes, c: &Credentials) -> Result<()> {
         let path = std::path::Path::new(&file.path);
+        if !path.is_absolute() {
+            return Err(refused(format!("Docker Engine puts files at absolute paths only, not {}", file.path)));
+        }
         let (Some(parent), Some(name)) = (path.parent().and_then(|p| p.to_str()), path.file_name()) else {
             return Err(refused(format!("{} names no file", file.path)));
         };
@@ -599,6 +606,13 @@ impl QuotaOperation for DockerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The engine's zero time is a time it does not state.
+    #[test]
+    fn times() {
+        assert!(time(Some("0001-01-01T00:00:00Z")).is_none());
+        assert!(time(Some("2026-11-11T21:00:00.123456789Z")).is_some());
+    }
 
     fn info(memory: Option<bool>, cpu: Option<bool>, warnings: &[&str]) -> Info {
         let warnings = Some(warnings.iter().map(|w| w.to_string()).collect());
