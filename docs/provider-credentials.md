@@ -51,6 +51,62 @@ Docker's spec names the permission each call needs: `sandboxesRead`, `sandboxesC
 - drydockd observes sandboxes by listing them every `poll_seconds` (default 30). An exec may run `exec_seconds` (default 60), and the agent's upload `upload_seconds` (default 300).
 - The personal access token goes to `token_exchange_url` only, and the access token it is exchanged for as a Bearer header to `api_url` (default `https://connect.docker.com/sandboxes`). Endpoint calls carry only the sandbox's short-lived credential. Change those settings only to hosts you trust with the token.
 
+## Docker Engine (`docker_engine`, Rust host)
+
+Credential: none. The engine has no authentication of its own: whoever can open its socket, or holds a client certificate its TLS endpoint trusts, controls it, and with it the engine's machine (a container can be made with any host path mounted, as root). Leave the instance's `credential` unset. The module reads its access from settings, and a request never carries it.
+
+`endpoint` is required: an instance without one is refused when it is configured. It is a Unix socket on drydock's machine:
+
+```toml
+[providers.engine]
+module = "docker_engine"
+image = "ubuntu@sha256:…"
+size = { cpus = 2, memory = "4GiB", disk = 0 }   # the engine sets no per-container disk
+egress = "open"
+semantics = { settle = true, idempotent = true }
+
+[providers.engine.settings]
+endpoint = "unix:///var/run/docker.sock"
+```
+
+or TCP with TLS and a client certificate, the three files as `dockerd --tlsverify` and `docker --tlsverify` use them:
+
+```toml
+[providers.engine.settings]
+endpoint = "tcp://engine.example.net:2376"
+tls = { ca = "/etc/drydock/engine/ca.pem", cert = "/etc/drydock/engine/cert.pem", key = "/etc/drydock/engine/key.pem" }
+```
+
+- `endpoint` is `unix://` and an absolute path, or `tcp://` and a host and port. TCP without `tls` is refused, and so is `tls` with a socket. The engine's TLS certificate is checked against `ca` alone, for the endpoint's host: a name against the certificate's DNS names, an IP address against its IP addresses.
+- drydock-host reads the three files when the instance is configured, and keeps the certificate and key in memory for as long as the configuration stands. Give them to the user drydock-host runs as, readable by it alone. A changed file takes effect when the instance is configured again. A file that cannot be read or parsed fails the configuration; a certificate the engine no longer accepts, an expired one for instance, fails each call with the TLS error, and readiness reports it.
+- Making the client certificate: Docker's [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/) shows the CA, the server certificate and the client certificate (`extendedKeyUsage = clientAuth`). Any client the CA signs has full control of the engine, so use a CA of the engine's own, signing nothing else.
+- The socket: the user drydock-host runs as needs read and write on it, usually by membership of the `docker` group, which is root on that machine.
+
+The module speaks Engine API v1.44 (Engine 25 and later): every request path starts `/v1.44/`, so a newer engine answers as v1.44 does. An older engine refuses each call with its own message, and the module reports that.
+
+| Call | Used for |
+|---|---|
+| `GET /version` | readiness, and the platform the module declares (the engine's `Os` and `Arch`) |
+| `POST /images/create` (`fromImage` by digest, `platform`, the registry credential in `X-Registry-Auth`), read to the end of its progress stream; then `GET /images/{reference}/json` | prepare |
+| `GET /info`; `POST /containers/create`; `POST /containers/{id}/start`; `GET /containers/{id}/json` | provision (`DELETE /containers/{id}` when create warns, or start or the inspect after it fails) |
+| `GET /containers/json?all=1`, filtered by the `drydock.provider` label on a `shared_account` | list |
+| `GET /containers/{id}/json` | inspect |
+| `DELETE /containers/{id}?force=1&v=1` | destroy |
+| `POST /containers/{id}/exec`, `POST /exec/{id}/start` (the connection is taken over), `GET /exec/{id}/json` | exec, and relay (reach) |
+| `PUT /containers/{id}/archive` | the agent's upload, after `mkdir -p` of its directory through exec |
+| `GET /info` | quota: the engine's count of running containers |
+
+- Control is the Engine API alone: the module runs no command on the engine's machine, assumes no shared user id and mounts nothing. The checkout is a clone inside the vessel.
+- Images: the engine pulls by digest, for the platform the engine states, with the prepare request's registry credential sent in that pull alone. Nothing is stored on the engine's machine, and pulled images stay there (drydock does not remove them).
+- Sizes: CPUs as `NanoCpus`, memory as `Memory` (and `MemorySwap` the same, when the engine states it can limit swap). A provision is refused, with the engine's own words, when `/info` does not state that it enforces memory limits and CPU quotas (rootless Docker without cgroups is one such engine), and a container whose create answers with warnings is removed and refused with them: the engine discards a limit it cannot apply and warns. The engine sets no per-container disk, so ask for a disk of 0; rows report no granted size.
+- Each container runs `sleep infinity` under the engine's init (`Init`), with the image's entrypoint replaced, so the image needs `sleep` and `sh`. drydockd uploads the agent after start and runs it through exec. When start fails (an image without `sleep`, for instance), or the inspect after it does, the container is removed and the provision answers with that failure; if the removal fails too, the reason names the container and says it may be left on the engine.
+- Reach is a relay: a process running `drydock-agent --bridge` through exec, its stdin and stdout carried over the connection the engine takes over. The engine has no port or socket forwarding.
+- Egress: open, or deny-all with no destinations, which is `NetworkMode: none`: the container has no network at all, and exec and the file calls still work. Inspect and list report egress enforced when the container's `NetworkMode` is `none`. Deny-all with destinations is refused: the engine has no allow-list.
+- On a `shared_account` (the default) the module labels what it makes with `drydock.provider` and lists with the engine's label filter; drydockd acts by id only on containers that carry it. On an `owned_account` nothing is labelled or filtered, so use an engine that runs only drydock's containers. The client's label is the `flotilla.label` label; provisioning a label twice makes two containers.
+- Rows carry the engine's state name in `vendor`; inspect adds its `ExitCode`, `OOMKilled` and `Error` as the reason. A stopped row has no cause: the engine does not say who stopped a container.
+- An exec runs up to `exec_seconds` (default 60); the engine has no exec timeout, so a command still running then keeps running after drydock stops reading it, until it ends or the container is destroyed: the API has no call that ends an exec'd process. A pull may take `pull_seconds` (default 600), and an upload `upload_seconds` (default 300). drydockd lists containers every `poll_seconds` (default 30).
+- The module declares no usage. Quota is the engine's count of running containers, all of them, not only drydock's; the engine admits nothing, so admission stays with the caller.
+
 ## Namespace (`namespace`, TypeScript host)
 
 Credential: a revocable token as JSON, `{"bearer_token": …}`. The same token is the `nscr.io` push password (user `token`).

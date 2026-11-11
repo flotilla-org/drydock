@@ -1,5 +1,6 @@
 //! Thin Rust module loader serving the public API. Common policy lives in drydock::runtime.
 pub mod daytona;
+pub mod docker_engine;
 pub mod docker_sandboxes;
 pub mod e2b;
 pub mod kit;
