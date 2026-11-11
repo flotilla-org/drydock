@@ -3,9 +3,14 @@
 How to add a provider module to drydock, as the code stands today. It was
 written while adding the Docker Cloud Sandboxes module
 ([`docker_sandboxes.rs`](../crates/drydock-host/src/docker_sandboxes.rs)), which
-is the worked example throughout. The Runtime, E2B, Tensorlake and Daytona
-modules in the same directory are the other Rust examples; Namespace and Modal
-are the TypeScript ones.
+is the worked example throughout; "Docker" below means that module. The
+Runtime, E2B, Tensorlake and Daytona modules in the same directory are the
+other Rust examples of hosted vendors; Namespace and Modal are the TypeScript
+ones. The Docker Engine module
+([`docker_engine.rs`](../crates/drydock-host/src/docker_engine.rs)) is the
+example of a provider that is not a hosted vendor: an engine reached at an
+endpoint, with no account and no credential. Where such a provider differs,
+the sections below say so.
 
 A module is a translator. It turns drydock's verbs into the vendor's API calls
 and reports what the vendor said. Everything else (waiting, idempotence,
@@ -19,7 +24,10 @@ There are two hosts:
 - **Rust**, in [`crates/drydock-host`](../crates/drydock-host). Modules are
   compiled in and share the [`kit`](../crates/drydock-host/src/kit/mod.rs): an
   HTTP client for the vendor's API with typed answers and a status table
-  ([`kit::api`](../crates/drydock-host/src/kit/api.rs)), lifecycle state
+  ([`kit::api`](../crates/drydock-host/src/kit/api.rs)), over HTTPS or an
+  endpoint drydock dials itself, a Unix socket or TLS with a client
+  certificate ([`kit::endpoint`](../crates/drydock-host/src/kit/endpoint.rs)),
+  lifecycle state
   tables, prepare's checks, guest commands (`kit::guest::Guest`, its
   `run_argv` overridden where the exec takes an argv, as Docker's does), and a
   WebSocket dialer
@@ -121,7 +129,9 @@ Register the module in two places: `pub mod` in
   with `OWNER_TAG` and report tags in `VendorState`; drydockd filters lists
   and refuses changes to other instances' environments. On an
   `owned_account`, tag nothing. Filter lists by tag only if the vendor's own
-  list call filters (Runtime's does; Docker's does not).
+  list call filters (Runtime's and Docker Engine's do; Docker's does not). An
+  engine shared with other users (an operator's own machine) is a
+  `shared_account` in this sense, though it has no account.
 - **Polling and events.** Declare a way in; drydockd lists and diffs.
 - **Retries.** Never retry. Classify the failure and return it.
 - **The agent.** On `BootstrapRoute::Upload` drydockd puts its own agent
@@ -145,9 +155,15 @@ egress, so its routes lack `None`.
   `reach` returns `Reach::relay(name, id)` and `relay` returns a byte stream
   to the agent's socket. Docker's relay runs `drydock-agent --bridge` as a
   process and carries its stdin and stdout over Docker's interact WebSocket,
-  through `kit::relay` given Docker's `Framing`.
+  through `kit::relay` given Docker's `Framing`. Docker Engine's exec takes
+  the HTTP connection over instead (`Endpoint::upgrade`), stdin unframed and
+  output in 8-byte-header frames, and `kit::relay::multiplexed` carries it.
+  An API with no port or socket forwarding reaches the agent this way.
 - **Platforms and image routes.** `platforms` lists what the vendor runs,
-  first preferred. `image_routes` says how an image gets in. Docker takes a
+  first preferred. A vendor that states its own platform is read rather
+  than given a fixed list: Docker Engine asks the engine's version call in
+  `refresh_readiness` (drydock-host calls it before every declaration) and
+  declares no platform until the engine has answered. `image_routes` says how an image gets in. Docker takes a
   public image by digest: `RegistryPull` with `Anonymous` auth, credential
   registration `NotRequired`, and `tools_layer: Upload`. In `prepare`, call
   `kit::image::check_prepare`, which refuses routes the module lacks,
@@ -180,12 +196,19 @@ egress, so its routes lack `None`.
   `VendorEvents`; see the Tensorlake and E2B modules.
 - **Usage, quota, export** are false unless the vendor has an API for them.
   Usage is passed through as the vendor reports it, or not declared. It is
-  never derived.
+  never derived. Quota likewise carries only what the vendor states: Docker
+  Engine states a count of running containers and no limit, so its quota is
+  that count alone. The engine's CPU and memory totals have no field to go
+  in, since a resource row needs its use as well as its limit.
 
 ## 4. Credentials and settings
 
 **The credential** arrives with each call in `Credentials`. The host keeps
-none between calls. drydockd reads it from the instance's `credential` (a
+none between calls. A provider whose access is the endpoint itself has none:
+Docker Engine's is the socket's permissions or a client certificate. It
+sends no key (`Auth::None`), and overrides `readiness`, whose default reports
+a missing credential; settings name the certificate files, and drydock-host
+reads them when the instance is configured. drydockd reads it from the instance's `credential` (a
 token file, an environment variable, or a JSON file). A JSON object without
 `json_field` arrives as one compacted line. Use `kit::api::Api` with
 `Auth::Bearer` or `Auth::Header(name)` to send it. Never put a secret in
@@ -207,7 +230,10 @@ a `Default` impl. Every key has a default. `configure` refuses zeroes where a
 zero makes no sense. Endpoints are settings, so a test or a self-hosted
 vendor can change them; `Api::new` accepts HTTPS URLs only. Docker's
 settings are `api_url`, `token_exchange_url`, `poll_seconds`, `exec_seconds`
-and `upload_seconds`.
+and `upload_seconds`. An endpoint drydock dials itself is a
+`kit::endpoint::Endpoint` (`unix://` and a path, or `tcp://host:port` with
+TLS files; plain TCP is refused), with `Api::over` on it; its module ignores
+the HTTP client `configure` is handed.
 
 **Document both** in [`provider-credentials.md`](provider-credentials.md):
 what the credential is, how to mint it with the least access, the calls the
@@ -254,8 +280,8 @@ drydock --config drydock.toml conformance --provider reference --options probe.j
 A vendor module does not run against a stand-in of its vendor. The live run
 is its check.
 
-**Live.** This runs on the operator's account and costs money. It needs
-`--live`. Configure the instance with its credential and a size the vendor
+**Live.** This runs on the operator's account and costs money; for an
+engine, on the operator's engine. It needs `--live`. Configure the instance with its credential and a size the vendor
 takes, for example:
 
 ```toml
@@ -287,7 +313,8 @@ drydock --config drydock.toml conformance --provider docker --options docker-pro
   its runs report the check not applicable; whether a deny-all request was
   really applied needs a hand check of the vendor's installed policy.
 - Use a unique `label` and an idle account. Check the report's `cleanup`
-  verdict. A failed cleanup means a sandbox may still be running and billing.
+  verdict. A failed cleanup means a sandbox may still be running and billing,
+  or, on an engine, a container still holding its memory.
 
 ## 7. What the PR reports
 
