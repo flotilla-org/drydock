@@ -67,7 +67,9 @@ impl Endpoint {
             let base = Url::parse("http://localhost/").map_err(|_| invalid())?;
             return Ok(Self { address: Address::Unix(path.into()), base });
         }
-        let url = Url::parse(endpoint).ok().filter(|u| u.scheme() == "tcp" && matches!(u.path(), "" | "/") && u.query().is_none());
+        let url = Url::parse(endpoint).ok().filter(|u| {
+            u.scheme() == "tcp" && matches!(u.path(), "" | "/") && u.query().is_none() && u.username().is_empty() && u.password().is_none()
+        });
         let (Some(host), Some(port)) = (url.as_ref().and_then(Url::host_str), url.as_ref().and_then(Url::port)) else {
             return Err(invalid());
         };
@@ -197,5 +199,8 @@ mod tests {
         ] {
             assert!(matches!(Endpoint::new(v, endpoint, tls), Err(ProtocolError::Refused { .. })), "{endpoint}");
         }
+        // A user and password are not an endpoint's, and are refused before the files are read.
+        let refused = Endpoint::new(v, "tcp://user:pw@engine.test:2376", Some(&files));
+        assert!(matches!(refused, Err(ProtocolError::Refused { reason }) if reason.contains("must be unix://")));
     }
 }

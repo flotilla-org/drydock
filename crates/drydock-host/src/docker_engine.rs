@@ -321,7 +321,9 @@ impl DockerEngine {
         }
         environment
     }
-    /// A process made by exec, as root, with stdin attached or stderr.
+    /// A process made by exec, as root, with stdin attached or stderr. Root is
+    /// uid 0 inside the container, which a user-namespaced engine maps to an
+    /// unprivileged uid on its machine.
     async fn exec_create(&self, id: &str, argv: &[String], env: BTreeMap<&str, String>, stdin: bool, c: &Credentials) -> Result<String> {
         #[derive(Deserialize)]
         struct Made {

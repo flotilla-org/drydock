@@ -119,8 +119,11 @@ async fn read_frame(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io
     if length > FRAME_LIMIT {
         return Err(invalid("a stream frame over 16 MiB"));
     }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes).await?;
+    let mut bytes = Vec::new();
+    reader.take(length as u64).read_to_end(&mut bytes).await?;
+    if bytes.len() < length {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(Some((stream, bytes)))
 }
 /// A process's output from a multiplexed stream, appended to `chunks` as
@@ -154,7 +157,11 @@ pub fn multiplexed(vendor: Vendor, connection: ByteStream) -> ByteStream {
     let output = async move {
         loop {
             match read_frame(&mut from_server).await {
-                Ok(Some((Stream::Stdout, bytes))) if writer.write_all(&bytes).await.is_ok() => {}
+                Ok(Some((Stream::Stdout, bytes))) => {
+                    if writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
                 Ok(Some((Stream::Stderr | Stream::Stdin, _))) => {}
                 Ok(None) => break,
                 Ok(Some((Stream::System, bytes))) => {
@@ -164,7 +171,6 @@ pub fn multiplexed(vendor: Vendor, connection: ByteStream) -> ByteStream {
                     );
                     break;
                 }
-                Ok(Some((Stream::Stdout, _))) => break,
                 Err(error) => {
                     tracing::warn!("{vendor} process stream failed, so the relay ends: {error}");
                     break;
