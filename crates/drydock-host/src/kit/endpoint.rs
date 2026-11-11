@@ -12,7 +12,7 @@ use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use reqwest::{
     Url,
-    header::{CONNECTION, HOST, HeaderValue, UPGRADE},
+    header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderValue, UPGRADE},
 };
 use rigging_http_client::ChannelLabel;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject};
@@ -103,7 +103,7 @@ impl Endpoint {
             return Err("request names another endpoint".into());
         }
         let mut builder = http::Request::builder().method(request.method().clone()).uri(&url[url::Position::BeforePath..]);
-        for (name, value) in request.headers() {
+        for (name, value) in request.headers().iter().filter(|(name, _)| ![HOST, CONTENT_LENGTH].contains(name)) {
             builder = builder.header(name, value);
         }
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
