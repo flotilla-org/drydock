@@ -129,7 +129,7 @@ identity_file = "/home/me/.config/drydock/b1_ed25519"
 
 - `address`, `port`, `user`, `host_key` and `identity_file` are required; nothing is guessed. `host_key` is the machine's raw host public key, as `ssh-keyscan` prints it without the host name, and the connection is refused unless the machine presents exactly that key. drydock reads no ssh_config, known_hosts or ssh-agent of the user it runs as, and needs OpenSSH 8.7 or later as `ssh` on its PATH. A machine behind a jump host cannot be reached yet.
 - `directory` is where vessel directories live, an absolute path without whitespace, colons, quotes, backslashes, backticks, `$` or `%` (a shell or systemd would read them). It defaults to `drydock` under the user's `XDG_RUNTIME_DIR` on the machine (`/run/user/<uid>/drydock`), which systemd empties when the machine restarts.
-- `identity_file` is an absolute path, on drydock's machine, to the OpenSSH private key, unencrypted (drydock never prompts for a passphrase) and readable by drydock-host. `ssh` reads it in place each time it connects; drydock never copies it. Readiness reports a missing or unreadable file as a missing credential.
+- `identity_file` is an absolute path, on drydock's machine, to the OpenSSH private key, unencrypted (drydock never prompts for a passphrase), readable by drydock-host and by no one else: `ssh` refuses a key file its owner has left readable by group or others, so give it mode `0600`. `ssh` reads it in place each time it connects; drydock never copies it. Readiness reports a missing or unreadable file as a missing credential.
 
 What the machine needs:
 
