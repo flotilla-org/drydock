@@ -118,7 +118,11 @@ impl Endpoint {
         let stream = self.connect().await.map_err(|e| e.to_string())?;
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream)).await.map_err(|e| e.to_string())?;
         // The connection ends when the server closes it or `sender` is dropped.
-        tokio::spawn(connection.with_upgrades());
+        tokio::spawn(async move {
+            if let Err(error) = connection.with_upgrades().await {
+                tracing::debug!("connection to the endpoint failed: {error}");
+            }
+        });
         sender.send_request(request).await.map_err(|e| e.to_string())
     }
     /// `request` asking to switch to `protocol`, within its deadline.
@@ -140,7 +144,11 @@ impl Endpoint {
 
 async fn whole(response: http::Response<Incoming>) -> std::result::Result<http::Response<Bytes>, String> {
     let (head, body) = response.into_parts();
-    let body = http_body_util::Limited::new(body, BODY_LIMIT).collect().await.map_err(|e| e.to_string())?.to_bytes();
+    let body = http_body_util::Limited::new(body, BODY_LIMIT)
+        .collect()
+        .await
+        .map_err(|e| if e.is::<http_body_util::LengthLimitError>() { "a response body over 64 MiB".to_owned() } else { e.to_string() })?;
+    let body = body.to_bytes();
     Ok(http::Response::from_parts(head, body))
 }
 
