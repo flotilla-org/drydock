@@ -233,6 +233,7 @@ printf 'linger=%s\n' "$(loginctl show-user "$(id -u)" --value -p Linger 2>/dev/n
     async fn survey(&self, only: Option<&str>) -> Result<Vec<(Found, Option<(f64, u64)>)>> {
         const SCRIPT: &str = r#"
 cd "$1" 2>/dev/null || exit 0
+# $2 is a glob: one checked id, or every id the prefix allows.
 for d in $2; do
   [ -f "$d/environment.json" ] || continue
   u="drydock-$d.service"
