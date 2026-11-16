@@ -14,6 +14,7 @@ async fn main() -> std::io::Result<()> {
     registry.insert("e2b".into(), std::sync::Arc::new(drydock_host::e2b::E2bModule::new()));
     registry.insert("local".into(), std::sync::Arc::new(drydock_host::local::LocalModule));
     registry.insert("runtime".into(), std::sync::Arc::new(drydock_host::runtime::RuntimeModule));
+    registry.insert("ssh_host".into(), std::sync::Arc::new(drydock_host::ssh_host::SshHostModule));
     registry.insert("tensorlake".into(), std::sync::Arc::new(drydock_host::tensorlake::TensorlakeModule::new()?));
     let host = Host::new(registry);
     // Register SIGTERM before binding so managed shutdown always drains streams.

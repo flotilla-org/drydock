@@ -652,6 +652,7 @@ dependencies = [
  "rigging-paths",
  "rigging-process",
  "rigging-replay-testkit",
+ "rigging-ssh",
  "rigging-stream",
  "rigging-tls",
  "rustls",
@@ -711,10 +712,12 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rigging-http-client",
+ "rigging-process",
  "rigging-stream",
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2053,7 +2056,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-client"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2067,7 +2070,7 @@ dependencies = [
 [[package]]
 name = "rigging-http-serve"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -2083,7 +2086,7 @@ dependencies = [
 [[package]]
 name = "rigging-paths"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "rigging-process",
 ]
@@ -2091,7 +2094,7 @@ dependencies = [
 [[package]]
 name = "rigging-process"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "async-trait",
  "libc",
@@ -2104,7 +2107,7 @@ dependencies = [
 [[package]]
 name = "rigging-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "serde",
  "serde_json",
@@ -2113,7 +2116,7 @@ dependencies = [
 [[package]]
 name = "rigging-replay-testkit"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "async-trait",
  "axum",
@@ -2132,9 +2135,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigging-ssh"
+version = "0.1.0"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
+dependencies = [
+ "async-trait",
+ "rigging-stream",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rigging-stream"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "tokio",
 ]
@@ -2142,7 +2156,7 @@ dependencies = [
 [[package]]
 name = "rigging-tls"
 version = "0.1.0"
-source = "git+https://github.com/flotilla-org/rigging?rev=69c0d917e8886d524b7a63126742b27d387c8c28#69c0d917e8886d524b7a63126742b27d387c8c28"
+source = "git+https://github.com/flotilla-org/rigging?rev=dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d#dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d"
 dependencies = [
  "reqwest",
  "rustls",

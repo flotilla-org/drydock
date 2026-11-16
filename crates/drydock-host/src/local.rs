@@ -2,20 +2,18 @@
 //! without a cloud provider or a container runtime. A test fixture, not a
 //! sandbox: every vessel shares the host's filesystem, network and users.
 //!
-//! An environment is a directory `<root>/<id>/` holding a record of what was
-//! asked for, its own copy of `drydock-agent` and the agent's socket at
-//! `run/drydock/agent.sock`. The agent runs as a child in a cgroup of its own where
-//! the kernel allows one, else in a session of its own (see `scope`), so destroying or
-//! suspending kills the agent and anything it started, and nothing else.
-//! Nothing else is remembered in memory: environments are found by their
-//! directories, so they survive a restart of the host.
+//! The vessels are host-direct (see [`kit::vessels`]). The agent runs as a child
+//! in a cgroup of its own where the kernel allows one, else in a session of its
+//! own (see `scope`). Sizes are recorded as asked for, and nothing holds a
+//! vessel to them.
 mod scope;
-use crate::module::*;
+use crate::{
+    kit::vessels::{self, AGENT, Found, Grant, LOG, Machine, RECORD, Record, SOCKET, SUSPENDED, Vessels, internal, unavailable},
+    module::*,
+};
 use async_trait::async_trait;
 use drydock_protocol::*;
 use scope::Scope;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     os::unix::{
@@ -27,18 +25,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// The longest Unix socket path every supported system accepts, with a margin.
-const SOCKET_PATH_LIMIT: usize = 100;
-const STARTUP: Duration = Duration::from_secs(30);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
-const SOCKET: &str = "run/drydock/agent.sock";
-const AGENT: &str = "opt/drydock/drydock-agent";
-const RECORD: &str = "environment.json";
 const PID: &str = "agent.pid";
 const SCOPE: &str = "agent.scope";
-const SUSPENDED: &str = "suspended";
 
 pub fn registry() -> Registry {
     BTreeMap::from([("local".into(), Arc::new(LocalModule) as Arc<dyn Module>)])
@@ -46,7 +36,7 @@ pub fn registry() -> Registry {
 
 pub struct LocalModule;
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
     /// Where environment directories live. Defaults to `local` under drydock's state directory.
@@ -70,7 +60,7 @@ impl Module for LocalModule {
         if !root.is_absolute() {
             return Err(refused("local root must be an absolute path"));
         }
-        Ok(Arc::new(Local { name: name.to_owned(), root, agent: settings.agent, lifecycle: tokio::sync::Mutex::new(()) }))
+        Ok(Arc::new(Vessels::new(name, Local { root, agent: settings.agent })))
     }
 }
 
@@ -83,63 +73,16 @@ fn default_root() -> Result<PathBuf> {
 /// The agent build a local vessel runs: the host's own platform, found the way
 /// drydock finds the build it pushes.
 fn agent_build(configured: Option<&Path>) -> std::result::Result<PathBuf, String> {
-    let platform = Platform::current();
-    let variable = format!("DRYDOCK_AGENT_BIN_{}_{}", platform.os.to_ascii_uppercase(), platform.architecture.to_ascii_uppercase());
-    let named = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    let path = configured.map(Path::to_path_buf).or_else(|| named(&variable)).or_else(|| named("DRYDOCK_AGENT_BIN")).or_else(|| {
-        let sibling = std::env::current_exe().ok()?.with_file_name("drydock-agent");
-        sibling.is_file().then_some(sibling)
-    });
-    match path {
-        Some(path) if path.is_file() => Ok(path),
+    match configured {
+        Some(path) if path.is_file() => Ok(path.to_path_buf()),
         Some(path) => Err(format!("agent build {} is not a file", path.display())),
-        None => Err(format!("install drydock-agent beside drydock-host, or set {variable} or the `agent` setting")),
+        None => drydock_provider::agent_build::agent_build(&Platform::current()).map_err(|e| format!("{e}, or the `agent` setting")),
     }
 }
 
-/// What provisioning was asked for, kept beside the environment.
-#[derive(Serialize, Deserialize)]
-struct Record {
-    /// Absent for an environment made by hand, which is listed unlabelled.
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    size: Option<Size>,
-    #[serde(default)]
-    platform: Option<Platform>,
-}
-
 struct Local {
-    name: String,
     root: PathBuf,
     agent: Option<PathBuf>,
-    /// Serializes changes, so a label is created once and suspend, resume and
-    /// destroy never interleave. Reads do not take it. One lock for the provider,
-    /// not one per environment, on purpose: a fixture's startup waits are short.
-    lifecycle: tokio::sync::Mutex<()>,
-}
-
-fn not_found() -> ProtocolError {
-    ProtocolError::NotFound { reason: "unknown environment".into() }
-}
-fn unavailable(reason: impl Into<String>) -> ProtocolError {
-    ProtocolError::Unavailable { reason: reason.into(), retry_after: None, provider_error: None }
-}
-fn internal(reason: impl Into<String>) -> ProtocolError {
-    ProtocolError::Internal { reason: reason.into(), provider_error: String::new() }
-}
-/// An id is `local-` and 12 lowercase hex digits, never a path.
-fn valid_id(id: &str) -> bool {
-    id.strip_prefix("local-").is_some_and(|hex| hex.len() == 12 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-}
-fn environment_id(label: &str) -> String {
-    format!("local-{}", &format!("{:x}", Sha256::digest(label.as_bytes()))[..12])
-}
-fn prepared_id(image_digest: &str, platform: &Platform) -> String {
-    format!("prepared-{}", &format!("{:x}", Sha256::digest(format!("{image_digest}\n{platform}").as_bytes()))[..12])
-}
-fn resume_token(provider: &str, id: &str) -> ResumeToken {
-    ResumeToken { token: Secret::new(format!("{provider}:{id}")) }
 }
 
 impl Local {
@@ -150,41 +93,57 @@ impl Local {
         self.dir(id).join(SOCKET)
     }
     async fn record(&self, id: &str) -> Result<Record> {
-        if !valid_id(id) {
-            return Err(not_found());
-        }
         match tokio::fs::read(self.dir(id).join(RECORD)).await {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| internal(format!("environment record: {e}"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(not_found()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(vessels::not_found()),
             Err(e) => Err(unavailable(format!("environment record: {e}"))),
         }
     }
-    async fn environment(&self, id: &str, record: Record) -> Environment {
-        let dir = self.dir(id);
-        let state = if running(&dir, &self.socket(id)).await {
-            Observation::Running
-        } else if dir.join(SUSPENDED).exists() {
-            Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) }
-        } else {
-            // The agent is gone and nobody asked: reported, not restarted.
-            Observation::Stopped { cause: Some(StopCause::GuestHalted) }
-        };
-        Environment {
-            id: id.to_owned(),
-            label: record.label.clone(),
-            provider: self.name.clone(),
-            state,
-            granted_size: record.size,
-            egress: Enforcement::Advisory,
-            platform: record.platform,
-            egress_measured: false,
-            egress_policy: None,
-            timestamp: None,
-            vendor: None,
+    async fn found(&self, id: String, record: Record) -> Found {
+        let dir = self.dir(&id);
+        let running = running(&dir, &self.socket(&id)).await;
+        Found { suspended: dir.join(SUSPENDED).exists(), id, record, running, vendor: None }
+    }
+}
+
+#[async_trait]
+impl Machine for Local {
+    fn prefix(&self) -> &'static str {
+        "local"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            material_modes: vec![MaterialMode::Frozen, MaterialMode::Pushed, MaterialMode::Shared],
+            checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
+            // Vessels are processes on this machine: its network is theirs.
+            reach_ways: vec![ReachWay::HostNetwork, ReachWay::OutwardExposure],
+            // Vessels share the host's filesystem; a client picks a directory per vessel below this one.
+            ..vessels::capabilities(vec![Platform::current()], self.root.to_string_lossy().into_owned())
         }
     }
-    /// Environments found on disk, with the label each was created for.
-    async fn found(&self) -> Result<Vec<(String, Record)>> {
+    fn ways_in(&self) -> Vec<WayIn> {
+        vec![WayIn::Poll { interval_ms: 1000 }]
+    }
+    fn readiness(&self, _: &Credentials) -> Readiness {
+        if !cfg!(target_os = "linux") {
+            return Readiness::MissingTool { reason: "local vessels track their processes through procfs and need Linux".into() };
+        }
+        match agent_build(self.agent.as_deref()) {
+            Ok(_) => Readiness::Ready,
+            Err(reason) => Readiness::MissingTool { reason },
+        }
+    }
+    fn platform(&self) -> Option<Platform> {
+        Some(Platform::current())
+    }
+    async fn grant(&self, size: &Size, _: &Credentials) -> Result<(Size, Option<Grant>)> {
+        Ok((size.clone(), None))
+    }
+    async fn vessels(&self, only: Option<&str>, _: &Credentials) -> Result<Vec<Found>> {
+        if let Some(id) = only {
+            let record = self.record(id).await?;
+            return Ok(vec![self.found(id.to_owned(), record).await]);
+        }
         let mut entries = match tokio::fs::read_dir(&self.root).await {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -192,25 +151,48 @@ impl Local {
         };
         let mut found = vec![];
         while let Some(entry) = entries.next_entry().await.map_err(|e| unavailable(format!("read local root: {e}")))? {
-            let Some(id) = entry.file_name().to_str().filter(|id| valid_id(id)).map(str::to_owned) else { continue };
+            let Some(id) = entry.file_name().to_str().filter(|id| vessels::valid_id("local", id)).map(str::to_owned) else { continue };
             match self.record(&id).await {
-                Ok(record) => found.push((id, record)),
+                Ok(record) => found.push(self.found(id, record).await),
                 Err(error) => tracing::warn!(%id, ?error, "skipping a local environment whose record cannot be read"),
             }
         }
-        found.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(found)
     }
-    /// Start the environment's agent as a child in a scope of its own, and
-    /// return once the agent answers hello.
-    async fn start(&self, id: &str) -> Result<()> {
+    async fn create(&self, id: &str, record: &Record, _: &Credentials) -> Result<()> {
+        let dir = self.dir(id);
+        vessels::check_socket(&dir, "root")?;
+        let build = agent_build(self.agent.as_deref()).map_err(|reason| unavailable(format!("no agent build: {reason}")))?;
+        let setup = || -> std::io::Result<()> {
+            for path in [self.root.clone(), dir.clone(), dir.join("opt/drydock"), dir.join("run/drydock")] {
+                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
+            }
+            // The vessel's own copy: an agent upgrade replaces this file, never the installed build.
+            // Written here while other threads may fork: `launch` execs it with
+            // spawn_retrying_busy, which waits out the ETXTBSY that can cause.
+            std::fs::copy(&build, dir.join(AGENT))?;
+            std::fs::set_permissions(dir.join(AGENT), std::fs::Permissions::from_mode(0o700))?;
+            // Whole or absent: a crash mid-write must not leave a record that never parses.
+            let staged = dir.join("environment.json.new");
+            std::fs::write(&staged, serde_json::to_vec(record).expect("record serializes"))?;
+            std::fs::rename(staged, dir.join(RECORD))
+        };
+        if let Err(e) = setup() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(unavailable(format!("create environment directory: {e}")));
+        }
+        Ok(())
+    }
+    /// The agent starts as a child, in a session of its own and, where the kernel
+    /// gives one, a cgroup of its own.
+    async fn launch(&self, id: &str, _: &Record, _: &Credentials) -> Result<()> {
         let dir = self.dir(id);
         let socket = self.socket(id);
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
-            .open(dir.join("agent.log"))
+            .open(dir.join(LOG))
             .map_err(|e| unavailable(format!("open agent log: {e}")))?;
         // A socket left by a dead agent would only be unlinked by the new one after a probe.
         let _ = tokio::fs::remove_file(&socket).await;
@@ -242,8 +224,7 @@ impl Local {
         let mut child = match spawn_retrying_busy(&mut command).await {
             Ok(child) => child,
             Err(e) => {
-                if let Some(scope) = cgroup.as_ref().filter(|scope| scope.release()) {
-                    let _ = scope;
+                if cgroup.as_ref().is_some_and(Scope::release) {
                     let _ = std::fs::remove_file(dir.join(SCOPE));
                 }
                 return Err(unavailable(format!("start agent: {e}")));
@@ -260,65 +241,41 @@ impl Local {
             return Err(unavailable(format!("record agent: {e}")));
         }
         // Reaps the agent when it exits, however that happens.
-        let exit = tokio::spawn(async move { child.wait().await });
-        let ready = tokio::time::timeout(STARTUP, async {
-            loop {
-                if hello(&socket).await {
-                    return Ok(());
-                }
-                if exit.is_finished() {
-                    return Err(unavailable(format!("agent exited during startup; see {}", dir.join("agent.log").display())));
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await;
-        let result = ready.unwrap_or_else(|_| Err(unavailable(format!("agent did not answer hello within {STARTUP:?}"))));
-        if result.is_err() {
-            let _ = stop(&dir, &socket).await;
-        }
-        result
+        tokio::spawn(async move { child.wait().await });
+        Ok(())
     }
-    async fn create(&self, request: ProvisionRequest) -> Result<Environment> {
-        let id = environment_id(&request.label);
-        let dir = self.dir(&id);
-        if self.socket(&id).as_os_str().len() >= SOCKET_PATH_LIMIT {
-            return Err(refused(format!(
-                "the agent socket path {} is too long for a Unix socket; set a shorter local `root`",
-                self.socket(&id).display()
-            )));
+    async fn running(&self, id: &str, _: &Credentials) -> bool {
+        running(&self.dir(id), &self.socket(id)).await
+    }
+    async fn stop(&self, id: &str, _: &Credentials) -> Result<()> {
+        stop(&self.dir(id), &self.socket(id)).await
+    }
+    async fn remove(&self, id: &str, _: &Credentials) -> Result<()> {
+        let dir = self.dir(id);
+        // The agent's artifact store keeps its unpacked trees read-only.
+        let writable = dir.clone();
+        tokio::task::spawn_blocking(move || owner_writable(&writable))
+            .await
+            .map_err(|e| internal(format!("make environment directory writable: {e}")))?;
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(unavailable(format!("remove environment directory: {e}"))),
         }
-        let build = agent_build(self.agent.as_deref()).map_err(|reason| ProtocolError::Unavailable {
-            reason: format!("no agent build: {reason}"),
-            retry_after: None,
-            provider_error: None,
-        })?;
-        let record = Record { label: Some(request.label), size: Some(request.size), platform: Some(request.prepared.platform) };
-        let setup = || -> std::io::Result<()> {
-            for path in [self.root.clone(), dir.clone(), dir.join("opt/drydock"), dir.join("run/drydock")] {
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
-            }
-            // The vessel's own copy: an agent upgrade replaces this file, never the installed build.
-            // Written here while other threads may fork: `start` execs it with
-            // spawn_retrying_busy, which waits out the ETXTBSY that can cause.
-            std::fs::copy(&build, dir.join(AGENT))?;
-            std::fs::set_permissions(dir.join(AGENT), std::fs::Permissions::from_mode(0o700))?;
-            // Whole or absent: a crash mid-write must not leave a record that never parses.
-            let staged = dir.join("environment.json.new");
-            std::fs::write(&staged, serde_json::to_vec(&record).expect("record serializes"))?;
-            std::fs::rename(staged, dir.join(RECORD))
-        };
-        if let Err(e) = setup() {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(unavailable(format!("create environment directory: {e}")));
+    }
+    async fn mark_suspended(&self, id: &str, suspended: bool, _: &Credentials) -> Result<()> {
+        let marker = self.dir(id).join(SUSPENDED);
+        if suspended {
+            return tokio::fs::write(marker, b"").await.map_err(|e| unavailable(format!("record suspension: {e}")));
         }
-        // Reads take no lock, so a list during this start can show the new environment as
-        // stopped, and as gone again if the start fails. Acceptable for a fixture.
-        if let Err(error) = self.start(&id).await {
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-            return Err(error);
+        match tokio::fs::remove_file(marker).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(unavailable(format!("clear suspension: {e}"))),
+            _ => Ok(()),
         }
-        Ok(self.environment(&id, record).await)
+    }
+    async fn connect(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
+        let stream = tokio::net::UnixStream::connect(self.socket(id)).await.map_err(|e| unavailable(format!("agent socket: {e}")))?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -425,181 +382,6 @@ fn owner_writable(dir: &Path) {
         match std::fs::read_dir(&dir) {
             Ok(entries) => pending.extend(entries.flatten().map(|entry| entry.path())),
             Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "cannot list a local environment directory before removing it"),
-        }
-    }
-}
-
-/// Whether the agent at `socket` answers `GET /hello`, which it serves over plain HTTP/1.1.
-async fn hello(socket: &Path) -> bool {
-    let attempt = async {
-        let mut stream = tokio::net::UnixStream::connect(socket).await?;
-        stream.write_all(b"GET /hello HTTP/1.1\r\nhost: agent\r\nconnection: close\r\n\r\n").await?;
-        let mut reply = Vec::new();
-        (&mut stream).take(65536).read_to_end(&mut reply).await?;
-        Ok::<_, std::io::Error>(reply.starts_with(b"HTTP/1.1 200"))
-    };
-    matches!(tokio::time::timeout(Duration::from_secs(2), attempt).await, Ok(Ok(true)))
-}
-
-#[async_trait]
-impl Provider for Local {
-    fn operations(&self) -> Operations<'_> {
-        Operations { suspend_resume: Some(self), ..Default::default() }
-    }
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            material_modes: vec![MaterialMode::Frozen, MaterialMode::Pushed, MaterialMode::Shared],
-            checkout_strategies: vec![CheckoutStrategy::HostWorktree, CheckoutStrategy::HostClone, CheckoutStrategy::CloneInVessel],
-            // Vessels share the host's filesystem; a client picks a directory per vessel below this one.
-            workspace_root: self.root.to_string_lossy().into_owned(),
-            suspend_resume: true,
-            suspend_preserves_memory: Some(false),
-            export: false,
-            // No isolation: nothing is enforced, and deny-all cannot be represented.
-            egress: EgressCapability { routes: vec![EgressRoute::Open], model: EgressModel::unfiltered() },
-            fallback_runner: false,
-            bootstrap: BootstrapRoute::Upload,
-            agent: true,
-            platforms: vec![Platform::current()],
-            // Nothing is pulled: the route only records which image was asked for.
-            image_routes: vec![ImageRoute::RegistryPull {
-                auth: RegistryAuthKind::Anonymous,
-                registration: CredentialRegistration::NotRequired,
-                digest_references: true,
-                tools_layer: ToolsLayer::Provider,
-            }],
-            usage: false,
-            quota: false,
-            // Vessels are directories on this machine: guest paths are its own.
-            host_filesystem: true,
-            // And the host's processes: same user, same PID namespace. Not a sandbox.
-            host_processes: true,
-            exclusive_label: true,
-            agent_tcp_port: None,
-            // Vessels are processes on this machine: its network is theirs.
-            reach_ways: vec![ReachWay::HostNetwork, ReachWay::OutwardExposure],
-            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
-        }
-    }
-    fn ways_in(&self) -> Vec<WayIn> {
-        vec![WayIn::Poll { interval_ms: 1000 }]
-    }
-    fn readiness(&self, _: &Credentials) -> Readiness {
-        if !cfg!(target_os = "linux") {
-            return Readiness::MissingTool { reason: "local vessels track their processes through procfs and need Linux".into() };
-        }
-        match agent_build(self.agent.as_deref()) {
-            Ok(_) => Readiness::Ready,
-            Err(reason) => Readiness::MissingTool { reason },
-        }
-    }
-    async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {
-        let platform = prepare_platform(&r)?;
-        Ok(Prepared {
-            provider: self.name.clone(),
-            id: prepared_id(&r.image_digest, &platform),
-            platform,
-            image_digest: r.image_digest,
-            tools_digest: r.tools_digest,
-        })
-    }
-    async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
-        let _changing = self.lifecycle.lock().await;
-        let id = environment_id(&r.label);
-        // Only an absent environment is created. An unreadable or corrupt record is an
-        // error, and a directory another label hashed to is never written over.
-        match self.record(&id).await {
-            Ok(record) if record.label.as_deref() == Some(r.label.as_str()) => {
-                return Ok(Provisioned::Existing(self.environment(&id, record).await));
-            }
-            Ok(_) => {
-                return Err(refused(format!("label {:?} collides with the id of another environment; use a different label", r.label)));
-            }
-            Err(ProtocolError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        if r.prepared.provider != self.name
-            || r.prepared.platform != Platform::current()
-            || r.prepared.id != prepared_id(&r.prepared.image_digest, &r.prepared.platform)
-        {
-            return Err(refused("unknown prepared form"));
-        }
-        if let EgressRequest::DenyAll { .. } = r.egress {
-            return Err(refused("local vessels share the host's network, so deny-all egress cannot be enforced; request open egress"));
-        }
-        self.create(r).await.map(Provisioned::Created)
-    }
-    async fn list(&self, _: &Credentials) -> Result<Vec<Environment>> {
-        let mut environments = vec![];
-        for (id, record) in self.found().await? {
-            environments.push(self.environment(&id, record).await);
-        }
-        Ok(environments)
-    }
-    async fn inspect(&self, id: &str, _: &Credentials) -> Result<Environment> {
-        let record = self.record(id).await?;
-        Ok(self.environment(id, record).await)
-    }
-    async fn destroy(&self, id: &str, _: &Credentials) -> Result<()> {
-        if !valid_id(id) {
-            return Ok(());
-        }
-        let _changing = self.lifecycle.lock().await;
-        let dir = self.dir(id);
-        stop(&dir, &self.socket(id)).await?;
-        // The agent's artifact store keeps its unpacked trees read-only.
-        let writable = dir.clone();
-        tokio::task::spawn_blocking(move || owner_writable(&writable))
-            .await
-            .map_err(|e| internal(format!("make environment directory writable: {e}")))?;
-        match tokio::fs::remove_dir_all(&dir).await {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(unavailable(format!("remove environment directory: {e}"))),
-        }
-    }
-    /// The agent's socket is on this machine: the host carries the connection.
-    async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
-        self.record(id).await?;
-        Ok(Reach::relay(&self.name, id))
-    }
-    async fn relay(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
-        self.record(id).await?;
-        let stream = tokio::net::UnixStream::connect(self.socket(id)).await.map_err(|e| unavailable(format!("agent socket: {e}")))?;
-        Ok(Box::new(stream))
-    }
-}
-
-#[async_trait]
-impl SuspendResume for Local {
-    /// Stops the agent and its process group; the directory and its files stay.
-    async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
-        let _changing = self.lifecycle.lock().await;
-        self.record(id).await?;
-        let dir = self.dir(id);
-        // Marked first, so the stop in between never reads as a crash.
-        tokio::fs::write(dir.join(SUSPENDED), b"").await.map_err(|e| unavailable(format!("record suspension: {e}")))?;
-        if let Err(error) = stop(&dir, &self.socket(id)).await {
-            let _ = tokio::fs::remove_file(dir.join(SUSPENDED)).await;
-            return Err(error);
-        }
-        Ok(resume_token(&self.name, id))
-    }
-    /// Starts the agent again, whether it was suspended or died.
-    async fn resume(&self, id: &str, token: ResumeToken, _: &Credentials) -> Result<()> {
-        let _changing = self.lifecycle.lock().await;
-        self.record(id).await?;
-        if token != resume_token(&self.name, id) {
-            return Err(refused("invalid resume token for this provider/environment"));
-        }
-        let dir = self.dir(id);
-        // A failed start leaves the suspension marker: the environment stays suspended.
-        if !running(&dir, &self.socket(id)).await {
-            self.start(id).await?;
-        }
-        match tokio::fs::remove_file(dir.join(SUSPENDED)).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(unavailable(format!("clear suspension: {e}"))),
-            _ => Ok(()),
         }
     }
 }

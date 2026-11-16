@@ -18,6 +18,7 @@ futures = "0.3"
 rigging-http-client.workspace = true
 rigging-http-serve.workspace = true
 rigging-stream.workspace = true
+rigging-ssh.workspace = true
 async-trait = "0.1"
 axum = "0.8"
 serde.workspace = true
@@ -36,6 +37,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
+tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 drydock-client = { version = "0.1.0", path = "../drydock-client" }
 

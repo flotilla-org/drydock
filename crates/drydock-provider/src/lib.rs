@@ -1,4 +1,5 @@
 //! Compiled Rust provider interface. Shared methods permit independent concurrent calls.
+pub mod agent_build;
 pub mod egress;
 pub mod rest;
 use async_trait::async_trait;

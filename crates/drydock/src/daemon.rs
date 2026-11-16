@@ -144,7 +144,7 @@ pub struct InstalledBuilds;
 #[async_trait::async_trait]
 impl AgentBuilds for InstalledBuilds {
     async fn build(&self, platform: &Platform) -> Result<Vec<u8>, String> {
-        let path = crate::local::agent_build(platform)?;
+        let path = drydock_provider::agent_build::agent_build(platform)?;
         tokio::fs::read(&path).await.map_err(|error| format!("{}: {error}", path.display()))
     }
 }

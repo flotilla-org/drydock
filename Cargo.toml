@@ -10,19 +10,20 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flotilla-org/drydock"
 
 [workspace.dependencies]
-rigging-paths = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
+rigging-paths = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
 reqwest = { version = "0.13", default-features = false }
 http = "1"
 sha2 = "0.10"
 # Plain tar only: the agent's artifacts and Tensorlake's build context.
 tar = { version = "0.4", default-features = false }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
-rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "69c0d917e8886d524b7a63126742b27d387c8c28" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
+rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "dbc0acdb74a5ead3c03664d8dadc2eaf2c45d00d" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 utoipa = "5.4"
