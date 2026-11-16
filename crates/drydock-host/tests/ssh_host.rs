@@ -45,15 +45,16 @@ async fn an_instance_names_its_machine_and_needs_its_key() {
     assert!(matches!(p.readiness(&Credentials::default()), Readiness::MissingCredential { .. }));
 }
 
-// The vessels' directory is used in the machine's shell commands and in the
-// session's socket forwards, so it is accepted exactly when it is absolute and
-// holds nothing either reads specially. Each case draws an absolute path of
-// ordinary segments (empty ones included), which is accepted; the same path
-// made relative, or with any one special character put at a drawn place, is refused.
+// The vessels' directory is used in the machine's shell commands, the agent's
+// unit and the session's socket forwards, so it is accepted exactly when it is
+// absolute and holds nothing a shell, systemd or a forward reads specially. Each
+// case draws an absolute path of ordinary segments (empty ones included), which
+// is accepted; the same path made relative, or with any one special character
+// put at a drawn place, is refused.
 #[hegel::test]
 fn the_directory_is_accepted_only_when_commands_and_forwards_take_it_as_it_is(tc: hegel::TestCase) {
     const ORDINARY: [char; 7] = ['a', 'Z', '0', '-', '.', '_', '/'];
-    const SPECIAL: [char; 7] = [' ', '\t', '\n', ':', '\'', '\\', '\u{7f}'];
+    const SPECIAL: [char; 11] = [' ', '\t', '\n', ':', '\'', '"', '\\', '`', '$', '%', '\u{7f}'];
     let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
     let mut directory = "/".to_owned();
     for _ in 0..length {

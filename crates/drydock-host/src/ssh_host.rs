@@ -71,13 +71,17 @@ impl Module for SshHostModule {
     }
 }
 
-/// A path the commands and the session's forwards both take: absolute, and
-/// nothing a shell or a forward specification reads specially.
+/// A path the commands, the agent's unit and the session's forwards all take:
+/// absolute, and nothing a shell, systemd or a forward specification reads specially.
 fn check_directory(path: &str) -> std::result::Result<(), String> {
-    if path.starts_with('/') && !path.contains(|c: char| c.is_whitespace() || c.is_control() || matches!(c, ':' | '\'' | '\\')) {
+    if path.starts_with('/')
+        && !path.contains(|c: char| c.is_whitespace() || c.is_control() || matches!(c, ':' | '\'' | '"' | '\\' | '`' | '$' | '%'))
+    {
         Ok(())
     } else {
-        Err(format!("the vessels' directory {path:?} must be an absolute path without whitespace, colons, quotes or backslashes"))
+        Err(format!(
+            "the vessels' directory {path:?} must be an absolute path without whitespace, colons, quotes, backslashes, backticks, `$` or `%`"
+        ))
     }
 }
 
@@ -136,9 +140,11 @@ impl SshHost {
             return Ok(live.session.clone());
         }
         *connection = None;
+        // Removed when the connection is dropped; a runtime directory is also emptied when the user's sessions end.
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from);
         let identity = tempfile::Builder::new()
             .prefix("drydock-ssh-")
-            .tempdir()
+            .tempdir_in(runtime.unwrap_or_else(std::env::temp_dir))
             .map_err(|e| unavailable(format!("private directory for the SSH key: {e}")))?;
         let path = identity.path().join("id");
         // OpenSSH reads a key only whole, its last line ended.
@@ -373,7 +379,7 @@ impl Machine for SshHost {
         if let Some((held, _)) = self.survey(None, c).await?.first() {
             return Err(ProtocolError::QuotaExhausted {
                 reason: format!(
-                    "{} cannot enforce per-vessel limits (its systemd user manager has no memory and cpu controllers delegated), so it takes one vessel at a time, and holds {}",
+                    "{} cannot enforce per-vessel limits (its systemd user manager has no memory and cpu controllers delegated), so it takes one vessel at a time, and holds {}: destroy that vessel, suspended or not, to free the machine",
                     self.machine(),
                     held.id
                 ),
@@ -390,12 +396,14 @@ impl Machine for SshHost {
         let platform = record.platform.as_ref().ok_or_else(|| refused("a vessel needs its platform"))?;
         let build = drydock_provider::agent_build::agent_build(platform)
             .map_err(|reason| unavailable(format!("no agent build for {platform}: {reason}")))?;
-        let mut file = tokio::fs::File::open(&build).await.map_err(|e| unavailable(format!("agent build {}: {e}", build.display())))?;
-        const UPLOAD_AGENT: &str = r#"umask 077 && mkdir -p "$1/opt/drydock" "$1/run/drydock" && cat > "$1/$2" && chmod 700 "$1/$2""#;
+        let build_error = |e: std::io::Error| unavailable(format!("agent build {}: {e}", build.display()));
+        let mut file = tokio::fs::File::open(&build).await.map_err(build_error)?;
+        let length = file.metadata().await.map_err(build_error)?.len().to_string();
+        const UPLOAD_AGENT: &str = r#"umask 077 && mkdir -p "$1/opt/drydock" "$1/run/drydock" && cat > "$1/$2" && [ "$(wc -c < "$1/$2")" -eq "$3" ] && chmod 700 "$1/$2""#;
         const WRITE_RECORD: &str = r#"umask 077 && cat > "$1/$2.new" && mv "$1/$2.new" "$1/$2""#;
         let record = serde_json::to_vec(record).expect("record serializes");
         let made = async {
-            let output = self.run(UPLOAD_AGENT, &[&dir, AGENT], Some(&mut file), c).await?;
+            let output = self.run(UPLOAD_AGENT, &[&dir, AGENT, &length], Some(&mut file), c).await?;
             if !output.status.success() {
                 return Err(failed("uploading the agent", &output));
             }
@@ -430,9 +438,13 @@ exec systemd-run --user --quiet --collect --unit="$u" --service-type=exec --work
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         self.ok("starting the agent", SCRIPT, &args, c).await.map(drop)
     }
-    async fn running(&self, id: &str, c: &Credentials) -> bool {
+    async fn running(&self, id: &str, c: &Credentials) -> Result<bool> {
         let script = r#"systemctl --user is-active --quiet "drydock-$1.service""#;
-        self.run(script, &[id], None, c).await.is_ok_and(|output| output.status.success())
+        Ok(self.run(script, &[id], None, c).await?.status.success())
+    }
+    /// Each look is a stream and a command over the session.
+    fn startup_poll(&self) -> Duration {
+        Duration::from_millis(250)
     }
     async fn stop(&self, id: &str, c: &Credentials) -> Result<()> {
         const SCRIPT: &str = r#"

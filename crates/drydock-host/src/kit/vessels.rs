@@ -85,9 +85,14 @@ pub trait Machine: Send + Sync + 'static {
     /// Starts the agent in a scope of its own, held to the record's grant;
     /// returns once it is started, before it answers.
     async fn launch(&self, id: &str, record: &Record, c: &Credentials) -> Result<()>;
-    /// Whether the agent's process is alive. An agent mid-upgrade has no socket
-    /// for a moment, so the process decides, not the socket.
-    async fn running(&self, id: &str, c: &Credentials) -> bool;
+    /// Whether the agent's process is alive, or an error when the machine could
+    /// not be asked. An agent mid-upgrade has no socket for a moment, so the
+    /// process decides, not the socket.
+    async fn running(&self, id: &str, c: &Credentials) -> Result<bool>;
+    /// How long to wait between looks at an agent that is starting.
+    fn startup_poll(&self) -> Duration {
+        Duration::from_millis(50)
+    }
     /// Ends the agent and everything in its scope, and waits until they are gone.
     async fn stop(&self, id: &str, c: &Credentials) -> Result<()>;
     /// Removes the stopped vessel's directory, whatever its contents' modes, following no link.
@@ -234,10 +239,11 @@ impl<M: Machine> Vessels<M> {
                 if hello(self.machine.connect(id, c).await).await {
                     return Ok(());
                 }
-                if !self.machine.running(id, c).await {
+                // A machine that cannot be asked is asked again until the deadline.
+                if let Ok(false) = self.machine.running(id, c).await {
                     return Err(unavailable(format!("agent exited during startup; see {LOG} in the vessel's directory")));
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(self.machine.startup_poll()).await;
             }
         })
         .await;

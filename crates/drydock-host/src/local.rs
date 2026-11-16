@@ -244,8 +244,8 @@ impl Machine for Local {
         tokio::spawn(async move { child.wait().await });
         Ok(())
     }
-    async fn running(&self, id: &str, _: &Credentials) -> bool {
-        running(&self.dir(id), &self.socket(id)).await
+    async fn running(&self, id: &str, _: &Credentials) -> Result<bool> {
+        Ok(running(&self.dir(id), &self.socket(id)).await)
     }
     async fn stop(&self, id: &str, _: &Credentials) -> Result<()> {
         stop(&self.dir(id), &self.socket(id)).await
