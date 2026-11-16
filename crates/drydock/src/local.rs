@@ -66,6 +66,9 @@ pub fn private_dir(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+/// drydockd's own lock. It doesn't end in `.lock`, so no socket's server lock
+/// (`<socket>.lock`, taken by the server at bind) can be the same file.
+pub const DAEMON_LOCK: &str = ".daemon-lock";
 /// Append lock suffixes: replacing an extension aliases distinct socket overrides.
 pub fn socket_lock_path(socket: &Path, suffix: &str) -> PathBuf {
     let mut path = socket.as_os_str().to_os_string();
@@ -254,9 +257,10 @@ mod tests {
     #[test]
     fn socket_overrides_do_not_alias_lifecycle_locks() {
         let dir = tempfile::tempdir().unwrap();
-        let first = lock(&socket_lock_path(&dir.path().join("daemon.sock"), ".lock")).unwrap();
+        let first = lock(&socket_lock_path(&dir.path().join("daemon.sock"), DAEMON_LOCK)).unwrap();
         first.try_lock().unwrap();
-        for name in ["daemon.other", "daemon.lock"] {
+        // The server's lock is `<socket>.lock`, so these sockets' servers must lock other files.
+        for name in ["daemon.other", "daemon.lock", "daemon.sock.daemon", "daemon.sock.daemon-"] {
             let other = lock(&socket_lock_path(&dir.path().join(name), ".lock")).unwrap();
             assert!(other.try_lock().is_ok(), "socket {name} aliases another daemon's lock");
         }

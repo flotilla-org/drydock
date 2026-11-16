@@ -36,7 +36,8 @@ async fn run() -> Result<(), String> {
     let socket = std::path::absolute(socket).map_err(|e| e.to_string())?;
     let run = socket.parent().ok_or("socket needs parent directory")?;
     local::private_dir(run)?;
-    let _lock = local::lock(&local::socket_lock_path(&socket, ".lock"))?;
+    // Held from before the hosts start; the server's own lock on `<socket>.lock` is taken only at bind.
+    let _lock = local::lock(&local::socket_lock_path(&socket, local::DAEMON_LOCK))?;
     _lock.try_lock().map_err(|_| "another daemon owns this socket")?;
     let mut options = if args.external_host.is_empty() { HostOption::installed().await? } else { Vec::new() };
     for (i, path) in args.external_host.into_iter().enumerate() {
