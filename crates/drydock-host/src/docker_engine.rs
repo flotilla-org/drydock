@@ -451,6 +451,9 @@ impl Provider for DockerEngine {
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
         check_prepared(ENGINE, &self.name, &r.prepared, &r.prepared.id)?;
         let network = network_mode(&r.egress)?;
+        if !(r.size.cpus.is_finite() && r.size.cpus > 0.0) {
+            return Err(refused("Docker Engine takes a positive number of CPUs"));
+        }
         if r.size.disk_bytes != 0 {
             return Err(refused("Docker Engine sets no per-container disk size: ask for a disk of 0"));
         }
@@ -559,10 +562,11 @@ impl Guest for DockerEngine {
             let state: ExecState = self.api.get(self.url(&["exec", &exec, "json"])?, c).await?;
             if !state.running {
                 output.exit = state.exit_code.map(|code| i32::try_from(code).unwrap_or(-1));
-                break;
+                return Ok(output);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        output.note = Some("Docker Engine still states the command running after its output ended".into());
         Ok(output)
     }
 }

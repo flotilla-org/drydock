@@ -202,6 +202,19 @@ mod tests {
         assert_eq!(frame_header([1, 0, 1, 0, 0, 0, 0, 1]), None);
     }
 
+    // Output keeps stdout and stderr in arrival order, and a server's error
+    // frame is an error with its text.
+    #[tokio::test]
+    async fn output_reads() {
+        let frames = [&[1, 0, 0, 0, 0, 0, 0, 1, b'a'][..], &[2, 0, 0, 0, 0, 0, 0, 1, b'b'], &[1, 0, 0, 0, 0, 0, 0, 1, b'c']].concat();
+        let mut chunks = Vec::new();
+        read_output(Box::new(std::io::Cursor::new(frames.clone())), &mut chunks).await.unwrap();
+        assert_eq!(chunks, [(false, b"a".to_vec()), (true, b"b".to_vec()), (false, b"c".to_vec())]);
+        let failed = [frames, vec![3, 0, 0, 0, 0, 0, 0, 2, b'n', b'o']].concat();
+        let error = read_output(Box::new(std::io::Cursor::new(failed)), &mut Vec::new()).await.unwrap_err();
+        assert_eq!(error.to_string(), "no");
+    }
+
     // Only an end between frames is the stream's end; an end inside a frame,
     // or a frame over the limit, is an error.
     #[tokio::test]

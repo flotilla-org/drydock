@@ -21,6 +21,8 @@ use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 /// A request's deadline when it sets none, as the host's HTTPS client has.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest response body read.
+const BODY_LIMIT: usize = 64 << 20;
 
 /// The client certificate, its key, and the CA the server's certificate must
 /// chain to, as PEM files.
@@ -138,7 +140,7 @@ impl Endpoint {
 
 async fn whole(response: http::Response<Incoming>) -> std::result::Result<http::Response<Bytes>, String> {
     let (head, body) = response.into_parts();
-    let body = body.collect().await.map_err(|e| e.to_string())?.to_bytes();
+    let body = http_body_util::Limited::new(body, BODY_LIMIT).collect().await.map_err(|e| e.to_string())?.to_bytes();
     Ok(http::Response::from_parts(head, body))
 }
 
