@@ -26,23 +26,37 @@ async fn configured(settings: serde_json::Value) -> Result<Arc<dyn Provider>, Pr
     SshHostModule.configure("b1", &configuration, Arc::new(NoHttp)).await
 }
 fn machine() -> serde_json::Value {
-    serde_json::json!({"address": "b1.lab.example.net", "port": 22, "user": "drydock", "host_key": "ssh-ed25519 AAAA"})
+    serde_json::json!({
+        "address": "b1.lab.example.net", "port": 22, "user": "drydock", "host_key": "ssh-ed25519 AAAA",
+        "identity_file": "/nonexistent/b1_ed25519",
+    })
 }
 
-// The endpoint settings are required, with nothing guessed, and unknown keys are refused;
-// an instance whose key is not delivered says so before it connects anywhere.
+// The endpoint settings and the key file's absolute path are required, with
+// nothing guessed, and unknown keys are refused; the instance takes no
+// credential, and readiness says when the key file cannot be read, before it
+// connects anywhere.
 #[tokio::test]
-async fn an_instance_names_its_machine_and_needs_its_key() {
-    for key in ["address", "port", "user", "host_key"] {
+async fn an_instance_names_its_machine_and_its_key_file() {
+    for key in ["address", "port", "user", "host_key", "identity_file"] {
         let mut settings = machine();
         settings.as_object_mut().unwrap().remove(key);
         assert!(matches!(configured(settings).await, Err(ProtocolError::Refused { .. })), "without {key}");
     }
     let mut settings = machine();
-    settings["identity_file"] = "/home/me/.ssh/id_ed25519".into();
-    assert!(matches!(configured(settings).await, Err(ProtocolError::Refused { .. })), "the key is a credential, never a setting");
+    settings["identity_file"] = "b1_ed25519".into();
+    assert!(matches!(configured(settings).await, Err(ProtocolError::Refused { .. })), "a relative key file");
+    let mut settings = machine();
+    settings["password"] = "hunter2".into();
+    assert!(matches!(configured(settings).await, Err(ProtocolError::Refused { .. })), "an unknown key");
+
     let p = configured(machine()).await.unwrap();
-    assert!(matches!(p.readiness(&Credentials::default()), Readiness::MissingCredential { .. }));
+    assert!(matches!(p.readiness(&Credentials::default()), Readiness::MissingCredential { .. }), "no key file");
+    let key = tempfile::NamedTempFile::new().unwrap();
+    let mut settings = machine();
+    settings["identity_file"] = key.path().to_str().unwrap().into();
+    let p = configured(settings).await.unwrap();
+    assert!(!matches!(p.readiness(&Credentials::default()), Readiness::MissingCredential { .. }), "a readable key file");
 }
 
 // The vessels' directory is used in the machine's shell commands, the agent's

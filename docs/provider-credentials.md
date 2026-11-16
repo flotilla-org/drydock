@@ -109,12 +109,11 @@ The module speaks Engine API v1.44 (Engine 25 and later): every request path sta
 
 ## SSH host (`ssh_host`, Rust host)
 
-Credential: the private key drydock signs in with, as a plain token file holding the OpenSSH private key, unencrypted (drydock never prompts for a passphrase). One instance is one machine:
+Credential: none. The private key drydock signs in with is a file named in the settings. One instance is one machine:
 
 ```toml
 [providers.b1]
 module = "ssh_host"
-credential = { file = "~/.config/drydock/b1_ed25519" }
 image = "ubuntu@sha256:…"   # recorded, not pulled: vessels run on the machine itself
 size = { cpus = 2, memory = "4GiB", disk = 0 }   # no per-vessel disk
 egress = "open"
@@ -124,12 +123,13 @@ address = "b1.lab.example.net"
 port = 22
 user = "drydock"
 host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…"
+identity_file = "/home/me/.config/drydock/b1_ed25519"
 # directory = "/run/user/1001/drydock"
 ```
 
-- `address`, `port`, `user` and `host_key` are required; nothing is guessed. `host_key` is the machine's raw host public key, as `ssh-keyscan` prints it without the host name, and the connection is refused unless the machine presents exactly that key. drydock reads no ssh_config, known_hosts or ssh-agent of the user it runs as, and needs OpenSSH 8.7 or later as `ssh` on its PATH. A machine behind a jump host cannot be reached yet.
+- `address`, `port`, `user`, `host_key` and `identity_file` are required; nothing is guessed. `host_key` is the machine's raw host public key, as `ssh-keyscan` prints it without the host name, and the connection is refused unless the machine presents exactly that key. drydock reads no ssh_config, known_hosts or ssh-agent of the user it runs as, and needs OpenSSH 8.7 or later as `ssh` on its PATH. A machine behind a jump host cannot be reached yet.
 - `directory` is where vessel directories live, an absolute path without whitespace, colons, quotes, backslashes, backticks, `$` or `%` (a shell or systemd would read them). It defaults to `drydock` under the user's `XDG_RUNTIME_DIR` on the machine (`/run/user/<uid>/drydock`), which systemd empties when the machine restarts.
-- drydock-host writes the key to a file only it can read, in a private directory under its own `XDG_RUNTIME_DIR` (else the temporary directory), for the life of its SSH connection, and connects again when the delivered key changes. A drydock-host that is killed leaves the file there; a runtime directory is emptied when the user's sessions end.
+- `identity_file` is an absolute path, on drydock's machine, to the OpenSSH private key, unencrypted (drydock never prompts for a passphrase) and readable by drydock-host. `ssh` reads it in place each time it connects; drydock never copies it. Readiness reports a missing or unreadable file as a missing credential.
 
 What the machine needs:
 

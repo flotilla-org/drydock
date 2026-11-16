@@ -4,7 +4,7 @@
 //! processes and filesystem are visible to it, and its egress is open.
 //!
 //! Control is the SSH session alone, pinned to the machine's host key and the
-//! instance's private key; drydock reads no ssh_config or ssh-agent. Commands
+//! private key file its settings name; drydock reads no ssh_config or ssh-agent. Commands
 //! run through exec, files go in on exec's stdin, and the relay is a stream to
 //! the agent's socket over the session. Each agent runs as a transient service
 //! of the user's systemd manager, so stopping the unit ends everything the
@@ -24,7 +24,6 @@ use futures::FutureExt;
 use rigging_ssh::{OpenSsh, SshSession, Target};
 use serde::Deserialize;
 use std::{
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
@@ -48,6 +47,8 @@ struct Settings {
     user: String,
     /// The machine's host public key, as `ssh-ed25519 AAAA…`.
     host_key: String,
+    /// The private key drydock authenticates with: an absolute path on drydock's machine.
+    identity_file: PathBuf,
     /// Where vessel directories live. Defaults to `drydock` under the user's XDG_RUNTIME_DIR.
     directory: Option<String>,
 }
@@ -62,8 +63,11 @@ impl Module for SshHostModule {
     }
     async fn configure(&self, name: &str, c: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings = serde_json::from_value(serde_json::to_value(&c.settings).expect("settings map")).map_err(|e| {
-            refused(format!("invalid ssh_host settings (address, port, user and host_key, and an optional directory): {e}"))
+            refused(format!("invalid ssh_host settings (address, port, user, host_key and identity_file, and an optional directory): {e}"))
         })?;
+        if !settings.identity_file.is_absolute() {
+            return Err(refused(format!("the identity_file {:?} must be an absolute path", settings.identity_file)));
+        }
         if let Some(directory) = &settings.directory {
             check_directory(directory).map_err(refused)?;
         }
@@ -99,16 +103,9 @@ struct Facts {
     enforced: bool,
 }
 
-/// One live session, and the private key file it authenticated with.
-struct Connection {
-    key: String,
-    session: Arc<OpenSsh>,
-    _identity: tempfile::TempDir,
-}
-
 struct SshHost {
     settings: Settings,
-    connection: tokio::sync::Mutex<Option<Connection>>,
+    connection: tokio::sync::Mutex<Option<Arc<OpenSsh>>>,
     /// Readiness and what the machine last said, from the last refresh.
     stated: Mutex<(Option<Readiness>, Option<Facts>)>,
 }
@@ -130,41 +127,19 @@ impl SshHost {
     fn facts(&self) -> Option<Facts> {
         self.stated.lock().unwrap_or_else(PoisonError::into_inner).1.clone()
     }
-    /// The session for the delivered key: the live one, or a new one.
-    async fn session(&self, c: &Credentials) -> Result<Arc<OpenSsh>> {
-        let key = c.token().ok_or_else(|| ProtocolError::CredentialRejected { reason: "SSH private key not delivered".into() })?;
+    /// The live session, or a new one.
+    async fn session(&self) -> Result<Arc<OpenSsh>> {
         let mut connection = self.connection.lock().await;
-        if let Some(live) = connection.as_ref().filter(|live| live.key == kit::digest(key.expose()))
-            && live.session.closed().now_or_never().is_none()
-        {
-            return Ok(live.session.clone());
+        if let Some(live) = connection.as_ref().filter(|live| live.closed().now_or_never().is_none()) {
+            return Ok(live.clone());
         }
         *connection = None;
-        // Removed when the connection is dropped; a runtime directory is also emptied when the user's sessions end.
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from);
-        let identity = tempfile::Builder::new()
-            .prefix("drydock-ssh-")
-            .tempdir_in(runtime.unwrap_or_else(std::env::temp_dir))
-            .map_err(|e| unavailable(format!("private directory for the SSH key: {e}")))?;
-        let path = identity.path().join("id");
-        // OpenSSH reads a key only whole, its last line ended.
-        let mut text = key.expose().to_owned();
-        if !text.ends_with('\n') {
-            text.push('\n');
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
-            .map_err(|e| unavailable(format!("write the SSH key: {e}")))?;
         let target = Target::Pinned {
             host: self.settings.address.clone(),
             port: self.settings.port,
             user: self.settings.user.clone(),
             host_key: self.settings.host_key.clone(),
-            identity_file: path,
+            identity_file: self.settings.identity_file.clone(),
         };
         let session = OpenSsh::connect(target, CONNECT).await.map_err(|e| ProtocolError::Unavailable {
             reason: format!("SSH connection to {} failed", self.machine()),
@@ -172,19 +147,13 @@ impl SshHost {
             provider_error: Some(e.to_string()),
         })?;
         let session = Arc::new(session);
-        *connection = Some(Connection { key: kit::digest(key.expose()), session: session.clone(), _identity: identity });
+        *connection = Some(session.clone());
         Ok(session)
     }
     /// `script` run by `sh` on the machine with `args` as its positional
     /// parameters, and `input`, if any, on its stdin.
-    async fn run(
-        &self,
-        script: &str,
-        args: &[&str],
-        input: Option<&mut (dyn AsyncRead + Send + Unpin)>,
-        c: &Credentials,
-    ) -> Result<std::process::Output> {
-        let session = self.session(c).await?;
+    async fn run(&self, script: &str, args: &[&str], input: Option<&mut (dyn AsyncRead + Send + Unpin)>) -> Result<std::process::Output> {
+        let session = self.session().await?;
         let argv: Vec<String> = ["sh", "-c", script, "sh"].iter().chain(args).map(|s| s.to_string()).collect();
         let command = kit::shell_command(&argv);
         let (ran, budget) = match input {
@@ -199,14 +168,14 @@ impl SshHost {
         ran.map_err(|_| lost(format!("no answer within {budget:?}")))?.map_err(|e| lost(e.to_string()))
     }
     /// `run`, its stdout when it succeeds.
-    async fn ok(&self, doing: &str, script: &str, args: &[&str], c: &Credentials) -> Result<String> {
-        let output = self.run(script, args, None, c).await?;
+    async fn ok(&self, doing: &str, script: &str, args: &[&str]) -> Result<String> {
+        let output = self.run(script, args, None).await?;
         if !output.status.success() {
             return Err(failed(doing, &output));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
-    async fn probe(&self, c: &Credentials) -> Result<Facts> {
+    async fn probe(&self) -> Result<Facts> {
         const SCRIPT: &str = r#"
 printf 'os=%s\narch=%s\nruntime=%s\ncpus=%s\n' "$(uname -s)" "$(uname -m)" "${XDG_RUNTIME_DIR-}" "$(nproc)"
 awk '/^MemTotal:/ { print "memory_kib=" $2 }' /proc/meminfo
@@ -217,7 +186,7 @@ if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.controllers" ]; then
 fi
 printf 'linger=%s\n' "$(loginctl show-user "$(id -u)" --value -p Linger 2>/dev/null)"
 "#;
-        let text = self.ok("reading the machine's facts", SCRIPT, &[], c).await?;
+        let text = self.ok("reading the machine's facts", SCRIPT, &[]).await?;
         let value = |key: &str| text.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix('=')).unwrap_or("").trim();
         let platform = (value("os") == "Linux").then(|| {
             let architecture = match value("arch") {
@@ -245,23 +214,23 @@ printf 'linger=%s\n' "$(loginctl show-user "$(id -u)" --value -p Linger 2>/dev/n
         Ok(facts)
     }
     /// What the machine said last, or says now.
-    async fn known(&self, c: &Credentials) -> Result<Facts> {
+    async fn known(&self) -> Result<Facts> {
         match self.facts() {
             Some(facts) => Ok(facts),
-            None => self.probe(c).await,
+            None => self.probe().await,
         }
     }
-    async fn root(&self, c: &Credentials) -> Result<PathBuf> {
-        self.known(c).await?.root.ok_or_else(|| {
+    async fn root(&self) -> Result<PathBuf> {
+        self.known().await?.root.ok_or_else(|| {
             refused(format!("{} has no XDG_RUNTIME_DIR for its vessels; set `directory` in the instance's settings", self.machine()))
         })
     }
-    async fn dir(&self, id: &str, c: &Credentials) -> Result<String> {
-        Ok(self.root(c).await?.join(id).to_string_lossy().into_owned())
+    async fn dir(&self, id: &str) -> Result<String> {
+        Ok(self.root().await?.join(id).to_string_lossy().into_owned())
     }
     /// Each vessel under the root (or only `id`), with the CPU and memory limits
     /// its unit's cgroup holds it to while it runs.
-    async fn survey(&self, only: Option<&str>, c: &Credentials) -> Result<Vec<(Found, Option<(f64, u64)>)>> {
+    async fn survey(&self, only: Option<&str>) -> Result<Vec<(Found, Option<(f64, u64)>)>> {
         const SCRIPT: &str = r#"
 cd "$1" 2>/dev/null || exit 0
 for d in $2; do
@@ -279,9 +248,9 @@ for d in $2; do
   printf '%s %s %s %s %s %s\n' "$d" "${state:-unknown}" "$mark" "${cpu:--}" "${memory:--}" "$record"
 done
 "#;
-        let root = self.root(c).await?;
+        let root = self.root().await?;
         let pattern = only.map_or_else(|| format!("{PREFIX}-*"), str::to_owned);
-        let text = self.ok("listing vessels", SCRIPT, &[&root.to_string_lossy(), &pattern], c).await?;
+        let text = self.ok("listing vessels", SCRIPT, &[&root.to_string_lossy(), &pattern]).await?;
         let machine = self.facts();
         let mut found = vec![];
         for line in text.lines() {
@@ -330,20 +299,19 @@ impl Machine for SshHost {
     fn ways_in(&self) -> Vec<WayIn> {
         vec![WayIn::Poll { interval_ms: POLL.as_millis() as u64 }]
     }
-    fn readiness(&self, c: &Credentials) -> Readiness {
-        if c.token().is_none() {
-            return Readiness::MissingCredential { reason: "the instance's SSH private key is not delivered".into() };
+    fn readiness(&self, _: &Credentials) -> Readiness {
+        if let Err(e) = std::fs::File::open(&self.settings.identity_file) {
+            return Readiness::MissingCredential {
+                reason: format!("the identity_file {} cannot be read: {e}", self.settings.identity_file.display()),
+            };
         }
         let stated = self.stated.lock().unwrap_or_else(PoisonError::into_inner).0.clone();
         stated.unwrap_or_else(|| Readiness::Unknown { reason: format!("{} has not been asked yet", self.machine()) })
     }
     /// Connects, and reads what the machine says of itself.
-    async fn refresh_readiness(&self, c: &Credentials) {
-        if c.token().is_none() {
-            return;
-        }
+    async fn refresh_readiness(&self, _: &Credentials) {
         let missing = |reason: String| Readiness::MissingTool { reason };
-        let readiness = match self.probe(c).await {
+        let readiness = match self.probe().await {
             Err(error) => Readiness::Unknown { reason: error.to_string() },
             Ok(Facts { platform: None, .. }) => missing(format!("{} is not Linux", self.machine())),
             Ok(Facts { manager: false, .. }) => {
@@ -365,18 +333,18 @@ impl Machine for SshHost {
         self.facts()?.platform
     }
     /// Limits where the machine enforces them; otherwise the whole machine, to one vessel at a time.
-    async fn grant(&self, size: &Size, c: &Credentials) -> Result<(Size, Option<Grant>)> {
+    async fn grant(&self, size: &Size, _: &Credentials) -> Result<(Size, Option<Grant>)> {
         if size.disk_bytes != 0 {
             return Err(refused("ssh_host sets no per-vessel disk size: ask for a disk of 0"));
         }
-        let facts = self.probe(c).await?;
+        let facts = self.probe().await?;
         if facts.enforced {
             if size.memory_bytes == 0 {
                 return Err(refused("ssh_host takes a positive memory size"));
             }
             return Ok((size.clone(), Some(Grant::Limits)));
         }
-        if let Some((held, _)) = self.survey(None, c).await?.first() {
+        if let Some((held, _)) = self.survey(None).await?.first() {
             return Err(ProtocolError::QuotaExhausted {
                 reason: format!(
                     "{} cannot enforce per-vessel limits (its systemd user manager has no memory and cpu controllers delegated), so it takes one vessel at a time, and holds {}: destroy that vessel, suspended or not, to free the machine",
@@ -387,11 +355,11 @@ impl Machine for SshHost {
         }
         Ok((Size { cpus: facts.cpus, memory_bytes: facts.memory_bytes, disk_bytes: 0 }, Some(Grant::WholeMachine)))
     }
-    async fn vessels(&self, only: Option<&str>, c: &Credentials) -> Result<Vec<Found>> {
-        Ok(self.survey(only, c).await?.into_iter().map(|(found, _)| found).collect())
+    async fn vessels(&self, only: Option<&str>, _: &Credentials) -> Result<Vec<Found>> {
+        Ok(self.survey(only).await?.into_iter().map(|(found, _)| found).collect())
     }
     async fn create(&self, id: &str, record: &Record, c: &Credentials) -> Result<()> {
-        let dir = self.dir(id, c).await?;
+        let dir = self.dir(id).await?;
         vessels::check_socket(Path::new(&dir), "directory")?;
         let platform = record.platform.as_ref().ok_or_else(|| refused("a vessel needs its platform"))?;
         let build = drydock_provider::agent_build::agent_build(platform)
@@ -403,11 +371,11 @@ impl Machine for SshHost {
         const WRITE_RECORD: &str = r#"umask 077 && cat > "$1/$2.new" && mv "$1/$2.new" "$1/$2""#;
         let record = serde_json::to_vec(record).expect("record serializes");
         let made = async {
-            let output = self.run(UPLOAD_AGENT, &[&dir, AGENT, &length], Some(&mut file), c).await?;
+            let output = self.run(UPLOAD_AGENT, &[&dir, AGENT, &length], Some(&mut file)).await?;
             if !output.status.success() {
                 return Err(failed("uploading the agent", &output));
             }
-            let output = self.run(WRITE_RECORD, &[&dir, RECORD], Some(&mut &record[..]), c).await?;
+            let output = self.run(WRITE_RECORD, &[&dir, RECORD], Some(&mut &record[..])).await?;
             if !output.status.success() {
                 return Err(failed("writing the vessel's record", &output));
             }
@@ -420,7 +388,7 @@ impl Machine for SshHost {
         made
     }
     /// A transient service of the user's manager, holding everything the agent starts.
-    async fn launch(&self, id: &str, record: &Record, c: &Credentials) -> Result<()> {
+    async fn launch(&self, id: &str, record: &Record, _: &Credentials) -> Result<()> {
         const SCRIPT: &str = r#"
 d="$1/$2"; u="drydock-$2.service"; agent="$d/$3"; socket="$d/$4"; log="$d/$5"; shift 5
 systemctl --user reset-failed "$u" 2>/dev/null
@@ -429,46 +397,46 @@ exec systemd-run --user --quiet --collect --unit="$u" --service-type=exec --work
   -p KillMode=control-group -p TimeoutStopSec=2 -p StandardOutput="append:$log" -p StandardError="append:$log" \
   "$@" -- "$agent" --socket "$socket"
 "#;
-        let root = self.root(c).await?.to_string_lossy().into_owned();
+        let root = self.root().await?.to_string_lossy().into_owned();
         let mut args: Vec<String> = [&root, id, AGENT, SOCKET, LOG].map(str::to_owned).into();
         if let (Some(Grant::Limits), Some(size)) = (record.grant, &record.size) {
             let cpu = format!("CPUQuota={}%", (size.cpus * 100.0).round().max(1.0));
             args.extend(["-p".into(), format!("MemoryMax={}", size.memory_bytes), "-p".into(), "MemorySwapMax=0".into(), "-p".into(), cpu]);
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.ok("starting the agent", SCRIPT, &args, c).await.map(drop)
+        self.ok("starting the agent", SCRIPT, &args).await.map(drop)
     }
-    async fn running(&self, id: &str, c: &Credentials) -> Result<bool> {
+    async fn running(&self, id: &str, _: &Credentials) -> Result<bool> {
         let script = r#"systemctl --user is-active --quiet "drydock-$1.service""#;
-        Ok(self.run(script, &[id], None, c).await?.status.success())
+        Ok(self.run(script, &[id], None).await?.status.success())
     }
     /// Each look is a stream and a command over the session.
     fn startup_poll(&self) -> Duration {
         Duration::from_millis(250)
     }
-    async fn stop(&self, id: &str, c: &Credentials) -> Result<()> {
+    async fn stop(&self, id: &str, _: &Credentials) -> Result<()> {
         const SCRIPT: &str = r#"
 u="drydock-$1.service"
 systemctl --user stop "$u" 2>/dev/null
 systemctl --user reset-failed "$u" 2>/dev/null
 ! systemctl --user is-active --quiet "$u"
 "#;
-        self.ok("stopping the vessel", SCRIPT, &[id], c).await.map(drop)
+        self.ok("stopping the vessel", SCRIPT, &[id]).await.map(drop)
     }
-    async fn remove(&self, id: &str, c: &Credentials) -> Result<()> {
+    async fn remove(&self, id: &str, _: &Credentials) -> Result<()> {
         // The agent's artifact store keeps its unpacked trees read-only; chmod -R follows no link.
         const SCRIPT: &str = r#"[ ! -e "$1" ] || { chmod -R u+w "$1" 2>/dev/null; rm -rf "$1"; }"#;
-        let dir = self.dir(id, c).await?;
-        self.ok("removing the vessel's directory", SCRIPT, &[&dir], c).await.map(drop)
+        let dir = self.dir(id).await?;
+        self.ok("removing the vessel's directory", SCRIPT, &[&dir]).await.map(drop)
     }
-    async fn mark_suspended(&self, id: &str, suspended: bool, c: &Credentials) -> Result<()> {
-        let marker = Path::new(&self.dir(id, c).await?).join(SUSPENDED).to_string_lossy().into_owned();
+    async fn mark_suspended(&self, id: &str, suspended: bool, _: &Credentials) -> Result<()> {
+        let marker = Path::new(&self.dir(id).await?).join(SUSPENDED).to_string_lossy().into_owned();
         let script = if suspended { r#": > "$1""# } else { r#"rm -f "$1""# };
-        self.ok("marking the vessel's suspension", script, &[&marker], c).await.map(drop)
+        self.ok("marking the vessel's suspension", script, &[&marker]).await.map(drop)
     }
-    async fn connect(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
-        let socket = self.root(c).await?.join(id).join(SOCKET);
-        let session = self.session(c).await?;
+    async fn connect(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
+        let socket = self.root().await?.join(id).join(SOCKET);
+        let session = self.session().await?;
         session.open_unix(&socket).await.map_err(|e| unavailable(format!("agent socket over SSH: {e}")))
     }
     fn states_capacity(&self) -> bool {
@@ -476,10 +444,10 @@ systemctl --user reset-failed "$u" 2>/dev/null
     }
     /// The machine's CPUs and memory, with the limits its running vessels are
     /// held to summed as in use. A vessel with the whole machine holds it all.
-    async fn quota(&self, c: &Credentials) -> Option<Result<Quota>> {
+    async fn quota(&self, _: &Credentials) -> Option<Result<Quota>> {
         let quota = async {
-            let facts = self.probe(c).await?;
-            let held: Vec<(f64, u64)> = self.survey(None, c).await?.into_iter().filter_map(|(_, limits)| limits).collect();
+            let facts = self.probe().await?;
+            let held: Vec<(f64, u64)> = self.survey(None).await?.into_iter().filter_map(|(_, limits)| limits).collect();
             let row = |resource, unit: &str, in_use: f64, limit: f64| ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: unit.into(),
