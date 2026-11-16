@@ -1,5 +1,6 @@
 //! What every Rust provider module needs and none should write again: the
-//! vendor's HTTP API with typed bodies and answers ([`api`]), commands run
+//! vendor's HTTP API with typed bodies and answers ([`api`]), reached over
+//! HTTPS or an endpoint drydock dials itself ([`endpoint`]), commands run
 //! in a guest ([`guest`]), destinations and addresses ([`egress`]),
 //! prepared-form names and prepare's checks ([`image`]), a relay over a
 //! JSON-framed process stream ([`relay`]), credentials exchanged for
@@ -8,6 +9,7 @@
 //! what differs: its endpoints, its wire types, its states, its quirks.
 pub mod api;
 pub mod egress;
+pub mod endpoint;
 pub mod exchange;
 pub mod guest;
 pub mod image;

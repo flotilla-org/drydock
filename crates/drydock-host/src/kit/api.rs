@@ -24,6 +24,9 @@ pub enum Auth {
     Bearer,
     /// The key alone in a header of the vendor's own (E2B's `X-API-Key`).
     Header(HeaderName),
+    /// No key: access is the endpoint's own (a socket's permissions, a client
+    /// certificate).
+    None,
 }
 
 /// One refused answer: what the status table and a vendor's overrides read.
@@ -184,7 +187,12 @@ impl Api {
     /// `base` must be an HTTPS URL without credentials or query.
     pub fn new(vendor: Vendor, base: &str, auth: Auth, http: Arc<dyn HttpClient>) -> Result<Self> {
         let base = https_base(vendor, base)?;
-        Ok(Self { vendor, base, auth, http, classify: |f| f.standard(f.reason(&f.message())), retry_after: retry_after_header })
+        Ok(Self::over(vendor, base, auth, http))
+    }
+    /// An API on a client that dials its own endpoint
+    /// ([`super::endpoint::Endpoint`]), `base` under that endpoint's origin.
+    pub fn over(vendor: Vendor, base: Url, auth: Auth, http: Arc<dyn HttpClient>) -> Self {
+        Self { vendor, base, auth, http, classify: |f| f.standard(f.reason(&f.message())), retry_after: retry_after_header }
     }
     /// The vendor's status table, in place of [`Failure::standard`] on its message.
     pub fn classify(mut self, classify: fn(&Failure) -> ProtocolError) -> Self {
@@ -210,6 +218,7 @@ impl Api {
         let value = match self.auth {
             Auth::Bearer => format!("Bearer {}", key.expose()),
             Auth::Header(_) => key.expose().to_owned(),
+            Auth::None => return Err(refused(format!("{} takes no API key", self.vendor))),
         };
         sensitive(&value).map_err(|_| refused(format!("invalid {} API key header", self.vendor)))
     }
@@ -230,7 +239,7 @@ impl Api {
     /// [`Self::send`], ending at `deadline` instead of the client's own
     /// (30 s), for a request whose body takes longer to send.
     #[allow(clippy::too_many_arguments)]
-    async fn send_within(
+    pub async fn send_within(
         &self,
         method: Method,
         url: Url,
@@ -246,11 +255,12 @@ impl Api {
         for (name, value) in headers {
             request.headers_mut().insert(name.clone(), value.clone());
         }
-        if authenticated {
-            let name = match &self.auth {
-                Auth::Bearer => AUTHORIZATION,
-                Auth::Header(name) => name.clone(),
-            };
+        let name = match &self.auth {
+            Auth::Bearer => Some(AUTHORIZATION),
+            Auth::Header(name) => Some(name.clone()),
+            Auth::None => None,
+        };
+        if let Some(name) = name.filter(|_| authenticated) {
             request.headers_mut().insert(name, self.key(c)?);
         }
         match body.into() {
