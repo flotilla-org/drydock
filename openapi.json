@@ -2643,7 +2643,8 @@
             "properties": {
               "unix": {
                 "type": "string",
-                "description": "An absolute Unix socket path."
+                "description": "An absolute Unix socket path.",
+                "pattern": "^/[^\\u0000]*$"
               }
             }
           }

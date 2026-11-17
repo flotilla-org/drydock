@@ -54,6 +54,15 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
         host.pattern = Some(validation::host_pattern().into());
         host.max_length = Some(253);
     }
+    if let Some(RefOr::T(Schema::OneOf(carried))) = schemas.get_mut("Carried") {
+        for variant in &mut carried.items {
+            if let RefOr::T(Schema::Object(variant)) = variant
+                && let Some(RefOr::T(Schema::Object(path))) = variant.properties.get_mut("unix")
+            {
+                path.pattern = Some("^/[^\\u0000]*$".into());
+            }
+        }
+    }
     if let Some(RefOr::T(Schema::Object(cidr))) = schemas.get_mut("Cidr") {
         cidr.pattern = Some(validation::cidr_pattern().into());
     }
