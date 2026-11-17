@@ -157,7 +157,11 @@ pub(crate) fn nonempty_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<
 }
 pub(crate) fn absolute_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let value = String::deserialize(d)?;
-    if value.starts_with('/') { Ok(value) } else { Err(serde::de::Error::custom("must be an absolute path")) }
+    if value.starts_with('/') && !value.contains('\0') {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom("must be an absolute path without NUL"))
+    }
 }
 pub(crate) fn is_platform_part(value: &str) -> bool {
     !value.is_empty() && value.len() <= 32 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
