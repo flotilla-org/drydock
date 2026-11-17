@@ -235,6 +235,10 @@ impl Client {
         }
         self.bounded(upgraded(request, protocol)).await
     }
+    pub async fn open_stream(&self, provider: &str, endpoint: &drydock_protocol::Carried) -> Result<rigging_stream::ByteStream> {
+        let request = self.request(Method::POST, &["v1", "providers", provider, "streams"])?.json(endpoint);
+        self.bounded(upgraded(request, "drydock-stream")).await
+    }
     pub async fn observe(&self, since: Option<&str>) -> Result<Records> {
         let mut request = self.request(Method::GET, &["v1", "events"])?;
         if let Some(since) = since {

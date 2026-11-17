@@ -120,7 +120,7 @@ impl Provider for RemoteProvider {
             push_access: ports.push_access.then_some(self),
             // The webhook way in is the declaration of this port.
             events: self.declaration.ways_in.iter().flatten().any(|w| matches!(w, WayIn::Webhook { .. })).then_some(self),
-            streams: None,
+            streams: ports.streams.then_some(self),
         }
     }
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {
@@ -143,6 +143,12 @@ impl Provider for RemoteProvider {
     }
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
         self.host(c).relay(self.name(), id).await.map_err(error)
+    }
+}
+#[async_trait]
+impl Streams for RemoteProvider {
+    async fn open(&self, endpoint: &Carried, c: &Credentials) -> Result<ByteStream> {
+        self.host(c).stream(self.name(), endpoint).await.map_err(error)
     }
 }
 #[async_trait]

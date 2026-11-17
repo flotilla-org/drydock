@@ -219,6 +219,9 @@ impl ProviderApi for Client {
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error> {
         self.upgrade(provider, id, "exec", "drydock-stream", Some(command)).await
     }
+    async fn stream(&self, provider: &str, endpoint: &Carried) -> Result<ByteStream, Error> {
+        self.open_stream(provider, endpoint).await
+    }
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
         let request = self
             .request(Method::PUT, &["v1", "providers", provider, "environments", id, "files"])?
