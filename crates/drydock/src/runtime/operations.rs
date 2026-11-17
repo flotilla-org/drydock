@@ -200,6 +200,20 @@ impl ProviderApi for Runtime {
             )
             .await?)
     }
+    async fn stream(&self, p: &str, endpoint: &Carried) -> ApiResult<ByteStream> {
+        let instance = self.instance(p).await?;
+        if !instance.capabilities.carries.contains(&endpoint.kind()) {
+            return Err(refused(format!("{p} carries no {} endpoints", endpoint.kind())).into());
+        }
+        let endpoint = endpoint.clone();
+        Ok(instance
+            .call(
+                Gate::Stream,
+                self.credential.clone(),
+                |p, c| async move { operation_port(p.operations().streams)?.open(&endpoint, &c).await },
+            )
+            .await?)
+    }
     async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> ApiResult<()> {
         let (id, file) = (id.to_owned(), file.clone());
         let instance = self.instance(p).await?;

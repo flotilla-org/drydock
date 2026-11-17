@@ -436,9 +436,11 @@ systemctl --user reset-failed "$u" 2>/dev/null
         self.ok("marking the vessel's suspension", script, &[&marker]).await.map(drop)
     }
     async fn connect(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
-        let socket = self.root().await?.join(id).join(SOCKET);
+        self.open(&self.root().await?.join(id).join(SOCKET)).await
+    }
+    async fn open(&self, path: &Path) -> Result<ByteStream> {
         let session = self.session().await?;
-        session.open_unix(&socket).await.map_err(|e| unavailable(format!("agent socket over SSH: {e}")))
+        session.open_unix(path).await.map_err(|e| unavailable(format!("{} on {} over SSH: {e}", path.display(), self.machine())))
     }
     fn states_capacity(&self) -> bool {
         true

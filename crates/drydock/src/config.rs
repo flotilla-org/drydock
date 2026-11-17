@@ -218,6 +218,19 @@ impl Config {
             if let Some(unknown) = p.pull_from.iter().find(|r| !config.registries.contains_key(*r)) {
                 return Err(format!("provider {name} pulls from unknown registry {unknown:?}"));
             }
+            let mut line = vec![name.as_str()];
+            let mut at = p;
+            while let Some(parent) = &at.parent {
+                at = config
+                    .providers
+                    .get(&parent.instance)
+                    .ok_or_else(|| format!("provider {name}: parent {:?} is not configured", parent.instance))?;
+                if line.contains(&parent.instance.as_str()) {
+                    line.push(&parent.instance);
+                    return Err(format!("provider {name}: its parents form a cycle ({})", line.join(" → ")));
+                }
+                line.push(&parent.instance);
+            }
         }
         for (name, registry) in &config.registries {
             registry.location().map_err(|e| format!("registry {name}: {e}"))?;

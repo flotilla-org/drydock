@@ -79,9 +79,11 @@ pub trait ProviderApi: Send + Sync {
     async fn usage(&self, provider: &str, period: &Period) -> Result<Usage, Error>;
     async fn relay(&self, provider: &str, id: &str) -> Result<ByteStream, Error>;
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error>;
-    /// A stream to an endpoint on the provider's machine, through its streams port.
+    /// Host only: a stream to an endpoint on the provider's machine, through
+    /// its streams port. drydockd opens these for its children alone and does
+    /// not serve this.
     async fn stream(&self, _provider: &str, _endpoint: &Carried) -> Result<ByteStream, Error> {
-        Err(ProtocolError::MethodNotAllowed { reason: "streams are not built yet".into() }.into())
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
     }
     /// Write one file into a guest, through the provider's files port.
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
@@ -297,9 +299,11 @@ impl FromRequestParts<Surface> for Api {
         }))
     }
 }
-/// The routes common to the server and hosts. Stream upgrades end when `stopping` becomes true.
+/// The routes hosts serve: the common routes, and `stream`, which the server
+/// does not serve. Stream upgrades end when `stopping` becomes true.
 pub fn router(api: Arc<dyn ProviderApi>, stopping: watch::Receiver<bool>) -> Router {
     routes()
+        .routes(routes!(stream))
         .split_for_parts()
         .0
         .fallback(not_found)
@@ -337,7 +341,6 @@ fn routes() -> OpenApiRouter<Surface> {
         .routes(routes!(reach))
         .routes(routes!(relay))
         .routes(routes!(exec))
-        .routes(routes!(stream))
         .routes(routes!(put_file))
         .routes(routes!(push_access))
         .routes(routes!(event))

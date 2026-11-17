@@ -329,9 +329,7 @@ impl Supervisor {
             // The host receives the document without server-only keys.
             let mut document = spec.configuration.clone();
             for provider in document.providers.values_mut() {
-                provider.credential = None;
-                provider.semantics = Default::default();
-                provider.events = None;
+                *provider = provider.for_host();
             }
             loop {
                 if let Some(child) = &mut child

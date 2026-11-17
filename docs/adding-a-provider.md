@@ -64,8 +64,13 @@ A Rust module is two types:
   [`drydock-provider`](../crates/drydock-provider/src/lib.rs): `capabilities`,
   `ways_in`, `prepare`, `provision`, `list`, `inspect`, `destroy`, `reach` and
   `relay`. Optional ports (`Exec`, `GuestFiles`, `SuspendResume`, `QuotaOperation`,
-  `UsageOperation`, `ExportOperation`, `PushAccessOperation`, `VendorEvents`)
-  are separate traits, returned from `operations()` when the vendor has them.
+  `UsageOperation`, `ExportOperation`, `PushAccessOperation`, `VendorEvents`,
+  `Streams`) are separate traits, returned from `operations()` when the vendor
+  has them. `Streams`, with `capabilities.carries`, makes the provider a parent:
+  it opens streams to endpoints on its machine for the instances whose
+  `parent` it is. A module whose instances can be given their endpoint by
+  drydockd, so that they can have a parent, says so with
+  `Module::takes_endpoint` and reads `ProviderConfiguration::endpoint`.
 
 Register the module in two places: `pub mod` in
 [`lib.rs`](../crates/drydock-host/src/lib.rs), and `registry.insert` in

@@ -146,8 +146,10 @@ async fn capabilities_are_honest_about_having_no_isolation() {
     assert!(c.host_processes, "vessels are processes of this machine: no isolation");
     // The network is the host's, and the agent carries exposures all the same.
     assert_eq!(c.reach_ways, [ReachWay::HostNetwork, ReachWay::OutwardExposure]);
+    // Its machine is this one, so it opens streams to sockets here for its children.
+    assert_eq!(c.carries, [CarriedKind::Unix]);
     let ports = Ports::from(p.operations());
-    assert_eq!(ports, Ports { suspend_resume: true, ..Ports::default() });
+    assert_eq!(ports, Ports { suspend_resume: true, streams: true, ..Ports::default() });
     assert_eq!(p.readiness(&credentials()), Readiness::Ready);
 }
 

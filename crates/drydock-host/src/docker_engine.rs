@@ -174,6 +174,9 @@ impl Module for DockerEngineModule {
     fn smallest_size(&self) -> Size {
         Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 0 }
     }
+    fn takes_endpoint(&self) -> bool {
+        true
+    }
     /// The engine is reached through its own endpoint, never the host's HTTPS
     /// client.
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
@@ -182,11 +185,17 @@ impl Module for DockerEngineModule {
         if [settings.poll_seconds, settings.pull_seconds, settings.exec_seconds, settings.upload_seconds].contains(&0) {
             return Err(refused("Docker Engine's poll, pull, exec and upload settings must be positive"));
         }
-        let Some(address) = settings.endpoint.as_deref() else {
-            return Err(refused(
-                "Docker Engine needs an endpoint in its settings: endpoint = \"unix:///var/run/docker.sock\", or \"tcp://host:2376\" with tls = { ca, cert, key }",
-            ));
+        let given = config.endpoint.as_ref().map(|Local::Unix(path)| format!("unix://{path}"));
+        let address = match (given, settings.endpoint.clone()) {
+            (Some(_), Some(_)) => return Err(refused("Docker Engine takes no endpoint in its settings when it has a parent")),
+            (Some(address), None) | (None, Some(address)) => address,
+            (None, None) => {
+                return Err(refused(
+                    "Docker Engine needs an endpoint in its settings: endpoint = \"unix:///var/run/docker.sock\", or \"tcp://host:2376\" with tls = { ca, cert, key }; or a parent",
+                ));
+            }
         };
+        let address = address.as_str();
         let endpoint = Arc::new(Endpoint::new(ENGINE, address, settings.tls.as_ref())?);
         let base = kit::api::join(endpoint.base(), &[API_VERSION, ""])?;
         let api = Api::over(ENGINE, base, Auth::None, endpoint.clone());

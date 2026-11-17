@@ -164,8 +164,8 @@ impl ProviderApi for Host {
         let document = update.apply(&current)?;
         let mut bindings = BTreeMap::new();
         for (name, config) in document.providers {
-            if config.credential.is_some() {
-                return Err(refused("credential is a server-only configuration key").into());
+            if config.credential.is_some() || config.parent.is_some() {
+                return Err(refused("credential and parent are server-only configuration keys").into());
             }
             let existing = self.bindings.read().await.get(&name).filter(|b| b.config == config).map(|b| b.provider.clone());
             let provider = match existing {
@@ -235,6 +235,13 @@ impl ProviderApi for Host {
     async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> ApiResult<ByteStream> {
         let provider = self.instance(p).await?;
         Ok(port(provider.operations().exec)?.exec(id, command.clone(), &self.credentials).await?)
+    }
+    async fn stream(&self, p: &str, endpoint: &Carried) -> ApiResult<ByteStream> {
+        let provider = self.instance(p).await?;
+        if !provider.capabilities().carries.contains(&endpoint.kind()) {
+            return Err(refused(format!("{p} carries no {} endpoints", endpoint.kind())).into());
+        }
+        Ok(port(provider.operations().streams)?.open(endpoint, &self.credentials).await?)
     }
     async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: Bytes) -> ApiResult<()> {
         let provider = self.instance(p).await?;
