@@ -217,6 +217,10 @@ async fn relay(
                         _ = tokio::io::copy_bidirectional(&mut connection, &mut stream) => {}
                     }
                 }
+                // The child's readiness already says its parent is not ready.
+                Err(error @ Error::NotReady(_)) => {
+                    tracing::debug!(provider = %child, %parent, %error, "no stream while the parent is not ready")
+                }
                 Err(error) => {
                     tracing::warn!(provider = %child, %parent, %error, "the parent could not open a stream to the child's endpoint")
                 }
