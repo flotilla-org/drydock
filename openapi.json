@@ -5165,7 +5165,6 @@
           },
           {
             "type": "object",
-            "description": "The instance's parent is not ready, and `reason` is the parent's\nreadiness: nothing reaches this instance's endpoint until it is.",
             "required": [
               "parent",
               "reason",
@@ -5186,7 +5185,8 @@
               }
             }
           }
-        ]
+        ],
+        "description": "`parent_not_ready`: the instance's parent is not ready, and `reason` is\nthe parent's readiness; nothing reaches the instance's endpoint until it is."
       },
       "RegistryAuthKind": {
         "type": "string",

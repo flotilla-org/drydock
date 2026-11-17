@@ -197,6 +197,7 @@ impl Runtime {
                 || capabilities.export != ports.export.is_some()
                 || capabilities.usage != ports.usage.is_some()
                 || capabilities.quota != ports.quota.is_some()
+                || capabilities.carries.is_empty() == ports.streams.is_some()
             {
                 return Err(refused("capabilities must match optional operation ports"));
             }

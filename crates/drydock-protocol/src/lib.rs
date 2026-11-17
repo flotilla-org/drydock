@@ -96,7 +96,7 @@ pub struct Parent {
 #[serde(rename_all = "snake_case")]
 pub enum Carried {
     /// An absolute Unix socket path.
-    Unix(String),
+    Unix(#[serde(deserialize_with = "validation::absolute_path")] String),
 }
 impl Carried {
     pub fn kind(&self) -> CarriedKind {
@@ -324,28 +324,17 @@ pub struct RateLimit {
     pub requests: u32,
     pub period_seconds: u64,
 }
+/// `parent_not_ready`: the instance's parent is not ready, and `reason` is
+/// the parent's readiness; nothing reaches the instance's endpoint until it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Readiness {
     Ready,
-    MissingTool {
-        reason: String,
-    },
-    MissingCredential {
-        reason: String,
-    },
-    VersionMismatch {
-        reason: String,
-    },
-    Unknown {
-        reason: String,
-    },
-    /// The instance's parent is not ready, and `reason` is the parent's
-    /// readiness: nothing reaches this instance's endpoint until it is.
-    ParentNotReady {
-        parent: String,
-        reason: String,
-    },
+    MissingTool { reason: String },
+    MissingCredential { reason: String },
+    VersionMismatch { reason: String },
+    Unknown { reason: String },
+    ParentNotReady { parent: String, reason: String },
 }
 impl std::fmt::Display for Readiness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -49,6 +49,7 @@ impl Module for RemoteModule {
         self.module.smallest_size.clone()
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+        // `endpoint` is kept: it is what drydockd made for `parent`, the host's to dial.
         let config =
             ProviderConfiguration { credential: None, semantics: Default::default(), events: None, parent: None, ..config.clone() };
         let patch = serde_json::json!({ "providers": { name: config } });
