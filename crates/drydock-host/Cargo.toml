@@ -18,6 +18,7 @@ futures = "0.3"
 rigging-http-client.workspace = true
 rigging-http-serve.workspace = true
 rigging-stream.workspace = true
+rigging-ssh.workspace = true
 async-trait = "0.1"
 axum = "0.8"
 serde.workspace = true

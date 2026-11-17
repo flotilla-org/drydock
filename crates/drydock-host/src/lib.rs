@@ -9,6 +9,7 @@ pub mod local;
 pub use drydock_oci as oci;
 pub mod reference;
 pub mod runtime;
+pub mod ssh_host;
 pub mod tensorlake;
 use axum::{
     Router,

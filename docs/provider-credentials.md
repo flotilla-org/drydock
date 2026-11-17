@@ -107,6 +107,58 @@ The module speaks Engine API v1.44 (Engine 25 and later): every request path sta
 - An exec runs up to `exec_seconds` (default 60); the engine has no exec timeout, so a command still running then keeps running after drydock stops reading it, until it ends or the container is destroyed: the API has no call that ends an exec'd process. A pull may take `pull_seconds` (default 600), and an upload `upload_seconds` (default 300). drydockd lists containers every `poll_seconds` (default 30).
 - The module declares no usage. Quota is the engine's count of running containers, all of them, not only drydock's; the engine admits nothing, so admission stays with the caller.
 
+## SSH host (`ssh_host`, Rust host)
+
+Credential: none. The private key drydock signs in with is a file named in the settings. One instance is one machine:
+
+```toml
+[providers.b1]
+module = "ssh_host"
+image = "ubuntu@sha256:…"   # recorded, not pulled: vessels run on the machine itself
+size = { cpus = 2, memory = "4GiB", disk = 0 }   # no per-vessel disk
+egress = "open"
+
+[providers.b1.settings]
+address = "b1.lab.example.net"
+port = 22
+user = "drydock"
+host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…"
+identity_file = "/home/me/.config/drydock/b1_ed25519"
+# directory = "/run/user/1001/drydock"
+```
+
+- `address`, `port`, `user`, `host_key` and `identity_file` are required; nothing is guessed. `host_key` is the machine's raw host public key, as `ssh-keyscan` prints it without the host name, and the connection is refused unless the machine presents exactly that key. drydock reads no ssh_config, known_hosts or ssh-agent of the user it runs as, and needs OpenSSH 8.7 or later as `ssh` on its PATH. A machine behind a jump host cannot be reached yet.
+- `directory` is where vessel directories live, an absolute path without whitespace, colons, quotes, backslashes, backticks, `$` or `%` (a shell or systemd would read them). It defaults to `drydock` under the user's `XDG_RUNTIME_DIR` on the machine (`/run/user/<uid>/drydock`), which systemd empties when the machine restarts.
+- `identity_file` is an absolute path, on drydock's machine, to the OpenSSH private key, unencrypted (drydock never prompts for a passphrase), readable by drydock-host and by no one else: `ssh` refuses a key file its owner has left readable by group or others, so give it mode `0600`. `ssh` reads it in place each time it connects; drydock never copies it. Readiness reports a missing or unreadable file as a missing credential.
+
+What the machine needs:
+
+- An OpenSSH server that accepts the key for `user`, and a POSIX login shell for it: every command runs as `sh -c` through it.
+- Linux, with a systemd user manager for `user` that keeps running without a login: `loginctl enable-linger <user>`. Without lingering the manager, the runtime directory and every vessel end when drydock's connection does, so readiness reports it missing.
+- A writable vessels' directory. Nothing goes in `/opt` or `/run` outside it, and nothing needs root.
+- For limits, cgroup v2 with the `memory` and `cpu` controllers delegated to the user's manager (`Delegate=` on `user@.service`, as systemd's [delegation](https://systemd.io/CGROUP_DELEGATION/) describes). The module reads the manager's `cgroup.controllers` to see whether they are.
+- drydock-host needs a `drydock-agent` build for the machine's platform: `drydock-agent-linux-<arch>` beside it, `DRYDOCK_AGENT_BIN_LINUX_<ARCH>`, or, when the machine's platform is drydock's own, `drydock-agent` beside it or `DRYDOCK_AGENT_BIN`.
+
+Every call is a command or a stream over one SSH session:
+
+| On the machine | Used for |
+|---|---|
+| `uname`, `nproc`, `/proc/meminfo`, `systemctl --user show`, the manager's `cgroup.controllers`, `loginctl show-user` | readiness, the platform, and provision and quota's statement of the machine |
+| `mkdir` and `cat` with the agent build on stdin, its length checked with `wc -c`, then the record the same way | provision: the vessel's directory |
+| `systemd-run --user --unit=drydock-<id>.service`, with the vessel's limits as properties | provision and resume: the agent, as a transient service |
+| `systemctl --user show` of each vessel's unit, its cgroup's `cpu.max` and `memory.max`, and the vessels' records | list, inspect, quota |
+| `systemctl --user stop drydock-<id>.service` | suspend, destroy |
+| `chmod -R u+w`, `rm -rf` | destroy: the vessel's directory |
+| a stream to `<directory>/<id>/run/drydock/agent.sock` | relay (reach) |
+
+- Vessels are host-direct, and the module declares them so (`host_filesystem`, `host_processes`): a vessel is the directory `<directory>/<id>/` and the processes its agent starts, as the machine's user, with the machine's processes and filesystem visible. The checkout is a clone in the vessel's directory. Egress is open and advisory: deny-all is refused. Nothing is pulled; the image is only recorded.
+- The agent runs unprivileged from the vessel's own copy, `<id>/opt/drydock/drydock-agent`, with its socket at `<id>/run/drydock/agent.sock`, as the service `drydock-<id>.service` of the user's manager. Stopping the unit ends the agent and everything it started. A vessel whose unit is not active is stopped: suspended when it was asked to be, otherwise halted. Resume starts the unit again; the directory stays. Rows carry the unit's `ActiveState` in `vendor`.
+- Sizes, where the manager has the controllers: each vessel's unit has `MemoryMax` (with `MemorySwapMax=0`) and `CPUQuota` from the size asked for, and that size is the vessel's granted size. Provisions on one instance are serialised.
+- The whole-machine case, where it does not: the machine takes one vessel at a time, granted the whole machine, and its unit carries no limits. The granted size is the machine's CPUs (`nproc`) and memory (`MemTotal`), shared with whatever else runs on the machine outside drydock, and the row's `vendor.reason` says so. A provision while one of this instance's vessels exists, running or suspended, is refused as exhausted quota naming it; destroying that vessel frees the machine.
+- Disk: no per-vessel disk is set, so ask for a disk of 0; granted sizes have a disk of 0.
+- Quota is what the machine states: its CPUs and memory as the limits, the CPU and memory limits its running vessels' cgroups hold summed as in use (a vessel with the whole machine holds all of it), the count of running vessels, and a concurrency limit of 1 in the whole-machine case. The module refuses nothing on free room; that is the caller's to decide.
+- Each command may take 60 seconds, and the agent's upload 300. drydockd lists the vessels every 5 seconds.
+
 ## Namespace (`namespace`, TypeScript host)
 
 Credential: a revocable token as JSON, `{"bearer_token": …}`. The same token is the `nscr.io` push password (user `token`).

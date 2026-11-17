@@ -14,6 +14,7 @@ pub mod exchange;
 pub mod guest;
 pub mod image;
 pub mod relay;
+pub mod vessels;
 
 use crate::module::{Result, refused};
 use drydock_protocol::*;
