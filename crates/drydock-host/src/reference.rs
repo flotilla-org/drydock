@@ -121,6 +121,7 @@ impl Provider for Reference {
             files: None,
             push_access: None,
             events: None,
+            streams: None,
         }
     }
     fn capabilities(&self) -> Capabilities {
@@ -161,6 +162,7 @@ impl Provider for Reference {
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
+            carries: vec![],
         }
     }
     async fn prepare(&self, r: PrepareRequest, _: &Credentials) -> Result<Prepared> {

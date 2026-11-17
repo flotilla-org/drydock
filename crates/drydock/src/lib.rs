@@ -369,7 +369,8 @@ impl Supervisor {
                             Readiness::MissingTool { reason }
                             | Readiness::MissingCredential { reason }
                             | Readiness::VersionMismatch { reason }
-                            | Readiness::Unknown { reason } => *reason = masker.text(reason),
+                            | Readiness::Unknown { reason }
+                            | Readiness::ParentNotReady { reason, .. } => *reason = masker.text(reason),
                         }
                         if let Some(readiness) = unavailable.remove(&provider.provider) {
                             provider.readiness = readiness;

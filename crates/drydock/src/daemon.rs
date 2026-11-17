@@ -362,6 +362,7 @@ impl Daemon {
                         readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
                         ports: Ports::default(),
                         ways_in: None,
+                        endpoint: None,
                     });
                 if let Some(readiness) = self.unavailable.get(name) {
                     declaration.readiness = readiness.clone();
@@ -1023,6 +1024,7 @@ fn conservative_capabilities() -> Capabilities {
         agent_tcp_port: None,
         reach_ways: vec![],
         semantics: Default::default(),
+        carries: vec![],
     }
 }
 

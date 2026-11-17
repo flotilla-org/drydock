@@ -42,6 +42,7 @@ impl Runtime {
             rate_limits: i.rate_limits.clone(),
             ports: i.provider.operations().into(),
             ways_in: Some(i.ways_in.clone()),
+            endpoint: i.config.endpoint.clone(),
         }
     }
 }
@@ -59,6 +60,7 @@ impl ProviderApi for Runtime {
                     name: name.clone(),
                     version: module.version().into(),
                     smallest_size: module.smallest_size(),
+                    takes_endpoint: module.takes_endpoint(),
                 })
                 .collect(),
         })

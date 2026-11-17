@@ -28,8 +28,9 @@ pub enum InwardTarget {
     Tcp(SocketAddr),
 }
 
-/// How the client is handed an exposure's end on drydock's machine. Drydock
-/// chooses it; only a Unix socket for now.
+/// How a client is handed an end drydock makes on its machine: an exposure's,
+/// or an instance's endpoint carried by its parent. Drydock chooses it; only a
+/// Unix socket for now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Local {

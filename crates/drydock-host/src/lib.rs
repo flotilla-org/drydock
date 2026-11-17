@@ -78,6 +78,7 @@ impl Host {
             rate_limits: p.rate_limits(),
             ports: p.operations().into(),
             ways_in: Some(p.ways_in()),
+            endpoint: None,
         }
     }
     async fn bindings(&self) -> Vec<(String, String, Arc<dyn Provider>)> {
@@ -145,7 +146,12 @@ impl ProviderApi for Host {
             loadable_modules: self
                 .registry
                 .iter()
-                .map(|(name, m)| LoadableModule { name: name.clone(), version: m.version().into(), smallest_size: m.smallest_size() })
+                .map(|(name, m)| LoadableModule {
+                    name: name.clone(),
+                    version: m.version().into(),
+                    smallest_size: m.smallest_size(),
+                    takes_endpoint: m.takes_endpoint(),
+                })
                 .collect(),
         })
     }

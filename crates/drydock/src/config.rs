@@ -2,7 +2,7 @@
 use crate::credentials::CredentialReference;
 use drydock_agent::Target;
 use drydock_protocol::{
-    Configuration, CredentialLocation, EgressRequest, EventsConfiguration, Ownership, ProviderConfiguration, SemanticOptions, Size,
+    Configuration, CredentialLocation, EgressRequest, EventsConfiguration, Ownership, Parent, ProviderConfiguration, SemanticOptions, Size,
 };
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ pub struct Provider {
     pub semantics: SemanticOptions,
     /// How drydockd hears about this instance's environments.
     pub events: Option<EventsConfiguration>,
+    /// The instance whose machine this one's endpoint is on.
+    pub parent: Option<Parent>,
 }
 /// A registry drydock can copy images into and providers can pull them from.
 #[derive(Clone, Deserialize)]
@@ -120,6 +122,8 @@ impl Provider {
             ownership: self.ownership,
             semantics: self.semantics.clone(),
             events: self.events.clone(),
+            parent: self.parent.clone(),
+            endpoint: None,
         }
     }
 }

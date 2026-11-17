@@ -74,6 +74,42 @@ pub struct ProviderConfiguration {
     /// through, beside or instead of the module's defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub events: Option<EventsConfiguration>,
+    /// Server only: the instance whose machine this one's endpoint is on, and
+    /// that endpoint there. The parent opens each connection to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Parent>,
+    /// Set by drydockd alone, for an instance with a parent: the socket on
+    /// drydock's machine whose connections the parent carries to the
+    /// instance's endpoint. A document that sets it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Local>,
+}
+/// An instance's parent, by instance name, and the endpoint on the parent's machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Parent {
+    pub instance: String,
+    pub endpoint: Carried,
+}
+/// An endpoint on a provider's machine that it can open streams to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Carried {
+    /// An absolute Unix socket path.
+    Unix(String),
+}
+impl Carried {
+    pub fn kind(&self) -> CarriedKind {
+        match self {
+            Self::Unix(_) => CarriedKind::Unix,
+        }
+    }
+}
+/// The forms of [`Carried`] a provider can open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CarriedKind {
+    Unix,
 }
 /// How one instance hears about its environments. Without a relay drydockd
 /// lists them at the module's interval; with one it reads the relay's stream
@@ -183,6 +219,10 @@ pub struct LoadableModule {
     pub version: String,
     /// Smallest supported resource request, used when the caller has no default.
     pub smallest_size: Size,
+    /// The module's instances can be given their endpoint as
+    /// [`ProviderConfiguration::endpoint`], so they can have a parent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub takes_endpoint: bool,
 }
 /// A configured provider, the same on the server and on hosts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -197,6 +237,10 @@ pub struct ProviderDeclaration {
     /// the provider's host did not declare them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ways_in: Option<Vec<WayIn>>,
+    /// Server only: for an instance with a parent, the socket drydockd made
+    /// for its endpoint, which a client can open too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Local>,
 }
 /// Which optional operations exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -214,6 +258,10 @@ pub struct Ports {
     /// [`ImageRoute::ProviderPush`] route.
     #[serde(default)]
     pub push_access: bool,
+    /// Opens a stream to an endpoint on the provider's machine, of a form in
+    /// [`Capabilities::carries`]: what makes the provider a parent.
+    #[serde(default)]
+    pub streams: bool,
 }
 /// One way a vendor offers to hear about its environments. The installation
 /// chooses which drydockd uses.
@@ -280,10 +328,24 @@ pub struct RateLimit {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Readiness {
     Ready,
-    MissingTool { reason: String },
-    MissingCredential { reason: String },
-    VersionMismatch { reason: String },
-    Unknown { reason: String },
+    MissingTool {
+        reason: String,
+    },
+    MissingCredential {
+        reason: String,
+    },
+    VersionMismatch {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+    /// The instance's parent is not ready, and `reason` is the parent's
+    /// readiness: nothing reaches this instance's endpoint until it is.
+    ParentNotReady {
+        parent: String,
+        reason: String,
+    },
 }
 impl std::fmt::Display for Readiness {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -293,6 +355,7 @@ impl std::fmt::Display for Readiness {
             Self::MissingCredential { reason } => write!(f, "missing credential: {reason}"),
             Self::VersionMismatch { reason } => write!(f, "version mismatch: {reason}"),
             Self::Unknown { reason } => write!(f, "unknown: {reason}"),
+            Self::ParentNotReady { parent, reason } => write!(f, "parent {parent} not ready: {reason}"),
         }
     }
 }
@@ -356,6 +419,11 @@ pub struct Capabilities {
     /// What the module's operations guarantee by themselves.
     #[serde(default)]
     pub semantics: Semantics,
+    /// The endpoints on its machine the provider opens streams to, for the
+    /// instances it is the parent of; nonempty exactly when it has the
+    /// `streams` port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carries: Vec<CarriedKind>,
 }
 /// Nothing: no material, checkout, image route or optional port; open egress,
 /// unfiltered; Bake bootstrap. Modules state what differs.
@@ -382,6 +450,7 @@ impl Default for Capabilities {
             exclusive_label: false,
             reach_ways: vec![],
             semantics: Semantics::default(),
+            carries: vec![],
         }
     }
 }

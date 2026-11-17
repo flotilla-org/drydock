@@ -55,7 +55,7 @@ Docker's spec names the permission each call needs: `sandboxesRead`, `sandboxesC
 
 Credential: none. The engine has no authentication of its own: whoever can open its socket, or holds a client certificate its TLS endpoint trusts, controls it, and with it the engine's machine (a container can be made with any host path mounted, as root). Leave the instance's `credential` unset. The module reads its access from settings, and a request never carries it.
 
-`endpoint` is required: an instance without one is refused when it is configured. It is a Unix socket on drydock's machine:
+`endpoint` is required unless the instance has a `parent`: an instance with neither is refused when it is configured. It is a Unix socket on drydock's machine:
 
 ```toml
 [providers.engine]
@@ -77,6 +77,21 @@ endpoint = "tcp://engine.example.net:2376"
 tls = { ca = "/etc/drydock/engine/ca.pem", cert = "/etc/drydock/engine/cert.pem", key = "/etc/drydock/engine/key.pem" }
 ```
 
+or, for an engine on another machine, a Unix socket on a parent instance's machine, which the parent carries each connection to. The engine's socket is not exposed beyond its machine, and the instance takes no `endpoint` in its settings:
+
+```toml
+[providers.b1-engine]
+module = "docker_engine"
+image = "ubuntu@sha256:…"
+size = { cpus = 2, memory = "4GiB", disk = 0 }
+egress = "open"
+semantics = { settle = true, idempotent = true }
+parent = { instance = "b1", endpoint = { unix = "/run/user/1002/docker.sock" } }
+```
+
+- `parent` names another instance by its name, here [b1's `ssh_host` instance](#ssh-host-ssh_host-rust-host), and an endpoint on its machine, here the rootless engine's socket of the user b1's instance signs in as. drydockd makes a socket for the instance under its runtime directory, gives that to the module as its endpoint, and for each connection the module opens there asks the parent for a stream to the engine's socket. The module speaks to it as to any local socket. The child's declaration (`GET /v1/providers/b1-engine`) shows that socket as `endpoint`; `docker -H unix://<it>` reaches the same engine.
+- Refused when the configuration is read: a parent that is not configured, parents that form a cycle, a parent whose module carries no streams or not that form of endpoint (the parent's `capabilities.carries`), a `parent` beside an `endpoint` setting, and a `parent` on an instance of a module that cannot be given its endpoint (`docker_engine` is the only one that can).
+- While the parent is not ready, the child's readiness is `parent_not_ready`, naming the parent and saying why, and its calls are refused as unavailable with that reason. A stream the parent cannot open, the engine's socket missing on b1 for instance, ends the module's connection, and the module reports that as the engine not answering.
 - `endpoint` is `unix://` and an absolute path, or `tcp://` and a host and port. TCP without `tls` is refused, and so is `tls` with a socket. The engine's TLS certificate is checked against `ca` alone, for the endpoint's host: a name against the certificate's DNS names, an IP address against its IP addresses. Its common name is not read, so a server certificate made without `subjectAltName` fails each call with a TLS error that the certificate is not valid for that name.
 - drydock-host reads the three files when the instance is configured, and keeps the certificate and key in memory for as long as the configuration stands. Give them to the user drydock-host runs as, readable by it alone. A changed file takes effect when the instance is configured again. A file that cannot be read or parsed fails the configuration; a certificate the engine no longer accepts, an expired one for instance, fails each call with the TLS error, and readiness reports it.
 - Making the client certificate: Docker's [Protect the Docker daemon socket](https://docs.docker.com/engine/security/protect-access/) shows the CA, the server certificate and the client certificate (`extendedKeyUsage = clientAuth`). Any client the CA signs has full control of the engine, so use a CA of the engine's own, signing nothing else.
@@ -150,6 +165,7 @@ Every call is a command or a stream over one SSH session:
 | `systemctl --user stop drydock-<id>.service` | suspend, destroy |
 | `chmod -R u+w`, `rm -rf` | destroy: the vessel's directory |
 | a stream to `<directory>/<id>/run/drydock/agent.sock` | relay (reach) |
+| a stream to a Unix socket path a child instance names | a child's endpoint, such as a [Docker engine's](#docker-engine-docker_engine-rust-host) |
 
 - Vessels are host-direct, and the module declares them so (`host_filesystem`, `host_processes`): a vessel is the directory `<directory>/<id>/` and the processes its agent starts, as the machine's user, with the machine's processes and filesystem visible. The checkout is a clone in the vessel's directory. Egress is open and advisory: deny-all is refused. Nothing is pulled; the image is only recorded.
 - The agent runs unprivileged from the vessel's own copy, `<id>/opt/drydock/drydock-agent`, with its socket at `<id>/run/drydock/agent.sock`, as the service `drydock-<id>.service` of the user's manager. Stopping the unit ends the agent and everything it started. A vessel whose unit is not active is stopped: suspended when it was asked to be, otherwise halted. Resume starts the unit again; the directory stays. Rows carry the unit's `ActiveState` in `vendor`.
@@ -158,6 +174,7 @@ Every call is a command or a stream over one SSH session:
 - Disk: no per-vessel disk is set, so ask for a disk of 0; granted sizes have a disk of 0.
 - Quota is what the machine states: its CPUs and memory as the limits, the CPU and memory limits its running vessels' cgroups hold summed as in use (a vessel with the whole machine holds all of it), the count of running vessels, and a concurrency limit of 1 in the whole-machine case. The module refuses nothing on free room; that is the caller's to decide.
 - Each command may take 60 seconds, and the agent's upload 300. drydockd lists the vessels every 5 seconds.
+- An instance carries streams (`capabilities.carries` is `["unix"]`), so it can be the `parent` of another instance whose endpoint is on the machine: each stream is a stream to a Unix socket, by absolute path, over the session, as the agents' are, opened as `user` with that user's access. A path that is not absolute is refused; a socket that is missing or that `user` cannot open fails the stream with the session's words. Only Unix sockets are carried; a TCP endpoint on the machine is refused when the configuration is read.
 
 ## Namespace (`namespace`, TypeScript host)
 

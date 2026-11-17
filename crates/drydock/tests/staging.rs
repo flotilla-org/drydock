@@ -357,6 +357,7 @@ impl Provider for PullingProvider {
             agent_tcp_port: None,
             reach_ways: vec![],
             semantics: Default::default(),
+            carries: vec![],
         }
     }
     fn ways_in(&self) -> Vec<WayIn> {

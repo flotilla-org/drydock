@@ -2322,6 +2322,93 @@
         }
       }
     },
+    "/v1/providers/{provider}/streams": {
+      "post": {
+        "tags": [
+          "host"
+        ],
+        "operationId": "stream",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Drydock-Credential",
+            "in": "header",
+            "description": "Opaque provider credential for this request only, passed as-is; never stored or logged",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Carried"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "101": {
+            "description": "Raw byte-stream upgrade to the endpoint; request Connection: Upgrade and Upgrade: drydock-stream",
+            "headers": {
+              "Connection": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Upgrade"
+              },
+              "Upgrade": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "drydock-stream"
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        }
+      }
+    },
     "/v1/providers/{provider}/usage": {
       "get": {
         "tags": [
@@ -2459,6 +2546,13 @@
           "bootstrap": {
             "$ref": "#/components/schemas/BootstrapRoute"
           },
+          "carries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CarriedKind"
+            },
+            "description": "The endpoints on its machine the provider opens streams to, for the\ninstances it is the parent of; nonempty exactly when it has the\n`streams` port."
+          },
           "checkout_strategies": {
             "type": "array",
             "items": {
@@ -2537,6 +2631,31 @@
             "type": "string"
           }
         }
+      },
+      "Carried": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An absolute Unix socket path.",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string",
+                "description": "An absolute Unix socket path."
+              }
+            }
+          }
+        ],
+        "description": "An endpoint on a provider's machine that it can open streams to."
+      },
+      "CarriedKind": {
+        "type": "string",
+        "description": "The forms of [`Carried`] a provider can open.",
+        "enum": [
+          "unix"
+        ]
       },
       "CheckoutStrategy": {
         "type": "string",
@@ -3811,6 +3930,10 @@
             "$ref": "#/components/schemas/Size",
             "description": "Smallest supported resource request, used when the caller has no default."
           },
+          "takes_endpoint": {
+            "type": "boolean",
+            "description": "The module's instances can be given their endpoint as\n[`ProviderConfiguration::endpoint`], so they can have a parent."
+          },
           "version": {
             "type": "string"
           }
@@ -3830,7 +3953,7 @@
             }
           }
         ],
-        "description": "How the client is handed an exposure's end on drydock's machine. Drydock\nchooses it; only a Unix socket for now."
+        "description": "How a client is handed an end drydock makes on its machine: an exposure's,\nor an instance's endpoint carried by its parent. Drydock chooses it; only a\nUnix socket for now."
       },
       "MaterialMode": {
         "type": "string",
@@ -4135,6 +4258,23 @@
           "owned_account"
         ]
       },
+      "Parent": {
+        "type": "object",
+        "description": "An instance's parent, by instance name, and the endpoint on the parent's machine.",
+        "required": [
+          "instance",
+          "endpoint"
+        ],
+        "properties": {
+          "endpoint": {
+            "$ref": "#/components/schemas/Carried"
+          },
+          "instance": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "Period": {
         "type": "object",
         "description": "RFC 3339 endpoints; start must be <= end (equal endpoints are an empty interval).",
@@ -4206,6 +4346,10 @@
           },
           "quota": {
             "type": "boolean"
+          },
+          "streams": {
+            "type": "boolean",
+            "description": "Opens a stream to an endpoint on the provider's machine, of a form in\n[`Capabilities::carries`]: what makes the provider a parent."
           },
           "suspend_resume": {
             "type": "boolean"
@@ -4547,6 +4691,17 @@
               }
             ]
           },
+          "endpoint": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Local",
+                "description": "Set by drydockd alone, for an instance with a parent: the socket on\ndrydock's machine whose connections the parent carries to the\ninstance's endpoint. A document that sets it is refused."
+              }
+            ]
+          },
           "events": {
             "oneOf": [
               {
@@ -4564,6 +4719,17 @@
           "ownership": {
             "$ref": "#/components/schemas/Ownership",
             "description": "Whether drydock owns the vendor account or shares it."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Parent",
+                "description": "Server only: the instance whose machine this one's endpoint is on, and\nthat endpoint there. The parent opens each connection to it."
+              }
+            ]
           },
           "semantics": {
             "$ref": "#/components/schemas/SemanticOptions",
@@ -4594,6 +4760,17 @@
         "properties": {
           "capabilities": {
             "$ref": "#/components/schemas/Capabilities"
+          },
+          "endpoint": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Local",
+                "description": "Server only: for an instance with a parent, the socket drydockd made\nfor its endpoint, which a client can open too."
+              }
+            ]
           },
           "module": {
             "type": "string"
@@ -4982,6 +5159,29 @@
                 "type": "string",
                 "enum": [
                   "unknown"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The instance's parent is not ready, and `reason` is the parent's\nreadiness: nothing reaches this instance's endpoint until it is.",
+            "required": [
+              "parent",
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "parent": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "parent_not_ready"
                 ]
               }
             }
