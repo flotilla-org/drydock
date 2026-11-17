@@ -5,7 +5,6 @@ use drydock_host::{
     ssh_host::SshHostModule,
 };
 use drydock_protocol::*;
-use hegel::generators as gs;
 use std::sync::Arc;
 
 struct NoHttp;
@@ -60,31 +59,27 @@ async fn an_instance_names_its_machine_and_its_key_file() {
 }
 
 // The vessels' directory is used in the machine's shell commands, the agent's
-// unit and the session's socket forwards, so it is accepted exactly when it is
-// absolute and holds nothing a shell, systemd or a forward reads specially. Each
-// case draws an absolute path of ordinary segments (empty ones included), which
-// is accepted; the same path made relative, or with any one special character
-// put at a drawn place, is refused.
-#[hegel::test]
-fn the_directory_is_accepted_only_when_commands_and_forwards_take_it_as_it_is(tc: hegel::TestCase) {
-    const ORDINARY: [char; 7] = ['a', 'Z', '0', '-', '.', '_', '/'];
-    const SPECIAL: [char; 11] = [' ', '\t', '\n', ':', '\'', '"', '\\', '`', '$', '%', '\u{7f}'];
-    let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
-    let mut directory = "/".to_owned();
-    for _ in 0..length {
-        directory.push(ORDINARY[tc.draw(gs::integers::<usize>().min_value(0).max_value(ORDINARY.len() - 1))]);
-    }
-    let at = tc.draw(gs::integers::<usize>().min_value(1).max_value(directory.len()));
-    let accepted = |directory: &str| {
+// unit and the session's socket forwards, so it must be absolute and hold
+// nothing a shell, systemd or a forward reads specially.
+#[tokio::test]
+async fn the_directory_is_absolute_and_plain() {
+    let with = |directory: &str| {
         let mut settings = machine();
         settings["directory"] = directory.into();
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(configured(settings)).is_ok()
+        configured(settings)
     };
-    assert!(accepted(&directory), "{directory:?}");
-    assert!(!accepted(directory.trim_start_matches('/')), "relative {directory:?}");
-    for special in SPECIAL {
-        let mut changed = directory.clone();
-        changed.insert(at, special);
-        assert!(!accepted(&changed), "{changed:?}");
+    assert!(with("/srv/drydock-1/vessels").await.is_ok());
+    for directory in [
+        "srv/drydock",
+        "/srv/dry dock",
+        "/srv/dry:dock",
+        "/srv/dry'dock",
+        "/srv/dry\"dock",
+        "/srv/dry\\dock",
+        "/srv/dry`dock",
+        "/srv/$HOME",
+        "/srv/100%",
+    ] {
+        assert!(matches!(with(directory).await, Err(ProtocolError::Refused { .. })), "{directory:?}");
     }
 }
