@@ -218,10 +218,23 @@ impl Config {
             if let Some(unknown) = p.pull_from.iter().find(|r| !config.registries.contains_key(*r)) {
                 return Err(format!("provider {name} pulls from unknown registry {unknown:?}"));
             }
+        }
+        config.check_parents()?;
+        for (name, registry) in &config.registries {
+            registry.location().map_err(|e| format!("registry {name}: {e}"))?;
+            if registry.chunk_bytes == Some(0) {
+                return Err(format!("registry {name}: chunk_bytes must be positive"));
+            }
+        }
+        Ok(config)
+    }
+    /// Every parent is a configured instance, and no instance is its own ancestor.
+    pub fn check_parents(&self) -> Result<(), String> {
+        for (name, p) in &self.providers {
             let mut line = vec![name.as_str()];
             let mut at = p;
             while let Some(parent) = &at.parent {
-                at = config
+                at = self
                     .providers
                     .get(&parent.instance)
                     .ok_or_else(|| format!("provider {name}: parent {:?} is not configured", parent.instance))?;
@@ -232,13 +245,7 @@ impl Config {
                 line.push(&parent.instance);
             }
         }
-        for (name, registry) in &config.registries {
-            registry.location().map_err(|e| format!("registry {name}: {e}"))?;
-            if registry.chunk_bytes == Some(0) {
-                return Err(format!("registry {name}: chunk_bytes must be positive"));
-            }
-        }
-        Ok(config)
+        Ok(())
     }
     pub async fn load(path: &Path) -> Result<Self, String> {
         Self::parse(&tokio::fs::read_to_string(path).await.map_err(|e| format!("read config {}: {e}", path.display()))?)

@@ -198,7 +198,10 @@ async fn relay(
                 continue;
             }
         };
-        let Some(started) = daemon.get() else { continue };
+        let Some(started) = daemon.get() else {
+            tracing::debug!(provider = %child, "closed a connection to the child's socket: drydockd is still starting");
+            continue;
+        };
         let Some(inner) = started.upgrade() else { break };
         let child = child.clone();
         tokio::spawn(async move {
@@ -215,11 +218,6 @@ async fn relay(
                 }
             }
         });
-    }
-    if let Some(inner) = daemon.get().and_then(std::sync::Weak::upgrade)
-        && let Some(carrier) = inner.carried.get(&child)
-    {
-        let _ = std::fs::remove_file(&carrier.socket);
     }
 }
 impl Daemon {
@@ -291,6 +289,7 @@ impl Daemon {
                 unavailable.insert(name.clone(), Readiness::MissingTool { reason });
             }
         }
+        config.check_parents()?;
         let mut carried = BTreeMap::new();
         let mut relays = Vec::new();
         let daemon = Arc::new(std::sync::OnceLock::new());
