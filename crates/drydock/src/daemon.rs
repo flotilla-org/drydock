@@ -204,6 +204,7 @@ async fn relay(
         };
         let Some(inner) = started.upgrade() else { break };
         let child = child.clone();
+        let mut stopping = stopping.clone();
         tokio::spawn(async move {
             let carrier = &inner.carried[&child];
             let parent = carrier.parent.clone();
@@ -211,7 +212,10 @@ async fn relay(
             drop(inner);
             match opened {
                 Ok(mut stream) => {
-                    let _ = tokio::io::copy_bidirectional(&mut connection, &mut stream).await;
+                    tokio::select! {
+                        _ = stopping.wait_for(|stopped| *stopped) => {}
+                        _ = tokio::io::copy_bidirectional(&mut connection, &mut stream) => {}
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(provider = %child, %parent, %error, "the parent could not open a stream to the child's endpoint")
