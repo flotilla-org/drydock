@@ -526,12 +526,13 @@ service announces its exit. Absent and null `status` mean the same: not known.
 
 `DELETE /services/{name}` sends SIGTERM to the service's process group and, if
 it is still running after `grace_ms` (10 seconds by default; anything over 60
-seconds counts as 60), SIGKILL; each signal goes only to a process group the
-recorded process still leads, checked just before. Once the leader has exited
-the group is not signalled, so descendants it left running are left alone. It
-replies with the last `ServiceInfo` once the service has exited, and removes
-the record but keeps the log until the name starts again. An upgrade's drain
-does not wait for services, and `Activated.running` does not list them.
+seconds counts as 60), SIGKILL, waiting at most five seconds more; each signal
+goes only to a process group the recorded process still leads, checked just
+before. Once the leader has exited the group is not signalled, so descendants
+it left running are left alone. It replies with the last `ServiceInfo` once
+the service has exited, and removes the record but keeps the log until the
+name starts again. An upgrade's drain does not wait for services, and
+`Activated.running` does not list them.
 
 ### Configuration, forwards and restarts
 

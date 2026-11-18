@@ -18,6 +18,8 @@ pub(crate) const LOG_LIMIT: u64 = 64 * 1024 * 1024;
 const ROTATE_EVERY: Duration = Duration::from_secs(1);
 pub(crate) const DEFAULT_GRACE: Duration = Duration::from_secs(10);
 pub(crate) const MAX_GRACE: Duration = Duration::from_secs(60);
+/// Longer than this after SIGKILL, the process is stuck in the kernel.
+const KILL_WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 
 #[derive(Serialize, Deserialize)]
@@ -219,7 +221,7 @@ impl Services {
         let _held = lock.lock().await;
         let record =
             self.record(name)?.ok_or_else(|| AgentError::new("service.find", name, ErrorKind::NotFound, "no service with this name"))?;
-        for (signal, wait) in [(rustix::process::Signal::TERM, grace), (rustix::process::Signal::KILL, MAX_GRACE)] {
+        for (signal, wait) in [(rustix::process::Signal::TERM, grace), (rustix::process::Signal::KILL, KILL_WAIT)] {
             let deadline = tokio::time::Instant::now() + wait;
             if !self.signal(&record, signal) {
                 break;
@@ -293,6 +295,7 @@ impl Services {
         }
     }
     /// Rotate every log past [`LOG_LIMIT`], for as long as the agent runs.
+    /// The per-name lock keeps a start from replacing the log mid-rotation.
     pub(crate) async fn rotate_logs(self: Arc<Self>) {
         loop {
             tokio::time::sleep(ROTATE_EVERY).await;
