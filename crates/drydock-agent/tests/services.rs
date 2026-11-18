@@ -44,7 +44,10 @@ async fn a_full_log_is_rotated_keeping_one_previous_file() {
     let h = harness(false, "test-build").await;
     let info = h
         .client
-        .put_service("big", &shell(&format!("head -c 70000000 /dev/zero; touch '{}'; exec sleep 60", h.vessel().join("done").display())))
+        .put_service(
+            "big",
+            &shell(&format!("yes 0123456 | head -c 70000000; touch '{}'; exec sleep 60", h.vessel().join("done").display())),
+        )
         .await
         .unwrap();
     let log = info.log.unwrap();
@@ -54,6 +57,8 @@ async fn a_full_log_is_rotated_keeping_one_previous_file() {
     until("the log was rotated", async || done.exists() && size(&previous) > 64 * 1024 * 1024).await;
     // Rotation may come mid-write, so the rest of the output is in the log.
     assert!(size(&log) + size(&previous) <= 70_000_000 && size(&log) < 64 * 1024 * 1024);
+    let kept = std::fs::read(&previous).unwrap();
+    assert!(kept.chunks(8).all(|line| line == &b"0123456\n"[..line.len()]), "the previous log holds the service's output");
     h.client.remove_service("big", None).await.unwrap();
 }
 
@@ -81,6 +86,20 @@ async fn starting_a_service_is_idempotent_by_name() {
     assert_eq!(h.client.services().await.unwrap().len(), 1);
     h.client.remove_service("engine", None).await.unwrap();
     assert_eq!(h.client.service("engine").await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+}
+
+// A start that cannot spawn keeps the previous run's log, however often it fails.
+#[tokio::test]
+async fn a_failed_start_keeps_the_previous_log() {
+    let h = harness(false, "test-build").await;
+    let first = h.client.put_service("engine", &shell("echo first")).await.unwrap();
+    until("the first run exited", async || h.client.service("engine").await.unwrap().state != ServiceState::Running).await;
+    let missing = Service { program: "/nonexistent/engine".into(), ..Service::default() };
+    for _ in 0..2 {
+        assert_eq!(h.client.put_service("engine", &missing).await.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+    let log = first.log.unwrap();
+    assert_eq!(std::fs::read(format!("{}.1", log.display())).unwrap(), b"first\n");
 }
 
 // A service that ignores SIGTERM is killed once the grace runs out.

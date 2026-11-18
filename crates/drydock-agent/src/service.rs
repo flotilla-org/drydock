@@ -61,11 +61,10 @@ impl Services {
         match std::fs::read(self.record_path(name)) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(record) => Ok(Some(record)),
-                // Records are replaced atomically, so this is damage from outside;
-                // kept, it would bar the name from ever starting again.
+                // Records are replaced atomically, so this is damage from outside.
+                // Read as absent, the next start replaces it.
                 Err(error) => {
-                    tracing::warn!(%error, service = name, "discarding an unreadable service record");
-                    let _ = std::fs::remove_file(self.record_path(name));
+                    tracing::warn!(%error, service = name, "ignoring an unreadable service record");
                     Ok(None)
                 }
             },
@@ -137,10 +136,15 @@ impl Services {
         let (stdout, stderr) = match service.output {
             ServiceOutput::File => {
                 let log = self.log_path(name);
-                match std::fs::rename(&log, rotated(&log)) {
-                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(AgentError::io(OP, log.display(), error)),
-                    _ => {}
-                }
+                // An empty log, as a start that failed to spawn leaves, never
+                // replaces the previous one.
+                let kept = match std::fs::symlink_metadata(&log) {
+                    Ok(metadata) if metadata.len() > 0 => std::fs::rename(&log, rotated(&log)),
+                    Ok(_) => std::fs::remove_file(&log),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                };
+                kept.map_err(|e| AgentError::io(OP, log.display(), e))?;
                 let file = std::fs::OpenOptions::new()
                     .append(true)
                     .create_new(true)
@@ -266,10 +270,13 @@ impl Services {
                 // the AsyncFd owns this one (as in process.rs).
                 #[allow(deprecated)]
                 let Ok(pidfd) = tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) else { continue };
-                let (exits, events) = (self.exits.clone(), self.events.clone());
+                let (exits, events, record) = (self.exits.clone(), self.events.clone(), self.record_path(&info.name));
                 tokio::spawn(async move {
                     let _ = pidfd.readable().await;
-                    exits.lock().unwrap().insert(info.pid, None);
+                    // A service already stopped and forgotten leaves nothing to report on.
+                    if record.exists() {
+                        exits.lock().unwrap().insert(info.pid, None);
+                    }
                     events.push(Event::ServiceExited { name: info.name, pid: info.pid, status: None });
                 });
             }
