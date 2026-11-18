@@ -152,7 +152,9 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
 }
 
 /// A provision's error answer: the error class, and what it left at the vendor.
-fn provision_error(error: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+fn provision_error(
+    error: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
     use utoipa::openapi::{Ref, schema::AllOfBuilder};
     AllOfBuilder::new().item(error).item(Ref::from_schema_name("ProvisionLeft")).into()
 }
