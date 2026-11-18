@@ -70,6 +70,30 @@ fn echo(path: &Path) {
         }
     });
 }
+/// Answers each request with a Docker Engine's version, one per connection.
+fn docker(path: &Path) {
+    let listener = tokio::net::UnixListener::bind(path).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut connection, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0; 1];
+                    if connection.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let body = r#"{"Os":"linux","Arch":"amd64"}"#;
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = connection.write_all(answer.as_bytes()).await;
+            });
+        }
+    });
+}
 fn endpoint(daemon: &Daemon, name: &str) -> PathBuf {
     let declaration = daemon.providers().into_iter().find(|p| p.provider == name).unwrap();
     let Some(Local::Unix(path)) = declaration.endpoint else { panic!("{name} has no endpoint") };
@@ -97,6 +121,18 @@ async fn a_childs_connections_reach_its_endpoint_through_the_parent() {
     assert_eq!(&answer, b"two");
     first.read_exact(&mut answer).await.unwrap();
     assert_eq!(&answer, b"one");
+}
+
+// The child is configured while drydockd starts, and what its endpoint says
+// on that first connection is what the child declares.
+#[tokio::test]
+async fn a_child_configured_at_start_reaches_its_endpoint_on_its_first_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("engine.sock");
+    docker(&target);
+    let daemon = start(dir.path(), &agent::agent_binary(), &engine(&target)).await.unwrap();
+    let engine = daemon.providers().into_iter().find(|p| p.provider == "engine").unwrap();
+    assert_eq!(engine.capabilities.platforms, vec![Platform::new("linux", "amd64")]);
 }
 
 // A stream the parent cannot open ends the child's connection; the child's

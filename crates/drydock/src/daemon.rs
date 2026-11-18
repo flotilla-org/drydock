@@ -176,12 +176,15 @@ impl AgentBuilds for InstalledBuilds {
     }
 }
 /// Serves a child's socket: for each connection, the parent opens a stream to
-/// the child's endpoint, and the two are joined until either ends. Until the
-/// daemon has started, each connection is closed at once, so the child's host
-/// does not wait on itself.
+/// the child's endpoint, and the two are joined until either ends. While the
+/// daemon starts, the parent's host opens it once that host is configured, so
+/// a child's first connection, made while it is configured, reaches its
+/// endpoint.
 async fn relay(
     daemon: Arc<std::sync::OnceLock<std::sync::Weak<Inner>>>,
+    starting: tokio::sync::watch::Receiver<BTreeMap<String, Client>>,
     child: String,
+    carrier: (String, Carried),
     listener: tokio::net::UnixListener,
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -198,18 +201,23 @@ async fn relay(
                 continue;
             }
         };
-        let Some(started) = daemon.get() else {
-            tracing::debug!(provider = %child, "closed a connection to the child's socket: drydockd is still starting");
-            continue;
-        };
-        let Some(inner) = started.upgrade() else { break };
-        let child = child.clone();
-        let mut stopping = stopping.clone();
+        let (daemon, mut starting, child, (parent, endpoint), mut stopping) =
+            (daemon.clone(), starting.clone(), child.clone(), carrier.clone(), stopping.clone());
         tokio::spawn(async move {
-            let carrier = &inner.carried[&child];
-            let parent = carrier.parent.clone();
-            let opened = async { Daemon::from_inner(inner.clone()).runtime(&parent)?.stream(&parent, &carrier.endpoint).await }.await;
-            drop(inner);
+            let opened = async {
+                if daemon.get().is_none()
+                    && let Ok(host) = starting.wait_for(|hosts| hosts.contains_key(&parent)).await.map(|hosts| hosts[&parent].clone())
+                {
+                    return host.open_stream(&parent, &endpoint).await;
+                }
+                let inner = daemon.get().and_then(std::sync::Weak::upgrade);
+                let inner = inner.ok_or_else(|| Error::Transport("drydockd did not start".into()))?;
+                Daemon::from_inner(inner).runtime(&parent)?.stream(&parent, &endpoint).await
+            };
+            let opened = tokio::select! {
+                _ = stopping.wait_for(|stopped| *stopped) => return,
+                opened = opened => opened,
+            };
             match opened {
                 Ok(mut stream) => {
                     tokio::select! {
@@ -301,6 +309,8 @@ impl Daemon {
         let mut carried = BTreeMap::new();
         let mut relays = Vec::new();
         let daemon = Arc::new(std::sync::OnceLock::new());
+        // Each parent's host, from when it is started until the daemon is.
+        let starting = tokio::sync::watch::channel(BTreeMap::new()).0;
         let stopping = tokio::sync::watch::channel(false).0;
         for (name, provider) in &config.providers {
             let Some(parent) = &provider.parent else { continue };
@@ -319,7 +329,8 @@ impl Daemon {
                 tokio::net::UnixListener::bind(&socket).map_err(|e| format!("provider {name}: socket {}: {e}", socket.display()))?;
             std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
                 .map_err(|e| format!("provider {name}: socket: {e}"))?;
-            let task = tokio::spawn(relay(daemon.clone(), name.clone(), listener, stopping.subscribe()));
+            let carrier = (parent.instance.clone(), parent.endpoint.clone());
+            let task = tokio::spawn(relay(daemon.clone(), starting.subscribe(), name.clone(), carrier, listener, stopping.subscribe()));
             relays.push(Relay { task, socket: socket.clone() });
             carried.insert(name.clone(), Carrier { parent: parent.instance.clone(), endpoint: parent.endpoint.clone(), socket });
         }
@@ -357,6 +368,11 @@ impl Daemon {
                 }
                 Err(error) => return Err(error.to_string()),
             };
+            starting.send_modify(|hosts| {
+                for name in assignments[i].iter().filter(|name| carried.values().any(|c: &Carrier| &c.parent == *name)) {
+                    hosts.insert(name.clone(), handle.host.clone());
+                }
+            });
             for (name, (selected_host, module)) in &selected {
                 if *selected_host == i {
                     modules.insert(name.clone(), (hosts.len(), module.clone()));
