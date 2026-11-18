@@ -706,7 +706,7 @@ impl Provider for E2b {
     }
     /// One create, answered with the row E2B returns: its id and tokens, and
     /// no state. The label is the client's, as the request gave it.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         let mut metadata = BTreeMap::from([(LABEL_TAG.to_owned(), r.label.clone())]);
         if self.ownership == Ownership::SharedAccount {
             metadata.insert(PROVIDER_TAG.to_owned(), self.name.clone());
@@ -718,9 +718,10 @@ impl Provider for E2b {
             metadata: &metadata,
             network: network(&r.egress)?,
         };
-        let created: Sandbox = self.post(&["v2", "sandboxes"], &body, c).await?;
+        let created: Sandbox = self.post(&["v2", "sandboxes"], &body, c).await.map_err(ProvisionFailure::creating)?;
         self.keep_tokens(&created);
-        let mut environment = self.environment(created)?;
+        let id = created.id.to_string();
+        let mut environment = self.environment(created).map_err(|e| ProvisionFailure::made(e, &self.name, &id))?;
         environment.label = Some(r.label);
         Ok(Provisioned::Created(environment))
     }

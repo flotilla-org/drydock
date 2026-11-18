@@ -74,9 +74,15 @@ fn every_route_carries_typed_error_statuses() {
     for path in document["paths"].as_object().unwrap().values() {
         for operation in path.as_object().unwrap().values() {
             for error in &errors {
-                let name = format!("Error{}", error.status());
+                // A provision's handler also says what it left; a 405 comes from the router.
+                let provision = operation["operationId"] == "provision" && error.status() != 405;
+                let name = format!("{}{}", if provision { "ProvisionError" } else { "Error" }, error.status());
                 assert_eq!(operation["responses"][error.status().to_string()]["$ref"], format!("#/components/responses/{name}"));
-                let body = &document["components"]["responses"][&name]["content"]["application/json"]["schema"];
+                let mut body = &document["components"]["responses"][&name]["content"]["application/json"]["schema"];
+                if provision {
+                    assert_eq!(body["allOf"][1]["$ref"], "#/components/schemas/ProvisionLeft");
+                    body = &body["allOf"][0];
+                }
                 assert_eq!(body["properties"]["kind"]["enum"], json!([error.class()]));
                 if error.retry_after().is_some() || error.status() == 503 {
                     assert!(document["components"]["responses"][&name]["headers"]["Retry-After"].is_object());

@@ -1,8 +1,8 @@
 //! Long-lived provider routing shared by drydockd and an embedding daemon.
 use crate::{
     HostConnection, HostHandle, HostSpec, Supervisor,
-    api::{ApiError, ApiJson, ApiPath, Exposed},
-    client::{Client, Error, StatusCache},
+    api::{ApiError, ApiJson, ApiPath, Exposed, ProvisionAnswer},
+    client::{Client, Error, ProvisionError, StatusCache},
     config::{Config, Egress},
     credentials::BuiltinCredentials,
     launch::{self, ImageResolver, LaunchOptions, RegistryResolver},
@@ -454,7 +454,7 @@ impl Daemon {
         Ok(self.ready_host(provider)?.handle.client.credentialed(self.credential.clone()))
     }
     /// Mutations discard cached status reads, whatever their outcome.
-    async fn invalidating<T>(&self, provider: &str, result: Result<T, Error>) -> Result<T, Error> {
+    async fn invalidating<T, E>(&self, provider: &str, result: Result<T, E>) -> Result<T, E> {
         if let Ok(host) = self.host(provider) {
             let cache = host.cache.lock().await.1.clone();
             cache.invalidate(provider).await;
@@ -620,7 +620,7 @@ impl Daemon {
             _ => Ok(request),
         }
     }
-    pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, Error> {
+    pub async fn launch(&self, provider: &str, options: &LaunchOptions) -> Result<Environment, ProvisionError> {
         let (prepared, size) = self.prepare(provider, options).await?;
         let platform = prepared.platform.clone();
         let label = uuid::Uuid::new_v4().to_string();
@@ -648,9 +648,10 @@ impl Daemon {
         let client = host.handle.client.credentialed(self.credential.clone());
         let provisioned = self.invalidating(provider, client.provision(provider, &request).await).await?;
         if let Some(build) = agent_build {
-            self.bootstrap(&client, provider, &provisioned, build.clone()).await?;
             let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
-            self.agent_ready(provider, environment, &platform, &build).await?;
+            let left = |error| ProvisionError::made(error, provider, &environment.id);
+            self.bootstrap(&client, provider, &provisioned, build.clone()).await.map_err(left)?;
+            self.agent_ready(provider, environment, &platform, &build).await.map_err(left)?;
         }
         Ok(provisioned.into_inner())
     }
@@ -877,13 +878,14 @@ impl ProviderApi for Daemon {
         let request = self.staged(p, request.clone()).await?;
         self.runtime(p)?.prepare(p, &request).await
     }
-    async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, Error> {
+    async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, ProvisionError> {
         let keyed = self.keyed(p, request).await?;
         let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
         if self.uploads(p) {
             let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
-            let build = self.build_for(environment, Some(&request.prepared.platform)).await?;
-            self.bootstrap(&self.runtime(p)?, p, &provisioned, build).await?;
+            let left = |error| ProvisionError::made(error, p, &environment.id);
+            let build = self.build_for(environment, Some(&request.prepared.platform)).await.map_err(left)?;
+            self.bootstrap(&self.runtime(p).map_err(left)?, p, &provisioned, build).await.map_err(left)?;
         }
         Ok(provisioned)
     }
@@ -1047,7 +1049,7 @@ async fn launch_route(
     State(d): State<Arc<Daemon>>,
     ApiPath(p): ApiPath<String>,
     ApiJson(o): ApiJson<LaunchOptions>,
-) -> Result<Json<Environment>, ApiError> {
+) -> Result<Json<Environment>, ProvisionAnswer> {
     Ok(Json(d.launch(&p, &o).await?))
 }
 async fn shell_route(

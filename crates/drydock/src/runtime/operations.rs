@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     api::{ConfigUpdate, ObservationStream, ProviderApi, Provisioned},
-    client::Error,
+    client::{Error, ProvisionError},
 };
 use module::{
     ByteStream,
@@ -97,7 +97,7 @@ impl ProviderApi for Runtime {
             .call(Gate::Prepare, self.credential.clone(), |p, c| async move { prepare_for_platform(&*p, r, &c).await })
             .await?)
     }
-    async fn provision(&self, p: &str, r: &ProvisionRequest) -> ApiResult<Provisioned<Environment>> {
+    async fn provision(&self, p: &str, r: &ProvisionRequest) -> std::result::Result<Provisioned<Environment>, ProvisionError> {
         if r.prepared.provider != p {
             return Err(refused("invalid size, label or prepared provider").into());
         }

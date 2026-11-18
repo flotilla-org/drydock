@@ -13,6 +13,8 @@ use std::{collections::BTreeMap, sync::Arc};
 /// The main server masks configured credential values in public diagnostics.
 /// Credentials, tokens and reach recipes still use Secret fields.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
+/// A provision's result: a failure says what it left at the vendor.
+pub type ProvisionResult = std::result::Result<Provisioned, ProvisionFailure>;
 pub fn refused(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Refused { reason: reason.into() }
 }
@@ -151,8 +153,11 @@ pub trait Provider: Send + Sync {
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared>;
     /// drydockd hands over deny-all destinations in normal form: host names
     /// lowercase with no final dot, an IPv4 literal host as its /32 CIDR, and
-    /// IPv4 CIDRs with their host bits cleared.
-    async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned>;
+    /// IPv4 CIDRs with their host bits cleared. A step that fails after the
+    /// vendor made the environment leaves it as it is and names it in the
+    /// failure; the vendor's create call fails as
+    /// [`ProvisionFailure::creating`].
+    async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> ProvisionResult;
     /// A row becoming running emits a Running event carrying its granted_size
     /// when stated; a row without one emits Running with no size.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>>;

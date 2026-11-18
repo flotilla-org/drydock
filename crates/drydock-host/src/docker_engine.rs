@@ -349,14 +349,6 @@ impl DockerEngine {
         let made: Made = self.api.call(Method::POST, self.container_url(id, &["exec"])?, Body::json(&body)?, c).await?;
         Ok(made.id.into())
     }
-    /// `failure`, after removing the container it left; when the removal
-    /// fails too, the reason says the container may still be there.
-    async fn removed(&self, id: &str, doing: &str, failure: ProtocolError, c: &Credentials) -> ProtocolError {
-        match self.destroy(id, c).await {
-            Ok(()) => failure.context(&format!("{doing}, so it was removed")),
-            Err(e) => failure.context(&format!("{doing}; container {id} may be left on the engine, as removing it failed ({e})")),
-        }
-    }
     /// Starts the process, the engine taking the connection over for its streams.
     async fn exec_start(&self, exec: &str) -> Result<ByteStream> {
         let url = self.url(&["exec", exec, "start"])?;
@@ -457,18 +449,18 @@ impl Provider for DockerEngine {
     /// Create and start, the size as limits the engine states it enforces,
     /// the labels as container labels, under the engine's init. The container
     /// waits on `sleep` until drydockd puts the agent in and starts it.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         check_prepared(ENGINE, &self.name, &r.prepared, &r.prepared.id)?;
         let network = network_mode(&r.egress)?;
         if !(r.size.cpus.is_finite() && r.size.cpus > 0.0) {
-            return Err(refused("Docker Engine takes a positive number of CPUs"));
+            return Err(refused("Docker Engine takes a positive number of CPUs").into());
         }
         if r.size.disk_bytes != 0 {
-            return Err(refused("Docker Engine sets no per-container disk size: ask for a disk of 0"));
+            return Err(refused("Docker Engine sets no per-container disk size: ask for a disk of 0").into());
         }
         let info: Info = self.api.get(self.url(&["info"])?, c).await?;
         if let Some(reason) = unenforced(&info) {
-            return Err(refused(reason));
+            return Err(refused(reason).into());
         }
         let mut labels = BTreeMap::from([(LABEL_TAG, r.label.as_str())]);
         if self.ownership == Ownership::SharedAccount {
@@ -487,21 +479,19 @@ impl Provider for DockerEngine {
         });
         let mut url = self.url(&["containers", "create"])?;
         url.query_pairs_mut().append_pair("platform", &r.prepared.platform.to_string());
-        let made: Made = self.api.call(Method::POST, url, Body::json(&body)?, c).await?;
+        let made: Made = self.api.call(Method::POST, url, Body::json(&body)?, c).await.map_err(ProvisionFailure::creating)?;
+        let left = |e: ProtocolError, doing: &str| ProvisionFailure::made(e.context(doing), &self.name, &made.id);
         // The engine discards a limit it cannot apply and warns.
         if let Some(warnings) = made.warnings.filter(|w| !w.is_empty()) {
-            let warned = refused(format!("Docker Engine warned: {}", warnings.join("; ")));
-            return Err(self.removed(&made.id, "creating the container", warned, c).await);
+            return Err(left(refused(format!("Docker Engine warned: {}", warnings.join("; "))), "creating the container"));
         }
         let start = self.container_url(&made.id, &["start"])?;
         if let Err(e) = self.api.call::<IgnoredAny>(Method::POST, start, Body::None, c).await {
-            return Err(self.removed(&made.id, "starting the container", e, c).await);
+            return Err(left(e, "starting the container"));
         }
-        // An error answer leaves drydockd without the id, so a container kept
-        // here would be one nothing records.
         match self.container(&made.id, c).await {
             Ok(container) => Ok(Provisioned::Created(self.inspected(container))),
-            Err(e) => Err(self.removed(&made.id, "inspecting the started container", e, c).await),
+            Err(e) => Err(left(e, "inspecting the started container")),
         }
     }
     /// Every container, stopped ones included; on a shared account only those

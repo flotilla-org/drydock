@@ -195,11 +195,12 @@ impl Instance {
     /// Calls are never retried here: an `Unavailable` mutation may have happened.
     /// A `credential` is used instead of the held one, for this call only: it
     /// neither needs nor changes the held credential's admission state.
-    pub(super) async fn call<T, F, Fut>(&self, gate: Gate, credential: Option<Secret>, f: F) -> Result<T>
+    pub(super) async fn call<T, E, F, Fut>(&self, gate: Gate, credential: Option<Secret>, f: F) -> std::result::Result<T, E>
     where
         T: Send,
+        E: Failure,
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<T>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<T, E>> + Send,
     {
         use tracing::Instrument;
         let deadline = gate.deadline(self.request_timeout);
@@ -209,16 +210,23 @@ impl Instance {
             .unwrap_or_else(|_| {
                 let unknown = if gate.mutates() { "; the provider outcome is unknown" } else { "" };
                 let reason = format!("{} timed out after {}s{unknown}", gate.name(), deadline.as_secs());
-                Err(ProtocolError::unavailable(reason, None))
+                Err(E::timed_out(ProtocolError::unavailable(reason, None)))
             })
     }
     /// Resolve readiness, gate cached capabilities, enforce declared budgets, invoke,
     /// and update credential rejection state once for every route and host poll.
-    pub(super) async fn call_with_budget<T, F, Fut>(&self, gate: Gate, poll: bool, credential: Option<Secret>, f: F) -> Result<T>
+    pub(super) async fn call_with_budget<T, E, F, Fut>(
+        &self,
+        gate: Gate,
+        poll: bool,
+        credential: Option<Secret>,
+        f: F,
+    ) -> std::result::Result<T, E>
     where
         T: Send,
+        E: Failure,
         F: FnOnce(Arc<dyn Provider>, Credentials) -> Fut + Send,
-        Fut: std::future::Future<Output = Result<T>> + Send,
+        Fut: std::future::Future<Output = std::result::Result<T, E>> + Send,
     {
         let (credentials, generation) = match credential {
             Some(value) => {
@@ -227,11 +235,9 @@ impl Instance {
                 let readiness = self.provider.readiness(&credentials);
                 if !matches!(readiness, Readiness::Ready) {
                     let reason = format!("provider is not ready: {readiness}");
-                    return Err(self.diagnostic_error_for_token(
-                        ProtocolError::unavailable(reason, None),
-                        gate.name(),
-                        credentials.token(),
-                    ));
+                    return Err(self
+                        .diagnostic_error_for_token(ProtocolError::unavailable(reason, None), gate.name(), credentials.token())
+                        .into());
                 }
                 (credentials, None)
             }
@@ -245,16 +251,16 @@ impl Instance {
                 if !availability.may_call {
                     if let Some(error) = auth.rejection_error.as_ref().filter(|_| auth.rejected) {
                         // Already masked and contextualized at the original failure.
-                        return Err(error.clone());
+                        return Err(error.clone().into());
                     }
                     let reason = format!("provider is not ready: {}", availability.readiness);
-                    return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()));
+                    return Err(self.diagnostic_error(ProtocolError::unavailable(reason, None), gate.name()).into());
                 }
                 (auth.credentials.clone(), Some(auth.generation))
             }
         };
         if !gate.supported(&self.capabilities) {
-            return Err(refused("operation capability not declared"));
+            return Err(refused("operation capability not declared").into());
         }
         self.reserve(gate.name(), poll)?;
         let call_token = credentials.token().cloned();
@@ -263,8 +269,9 @@ impl Instance {
         // (including CredentialRejected) is always recorded in the same poll.
         let result = f(self.provider.clone(), credentials)
             .await
-            .map_err(|error| self.diagnostic_error_for_token(error, gate.name(), call_token.as_ref()));
+            .map_err(|error| error.map(|error| self.diagnostic_error_for_token(error, gate.name(), call_token.as_ref())));
         if let Err(error) = &result {
+            let error = error.error();
             tracing::warn!(provider = %self.name, route = gate.name(), error_class = error.class(), error = %error, "provider call failed");
         }
         if let Some(generation) = generation {
@@ -272,15 +279,16 @@ impl Instance {
         }
         result
     }
-    pub(super) fn finish_call<T>(&self, generation: u64, poll: bool, operation: &str, result: &Result<T>) {
+    pub(super) fn finish_call<T, E: Failure>(&self, generation: u64, poll: bool, operation: &str, result: &std::result::Result<T, E>) {
+        let result = result.as_ref().map_err(Failure::error);
         let mut auth = self.auth.recover();
         let before = self.readiness(&auth);
         if auth.generation == generation {
             if poll {
-                *self.poll_error.recover() = result.as_ref().err().cloned();
+                *self.poll_error.recover() = result.err().cloned();
             }
             if matches!(result, Err(ProtocolError::CredentialRejected { .. })) {
-                auth.rejection_error = result.as_ref().err().cloned();
+                auth.rejection_error = result.err().cloned();
                 auth.rejected = true;
                 auth.generation += 1; // invalidate every call started before this rejection
             }
@@ -367,4 +375,34 @@ impl Instance {
 // refusal rather than panic after the cached capability gate has admitted it.
 pub(super) fn operation_port<T: ?Sized>(port: Option<&T>) -> Result<&T> {
     port.ok_or_else(|| refused("operation port unavailable"))
+}
+
+/// A call's failure: a protocol error, or a provision's, which says what it
+/// left at the vendor.
+pub(super) trait Failure: From<ProtocolError> + Send {
+    fn error(&self) -> &ProtocolError;
+    fn map(self, f: impl FnOnce(ProtocolError) -> ProtocolError) -> Self;
+    /// The call outlived its deadline, with no answer.
+    fn timed_out(error: ProtocolError) -> Self {
+        error.into()
+    }
+}
+impl Failure for ProtocolError {
+    fn error(&self) -> &ProtocolError {
+        self
+    }
+    fn map(self, f: impl FnOnce(ProtocolError) -> ProtocolError) -> Self {
+        f(self)
+    }
+}
+impl Failure for ProvisionFailure {
+    fn error(&self) -> &ProtocolError {
+        &self.error
+    }
+    fn map(self, f: impl FnOnce(ProtocolError) -> ProtocolError) -> Self {
+        Self { error: f(self.error), left: self.left }
+    }
+    fn timed_out(error: ProtocolError) -> Self {
+        Self::unknown(error)
+    }
 }

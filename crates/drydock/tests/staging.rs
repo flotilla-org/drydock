@@ -383,7 +383,7 @@ impl Provider for PullingProvider {
             tools_digest: r.tools_digest,
         })
     }
-    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ModuleResult<drydock_host::module::Provisioned> {
+    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> drydock_host::module::ProvisionResult {
         unimplemented!()
     }
     async fn list(&self, _: &Credentials) -> ModuleResult<Vec<Environment>> {

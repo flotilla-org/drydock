@@ -56,6 +56,13 @@ struct ReferenceSettings {
     /// stand-in vessel is the test host.
     #[serde(default)]
     host_filesystem: bool,
+    /// Return the environment a label names. Without it a label is a tag, as
+    /// on most vendors, and each provision creates.
+    #[serde(default = "default_exclusive_label")]
+    exclusive_label: bool,
+}
+fn default_exclusive_label() -> bool {
+    true
 }
 fn default_workspace_root() -> String {
     "/workspace".into()
@@ -158,7 +165,7 @@ impl Provider for Reference {
             quota: true,
             host_filesystem: self.settings.host_filesystem,
             host_processes: false,
-            exclusive_label: true,
+            exclusive_label: self.settings.exclusive_label,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
             semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
@@ -179,10 +186,10 @@ impl Provider for Reference {
         });
         Ok(Prepared { tools_digest: r.tools_digest, ..prepared.clone() })
     }
-    async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> ProvisionResult {
         self.check()?;
         let mut state = self.state.recover();
-        if let Some(s) = state.environments.values().find(|s| s.label.as_deref() == Some(&r.label)) {
+        if let Some(s) = state.environments.values().find(|s| self.settings.exclusive_label && s.label.as_deref() == Some(&r.label)) {
             return Ok(Provisioned::Existing(Environment {
                 egress_measured: true,
                 timestamp: state.provider_timestamp.map(Into::into),
@@ -190,10 +197,10 @@ impl Provider for Reference {
             }));
         }
         if !state.prepared.values().any(|p| Prepared { tools_digest: r.prepared.tools_digest.clone(), ..p.clone() } == r.prepared) {
-            return Err(refused("unknown prepared form"));
+            return Err(refused("unknown prepared form").into());
         }
         if matches!(&r.egress,EgressRequest::DenyAll {direct} if !direct.is_empty()) {
-            return Err(refused("reference cannot implement direct destinations"));
+            return Err(refused("reference cannot implement direct destinations").into());
         }
         state.next += 1;
         let s = Environment {

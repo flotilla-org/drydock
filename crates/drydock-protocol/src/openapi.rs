@@ -109,6 +109,7 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
         for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
             let provision = operation.operation_id.as_deref() == Some("provision");
             provisions += usize::from(provision);
+            // A 405 comes from the router, before the provision handler runs.
             for (status, class) in [
                 ("404", "not_found"),
                 ("405", "method_not_allowed"),
@@ -120,6 +121,7 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
                 ("424", "command_failed"),
                 ("500", "internal"),
             ] {
+                let provision = provision && status != "405";
                 let name = if provision { format!("ProvisionError{status}") } else { format!("Error{status}") };
                 let Some(RefOr::T(mut response)) = operation.responses.responses.get(status).cloned() else {
                     panic!("missing error response")
@@ -161,15 +163,6 @@ fn provision_error(
 
 /// The `left` field every provision error answer carries.
 fn provision_left() -> utoipa::openapi::schema::Schema {
-    use utoipa::openapi::{
-        Ref,
-        schema::{ObjectBuilder, OneOfBuilder, Type},
-    };
-    let left = OneOfBuilder::new()
-        .item(Ref::from_schema_name("Left"))
-        .item(ObjectBuilder::new().schema_type(Type::Null))
-        .description(Some(
-            "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none.",
-        ));
-    ObjectBuilder::new().property("left", left).required("left").into()
+    use utoipa::openapi::{Ref, schema::ObjectBuilder};
+    ObjectBuilder::new().property("left", Ref::from_schema_name("Left")).required("left").into()
 }

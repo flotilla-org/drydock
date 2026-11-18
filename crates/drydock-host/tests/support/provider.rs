@@ -1,6 +1,6 @@
 // The one fake provider shared by the bridge, loader and runtime tests.
 #![allow(dead_code)]
-use drydock_host::module::{HttpClient, Provisioned};
+use drydock_host::module::HttpClient;
 use drydock_host::reference;
 use drydock_protocol::*;
 use std::time::Duration;
@@ -145,7 +145,7 @@ impl drydock_host::module::Provider for ControlledProvider {
         }
         self.inner.prepare(r, c).await
     }
-    async fn provision(&self, r: ProvisionRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &drydock_host::module::Credentials) -> drydock_host::module::ProvisionResult {
         self.control.provisioned.lock().unwrap().push(r.egress.clone());
         self.inner.provision(r, c).await
     }

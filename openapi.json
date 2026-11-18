@@ -597,7 +597,7 @@
             "$ref": "#/components/responses/ProvisionError404"
           },
           "405": {
-            "$ref": "#/components/responses/ProvisionError405"
+            "$ref": "#/components/responses/Error405"
           },
           "422": {
             "$ref": "#/components/responses/ProvisionError422"
@@ -3830,20 +3830,62 @@
         "description": "Where an inward exposure's connections go, in the vessel."
       },
       "Left": {
-        "type": "object",
-        "description": "An environment a failed provision left. It names its provider, as the\nrequest path did, so that it is the whole of what destroy needs.",
-        "required": [
-          "provider",
-          "id"
-        ],
-        "properties": {
-          "id": {
-            "type": "string"
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The vendor made this environment before a later step failed. It names\nits provider, as the request path did, so that it is the whole of what\ndestroy needs.",
+            "required": [
+              "provider",
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "made"
+                ]
+              },
+              "provider": {
+                "type": "string"
+              }
+            }
           },
-          "provider": {
-            "type": "string"
+          {
+            "type": "object",
+            "description": "The vendor made nothing.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Whether the vendor made anything cannot be known: its answer to the\ncreate was lost.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
           }
-        }
+        ],
+        "description": "What a failed provision left at the vendor. Nothing removes what it left:\nit stays listed under the request's label, a provision under that label\ntakes it up, and destroy removes it."
       },
       "LoadableModule": {
         "type": "object",
@@ -4739,15 +4781,7 @@
         ],
         "properties": {
           "left": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Left"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
+            "$ref": "#/components/schemas/Left"
           }
         }
       },
@@ -5983,38 +6017,6 @@
                       "type": "string",
                       "enum": [
                         "not_found"
-                      ]
-                    },
-                    "reason": {
-                      "type": "string"
-                    }
-                  }
-                },
-                {
-                  "$ref": "#/components/schemas/ProvisionLeft"
-                }
-              ]
-            }
-          }
-        }
-      },
-      "ProvisionError405": {
-        "description": "MethodNotAllowed",
-        "content": {
-          "application/json": {
-            "schema": {
-              "allOf": [
-                {
-                  "type": "object",
-                  "required": [
-                    "reason",
-                    "kind"
-                  ],
-                  "properties": {
-                    "kind": {
-                      "type": "string",
-                      "enum": [
-                        "method_not_allowed"
                       ]
                     },
                     "reason": {

@@ -182,7 +182,8 @@ and its labels in `vendor`, beside the coarse `state`. It declares no
 guarantee beyond `token_is_id`: drydockd adds waiting, idempotence and
 ownership as the instance's `semantics` and `ownership` ask (see the
 top-level README). Sandboxes are named by Daytona; a label is a tag, and
-provisioning a label twice makes two sandboxes.
+drydockd takes up the live sandbox a label names (see the top-level README's
+Labels).
 
 | Verb | Daytona calls |
 |---|---|

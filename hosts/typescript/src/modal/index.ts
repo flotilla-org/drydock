@@ -14,6 +14,8 @@ import {
 } from "modal";
 import { parseImageRef, type ImageRef } from "../oci.js";
 import {
+  creating,
+  made,
   ProtocolFailure,
   refused,
   type Context,
@@ -508,8 +510,9 @@ class Modal implements Provider {
         throw protocolError(error);
       }
       signal.throwIfAborted();
-      const sandbox = await call(() =>
-        client.sandboxes.create(app, image, {
+      let sandbox: Sandbox;
+      try {
+        sandbox = await client.sandboxes.create(app, image, {
           tags,
           cpu,
           memoryMiB,
@@ -517,10 +520,16 @@ class Modal implements Provider {
           runtime: this.settings.runtime,
           command: ["sleep", "infinity"],
           ...network,
-        }),
-      );
+        });
+      } catch (error) {
+        // Modal never scheduled the create, for want of capacity.
+        if (error instanceof ResourceExhaustedError) throw protocolError(error);
+        throw creating(protocolError(error));
+      }
       try {
         await this.ensureAgent(sandbox);
+      } catch (error) {
+        throw made(protocolError(error), this.name, sandbox.sandboxId);
       } finally {
         sandbox.detach();
       }

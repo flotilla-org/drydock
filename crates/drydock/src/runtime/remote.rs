@@ -124,8 +124,11 @@ impl Provider for RemoteProvider {
     async fn prepare(&self, request: PrepareRequest, c: &Credentials) -> Result<Prepared> {
         self.host(c).prepare(self.name(), &request).await.map_err(mutation)
     }
-    async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        self.host(c).provision(self.name(), &request).await.map_err(mutation)
+    async fn provision(&self, request: ProvisionRequest, c: &Credentials) -> ProvisionResult {
+        self.host(c)
+            .provision(self.name(), &request)
+            .await
+            .map_err(|failure| ProvisionFailure { error: mutation(failure.error), left: failure.left })
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         self.host(c).list(self.name()).await.map_err(error)

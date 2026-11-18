@@ -116,9 +116,10 @@ wait`, `ingress access` and `containerregistry *`,
   never runs, so the create is followed by drydock's agent as the service
   `drydock-agent` (`/opt/drydock/drydock-agent`, on boot, always restarted,
   keeping the devbox awake); if the service cannot be added provision fails
-  and leaves the devbox, naming its id, for the client to inspect or destroy.
-  It keeps billing until destroyed, and a retry makes another devbox. A label is the client's name: provisioning it
-  again makes another devbox. An unknown prepared form is Namespace's refusal.
+  and leaves the devbox, its `left` naming it, for the client to inspect or
+  destroy. It keeps billing until destroyed. A label is a tag, and drydockd
+  takes up the live devbox a label names. An unknown prepared form is
+  Namespace's refusal.
 - Reach is this host's relay route, with no call to Namespace; the relay is an
   SSH exec channel over the SDK's gateway running `drydock-agent --bridge`,
   since the gateway refuses Unix-socket forwards. Opening it is Namespace's
@@ -188,8 +189,8 @@ and sandbox backend from those, so run the host without them.
   sandbox in the app whose id it is given.
 - Provision is one create of an unnamed sandbox, tagged `flotilla.label` with
   the client's label and, on a `shared_account` (the default), `drydock.provider`
-  with the instance; on an `owned_account` nothing else is tagged. A label is
-  the client's, so provisioning it twice makes two sandboxes. The sandbox has a
+  with the instance; on an `owned_account` nothing else is tagged. A label is a
+  tag, and drydockd takes up the live sandbox a label names. The sandbox has a
   timeout of `lifetime_seconds`, CPUs and whole MiB of memory, and
   `sleep infinity` as its command, which only keeps it alive. Modal's disk is
   fixed and cannot be sized, so a requested disk is accepted and not applied.
@@ -204,9 +205,10 @@ and sandbox backend from those, so run the host without them.
   Modal's configuration. drydockd cannot start the agent itself: its upload
   bootstrap needs the files and exec ports this host does not offer, and
   listens on loopback. A sandbox whose agent does not start is left as it is:
-  provision fails, and the sandbox stays listed under its label until it is
-  destroyed. Until then it runs, and is billed, for up to `lifetime_seconds`
-  (default 24 hours), the only bound until drydock#292. The SDK takes no abort signal, so a cancelled call stops between
+  provision fails, its `left` naming the sandbox, which stays listed under its
+  label until the client destroys it or provisions the label into it. Until
+  then it runs, and is billed, for up to `lifetime_seconds` (default 24
+  hours). The SDK takes no abort signal, so a cancelled call stops between
   SDK calls, never during one.
 - Reach is `dial`: the agent's TCP listener behind Modal's connect-token edge,
   which drydock dials itself. Each reach mints a connect token for port 7811

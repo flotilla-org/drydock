@@ -99,7 +99,7 @@ async fn held(daemon: &Daemon) -> Option<Environment> {
     webhooks::held(daemon, SANDBOX).await
 }
 /// A provision of the `vessel` label, answered once the settling wait ends.
-fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned, drydock::client::Error>> {
+fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned, drydock::client::ProvisionError>> {
     let prepared = Prepared {
         provider: "daytona".into(),
         id: "snapshot".into(),
@@ -369,5 +369,6 @@ async fn a_wait_completes_on_a_webhook_event_without_a_poll() {
     assert_eq!(vendor_state.state, "started");
     assert_eq!(vendor_state.tags.unwrap()[OWNER_TAG], "daytona");
     assert_eq!(environment.label.as_deref(), Some("vessel"));
-    assert_eq!(vendor.lists.load(SeqCst), lists, "the wait asked for a poll");
+    // One list is the provision's, finding nothing under its label.
+    assert_eq!(vendor.lists.load(SeqCst), lists + 1, "the wait asked for a poll");
 }

@@ -194,7 +194,11 @@ impl ProviderApi for Host {
     async fn prepare(&self, p: &str, r: &PrepareRequest) -> ApiResult<Prepared> {
         Ok(prepare_for_platform(&*self.instance(p).await?, r.clone(), &self.credentials).await?)
     }
-    async fn provision(&self, p: &str, r: &ProvisionRequest) -> ApiResult<Provisioned<Environment>> {
+    async fn provision(
+        &self,
+        p: &str,
+        r: &ProvisionRequest,
+    ) -> std::result::Result<Provisioned<Environment>, drydock_client::ProvisionError> {
         Ok(self.instance(p).await?.provision(r.clone(), &self.credentials).await?)
     }
     async fn list(&self, p: &str) -> ApiResult<Vec<Environment>> {

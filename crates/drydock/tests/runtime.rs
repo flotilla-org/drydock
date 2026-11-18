@@ -498,6 +498,19 @@ async fn partial_factory_failure_preserves_configuration() {
 
 // Loopback enforcement belongs to Rigging, so the host must propagate its refusal
 // without creating a token file or introducing its own parallel bind/auth policy.
+// On a module whose labels are only tags, a provision under a label that
+// already names an environment of the instance takes it up.
+#[tokio::test]
+async fn a_label_names_one_environment() {
+    let h = Harness::start().await;
+    h.configure(vec![provider("a", json!({"exclusive_label": false}))]).await;
+    h.credential("a", "one").await;
+    let prepared = h.prepared("a").await;
+    let made = h.provision("a", "vessel", &prepared, 201).await;
+    assert_eq!(h.provision("a", "vessel", &prepared, 200).await.id, made.id);
+    assert!(h.providers().await[0].capabilities.exclusive_label);
+}
+
 #[tokio::test]
 async fn tcp_refuses_nonloopback_bind() {
     let dir = tempfile::tempdir().unwrap();

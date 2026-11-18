@@ -159,7 +159,7 @@ mod operation_tests {
         async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
             self.0.prepare(r, c).await
         }
-        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> module::ProvisionResult {
             self.0.provision(r, c).await
         }
         async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
@@ -192,7 +192,7 @@ mod operation_tests {
         async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
             Ok(Prepared { platform: Platform::new("linux", "riscv64"), ..self.0.prepare(r, c).await? })
         }
-        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+        async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> module::ProvisionResult {
             self.0.provision(r, c).await
         }
         async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
@@ -714,7 +714,7 @@ mod semantics_layer {
             self.0.prepare(r, c).await
         }
         // A create answer with no vendor row, so no tags, as E2B's is.
-        async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> Result<Provisioned> {
+        async fn provision(&self, r: ProvisionRequest, _: &Credentials) -> module::ProvisionResult {
             let made = Environment { label: Some(r.label), vendor: None, ..environment("a", serde_json::json!({"state": "running"})) };
             self.1.rows.recover().push(tagged("a"));
             Ok(Provisioned::Created(made))
@@ -936,7 +936,11 @@ mod semantics_layer {
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), caller.provision("a", &request))
             .await
             .expect("the wait answers before its deadline");
-        let Err(crate::client::Error::Protocol(ProtocolError::Unavailable { reason, .. })) = result else { panic!("{result:?}") };
+        let Err(crate::client::ProvisionError { error: crate::client::Error::Protocol(ProtocolError::Unavailable { reason, .. }), .. }) =
+            result
+        else {
+            panic!("{result:?}")
+        };
         assert!(reason.contains("cannot confirm environment e is running") && reason.contains("missing credential"), "{reason}");
     }
 

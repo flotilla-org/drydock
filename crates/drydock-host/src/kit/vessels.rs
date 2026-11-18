@@ -232,8 +232,7 @@ impl<M: Machine> Vessels<M> {
             vendor: found.vendor,
         }
     }
-    /// Start the vessel's agent and return once it answers hello; a start that
-    /// fails is stopped again.
+    /// Start the vessel's agent and return once it answers hello.
     async fn start(&self, id: &str, record: &Record, c: &Credentials) -> Result<()> {
         self.machine.launch(id, record, c).await?;
         let ready = tokio::time::timeout(STARTUP, async {
@@ -249,11 +248,7 @@ impl<M: Machine> Vessels<M> {
             }
         })
         .await;
-        let result = ready.unwrap_or_else(|_| Err(unavailable(format!("agent did not answer hello within {STARTUP:?}"))));
-        if result.is_err() {
-            let _ = self.machine.stop(id, c).await;
-        }
-        result
+        ready.unwrap_or_else(|_| Err(unavailable(format!("agent did not answer hello within {STARTUP:?}"))))
     }
 }
 
@@ -285,7 +280,7 @@ impl<M: Machine> Provider for Vessels<M> {
             tools_digest: r.tools_digest,
         })
     }
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         let _changing = self.lifecycle.lock().await;
         let id = environment_id(self.machine.prefix(), &r.label);
         // Only an absent vessel is created. An unreadable or corrupt record is an
@@ -295,32 +290,33 @@ impl<M: Machine> Provider for Vessels<M> {
                 return Ok(Provisioned::Existing(self.environment(found)));
             }
             Ok(_) => {
-                return Err(refused(format!("label {:?} collides with the id of another environment; use a different label", r.label)));
+                return Err(
+                    refused(format!("label {:?} collides with the id of another environment; use a different label", r.label)).into()
+                );
             }
             Err(ProtocolError::NotFound { .. }) => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
         if r.prepared.provider != self.name
             || self.machine.platform().as_ref() != Some(&r.prepared.platform)
             || r.prepared.id != prepared_id(&r.prepared.image_digest, &r.prepared.platform)
         {
-            return Err(refused("unknown prepared form"));
+            return Err(refused("unknown prepared form").into());
         }
         if let EgressRequest::DenyAll { .. } = r.egress {
             return Err(refused(
                 "host-direct vessels share their machine's network, so deny-all egress cannot be enforced; request open egress",
-            ));
+            )
+            .into());
         }
         let (size, grant) = self.machine.grant(&r.size, c).await?;
         let record = Record { label: Some(r.label), size: Some(size), platform: Some(r.prepared.platform), grant };
         self.machine.create(&id, &record, c).await?;
+        let left = |error| ProvisionFailure::made(error, &self.name, &id);
         // Reads take no lock, so a list during this start can show the new vessel
-        // as stopped, and as gone again if the start fails.
-        if let Err(error) = self.start(&id, &record, c).await {
-            let _ = self.machine.remove(&id, c).await;
-            return Err(error);
-        }
-        Ok(Provisioned::Created(self.environment(self.found(&id, c).await?)))
+        // as stopped.
+        self.start(&id, &record, c).await.map_err(left)?;
+        Ok(Provisioned::Created(self.environment(self.found(&id, c).await.map_err(left)?)))
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         let mut found = self.machine.vessels(None, c).await?;

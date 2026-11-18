@@ -438,7 +438,7 @@ impl Provider for DockerSandboxes {
     }
     /// One create, answered with Docker's row. The owner tag goes on only on a
     /// shared account; no policy goes on, since only open egress is taken.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         check_prepared(DOCKER, &self.name, &r.prepared, &r.prepared.image_digest)?;
         check_egress(&r.egress)?;
         let mut labels = BTreeMap::from([(LABEL_TAG, r.label.as_str())]);
@@ -452,7 +452,11 @@ impl Provider for DockerSandboxes {
             "labels": labels,
         });
         let c = &self.access(c).await?;
-        let created: Sandbox = self.api.call(Method::POST, self.api.url(&["v1", "sandboxes"])?, Body::json(&body)?, c).await?;
+        let created: Sandbox = self
+            .api
+            .call(Method::POST, self.api.url(&["v1", "sandboxes"])?, Body::json(&body)?, c)
+            .await
+            .map_err(ProvisionFailure::creating)?;
         Ok(Provisioned::Created(self.environment(created)))
     }
     /// Every sandbox the credential's owner has, every page: Docker filters by
