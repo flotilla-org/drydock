@@ -102,12 +102,12 @@ impl ProviderApi for Runtime {
             return Err(refused("invalid size, label or prepared provider").into());
         }
         let instance = self.instance(p).await?;
-        let generation = *instance.observation_generation.recover();
         let r = ProvisionRequest { egress: normal(&r.egress), ..r.clone() };
         let _held = match &instance.labels {
             Some(labels) => Some(labels.hold(&r.label).await),
             None => None,
         };
+        let generation = *instance.observation_generation.recover();
         let result = instance.call(Gate::Provision, self.credential.clone(), |p, c| async move { p.provision(r, &c).await }).await?;
         let (Provisioned::Created(row) | Provisioned::Existing(row)) = &result;
         cache_observation(&instance, row, generation);
