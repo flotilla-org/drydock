@@ -27,8 +27,6 @@ struct Record {
     /// The process's start time, which a reused PID does not share.
     started: u64,
 }
-/// The PID that exited, and its status when known.
-type Exit = (u32, Option<ExitStatus>);
 /// A running process as the kernel reports it.
 struct Live {
     started: u64,
@@ -40,9 +38,9 @@ pub(crate) struct Services {
     events: Arc<crate::events::Events>,
     /// Starts, stops and rotations of one name never interleave.
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Exits this agent process saw, by name, with the PID that exited. The
-    /// status is known only for services this process started.
-    exits: Arc<Mutex<HashMap<String, Exit>>>,
+    /// Exits this agent process saw, by PID. The status is known only for
+    /// services this process started.
+    exits: Arc<Mutex<HashMap<u32, Option<ExitStatus>>>>,
     /// Children of this process whose exit is not recorded in `exits` yet.
     waiting: Arc<Mutex<std::collections::HashSet<u32>>>,
 }
@@ -79,8 +77,8 @@ impl Services {
         live(record.pid).is_some_and(|live| live.started == record.started)
     }
     fn info(&self, name: &str, record: &Record) -> ServiceInfo {
-        let state = match self.exits.lock().unwrap().get(name) {
-            Some((pid, status)) if *pid == record.pid => ServiceState::Exited { status: *status },
+        let state = match self.exits.lock().unwrap().get(&record.pid) {
+            Some(status) => ServiceState::Exited { status: *status },
             _ if Self::running(record) => ServiceState::Running,
             _ => ServiceState::Exited { status: None },
         };
@@ -118,13 +116,14 @@ impl Services {
         check_name(name)?;
         let lock = self.lock(name);
         let _held = lock.lock().await;
-        if let Some(record) = self.record(name)?
-            && self.info(name, &record).state == ServiceState::Running
+        let previous = self.record(name)?;
+        if let Some(record) = &previous
+            && self.info(name, record).state == ServiceState::Running
         {
             if record.service != service {
                 return Err(AgentError::new(OP, name, ErrorKind::Conflict, "a service with this name runs from a different request"));
             }
-            return Ok((self.info(name, &record), false));
+            return Ok((self.info(name, record), false));
         }
         if service.environment.iter().any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
             return Err(AgentError::new("service.environment", name, ErrorKind::InvalidInput, "invalid service environment"));
@@ -161,7 +160,11 @@ impl Services {
         }
         command.process_group(0).kill_on_drop(false);
         let mut child = command.spawn().map_err(|e| AgentError::io(OP, &service.program, e))?;
-        let pid = child.id().unwrap_or_default();
+        let Some(pid) = child.id() else {
+            return Err(AgentError::io(OP, name, io::Error::other("the started service was reaped before its PID was read")));
+        };
+        // A service that has already exited has no start time: recorded as 0,
+        // it never reads as running.
         let record = Record { service, pid, started: live(pid).map_or(0, |live| live.started) };
         let written = serde_json::to_vec(&record)
             .map_err(io::Error::other)
@@ -173,7 +176,12 @@ impl Services {
             tokio::spawn(async move { child.wait().await });
             return Err(AgentError::io(OP, name, error));
         }
-        self.exits.lock().unwrap().remove(name);
+        let mut exits = self.exits.lock().unwrap();
+        exits.remove(&pid);
+        if let Some(previous) = previous {
+            exits.remove(&previous.pid);
+        }
+        drop(exits);
         self.waiting.lock().unwrap().insert(pid);
         let (exits, waiting, events, name_owned) = (self.exits.clone(), self.waiting.clone(), self.events.clone(), name.to_owned());
         tokio::spawn(async move {
@@ -187,7 +195,7 @@ impl Services {
                     None
                 }
             };
-            exits.lock().unwrap().insert(name_owned.clone(), (pid, status));
+            exits.lock().unwrap().insert(pid, status);
             waiting.lock().unwrap().remove(&pid);
             events.push(Event::ServiceExited { name: name_owned, pid, status });
         });
@@ -223,7 +231,7 @@ impl Services {
             return Err(AgentError::new("service.stop", name, ErrorKind::TimedOut, "the service outlived SIGKILL"));
         }
         std::fs::remove_file(self.record_path(name)).map_err(|e| AgentError::io("service.stop", name, e))?;
-        self.exits.lock().unwrap().remove(name);
+        self.exits.lock().unwrap().remove(&record.pid);
         Ok(info)
     }
     /// Signal the group the service leads, checked just before, so a reused
@@ -261,7 +269,7 @@ impl Services {
                 let (exits, events) = (self.exits.clone(), self.events.clone());
                 tokio::spawn(async move {
                     let _ = pidfd.readable().await;
-                    exits.lock().unwrap().insert(info.name.clone(), (info.pid, None));
+                    exits.lock().unwrap().insert(info.pid, None);
                     events.push(Event::ServiceExited { name: info.name, pid: info.pid, status: None });
                 });
             }
@@ -275,8 +283,9 @@ impl Services {
             tokio::time::sleep(ROTATE_EVERY).await;
             let services = self.clone();
             let due = tokio::task::spawn_blocking(move || {
-                let services = services.list().unwrap_or_default().into_iter();
-                services.filter_map(|info| Some((info.name, info.log?))).filter(|(_, log)| full(log)).collect::<Vec<_>>()
+                let entries = std::fs::read_dir(&services.dir).into_iter().flatten().flatten();
+                let logs = entries.filter_map(|entry| Some((entry.file_name().to_str()?.strip_suffix(".log")?.to_owned(), entry.path())));
+                logs.filter(|(name, log)| check_name(name).is_ok() && full(log)).collect::<Vec<_>>()
             });
             for (name, log) in due.await.unwrap_or_default() {
                 let lock = self.lock(&name);
