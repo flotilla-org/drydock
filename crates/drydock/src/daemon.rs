@@ -205,6 +205,8 @@ async fn relay(
             (daemon.clone(), starting.clone(), child.clone(), carrier.clone(), stopping.clone());
         tokio::spawn(async move {
             let opened = async {
+                // Until then the parent's Runtime has not committed it, so the
+                // stream skips its readiness check and rate budget.
                 if daemon.get().is_none()
                     && let Ok(host) = starting.wait_for(|hosts| hosts.contains_key(&parent)).await.map(|hosts| hosts[&parent].clone())
                 {
