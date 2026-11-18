@@ -88,6 +88,8 @@ impl HostStatus {
 }
 pub struct HostHandle {
     pub client: runtime::Runtime,
+    /// The host's own API, without the runtime's admission and budgets.
+    pub host: Client,
     pub status: watch::Receiver<HostStatus>,
     instances: Vec<String>,
     task: JoinHandle<()>,
@@ -228,7 +230,7 @@ impl Supervisor {
             let _lease = lease;
             supervisor.run(spec, socket, host_client, policy, status).await;
         });
-        Ok(HostHandle { client: public_client, status: receiver, instances, task })
+        Ok(HostHandle { client: public_client, host: client, status: receiver, instances, task })
     }
     async fn refresh(
         &self,
@@ -329,9 +331,7 @@ impl Supervisor {
             // The host receives the document without server-only keys.
             let mut document = spec.configuration.clone();
             for provider in document.providers.values_mut() {
-                provider.credential = None;
-                provider.semantics = Default::default();
-                provider.events = None;
+                *provider = provider.for_host();
             }
             loop {
                 if let Some(child) = &mut child
@@ -369,7 +369,8 @@ impl Supervisor {
                             Readiness::MissingTool { reason }
                             | Readiness::MissingCredential { reason }
                             | Readiness::VersionMismatch { reason }
-                            | Readiness::Unknown { reason } => *reason = masker.text(reason),
+                            | Readiness::Unknown { reason }
+                            | Readiness::ParentNotReady { reason, .. } => *reason = masker.text(reason),
                         }
                         if let Some(readiness) = unavailable.remove(&provider.provider) {
                             provider.readiness = readiness;
@@ -458,6 +459,7 @@ mod tests {
             let (_sender, status) = watch::channel(HostStatus::new(readiness.clone(), 0));
             let mut handle = HostHandle {
                 client: runtime::Runtime::new(Default::default()),
+                host: Client::unix(Path::new("/nonexistent")).unwrap(),
                 status,
                 instances: vec![],
                 task: tokio::spawn(std::future::pending()),

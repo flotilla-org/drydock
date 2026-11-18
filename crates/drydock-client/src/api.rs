@@ -79,6 +79,12 @@ pub trait ProviderApi: Send + Sync {
     async fn usage(&self, provider: &str, period: &Period) -> Result<Usage, Error>;
     async fn relay(&self, provider: &str, id: &str) -> Result<ByteStream, Error>;
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error>;
+    /// Host only: a stream to an endpoint on the provider's machine, through
+    /// its streams port. drydockd opens these for its children alone and does
+    /// not serve this.
+    async fn stream(&self, _provider: &str, _endpoint: &Carried) -> Result<ByteStream, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
     /// Write one file into a guest, through the provider's files port.
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
     /// Mint push access to the provider's own registry.
@@ -215,6 +221,9 @@ impl ProviderApi for Client {
     async fn exec(&self, provider: &str, id: &str, command: &ExecRequest) -> Result<ByteStream, Error> {
         self.upgrade(provider, id, "exec", "drydock-stream", Some(command)).await
     }
+    async fn stream(&self, provider: &str, endpoint: &Carried) -> Result<ByteStream, Error> {
+        self.open_stream(provider, endpoint).await
+    }
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
         let request = self
             .request(Method::PUT, &["v1", "providers", provider, "environments", id, "files"])?
@@ -290,9 +299,11 @@ impl FromRequestParts<Surface> for Api {
         }))
     }
 }
-/// The routes common to the server and hosts. Stream upgrades end when `stopping` becomes true.
+/// The routes hosts serve: the common routes, and `stream`, which the server
+/// does not serve. Stream upgrades end when `stopping` becomes true.
 pub fn router(api: Arc<dyn ProviderApi>, stopping: watch::Receiver<bool>) -> Router {
     routes()
+        .routes(routes!(stream))
         .split_for_parts()
         .0
         .fallback(not_found)
@@ -617,6 +628,17 @@ async fn exec(
     let on = upgrade(&mut request, "drydock-stream").map_err(|refusal| refusal.0)?;
     let ApiJson(command) = ApiJson::<ExecRequest>::from_request(request, &()).await.map_err(|refusal| refusal.0)?;
     let stream = api.exec(&p, &id, &command).await?;
+    Ok(switch(on, "drydock-stream", stream, s.stopping))
+}
+#[utoipa::path(post, tag = "host", path = "/v1/providers/{provider}/streams",
+params(("provider" = String, Path, description = "Opaque provider")),
+request_body = Carried,
+responses((status = 101, description = "Raw byte-stream upgrade to the endpoint; request Connection: Upgrade and Upgrade: drydock-stream", headers(("Connection" = String, description = "Upgrade"), ("Upgrade" = String, description = "drydock-stream"))), ErrorResponses)
+)]
+async fn stream(State(s): State<Surface>, Api(api): Api, ApiPath(p): ApiPath<String>, mut request: Request) -> ApiResult<Response> {
+    let on = upgrade(&mut request, "drydock-stream").map_err(|refusal| refusal.0)?;
+    let ApiJson(endpoint) = ApiJson::<Carried>::from_request(request, &()).await.map_err(|refusal| refusal.0)?;
+    let stream = api.stream(&p, &endpoint).await?;
     Ok(switch(on, "drydock-stream", stream, s.stopping))
 }
 /// A file's raw bytes, as the files route takes them.

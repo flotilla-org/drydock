@@ -2459,6 +2459,13 @@
           "bootstrap": {
             "$ref": "#/components/schemas/BootstrapRoute"
           },
+          "carries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CarriedKind"
+            },
+            "description": "The endpoints on its machine the provider opens streams to, for the\ninstances it is the parent of; nonempty exactly when it has the\n`streams` port."
+          },
           "checkout_strategies": {
             "type": "array",
             "items": {
@@ -2537,6 +2544,32 @@
             "type": "string"
           }
         }
+      },
+      "Carried": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An absolute Unix socket path.",
+            "required": [
+              "unix"
+            ],
+            "properties": {
+              "unix": {
+                "type": "string",
+                "description": "An absolute Unix socket path.",
+                "pattern": "^/[^\\u0000]*$"
+              }
+            }
+          }
+        ],
+        "description": "An endpoint on a provider's machine that it can open streams to."
+      },
+      "CarriedKind": {
+        "type": "string",
+        "description": "The forms of [`Carried`] a provider can open.",
+        "enum": [
+          "unix"
+        ]
       },
       "CheckoutStrategy": {
         "type": "string",
@@ -3811,6 +3844,10 @@
             "$ref": "#/components/schemas/Size",
             "description": "Smallest supported resource request, used when the caller has no default."
           },
+          "takes_endpoint": {
+            "type": "boolean",
+            "description": "The module's instances can be given their endpoint as\n[`ProviderConfiguration::endpoint`], so they can have a parent."
+          },
           "version": {
             "type": "string"
           }
@@ -3830,7 +3867,7 @@
             }
           }
         ],
-        "description": "How the client is handed an exposure's end on drydock's machine. Drydock\nchooses it; only a Unix socket for now."
+        "description": "How a client is handed an end drydock makes on its machine: an exposure's,\nor an instance's endpoint carried by its parent. Drydock chooses it; only a\nUnix socket for now."
       },
       "MaterialMode": {
         "type": "string",
@@ -4135,6 +4172,23 @@
           "owned_account"
         ]
       },
+      "Parent": {
+        "type": "object",
+        "description": "An instance's parent, by instance name, and the endpoint on the parent's machine.",
+        "required": [
+          "instance",
+          "endpoint"
+        ],
+        "properties": {
+          "endpoint": {
+            "$ref": "#/components/schemas/Carried"
+          },
+          "instance": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "Period": {
         "type": "object",
         "description": "RFC 3339 endpoints; start must be <= end (equal endpoints are an empty interval).",
@@ -4206,6 +4260,10 @@
           },
           "quota": {
             "type": "boolean"
+          },
+          "streams": {
+            "type": "boolean",
+            "description": "Opens a stream to an endpoint on the provider's machine, of a form in\n[`Capabilities::carries`]: what makes the provider a parent."
           },
           "suspend_resume": {
             "type": "boolean"
@@ -4547,6 +4605,17 @@
               }
             ]
           },
+          "endpoint": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Local",
+                "description": "Set by drydockd alone, for an instance with a parent: the socket on\ndrydock's machine whose connections the parent carries to the\ninstance's endpoint. A document that sets it is refused."
+              }
+            ]
+          },
           "events": {
             "oneOf": [
               {
@@ -4564,6 +4633,17 @@
           "ownership": {
             "$ref": "#/components/schemas/Ownership",
             "description": "Whether drydock owns the vendor account or shares it."
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Parent",
+                "description": "Server only: the instance whose machine this one's endpoint is on, and\nthat endpoint there. The parent opens each connection to it."
+              }
+            ]
           },
           "semantics": {
             "$ref": "#/components/schemas/SemanticOptions",
@@ -4594,6 +4674,17 @@
         "properties": {
           "capabilities": {
             "$ref": "#/components/schemas/Capabilities"
+          },
+          "endpoint": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Local",
+                "description": "Server only: for an instance with a parent, the socket drydockd made\nfor its endpoint, which a client can open too."
+              }
+            ]
           },
           "module": {
             "type": "string"
@@ -4985,8 +5076,31 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "parent",
+              "reason",
+              "status"
+            ],
+            "properties": {
+              "parent": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "parent_not_ready"
+                ]
+              }
+            }
           }
-        ]
+        ],
+        "description": "`parent_not_ready`: the instance's parent is not ready, and `reason` is\nthe parent's readiness; nothing reaches the instance's endpoint until it is."
       },
       "RegistryAuthKind": {
         "type": "string",

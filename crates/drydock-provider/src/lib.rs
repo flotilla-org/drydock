@@ -81,6 +81,11 @@ pub trait Module: Send + Sync {
         Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 }
     }
     fn version(&self) -> &str;
+    /// Whether instances can be given their endpoint as
+    /// [`ProviderConfiguration::endpoint`], and so have a parent.
+    fn takes_endpoint(&self) -> bool {
+        false
+    }
     /// Cancelled when the host stops. Dropping the future must release uncommitted
     /// resources; factories must yield while waiting on external work.
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
@@ -170,6 +175,14 @@ pub struct Operations<'a> {
     pub files: Option<&'a dyn GuestFiles>,
     pub push_access: Option<&'a dyn PushAccessOperation>,
     pub events: Option<&'a dyn VendorEvents>,
+    pub streams: Option<&'a dyn Streams>,
+}
+/// Opens streams to endpoints on the provider's machine, for the instances it
+/// is the parent of. An endpoint of a form not in [`Capabilities::carries`],
+/// or one the provider cannot open, is refused.
+#[async_trait]
+pub trait Streams: Send + Sync {
+    async fn open(&self, endpoint: &Carried, c: &Credentials) -> Result<ByteStream>;
 }
 /// Reads the vendor's own event deliveries.
 #[async_trait]
@@ -226,6 +239,7 @@ impl From<Operations<'_>> for Ports {
             quota: p.quota.is_some(),
             files: p.files.is_some(),
             push_access: p.push_access.is_some(),
+            streams: p.streams.is_some(),
         }
     }
 }

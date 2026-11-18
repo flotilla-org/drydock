@@ -2,7 +2,7 @@
 use crate::credentials::CredentialReference;
 use drydock_agent::Target;
 use drydock_protocol::{
-    Configuration, CredentialLocation, EgressRequest, EventsConfiguration, Ownership, ProviderConfiguration, SemanticOptions, Size,
+    Configuration, CredentialLocation, EgressRequest, EventsConfiguration, Ownership, Parent, ProviderConfiguration, SemanticOptions, Size,
 };
 use rigging_process::EnvVars;
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ pub struct Provider {
     pub semantics: SemanticOptions,
     /// How drydockd hears about this instance's environments.
     pub events: Option<EventsConfiguration>,
+    /// The instance whose machine this one's endpoint is on.
+    pub parent: Option<Parent>,
 }
 /// A registry drydock can copy images into and providers can pull them from.
 #[derive(Clone, Deserialize)]
@@ -120,6 +122,8 @@ impl Provider {
             ownership: self.ownership,
             semantics: self.semantics.clone(),
             events: self.events.clone(),
+            parent: self.parent.clone(),
+            endpoint: None,
         }
     }
 }
@@ -215,6 +219,7 @@ impl Config {
                 return Err(format!("provider {name} pulls from unknown registry {unknown:?}"));
             }
         }
+        config.check_parents()?;
         for (name, registry) in &config.registries {
             registry.location().map_err(|e| format!("registry {name}: {e}"))?;
             if registry.chunk_bytes == Some(0) {
@@ -222,6 +227,25 @@ impl Config {
             }
         }
         Ok(config)
+    }
+    /// Every parent is a configured instance, and no instance is its own ancestor.
+    pub fn check_parents(&self) -> Result<(), String> {
+        for (name, p) in &self.providers {
+            let mut line = vec![name.as_str()];
+            let mut at = p;
+            while let Some(parent) = &at.parent {
+                at = self
+                    .providers
+                    .get(&parent.instance)
+                    .ok_or_else(|| format!("provider {name}: parent {:?} is not configured", parent.instance))?;
+                if line.contains(&parent.instance.as_str()) {
+                    line.push(&parent.instance);
+                    return Err(format!("provider {name}: its parents form a cycle ({})", line.join(" → ")));
+                }
+                line.push(&parent.instance);
+            }
+        }
+        Ok(())
     }
     pub async fn load(path: &Path) -> Result<Self, String> {
         Self::parse(&tokio::fs::read_to_string(path).await.map_err(|e| format!("read config {}: {e}", path.display()))?)

@@ -100,6 +100,8 @@ pub trait Machine: Send + Sync + 'static {
     async fn mark_suspended(&self, id: &str, suspended: bool, c: &Credentials) -> Result<()>;
     /// A stream to the vessel's agent socket.
     async fn connect(&self, id: &str, c: &Credentials) -> Result<ByteStream>;
+    /// A stream to the Unix socket at `path` on the machine.
+    async fn open(&self, path: &Path) -> Result<ByteStream>;
     /// What the machine states of its capacity, for a machine that states it.
     async fn quota(&self, _: &Credentials) -> Option<Result<Quota>> {
         None
@@ -259,10 +261,10 @@ impl<M: Machine> Vessels<M> {
 impl<M: Machine> Provider for Vessels<M> {
     fn operations(&self) -> Operations<'_> {
         let quota = self.machine.states_capacity().then_some(self as &dyn QuotaOperation);
-        Operations { suspend_resume: Some(self), quota, ..Default::default() }
+        Operations { suspend_resume: Some(self), quota, streams: Some(self), ..Default::default() }
     }
     fn capabilities(&self) -> Capabilities {
-        self.machine.capabilities()
+        Capabilities { carries: vec![CarriedKind::Unix], ..self.machine.capabilities() }
     }
     fn ways_in(&self) -> Vec<WayIn> {
         self.machine.ways_in()
@@ -344,6 +346,14 @@ impl<M: Machine> Provider for Vessels<M> {
     async fn relay(&self, id: &str, c: &Credentials) -> Result<ByteStream> {
         self.found(id, c).await?;
         self.machine.connect(id, c).await
+    }
+}
+
+#[async_trait]
+impl<M: Machine> Streams for Vessels<M> {
+    async fn open(&self, endpoint: &Carried, _: &Credentials) -> Result<ByteStream> {
+        let Carried::Unix(path) = endpoint;
+        self.machine.open(Path::new(path)).await
     }
 }
 

@@ -274,7 +274,10 @@ impl Machine for Local {
         }
     }
     async fn connect(&self, id: &str, _: &Credentials) -> Result<ByteStream> {
-        let stream = tokio::net::UnixStream::connect(self.socket(id)).await.map_err(|e| unavailable(format!("agent socket: {e}")))?;
+        self.open(&self.socket(id)).await
+    }
+    async fn open(&self, path: &Path) -> Result<ByteStream> {
+        let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| unavailable(format!("{}: {e}", path.display())))?;
         Ok(Box::new(stream))
     }
 }

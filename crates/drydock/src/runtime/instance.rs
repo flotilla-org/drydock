@@ -93,6 +93,7 @@ pub(super) enum Gate {
     PushAccess,
     Usage,
     Quota,
+    Stream,
 }
 impl Gate {
     pub(super) fn name(self) -> &'static str {
@@ -112,6 +113,7 @@ impl Gate {
             Self::PushAccess => "push_access",
             Self::Usage => "usage",
             Self::Quota => "quota",
+            Self::Stream => "stream",
         }
     }
     /// Long mutations keep the deadline the Daemon gave its POST routes.
@@ -140,6 +142,7 @@ impl Gate {
             Self::Files | Self::PushAccess => true,
             Self::Usage => c.usage,
             Self::Quota => c.quota,
+            Self::Stream => !c.carries.is_empty(),
         }
     }
 }

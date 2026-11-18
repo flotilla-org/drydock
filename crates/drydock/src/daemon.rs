@@ -104,6 +104,33 @@ pub struct Inner {
     /// and provisions of other labels never wait on it.
     keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     stopping: tokio::sync::watch::Sender<bool>,
+    /// Each instance with a parent, by name.
+    carried: BTreeMap<String, Carrier>,
+    /// Held for their lifetime: dropping one ends its socket.
+    _relays: Vec<Relay>,
+}
+/// A child's endpoint on its parent's machine, and the socket drydockd made
+/// for it, whose connections the parent carries there.
+struct Carrier {
+    parent: String,
+    endpoint: Carried,
+    socket: PathBuf,
+}
+impl Carrier {
+    fn local(&self) -> Local {
+        Local::Unix(self.socket.to_string_lossy().into_owned())
+    }
+}
+/// A child's socket, served until the daemon goes.
+struct Relay {
+    task: tokio::task::JoinHandle<()>,
+    socket: PathBuf,
+}
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 /// The boundaries a daemon reaches beyond itself. Tests stand in for them.
 pub struct Seams {
@@ -146,6 +173,69 @@ impl AgentBuilds for InstalledBuilds {
     async fn build(&self, platform: &Platform) -> Result<Vec<u8>, String> {
         let path = drydock_provider::agent_build::agent_build(platform)?;
         tokio::fs::read(&path).await.map_err(|error| format!("{}: {error}", path.display()))
+    }
+}
+/// Serves a child's socket: for each connection, the parent opens a stream to
+/// the child's endpoint, and the two are joined until either ends. While the
+/// daemon starts, the parent's host opens it once that host is configured, so
+/// a child's first connection, made while it is configured, reaches its
+/// endpoint.
+async fn relay(
+    daemon: Arc<std::sync::OnceLock<std::sync::Weak<Inner>>>,
+    starting: tokio::sync::watch::Receiver<BTreeMap<String, Client>>,
+    child: String,
+    carrier: (String, Carried),
+    listener: tokio::net::UnixListener,
+    mut stopping: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            _ = stopping.wait_for(|stopped| *stopped) => break,
+            accepted = listener.accept() => accepted,
+        };
+        let mut connection = match accepted {
+            Ok((connection, _)) => connection,
+            Err(error) => {
+                tracing::warn!(provider = %child, %error, "accepting on the child's socket failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let (daemon, mut starting, child, (parent, endpoint), mut stopping) =
+            (daemon.clone(), starting.clone(), child.clone(), carrier.clone(), stopping.clone());
+        tokio::spawn(async move {
+            let opened = async {
+                // Until then the parent's Runtime has not committed it, so the
+                // stream skips its readiness check and rate budget.
+                if daemon.get().is_none()
+                    && let Ok(host) = starting.wait_for(|hosts| hosts.contains_key(&parent)).await.map(|hosts| hosts[&parent].clone())
+                {
+                    return host.open_stream(&parent, &endpoint).await;
+                }
+                let inner = daemon.get().and_then(std::sync::Weak::upgrade);
+                let inner = inner.ok_or_else(|| Error::Transport("drydockd did not start".into()))?;
+                Daemon::from_inner(inner).runtime(&parent)?.stream(&parent, &endpoint).await
+            };
+            let opened = tokio::select! {
+                _ = stopping.wait_for(|stopped| *stopped) => return,
+                opened = opened => opened,
+            };
+            match opened {
+                Ok(mut stream) => {
+                    tokio::select! {
+                        _ = stopping.wait_for(|stopped| *stopped) => {}
+                        _ = tokio::io::copy_bidirectional(&mut connection, &mut stream) => {}
+                    }
+                }
+                // The child's readiness already says its parent is not ready.
+                Err(error @ Error::NotReady(_)) => {
+                    tracing::debug!(provider = %child, %parent, %error, "no stream while the parent is not ready")
+                }
+                Err(error) => {
+                    tracing::warn!(provider = %child, %parent, %error, "the parent could not open a stream to the child's endpoint")
+                }
+            }
+        });
     }
 }
 impl Daemon {
@@ -217,6 +307,35 @@ impl Daemon {
                 unavailable.insert(name.clone(), Readiness::MissingTool { reason });
             }
         }
+        config.check_parents()?;
+        let mut carried = BTreeMap::new();
+        let mut relays = Vec::new();
+        let daemon = Arc::new(std::sync::OnceLock::new());
+        // Each parent's host, from when it is started until the daemon is.
+        let starting = tokio::sync::watch::channel(BTreeMap::new()).0;
+        let stopping = tokio::sync::watch::channel(false).0;
+        for (name, provider) in &config.providers {
+            let Some(parent) = &provider.parent else { continue };
+            if let Some((_, module)) = selected.get(&provider.module)
+                && !module.takes_endpoint
+            {
+                return Err(format!("provider {name}: module {} cannot be given its endpoint, so it has no parent", provider.module));
+            }
+            let directory = run.join("parents");
+            crate::local::private_dir(&directory)?;
+            // Named by the child, so a reordered configuration keeps each path.
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes());
+            let socket = directory.join(format!("{}.sock", &format!("{digest:x}")[..16]));
+            let _ = std::fs::remove_file(&socket);
+            let listener =
+                tokio::net::UnixListener::bind(&socket).map_err(|e| format!("provider {name}: socket {}: {e}", socket.display()))?;
+            std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .map_err(|e| format!("provider {name}: socket: {e}"))?;
+            let carrier = (parent.instance.clone(), parent.endpoint.clone());
+            let task = tokio::spawn(relay(daemon.clone(), starting.subscribe(), name.clone(), carrier, listener, stopping.subscribe()));
+            relays.push(Relay { task, socket: socket.clone() });
+            carried.insert(name.clone(), Carrier { parent: parent.instance.clone(), endpoint: parent.endpoint.clone(), socket });
+        }
         let mut hosts = Vec::new();
         let mut placements = BTreeMap::new();
         let mut modules = BTreeMap::new();
@@ -225,7 +344,9 @@ impl Daemon {
             let mut credentials = BTreeMap::new();
             for name in &assignments[i] {
                 let p = &config.providers[name];
-                providers.insert(name.clone(), p.configuration());
+                let mut configuration = p.configuration();
+                configuration.endpoint = carried.get(name).map(Carrier::local);
+                providers.insert(name.clone(), configuration);
                 // A credential path that cannot be resolved (for example, no
                 // HOME for ~/...) is missing evidence, not a daemon failure.
                 // The supervisor reports MissingCredential for absent references.
@@ -249,6 +370,11 @@ impl Daemon {
                 }
                 Err(error) => return Err(error.to_string()),
             };
+            starting.send_modify(|hosts| {
+                for name in assignments[i].iter().filter(|name| carried.values().any(|c: &Carrier| &c.parent == *name)) {
+                    hosts.insert(name.clone(), handle.host.clone());
+                }
+            });
             for (name, (selected_host, module)) in &selected {
                 if *selected_host == i {
                     modules.insert(name.clone(), (hosts.len(), module.clone()));
@@ -260,8 +386,23 @@ impl Daemon {
             let cache = StatusCache::new(handle.client.clone(), &status.providers);
             hosts.push(ManagedHost { handle, cache: Mutex::new((status.generation, Arc::new(cache))) });
         }
+        for (name, carrier) in &carried {
+            let Some(placement) = placements.get(&carrier.parent) else { continue };
+            let status = hosts[placement.host].handle.status.borrow().clone();
+            let Some(parent) = status.providers.iter().find(|d| d.provider == carrier.parent) else { continue };
+            if !parent.capabilities.carries.contains(&carrier.endpoint.kind()) {
+                return Err(format!(
+                    "provider {name}: parent {} (module {}) carries no {} endpoints",
+                    carrier.parent,
+                    parent.module,
+                    carrier.endpoint.kind()
+                ));
+            }
+        }
         let staging = crate::staging::Staging::new(registries, config.registries.clone());
         let inner = Arc::new_cyclic(|weak| Inner {
+            _relays: relays,
+            carried,
             config,
             staging,
             modules,
@@ -274,8 +415,9 @@ impl Daemon {
             dialer,
             builds,
             keying: Default::default(),
-            stopping: tokio::sync::watch::channel(false).0,
+            stopping,
         });
+        let _ = daemon.set(Arc::downgrade(&inner));
         inner.exposures.restore();
         Ok(Arc::new(Self { inner, credential: None }))
     }
@@ -300,8 +442,12 @@ impl Daemon {
     fn ready_host(&self, provider: &str) -> Result<&ManagedHost, Error> {
         let host = self.host(provider)?;
         match host.handle.status.borrow().readiness.clone() {
-            Readiness::Ready => Ok(host),
-            readiness => Err(Error::NotReady(readiness)),
+            Readiness::Ready => {}
+            readiness => return Err(Error::NotReady(readiness)),
+        }
+        match self.parent_unready(provider, &self.statuses()) {
+            Some(readiness) => Err(Error::NotReady(readiness)),
+            None => Ok(host),
         }
     }
     fn runtime(&self, provider: &str) -> Result<crate::runtime::Runtime, Error> {
@@ -345,34 +491,54 @@ impl Daemon {
     }
     /// Every configured provider, including those no host can serve, with the reason.
     pub fn providers(&self) -> Vec<ProviderDeclaration> {
-        let statuses: Vec<_> = self.hosts.iter().map(|h| h.handle.status.borrow().clone()).collect();
+        let statuses = self.statuses();
         self.config
             .providers
-            .iter()
-            .map(|(name, configured)| {
-                let status = self.placements.get(name).map(|p| &statuses[p.host]);
-                let mut declaration = status
-                    .and_then(|s| s.providers.iter().find(|p| &p.provider == name && p.module == configured.module))
-                    .cloned()
-                    .unwrap_or_else(|| ProviderDeclaration {
-                        provider: name.clone(),
-                        module: configured.module.clone(),
-                        capabilities: conservative_capabilities(),
-                        rate_limits: vec![],
-                        readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
-                        ports: Ports::default(),
-                        ways_in: None,
-                    });
-                if let Some(readiness) = self.unavailable.get(name) {
-                    declaration.readiness = readiness.clone();
-                } else if let Some(status) = status
-                    && !matches!(status.readiness, Readiness::Ready)
-                {
-                    declaration.readiness = status.readiness.clone();
+            .keys()
+            .map(|name| {
+                let mut declaration = self.declared(name, &statuses);
+                if let Some(readiness) = self.parent_unready(name, &statuses) {
+                    declaration.readiness = readiness;
                 }
                 declaration
             })
             .collect()
+    }
+    fn statuses(&self) -> Vec<crate::HostStatus> {
+        self.hosts.iter().map(|h| h.handle.status.borrow().clone()).collect()
+    }
+    /// A child's readiness while its parent, or one above it, is not ready.
+    fn parent_unready(&self, name: &str, statuses: &[crate::HostStatus]) -> Option<Readiness> {
+        let parent = &self.carried.get(name)?.parent;
+        let readiness = self.parent_unready(parent, statuses).unwrap_or_else(|| self.declared(parent, statuses).readiness);
+        (readiness != Readiness::Ready).then(|| Readiness::ParentNotReady { parent: parent.clone(), reason: readiness.to_string() })
+    }
+    /// What the provider's host declares, or why there is no declaration.
+    fn declared(&self, name: &str, statuses: &[crate::HostStatus]) -> ProviderDeclaration {
+        let configured = &self.config.providers[name];
+        let status = self.placements.get(name).map(|p| &statuses[p.host]);
+        let mut declaration = status
+            .and_then(|s| s.providers.iter().find(|p| p.provider == name && p.module == configured.module))
+            .cloned()
+            .unwrap_or_else(|| ProviderDeclaration {
+                provider: name.to_owned(),
+                module: configured.module.clone(),
+                capabilities: conservative_capabilities(),
+                rate_limits: vec![],
+                readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
+                ports: Ports::default(),
+                ways_in: None,
+                endpoint: None,
+            });
+        declaration.endpoint = self.carried.get(name).map(Carrier::local);
+        if let Some(readiness) = self.unavailable.get(name) {
+            declaration.readiness = readiness.clone();
+        } else if let Some(status) = status
+            && !matches!(status.readiness, Readiness::Ready)
+        {
+            declaration.readiness = status.readiness.clone();
+        }
+        declaration
     }
     /// Daemon routes first; every provider operation falls through to the shared router.
     pub fn router(self: &Arc<Self>) -> Router {
@@ -1023,6 +1189,7 @@ fn conservative_capabilities() -> Capabilities {
         agent_tcp_port: None,
         reach_ways: vec![],
         semantics: Default::default(),
+        carries: vec![],
     }
 }
 

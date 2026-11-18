@@ -42,6 +42,7 @@ impl Runtime {
             rate_limits: i.rate_limits.clone(),
             ports: i.provider.operations().into(),
             ways_in: Some(i.ways_in.clone()),
+            endpoint: i.config.endpoint.clone(),
         }
     }
 }
@@ -59,6 +60,7 @@ impl ProviderApi for Runtime {
                     name: name.clone(),
                     version: module.version().into(),
                     smallest_size: module.smallest_size(),
+                    takes_endpoint: module.takes_endpoint(),
                 })
                 .collect(),
         })
@@ -195,6 +197,20 @@ impl ProviderApi for Runtime {
                 Gate::Exec,
                 self.credential.clone(),
                 |p, c| async move { operation_port(p.operations().exec)?.exec(&id, command, &c).await },
+            )
+            .await?)
+    }
+    async fn stream(&self, p: &str, endpoint: &Carried) -> ApiResult<ByteStream> {
+        let instance = self.instance(p).await?;
+        if !instance.capabilities.carries.contains(&endpoint.kind()) {
+            return Err(refused(format!("{p} carries no {} endpoints", endpoint.kind())).into());
+        }
+        let endpoint = endpoint.clone();
+        Ok(instance
+            .call(
+                Gate::Stream,
+                self.credential.clone(),
+                |p, c| async move { operation_port(p.operations().streams)?.open(&endpoint, &c).await },
             )
             .await?)
     }

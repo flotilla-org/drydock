@@ -50,6 +50,7 @@ pub(super) fn mask_readiness(readiness: Readiness, masker: &DiagnosticMasker) ->
         Readiness::MissingTool { reason } => Readiness::MissingTool { reason: masker.text(&reason) },
         Readiness::VersionMismatch { reason } => Readiness::VersionMismatch { reason: masker.text(&reason) },
         Readiness::Unknown { reason } => Readiness::Unknown { reason: masker.text(&reason) },
+        Readiness::ParentNotReady { parent, reason } => Readiness::ParentNotReady { parent, reason: masker.text(&reason) },
         Readiness::Ready => Readiness::Ready,
     }
 }
@@ -62,5 +63,6 @@ pub(super) fn readiness_status(value: &Readiness) -> &'static str {
         Readiness::MissingCredential { .. } => "missing_credential",
         Readiness::VersionMismatch { .. } => "version_mismatch",
         Readiness::Unknown { .. } => "unknown",
+        Readiness::ParentNotReady { .. } => "parent_not_ready",
     }
 }
