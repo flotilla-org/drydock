@@ -53,17 +53,10 @@ impl Error {
 }
 /// A failed provision: the error, and what it left at the vendor.
 #[derive(Debug, thiserror::Error)]
-#[error("{error}{}", left_text(left))]
+#[error("{error}{left}")]
 pub struct ProvisionError {
     pub error: Error,
     pub left: Left,
-}
-fn left_text(left: &Left) -> String {
-    match left {
-        Left::Made { provider, id } => format!("; left environment {id} of provider {provider}"),
-        Left::None => String::new(),
-        Left::Unknown => "; whether the vendor made an environment is unknown".into(),
-    }
 }
 impl ProvisionError {
     pub fn made(error: impl Into<Error>, provider: &str, id: &str) -> Self {

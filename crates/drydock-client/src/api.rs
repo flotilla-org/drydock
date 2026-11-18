@@ -478,9 +478,9 @@ impl IntoResponse for ProvisionAnswer {
     fn into_response(self) -> Response {
         let failure = ProvisionFailure { error: protocol(self.0.error), left: self.0.left };
         // The error's own response gives the status and Retry-After; only the body differs.
-        let mut response = Refusal(failure.error.clone()).into_response();
-        *response.body_mut() = Body::from(serde_json::to_vec(&failure).expect("a provision failure serializes"));
-        response
+        let (mut parts, _) = Refusal(failure.error.clone()).into_response().into_parts();
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(serde_json::to_vec(&failure).expect("a provision failure serializes")))
     }
 }
 #[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments",

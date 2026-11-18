@@ -1406,10 +1406,16 @@ impl From<ProtocolError> for ProvisionFailure {
 }
 impl std::fmt::Display for ProvisionFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.left {
-            Left::Made { provider, id } => write!(f, "{}; left environment {id} of provider {provider}", self.error),
-            Left::None => write!(f, "{}", self.error),
-            Left::Unknown => write!(f, "{}; whether the vendor made an environment is unknown", self.error),
+        write!(f, "{}{}", self.error, self.left)
+    }
+}
+/// What a failure's text adds after the error: nothing when nothing was left.
+impl std::fmt::Display for Left {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Left::Made { provider, id } => write!(f, "; left environment {id} of provider {provider}"),
+            Left::None => Ok(()),
+            Left::Unknown => write!(f, "; whether the vendor made an environment is unknown"),
         }
     }
 }

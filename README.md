@@ -740,8 +740,10 @@ A provision under a label that already names a live environment of the
 instance answers that environment (200) instead of making a second one. A
 module that declares `exclusive_label` does this itself; for any other,
 drydockd lists the instance's environments before the create, one list per
-provision, and holds one provision of a label at a time. That hold is within
-one drydockd: two drydockds sharing an instance on one account can still race.
+provision, and holds one provision of a label at a time, through its settle
+wait, so a second provision of the label waits for the first to answer. That
+hold is within one drydockd: two drydockds sharing an instance on one account
+can still race.
 The declaration clients read states `exclusive_label` for every instance.
 A take-up answers like a create: under `settle` a running or starting
 environment is waited on as usual, and a stopped one, or one in an unknown
