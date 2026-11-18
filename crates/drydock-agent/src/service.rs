@@ -124,6 +124,9 @@ impl Services {
             }
             return Ok((self.info(name, record), false));
         }
+        if service.program.is_empty() {
+            return Err(AgentError::new("service.program", name, ErrorKind::InvalidInput, "a service needs a program"));
+        }
         if service.environment.iter().any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0')) {
             return Err(AgentError::new("service.environment", name, ErrorKind::InvalidInput, "invalid service environment"));
         }

@@ -700,7 +700,10 @@ async fn remove_service(
     Query(query): Query<crate::query::StopQuery>,
 ) -> Refusal<Json<ServiceInfo>> {
     let grace = query.grace_ms.map_or(crate::service::DEFAULT_GRACE, std::time::Duration::from_millis).min(crate::service::MAX_GRACE);
-    Ok(Json(s.services.remove(&name, grace).await?))
+    // Run to the end even if the client goes away, so a stop is never left
+    // half done with its record kept.
+    let stop = tokio::spawn(async move { s.services.remove(&name, grace).await });
+    Ok(Json(stop.await.map_err(|e| AgentError::new("service.stop", "", ErrorKind::Other, e.to_string()))??))
 }
 
 fn sha256_header(digest: &str) -> [(header::HeaderName, header::HeaderValue); 1] {

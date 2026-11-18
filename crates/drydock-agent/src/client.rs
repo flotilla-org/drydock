@@ -496,7 +496,8 @@ impl Client {
     /// Stop a service, SIGKILL following SIGTERM after `grace` (at most 60
     /// seconds; the agent's default without one), and forget it.
     pub async fn remove_service(&self, name: &str, grace: Option<std::time::Duration>) -> io::Result<crate::ServiceInfo> {
-        let query = crate::query::encode(&crate::query::StopQuery { grace_ms: grace.map(|g| g.as_millis() as u64) })?;
+        let query =
+            crate::query::encode(&crate::query::StopQuery { grace_ms: grace.map(|g| u64::try_from(g.as_millis()).unwrap_or(u64::MAX)) })?;
         self.link.json("DELETE", &format!("/services/{}{query}", encode_segment(name)), empty()).await
     }
 

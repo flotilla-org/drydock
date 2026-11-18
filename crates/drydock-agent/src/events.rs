@@ -29,7 +29,7 @@ pub enum Event {
     ProcessExited { id: String, status: ExitStatus },
     /// A service has exited. The status is known only to the agent process
     /// that started it; one that took the service over from an earlier agent
-    /// process reports none.
+    /// process reports none, and only on Linux does such an agent see the exit.
     ServiceExited { name: String, pid: u32, status: Option<ExitStatus> },
     /// A forward stopped working: its listener failed, or a connection to it
     /// was closed because nobody claimed it in time.
