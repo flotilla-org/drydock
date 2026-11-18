@@ -769,7 +769,8 @@ the error, in `left`:
 (start, the agent's upload or hello, the settle wait); `none` says the vendor
 made nothing; `unknown` says whether it did cannot be known, as when its
 answer to the create was lost or the vendor failed it other than by refusing
-it. A provision that took up an environment names it the same way. A client
+it, or the provision's deadline passed, during the settle wait too. A retry of
+the label finds what an `unknown` provision made. A provision that took up an environment names it the same way. A client
 reads `left` on every failed provision, whatever its class: a `refused` one
 can still name an environment. What a provision left stays listed under its
 label: the client destroys it, retries the label into it, or keeps it to look

@@ -306,6 +306,8 @@ fn provisioned<T: DeserializeOwned>(response: Result<http::Response<bytes::Bytes
     match serde_json::from_slice::<ProvisionFailure>(response.body()) {
         Ok(failure) if failure.error.status() == status.as_u16() => Err(failure.into()),
         Ok(failure) => Err(unknown(Error::InvalidResponse(format!("HTTP {status} carried a {} error", failure.error.class())))),
+        // Refused before any handler: the route's answers for no credential and a wrong method.
+        Err(_) if matches!(status.as_u16(), 401 | 405) => Err(protocol_error(status, response.body()).into()),
         Err(error) => Err(unknown(Error::InvalidResponse(format!("HTTP {status} without a provision failure body: {error}")))),
     }
 }

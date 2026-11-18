@@ -1384,7 +1384,8 @@ impl ProvisionFailure {
         Self { error, left: Left::Unknown }
     }
     /// The failure of the vendor call that creates the environment: a
-    /// refusal made nothing, and any other failure may have.
+    /// refusal, a rate limit or quota included, made nothing, and any other
+    /// failure may have.
     pub fn creating(error: ProtocolError) -> Self {
         match error {
             ProtocolError::NotFound { .. }

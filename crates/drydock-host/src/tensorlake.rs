@@ -681,7 +681,7 @@ impl Provider for Tensorlake {
     /// The live sandbox the label's name already names, or one create,
     /// answered with what Tensorlake's answer states. The name is found by
     /// the label's translation, since a long label cannot be read back from
-    /// a listed name.
+    /// a listed name: drydockd's own lookup by label misses it.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         check_prepared(TENSORLAKE, &self.name, &r.prepared, &image_name(&r.prepared.image_digest, &r.prepared.platform))?;
         let policy = Policy::request(&r.egress)?;
