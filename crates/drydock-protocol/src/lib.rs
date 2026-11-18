@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "14";
+pub const PROTOCOL_VERSION: &str = "15";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -1349,6 +1349,29 @@ pub struct ResumeToken {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Export {
     pub reference: String,
+}
+/// The answer to a failed provision: the error, and what it left at the
+/// vendor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvisionFailure {
+    #[serde(flatten)]
+    pub error: ProtocolError,
+    /// The environment the vendor made before a later step failed, left as
+    /// it was: it stays listed under the request's label, a provision under
+    /// that label takes it up, and destroy removes it. Null when the vendor
+    /// made none.
+    pub left: Option<Left>,
+}
+/// An environment a failed provision left.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Left {
+    pub provider: String,
+    pub id: String,
+}
+impl From<ProtocolError> for ProvisionFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self { error, left: None }
+    }
 }
 /// Adaptors never retry. Internal preserves the vendor's raw error text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
