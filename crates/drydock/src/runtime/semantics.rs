@@ -262,27 +262,39 @@ impl Provider for Added {
         self.inner.prepare(r, c).await
     }
     /// The live environment of this instance the label already names, or
-    /// the module's provision. An environment whose wait fails is left.
+    /// the module's provision. An environment whose wait fails is left, and
+    /// so is one taken up stopped or in an unknown state.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         let _held = if self.exclusive { None } else { Some(self.labels.hold(&r.label).await) };
-        if !self.exclusive {
-            let named = self.list(c).await?.into_iter().find(|e| e.label.as_deref() == Some(r.label.as_str()) && e.live());
-            if let Some(e) = named {
-                return Ok(Provisioned::Existing(e));
-            }
-        }
-        match self.inner.provision(r, c).await? {
-            Provisioned::Created(e) => {
-                self.observed.claimed.recover().insert(e.id.clone(), e.clone());
-                self.observed.claimed_now.notify_one();
-                if !self.settle {
-                    return Ok(Provisioned::Created(e));
+        let label = r.label.clone();
+        let named = match self.exclusive {
+            true => None,
+            false => self.list(c).await?.into_iter().find(|e| e.label.as_deref() == Some(r.label.as_str()) && e.live()),
+        };
+        let (e, created) = match named {
+            Some(e) => (e, false),
+            None => match self.inner.provision(r, c).await? {
+                Provisioned::Created(e) => {
+                    self.observed.claimed.recover().insert(e.id.clone(), e.clone());
+                    self.observed.claimed_now.notify_one();
+                    (e, true)
                 }
-                let running = self.running(&e.id).await;
-                Ok(Provisioned::Created(running.map_err(|error| ProvisionFailure::made(error, &self.observed.provider, &e.id))?))
-            }
-            provisioned => Ok(provisioned),
+                Provisioned::Existing(e) => (e, false),
+            },
+        };
+        let left = |error| ProvisionFailure::made(error, &self.observed.provider, &e.id);
+        let unusable = matches!(
+            e.state,
+            Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping } | Observation::Unknown { .. }
+        );
+        if !created && unusable {
+            return Err(left(refused(format!("environment {} under label {label} is {}", e.id, described(&e)))));
         }
+        let e = match self.settle && (created || e.state != Observation::Running) {
+            true => self.running(&e.id).await.map_err(left)?,
+            false => e,
+        };
+        Ok(if created { Provisioned::Created(e) } else { Provisioned::Existing(e) })
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         Ok(self.inner.list(c).await?.into_iter().filter(|e| self.ours(e)).collect())

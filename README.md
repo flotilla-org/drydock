@@ -743,12 +743,12 @@ drydockd lists the instance's environments before the create, one list per
 provision, and holds one provision of a label at a time. That hold is within
 one drydockd: two drydockds sharing an instance on one account can still race.
 The declaration clients read states `exclusive_label` for every instance.
-The environment is answered as it is, in whatever state it was left: neither
-the settle wait nor the module's own steps after create (a module that starts
-the agent, for one) run again for it. drydockd's own agent upload runs again
-where it is the bootstrap, putting the agent in only when it is absent. A
-client that retries into what a failed provision left checks the environment
-itself, or destroys it and provisions a fresh label.
+A take-up answers like a create: under `settle` a running or starting
+environment is waited on as usual, and a stopped one, or one in an unknown
+state, fails at once with `left` naming it. A successful provision is a usable
+environment. The module's own steps after create (a module that starts the
+agent, for one) do not run again; drydockd's own agent upload runs again where
+it is the bootstrap, putting the agent in only when it is absent.
 
 Once the vendor has made an environment, nothing removes it after a failed
 provision, neither drydockd nor a module; a module undoes only a half-made
@@ -764,9 +764,9 @@ the error, in `left`:
 `made` names the environment the vendor made before a later step failed
 (start, the agent's upload or hello, the settle wait); `none` says the vendor
 made nothing; `unknown` says whether it did cannot be known, as when its
-answer to the create was lost. A step that fails after a provision took up an
-environment that was already there answers `none`: the provision made nothing,
-and the client already holds that environment. What a provision left stays
+answer to the create was lost or the vendor failed it other than by refusing
+it. A provision that took up an environment names it the same way. What a
+provision left stays
 listed under its label: the client destroys it, retries the label into it, or
 keeps it to look at. A launch's failure says the same.
 
