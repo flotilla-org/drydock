@@ -190,6 +190,8 @@ refused. Forward IDs are one percent-encoded route segment.
 | GET | `/processes/{id}/output?stdout=N&stderr=M` | Become the reader; framed output from those offsets, then the exit |
 | PUT | `/processes/{id}/stdin` | Stream the body to stdin, then close it |
 | POST | `/processes/{id}/signals` | `{ "signal": N }` to the process group |
+| GET | `/services` | Every service the agent has a record of, as `ServiceInfo` |
+| GET / PUT / DELETE | `/services/{name}` | `ServiceInfo` / start a `Service` unless it already runs (201 or 200) / stop it and forget it |
 | GET / HEAD / PUT | `/files/{path}` | Stream a file (Range, `ETag`, `If-Match`) / its size / an atomic streamed write |
 | GET / PATCH / DELETE | `/entries/{path}` | Stat without following links / change mode and owner / remove (`?recursive=true`) |
 | GET / PUT | `/dirs/{path}` | List a directory / create one |
@@ -452,6 +454,63 @@ reaps children inherited across re-exec after they exit. Discovery is best
 effort when procfs child lists are unavailable. The provider's init reaps
 children orphaned by an agent crash.
 
+### Services
+
+A service is a long-lived process, such as an engine (`dockerd`, Firecracker),
+kept running under a name the client chooses: letters, digits, `_`, `.` and
+`-`, starting with a letter or digit, at most 64 bytes, one route segment.
+Unlike a process, its output never passes through the agent, so unread output
+cannot block it, and it outlives agent restarts and re-execs, upgrades
+included. After one, the new agent still reports it and can stop it.
+
+```text
+PUT /services/dockerd
+{"program": "/usr/bin/dockerd", "args": ["--host", "unix:///var/run/docker.sock"],
+ "cwd": null, "environment": {"DOCKER_RAMDISK": "1"}, "output": "file"}
+
+201 {"name": "dockerd", "pid": 812, "service": {...as sent...}, "state": "running",
+     "log": "/opt/drydock/drydock-agent.services/dockerd.log"}
+
+GET /services/dockerd
+200 {"name": "dockerd", "pid": 812, "service": {...}, "state": "exited",
+     "status": {"code": 1, "signal": null, "timed_out": false}, "log": "..."}
+
+DELETE /services/dockerd?grace_ms=10000
+200 {"name": "dockerd", "pid": 812, "service": {...}, "state": "exited", "status": null, "log": "..."}
+```
+
+`PUT` is idempotent on the name: a service of that name still running from
+the same `Service` body is left alone (200); one running from a different
+body is a 409, so stop it first; otherwise, never started, exited, or gone
+with an earlier boot, the service is started (201). The service leads its own
+process group with stdin `/dev/null` and the environment a process gets
+(configured environment, pipeline defaults, the request's `environment`);
+only the body is compared, not the configuration, which a restarted agent
+no longer holds. `output: "file"` (the default) sends stdout and stderr, in
+the order written, to `<name>.log` in the agent's service directory, emptied
+at each start, mode 0600; read it with `GET /files/{path}`, ranged to follow
+it. The agent never reads it, and nothing bounds it but the filesystem.
+`output: "discard"` sends both to `/dev/null`, and `log` is null.
+
+The service directory is `<executable>.services` beside the installed agent
+(`/opt/drydock/drydock-agent.services`), on the same disk as the store rather
+than the `/run` tmpfs, so a chatty log does not take guest memory. Each
+service has a record there, `<name>.json`, holding its body, PID and the
+process's start time. The agent finds its services again from these records:
+a record whose PID still names a process started at that time is running;
+any other has exited. So a record left by an earlier boot reads as exited,
+and a reused PID never passes for the service. While the agent that started a
+service runs it waits for it and keeps its exit status; across a re-exec the
+new agent still reaps it but the status is not known (`status: null`), and
+after a crash the provider's init reaps it.
+
+`DELETE /services/{name}` sends SIGTERM to the service's process group and,
+if it is still running after `grace_ms` (10 seconds by default, at most 60),
+SIGKILL; it replies with the last `ServiceInfo` once the service has exited,
+and removes the record but keeps the log until the name starts again. An
+upgrade's drain does not wait for services, and `Activated.running` does not
+list them.
+
 ### Configuration, forwards and restarts
 
 `Configuration` replaces egress, CA, enabled features and process environment
@@ -527,9 +586,9 @@ waits for the running ones to exit, up to `drain_ms` from the request body
 the processes still running at the limit; they keep running across the
 re-exec, but lose their handles and output reader. The agent then re-execs
 with the original flags; the host reconnects with a fresh connection and
-verifies the new fingerprint. The agent's processes are short calls:
-anything long-running that holds file descriptors belongs under cleat, not
-the agent.
+verifies the new fingerprint. The agent's processes are short calls: a
+long-running service is started as a [service](#services) instead, and an
+interactive one belongs under cleat.
 
 The candidate runs on probation: a durable `.probation` marker records it,
 and it runs from `.upgrade` while the installed entry point stays the previous
