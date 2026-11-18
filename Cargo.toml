@@ -10,20 +10,20 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/flotilla-org/drydock"
 
 [workspace.dependencies]
-rigging-paths = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
+rigging-paths = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 reqwest = { version = "0.13", default-features = false }
 http = "1"
 sha2 = "0.10"
 # Plain tar only: the agent's artifacts and Tensorlake's build context.
 tar = { version = "0.4", default-features = false }
-rigging-process = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-stream = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-http-client = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-tls = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
-rigging-ssh = { git = "https://github.com/flotilla-org/rigging", rev = "261a4460166fc79e1b6442a693f62d4e41bef8d4" }
+rigging-process = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-stream = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-replay-testkit = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-http-client = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-http-serve = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-tls = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-relay-protocol = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
+rigging-ssh = { git = "https://github.com/flotilla-org/rigging", branch = "main" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 utoipa = "5.4"
