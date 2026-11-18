@@ -103,8 +103,12 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
     let Some(RefOr::T(Schema::OneOf(errors))) = schemas.get("ProtocolError") else { panic!("ProtocolError schema changed") };
     let variants = errors.items.clone();
     let components = document.components.as_mut().expect("components");
+    components.schemas.insert("ProvisionLeft".into(), provision_left().into());
+    let mut provisions = 0;
     for path in document.paths.paths.values_mut() {
         for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
+            let provision = operation.operation_id.as_deref() == Some("provision");
+            provisions += usize::from(provision);
             for (status, class) in [
                 ("404", "not_found"),
                 ("405", "method_not_allowed"),
@@ -116,7 +120,6 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
                 ("424", "command_failed"),
                 ("500", "internal"),
             ] {
-                let provision = operation.operation_id.as_deref() == Some("provision");
                 let name = if provision { format!("ProvisionError{status}") } else { format!("Error{status}") };
                 let Some(RefOr::T(mut response)) = operation.responses.responses.get(status).cloned() else {
                     panic!("missing error response")
@@ -124,7 +127,7 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
                 let variant = variants.iter().find(|variant| {
                     matches!(variant, RefOr::T(Schema::Object(object)) if matches!(object.properties.get("kind"), Some(RefOr::T(Schema::Object(kind))) if kind.enum_values.as_ref().is_some_and(|values| values.contains(&serde_json::Value::String(class.into())))))
                 }).expect("error class schema exists").clone();
-                let variant = if provision { left(variant) } else { variant };
+                let variant = if provision { provision_error(variant) } else { variant };
                 response.content.get_mut("application/json").expect("JSON error").schema = Some(variant);
                 if status == "429" || status == "503" {
                     response.headers.insert(
@@ -144,14 +147,21 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
             }
         }
     }
+    assert_eq!(provisions, 1, "exactly one provision operation carries what a failure left");
     document
 }
 
 /// A provision's error answer: the error class, and what it left at the vendor.
-fn left(error: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+fn provision_error(error: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+    use utoipa::openapi::{Ref, schema::AllOfBuilder};
+    AllOfBuilder::new().item(error).item(Ref::from_schema_name("ProvisionLeft")).into()
+}
+
+/// The `left` field every provision error answer carries.
+fn provision_left() -> utoipa::openapi::schema::Schema {
     use utoipa::openapi::{
         Ref,
-        schema::{AllOfBuilder, ObjectBuilder, OneOfBuilder, Type},
+        schema::{ObjectBuilder, OneOfBuilder, Type},
     };
     let left = OneOfBuilder::new()
         .item(Ref::from_schema_name("Left"))
@@ -159,6 +169,5 @@ fn left(error: utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>) -> utoip
         .description(Some(
             "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none.",
         ));
-    let field = ObjectBuilder::new().property("left", left).required("left");
-    AllOfBuilder::new().item(error).item(field).into()
+    ObjectBuilder::new().property("left", left).required("left").into()
 }

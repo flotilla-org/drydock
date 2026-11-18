@@ -1362,7 +1362,8 @@ pub struct ProvisionFailure {
     /// made none.
     pub left: Option<Left>,
 }
-/// An environment a failed provision left.
+/// An environment a failed provision left. It names its provider, as the
+/// request path did, so that it is the whole of what destroy needs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Left {
     pub provider: String,

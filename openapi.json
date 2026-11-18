@@ -3831,7 +3831,7 @@
       },
       "Left": {
         "type": "object",
-        "description": "An environment a failed provision left.",
+        "description": "An environment a failed provision left. It names its provider, as the\nrequest path did, so that it is the whole of what destroy needs.",
         "required": [
           "provider",
           "id"
@@ -4729,6 +4729,25 @@
               "$ref": "#/components/schemas/WayIn"
             },
             "description": "The ways the vendor offers to hear about environments; absent when\nthe provider's host did not declare them."
+          }
+        }
+      },
+      "ProvisionLeft": {
+        "type": "object",
+        "required": [
+          "left"
+        ],
+        "properties": {
+          "left": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Left"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
           }
         }
       },
@@ -5940,23 +5959,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -5988,23 +5991,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6036,23 +6023,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6084,23 +6055,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6143,23 +6098,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6208,23 +6147,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6261,23 +6184,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6309,23 +6216,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
@@ -6381,23 +6272,7 @@
                   }
                 },
                 {
-                  "type": "object",
-                  "required": [
-                    "left"
-                  ],
-                  "properties": {
-                    "left": {
-                      "oneOf": [
-                        {
-                          "$ref": "#/components/schemas/Left"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "description": "The environment the vendor made before a later step failed, left as it was: it stays listed under the request's label, a provision under that label takes it up, and destroy removes it. Null when the vendor made none."
-                    }
-                  }
+                  "$ref": "#/components/schemas/ProvisionLeft"
                 }
               ]
             }
