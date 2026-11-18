@@ -498,7 +498,8 @@ in place (the service holds it open for appending); bytes written between the
 copy and the emptying are lost, and a log can pass 64 MiB by what the service
 writes in a second. A reader following the log sees it shrink to nothing at
 each rotation. Without a running agent nothing rotates it. `output: "discard"`
-sends both to `/dev/null`, and `log` is null.
+sends both to `/dev/null`, and `log` is null. A log an earlier `file` run left
+stays until a later `file` start moves it.
 
 The service directory is `<executable>.services` beside the installed agent
 (`/opt/drydock/drydock-agent.services`), on the same disk as the store rather
@@ -509,6 +510,7 @@ record whose PID still names a process started at that time is running; any
 other has exited. So a record left by an earlier boot reads as exited, and a
 reused PID never passes for the service. An unreadable record is ignored with
 a warning, as if the service had never started, and the next start replaces
+it. If the service it named still runs, the agent can no longer find or stop
 it. The record keeps the request as sent, `environment` included, and every
 reply carries it back, so a secret in a service's environment is readable by
 every client of the agent, as it is to the vessel's root. While the agent that

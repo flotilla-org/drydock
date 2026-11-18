@@ -124,6 +124,9 @@ impl Services {
             }
             return Ok((self.info(name, record), false));
         }
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            return Err(AgentError::new(OP, name, ErrorKind::Unsupported, "services are not built for this platform yet"));
+        }
         if service.program.is_empty() {
             return Err(AgentError::new("service.program", name, ErrorKind::InvalidInput, "a service needs a program"));
         }
@@ -276,8 +279,10 @@ impl Services {
                 let (exits, events, record) = (self.exits.clone(), self.events.clone(), self.record_path(&info.name));
                 tokio::spawn(async move {
                     let _ = pidfd.readable().await;
-                    // A service already stopped and forgotten leaves nothing to report on.
-                    if record.exists() {
+                    // A service already stopped and forgotten, or started again,
+                    // leaves nothing to record.
+                    let current = std::fs::read(&record).ok().and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok());
+                    if current.is_some_and(|current| current.pid == info.pid) {
                         exits.lock().unwrap().insert(info.pid, None);
                     }
                     events.push(Event::ServiceExited { name: info.name, pid: info.pid, status: None });
