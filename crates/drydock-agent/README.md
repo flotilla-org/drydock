@@ -491,11 +491,13 @@ one name take turns. The service leads its own process group with stdin
 which a restarted agent no longer holds. `output: "file"` (the default)
 sends stdout and stderr, in the order written, straight to `<name>.log` in
 the agent's service directory, mode 0600; read it with `GET /files/{path}`,
-ranged to follow it. Each start moves the previous log to `<name>.log.1`.
+ranged to follow it. Each start moves the previous log to `<name>.log.1`,
+also a start that then fails to spawn.
 The agent checks the log every second and, once it is past 64 MiB, copies it
 to `<name>.log.1` and empties it in place (the service holds it open for
 appending); bytes written between the copy and the emptying are lost, and a
-log can pass 64 MiB by what the service writes in a second. Without a
+log can pass 64 MiB by what the service writes in a second. A reader
+following the log sees it shrink to nothing at each rotation. Without a
 running agent nothing rotates it. `output: "discard"` sends both to
 `/dev/null`, and `log` is null.
 
@@ -503,20 +505,23 @@ The service directory is `<executable>.services` beside the installed agent
 (`/opt/drydock/drydock-agent.services`), on the same disk as the store rather
 than the `/run` tmpfs, so a chatty log does not take guest memory. Each
 service has a record there, `<name>.json`, holding its body, PID and the
-process's start time. The agent finds its services again from these records:
-a record whose PID still names a process started at that time is running;
-any other has exited. So a record left by an earlier boot reads as exited,
-and a reused PID never passes for the service. While the agent that started a
-service runs it waits for it and keeps its exit status; across a re-exec the
-new agent still reaps it but the status is not known (`status: null`), and
-after a crash the provider's init reaps it. `pid` is the PID the service last
-had; once it has exited it may name another process. Each exit the agent sees
-is pushed on `/events` as `{"kind": "service_exited", "name", "pid",
-"status"}`. On Linux an agent that finds a running service at startup
-watches it through a pidfd, opened after the start-time check, so its exit
-is announced too, with `status: null`. Elsewhere only the agent that started
-a service announces its exit. Absent and null `status` mean the same: not
-known.
+process's start time. The agent finds its services again from these records: a
+record whose PID still names a process started at that time is running; any
+other has exited. So a record left by an earlier boot reads as exited, and a
+reused PID never passes for the service. An unreadable record is discarded
+with a warning, as if the service had never started. The record keeps the
+request as sent, `environment` included, and every reply carries it back, so a
+secret in a service's environment is readable by every client of the agent, as
+it is to the vessel's root. While the agent that started a service runs it
+waits for it and keeps its exit status; across a re-exec the new agent still
+reaps it but the status is not known (`status: null`), and after a crash the
+provider's init reaps it. `pid` is the PID the service last had; once it has
+exited it may name another process. Each exit the agent sees is pushed on
+`/events` as `{"kind": "service_exited", "name", "pid", "status"}`. On Linux
+an agent that finds a running service at startup watches it through a pidfd,
+opened after the start-time check, so its exit is announced too, with `status:
+null`. Elsewhere only the agent that started a service announces its exit.
+Absent and null `status` mean the same: not known.
 
 `DELETE /services/{name}` sends SIGTERM to the service's process group and,
 if it is still running after `grace_ms` (10 seconds by default;

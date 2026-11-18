@@ -43,10 +43,12 @@ pub(crate) struct Services {
     /// Exits this agent process saw, by name, with the PID that exited. The
     /// status is known only for services this process started.
     exits: Arc<Mutex<HashMap<String, Exit>>>,
+    /// Children of this process whose exit is not recorded in `exits` yet.
+    waiting: Arc<Mutex<std::collections::HashSet<u32>>>,
 }
 impl Services {
     pub(crate) fn new(dir: PathBuf, events: Arc<crate::events::Events>) -> Self {
-        Self { dir, events, locks: Mutex::default(), exits: Arc::default() }
+        Self { dir, events, locks: Mutex::default(), exits: Arc::default(), waiting: Arc::default() }
     }
     fn lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.locks.lock().unwrap().entry(name.to_owned()).or_default().clone()
@@ -59,7 +61,16 @@ impl Services {
     }
     fn record(&self, name: &str) -> Result<Option<Record>, AgentError> {
         match std::fs::read(self.record_path(name)) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| AgentError::io("service.record", name, crate::invalid(e))),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(record) => Ok(Some(record)),
+                // Records are replaced atomically, so this is damage from outside;
+                // kept, it would bar the name from ever starting again.
+                Err(error) => {
+                    tracing::warn!(%error, service = name, "discarding an unreadable service record");
+                    let _ = std::fs::remove_file(self.record_path(name));
+                    Ok(None)
+                }
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(AgentError::io("service.record", name, error)),
         }
@@ -159,10 +170,12 @@ impl Services {
             // Unrecorded, it could never be found or stopped again.
             let _ = rustix::process::Pid::from_raw(pid as i32)
                 .map(|group| rustix::process::kill_process_group(group, rustix::process::Signal::KILL));
+            tokio::spawn(async move { child.wait().await });
             return Err(AgentError::io(OP, name, error));
         }
         self.exits.lock().unwrap().remove(name);
-        let (exits, events, name_owned) = (self.exits.clone(), self.events.clone(), name.to_owned());
+        self.waiting.lock().unwrap().insert(pid);
+        let (exits, waiting, events, name_owned) = (self.exits.clone(), self.waiting.clone(), self.events.clone(), name.to_owned());
         tokio::spawn(async move {
             let status = match child.wait().await {
                 Ok(status) => {
@@ -175,6 +188,7 @@ impl Services {
                 }
             };
             exits.lock().unwrap().insert(name_owned.clone(), (pid, status));
+            waiting.lock().unwrap().remove(&pid);
             events.push(Event::ServiceExited { name: name_owned, pid, status });
         });
         Ok((self.info(name, &record), true))
@@ -199,11 +213,17 @@ impl Services {
                 tokio::time::sleep(POLL).await;
             }
         }
+        // A child of this process is gone before its waiter records the status.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while self.waiting.lock().unwrap().contains(&record.pid) && !Self::running(&record) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(POLL).await;
+        }
         let info = self.info(name, &record);
         if info.state == ServiceState::Running {
             return Err(AgentError::new("service.stop", name, ErrorKind::TimedOut, "the service outlived SIGKILL"));
         }
         std::fs::remove_file(self.record_path(name)).map_err(|e| AgentError::io("service.stop", name, e))?;
+        self.exits.lock().unwrap().remove(name);
         Ok(info)
     }
     /// Signal the group the service leads, checked just before, so a reused
@@ -218,6 +238,12 @@ impl Services {
     /// Watch the services an earlier agent process started, so their exits
     /// are still announced, without a status.
     pub(crate) fn adopt(&self) {
+        // Copies a rotation left behind when an agent died during it.
+        for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
         let Ok(services) = self.list() else { return };
         for info in services.into_iter().filter(|info| info.state == ServiceState::Running) {
             #[cfg(target_os = "linux")]
@@ -228,6 +254,8 @@ impl Services {
                 if !self.record(&info.name).ok().flatten().is_some_and(|record| Self::running(&record)) {
                     continue;
                 }
+                // Deprecated only for descriptors a caller might close early;
+                // the AsyncFd owns this one (as in process.rs).
                 #[allow(deprecated)]
                 let Ok(pidfd) = tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE) else { continue };
                 let (exits, events) = (self.exits.clone(), self.events.clone());
@@ -245,18 +273,25 @@ impl Services {
     pub(crate) async fn rotate_logs(self: Arc<Self>) {
         loop {
             tokio::time::sleep(ROTATE_EVERY).await;
-            for info in self.list().unwrap_or_default() {
-                let Some(log) = info.log else { continue };
-                if std::fs::metadata(&log).is_ok_and(|m| m.len() > LOG_LIMIT) {
-                    let lock = self.lock(&info.name);
-                    let _held = lock.lock().await;
-                    if let Err(error) = rotate(&log) {
-                        tracing::warn!(%error, service = %info.name, "service log rotation failed");
-                    }
+            let services = self.clone();
+            let due = tokio::task::spawn_blocking(move || {
+                let services = services.list().unwrap_or_default().into_iter();
+                services.filter_map(|info| Some((info.name, info.log?))).filter(|(_, log)| full(log)).collect::<Vec<_>>()
+            });
+            for (name, log) in due.await.unwrap_or_default() {
+                let lock = self.lock(&name);
+                let _held = lock.lock().await;
+                // A start may have replaced the log while this waited for the lock.
+                let rotated = tokio::task::spawn_blocking(move || if full(&log) { rotate(&log) } else { Ok(()) }).await;
+                if let Ok(Err(error)) = rotated {
+                    tracing::warn!(%error, service = %name, "service log rotation failed");
                 }
             }
         }
     }
+}
+fn full(log: &Path) -> bool {
+    std::fs::metadata(log).is_ok_and(|m| m.len() > LOG_LIMIT)
 }
 fn rotated(log: &Path) -> PathBuf {
     let mut name = log.as_os_str().to_owned();

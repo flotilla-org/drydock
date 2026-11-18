@@ -42,11 +42,18 @@ async fn unread_output_never_blocks_a_service() {
 #[tokio::test]
 async fn a_full_log_is_rotated_keeping_one_previous_file() {
     let h = harness(false, "test-build").await;
-    let info = h.client.put_service("big", &shell("head -c 70000000 /dev/zero; exec sleep 60")).await.unwrap();
+    let info = h
+        .client
+        .put_service("big", &shell(&format!("head -c 70000000 /dev/zero; touch '{}'; exec sleep 60", h.vessel().join("done").display())))
+        .await
+        .unwrap();
     let log = info.log.unwrap();
     let previous = PathBuf::from(format!("{}.1", log.display()));
-    until("the log was rotated", async || std::fs::metadata(&previous).is_ok_and(|m| m.len() == 70_000_000)).await;
-    assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+    let size = |path: &Path| std::fs::metadata(path).map_or(0, |m| m.len());
+    let done = h.vessel().join("done");
+    until("the log was rotated", async || done.exists() && size(&previous) > 64 * 1024 * 1024).await;
+    // Rotation may come mid-write, so the rest of the output is in the log.
+    assert!(size(&log) + size(&previous) <= 70_000_000 && size(&log) < 64 * 1024 * 1024);
     h.client.remove_service("big", None).await.unwrap();
 }
 
@@ -85,13 +92,26 @@ async fn stopping_escalates_to_sigkill() {
     h.client.put_service("stubborn", &shell(&script)).await.unwrap();
     until("the trap was set", async || ready.exists()).await;
     let stopped = h.client.remove_service("stubborn", Some(Duration::from_millis(200))).await.unwrap();
-    assert!(matches!(stopped.state, ServiceState::Exited { status: Some(ExitStatus { signal: Some(9), .. }) | None }), "{stopped:?}");
+    assert_eq!(stopped.state, ServiceState::Exited { status: Some(ExitStatus { code: None, signal: Some(9), timed_out: false }) });
+}
+
+// A name is one safe file name: no path, no leading dot, at most 64 bytes.
+#[tokio::test]
+async fn names_are_refused_unless_one_safe_file_name() {
+    let h = harness(false, "test-build").await;
+    for name in ["a/b", ".hidden", "-flag", &"x".repeat(65)] {
+        let refused = h.client.put_service(name, &shell("true")).await.unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+    }
+    assert!(h.client.services().await.unwrap().is_empty());
 }
 
 /// An agent executable serving `socket`, upgraded once to another build.
 struct Upgraded {
     client: Client,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     socket: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     dir: tempfile::TempDir,
     _agent: tokio::process::Child,
 }
