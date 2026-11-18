@@ -2477,7 +2477,7 @@
           },
           "exclusive_label": {
             "type": "boolean",
-            "description": "Provision of a label that names an environment returns it, concurrent\nprovisions included: the module refuses a second sandbox for a label.\nWithout it a label is only the client's name for what it made, and\nevery provision may create an environment."
+            "description": "Provision of a label that names an environment returns it, concurrent\nprovisions included: the module refuses a second sandbox for a label.\nWithout it a label is only the client's name for what it made, and\nevery provision may create an environment. drydockd states it for every\ninstance; where the module does not, it holds within that drydockd\nonly, not at the vendor."
           },
           "export": {
             "type": "boolean"

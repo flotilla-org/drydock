@@ -79,7 +79,6 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
     let o = &config.semantics;
     let added = Added {
         exclusive: provider.capabilities().exclusive_label,
-        labels: Labels::default(),
         owner: (shared && !declared.owner_scoped).then(|| observed.provider.clone()),
         settle: o.settle && !declared.settles,
         idempotent: o.idempotent && !declared.idempotent,
@@ -97,8 +96,6 @@ struct Added {
     inner: Arc<dyn Provider>,
     /// The module returns the environment a label names itself.
     exclusive: bool,
-    /// The labels being provisioned, when the module does not hold them.
-    labels: Labels,
     /// The instance whose tag marks what it may list and act on by id, on a
     /// shared account.
     owner: Option<String>,
@@ -204,9 +201,9 @@ impl Added {
 
 /// One provision of a label at a time, within this drydockd.
 #[derive(Default)]
-struct Labels(Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>);
+pub(super) struct Labels(Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>);
 impl Labels {
-    async fn hold(&self, label: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn hold(&self, label: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.0.recover();
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -265,7 +262,6 @@ impl Provider for Added {
     /// the module's provision. An environment whose wait fails is left, and
     /// so is one taken up stopped or in an unknown state.
     async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
-        let _held = if self.exclusive { None } else { Some(self.labels.hold(&r.label).await) };
         let label = r.label.clone();
         let named = match self.exclusive {
             true => None,
@@ -288,7 +284,11 @@ impl Provider for Added {
             Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping } | Observation::Unknown { .. }
         );
         if !created && unusable {
-            return Err(left(refused(format!("environment {} under label {label} is {}", e.id, described(&e)))));
+            return Err(left(refused(format!(
+                "environment {} under label {label} is {}; destroy it to provision the label again",
+                e.id,
+                described(&e)
+            ))));
         }
         let e = match self.settle && (created || e.state != Observation::Running) {
             true => self.running(&e.id).await.map_err(left)?,

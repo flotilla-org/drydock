@@ -374,7 +374,8 @@ impl<M: Machine> SuspendResume for Vessels<M> {
         if token != resume_token(&self.name, id) {
             return Err(refused("invalid resume token for this provider/environment"));
         }
-        // A failed start leaves the suspension marker: the vessel stays suspended.
+        // A failed start leaves the suspension marker: the vessel stays
+        // suspended, though an agent that never answered hello may run on.
         if !found.running {
             self.start(id, &found.record, c).await?;
         }

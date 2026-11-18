@@ -409,7 +409,9 @@ pub struct Capabilities {
     /// Provision of a label that names an environment returns it, concurrent
     /// provisions included: the module refuses a second sandbox for a label.
     /// Without it a label is only the client's name for what it made, and
-    /// every provision may create an environment.
+    /// every provision may create an environment. drydockd states it for every
+    /// instance; where the module does not, it holds within that drydockd
+    /// only, not at the vendor.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_label: bool,
     /// The ways, beyond the guest's own egress, that a vessel can reach a

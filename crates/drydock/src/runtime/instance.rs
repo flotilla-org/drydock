@@ -38,6 +38,9 @@ pub(super) struct Instance {
     pub(super) request_timeout: std::time::Duration,
     /// The observer's view of this provider, as drydockd's waits read it.
     pub(super) observed: Arc<Observed>,
+    /// The labels being provisioned, when the module does not hold them. A
+    /// provision waits for its label before its call's deadline starts.
+    pub(super) labels: Option<semantics::Labels>,
 }
 #[derive(Default)]
 pub(super) struct DestroyState {

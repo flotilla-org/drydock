@@ -747,8 +747,10 @@ can still race.
 The declaration clients read states `exclusive_label` for every instance.
 A take-up answers like a create: under `settle` a running or starting
 environment is waited on as usual, and a stopped one, or one in an unknown
-state, fails at once with `left` naming it. A successful provision is a usable
-environment. The module's own steps after create (a module that starts the
+state, fails at once with `left` naming it, until the client destroys it. That
+holds for a module that declares `exclusive_label` too: a `local` or `ssh_host`
+vessel taken up stopped fails where it was once answered. A successful
+provision is a usable environment. The module's own steps after create (a module that starts the
 agent, for one) do not run again; drydockd's own agent upload runs again where
 it is the bootstrap, putting the agent in only when it is absent.
 
