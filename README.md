@@ -743,9 +743,18 @@ drydockd lists the instance's environments before the create, one list per
 provision, and holds one provision of a label at a time. That hold is within
 one drydockd: two drydockds sharing an instance on one account can still race.
 The declaration clients read states `exclusive_label` for every instance.
+The environment is answered as it is, in whatever state it was left: neither
+the settle wait nor the module's own steps after create (a module that starts
+the agent, for one) run again for it. drydockd's own agent upload runs again
+where it is the bootstrap, putting the agent in only when it is absent. A
+client that retries into what a failed provision left checks the environment
+itself, or destroys it and provisions a fresh label.
 
-Nothing cleans up after a failed provision, neither drydockd nor a module.
-Its failure answer says what it left beside the error, in `left`:
+Once the vendor has made an environment, nothing removes it after a failed
+provision, neither drydockd nor a module; a module undoes only a half-made
+environment that nothing could find later (a `local` or `ssh_host` vessel
+whose record was never written). The failure answer says what it left beside
+the error, in `left`:
 
 ```json
 {"kind": "unavailable", "reason": "environment sb-7f3a is still \"starting\" after 120s waiting to be running",
@@ -755,9 +764,11 @@ Its failure answer says what it left beside the error, in `left`:
 `made` names the environment the vendor made before a later step failed
 (start, the agent's upload or hello, the settle wait); `none` says the vendor
 made nothing; `unknown` says whether it did cannot be known, as when its
-answer to the create was lost. What a provision left stays listed under its
-label: the client destroys it, retries the label into it, or keeps it to look
-at. A launch's failure says the same.
+answer to the create was lost. A step that fails after a provision took up an
+environment that was already there answers `none`: the provision made nothing,
+and the client already holds that environment. What a provision left stays
+listed under its label: the client destroys it, retries the label into it, or
+keeps it to look at. A launch's failure says the same.
 
 ### Vendor events
 

@@ -78,7 +78,8 @@ export function made(
   return new ProtocolFailure(failure.detail, { kind: "made", provider, id });
 }
 /** The vendor's create call failed: a refusal made nothing, and any other
- * failure may have. */
+ * failure may have. The refusal kinds are those of the Rust
+ * `ProvisionFailure::creating`; a kind not listed is safely unknown. */
 export function creating(failure: ProtocolFailure): ProtocolFailure {
   const answered = [
     "not_found",

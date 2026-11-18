@@ -649,7 +649,7 @@ impl Daemon {
         let provisioned = self.invalidating(provider, client.provision(provider, &request).await).await?;
         if let Some(build) = agent_build {
             let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
-            let left = |error| ProvisionError::made(error, provider, &environment.id);
+            let left = |error| left_after(error, provider, &provisioned);
             self.bootstrap(&client, provider, &provisioned, build.clone()).await.map_err(left)?;
             self.agent_ready(provider, environment, &platform, &build).await.map_err(left)?;
         }
@@ -837,6 +837,14 @@ impl Daemon {
         Ok(self.client_key_directory(label).join("id_ed25519"))
     }
 }
+/// A step's failure after the provider answered: an environment this
+/// provision made is left, and one it took up was there before it.
+fn left_after(error: Error, provider: &str, provisioned: &crate::api::Provisioned<Environment>) -> ProvisionError {
+    match provisioned {
+        crate::api::Provisioned::Created(environment) => ProvisionError::made(error, provider, &environment.id),
+        crate::api::Provisioned::Existing(_) => error.into(),
+    }
+}
 // Routing between per-host runtimes. Policy stays in each host's Runtime;
 // the Daemon adds only placement and its existing status-read cache.
 #[async_trait::async_trait]
@@ -883,7 +891,7 @@ impl ProviderApi for Daemon {
         let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
         if self.uploads(p) {
             let (crate::api::Provisioned::Created(environment) | crate::api::Provisioned::Existing(environment)) = &provisioned;
-            let left = |error| ProvisionError::made(error, p, &environment.id);
+            let left = |error| left_after(error, p, &provisioned);
             let build = self.build_for(environment, Some(&request.prepared.platform)).await.map_err(left)?;
             self.bootstrap(&self.runtime(p).map_err(left)?, p, &provisioned, build).await.map_err(left)?;
         }
