@@ -765,16 +765,17 @@ the error, in `left`:
  "left": {"kind": "made", "provider": "modal", "id": "sb-7f3a"}}
 ```
 
-`made` names the environment the vendor made before a later step failed
-(start, the agent's upload or hello, the settle wait); `none` says the vendor
-made nothing; `unknown` says whether it did cannot be known, as when its
-answer to the create was lost or the vendor failed it other than by refusing
-it, or the provision's deadline passed, during the settle wait too. A retry of
-the label finds what an `unknown` provision made. A provision that took up an environment names it the same way. A client
-reads `left` on every failed provision, whatever its class: a `refused` one
-can still name an environment. What a provision left stays listed under its
-label: the client destroys it, retries the label into it, or keeps it to look
-at. A launch's failure says the same.
+`made` names the environment the vendor made, or the provision took up,
+before a later step failed: start, the agent's upload or hello, the settle
+wait, or a take-up found stopped. `none` says the vendor made nothing.
+`unknown` says whether it did cannot be known: the answer to the create was
+lost or unreadable (a proxy's included), the vendor failed the create other
+than by refusing it, or the provision's deadline passed, during the settle
+wait too. A retry of the label finds what an `unknown` provision made. A
+client reads `left` on every failed provision, whatever its class: a `refused`
+one can still name an environment. What a provision left stays listed under
+its label: the client destroys it, retries the label into it, or keeps it to
+look at. A launch's failure says the same.
 
 ### Vendor events
 
