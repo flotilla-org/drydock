@@ -17,6 +17,7 @@ pub use reach::{Attempt, Attempted, Attempts, DEFAULT_TIMEOUT_MS, Identity, MAX_
 mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
+mod service;
 pub mod socket;
 pub mod stand_in;
 mod store;
@@ -32,7 +33,7 @@ pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
 pub const FEATURES: &[&str] =
-    &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts", "destinations"];
+    &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts", "destinations", "services"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -240,7 +241,8 @@ pub struct Service {
 #[serde(rename_all = "snake_case")]
 pub enum ServiceOutput {
     /// Both streams, in the order written, to the file [`ServiceInfo::log`]
-    /// names, emptied each time the service starts.
+    /// names. Each start, and each pass of 64 MiB, keeps the previous content
+    /// as `<log>.1`.
     #[default]
     File,
     Discard,
@@ -249,6 +251,8 @@ pub enum ServiceOutput {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceInfo {
     pub name: String,
+    /// The PID the service last had; once it has exited, it may name
+    /// another process.
     pub pid: u32,
     pub service: Service,
     #[serde(flatten)]
