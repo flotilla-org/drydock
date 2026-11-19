@@ -307,7 +307,7 @@ From then on it is an ordinary instance: `POST
   unix:///var/run/docker.sock` and needs `dockerd`. drydockd checks the
   programs, starts the service through the parent vessel's agent, under a name
   of its own (`drydock-carried-…`), and waits up to 20 seconds for the endpoint
-  to answer; then it configures the instance. A `parent.endpoint` in the body
+  to answer, opening and closing a connection to it every quarter second; then it configures the instance. A `parent.endpoint` in the body
   carries an engine the client started itself instead, and no recipe runs.
 - **What is left.** A carry that fails after the service started answers with
   the failure and `left` naming it (`{"kind": "service", "provider", "id",

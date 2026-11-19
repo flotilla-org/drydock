@@ -104,6 +104,7 @@ pub(super) fn child_socket(run: &FsPath, name: &str) -> Result<(PathBuf, tokio::
     // A socket left here is stale: a name's live relay is dropped before
     // its name can be carried again, under the name's turn.
     let socket = directory.join(format!("{}.sock", digest(name)));
+    // A Unix socket path must fit in sun_path with its terminator.
     if socket.as_os_str().len() > 107 {
         return Err(format!("provider {name}: drydock's runtime directory is too long for the socket {}", socket.display()));
     }
@@ -112,6 +113,10 @@ pub(super) fn child_socket(run: &FsPath, name: &str) -> Result<(PathBuf, tokio::
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .map_err(|e| format!("provider {name}: socket: {e}"))?;
     Ok((socket, listener))
+}
+/// A failure after a carry started its recipe's service, which it leaves.
+fn left_service(error: Error, provider: &str, id: &str, name: &str) -> ProvisionError {
+    ProvisionError { error, left: Left::Service(Box::new(LeftService { provider: provider.into(), id: id.into(), name: name.into() })) }
 }
 fn refused(reason: impl Into<String>) -> Error {
     Error::Protocol(ProtocolError::Refused { reason: reason.into() })
@@ -200,10 +205,7 @@ impl Daemon {
             None => None,
         };
         let left = |error: Error| match &service {
-            Some((service, _)) => ProvisionError {
-                error,
-                left: Left::Service(Box::new(LeftService { provider: parent.clone(), id: environment.clone(), name: service.clone() })),
-            },
+            Some((service, _)) => left_service(error, parent, &environment, service),
             None => error.into(),
         };
         let (socket, listener) = child_socket(&self.run, name).map_err(|e| left(Error::Transport(e)))?;
@@ -287,14 +289,7 @@ impl Daemon {
         }
         let service = format!("drydock-carried-{}", digest(name));
         agent.start_service(&service, &recipe.service).await.map_err(agent_error)?;
-        let left = |error: Error| ProvisionError {
-            error,
-            left: Left::Service(Box::new(LeftService {
-                provider: link.provider.clone(),
-                id: link.environment.clone(),
-                name: service.clone(),
-            })),
-        };
+        let left = |error: Error| left_service(error, &link.provider, &link.environment, &service);
         let deadline = tokio::time::Instant::now() + CONNECT;
         loop {
             if agent.open_inward(&link.forward.id).await.is_ok() {
