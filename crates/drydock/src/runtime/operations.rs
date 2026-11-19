@@ -43,6 +43,7 @@ impl Runtime {
             ports: i.provider.operations().into(),
             ways_in: Some(i.ways_in.clone()),
             endpoint: i.config.endpoint.clone(),
+            parent: None,
         }
     }
 }

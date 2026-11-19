@@ -79,6 +79,7 @@ impl Host {
             ports: p.operations().into(),
             ways_in: Some(p.ways_in()),
             endpoint: None,
+            parent: None,
         }
     }
     async fn bindings(&self) -> Vec<(String, String, Arc<dyn Provider>)> {

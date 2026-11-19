@@ -529,8 +529,10 @@ impl Daemon {
                 ports: Ports::default(),
                 ways_in: None,
                 endpoint: None,
+                parent: None,
             });
         declaration.endpoint = self.carried.get(name).map(Carrier::local);
+        declaration.parent = configured.parent.clone();
         if let Some(readiness) = self.unavailable.get(name) {
             declaration.readiness = readiness.clone();
         } else if let Some(status) = status

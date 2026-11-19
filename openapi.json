@@ -392,6 +392,140 @@
             "$ref": "#/components/responses/Error503"
           }
         }
+      },
+      "put": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "put_provider",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Carried instance name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "module, settings, and parent with an environment; ownership and semantics as in the configuration. credential, events and endpoint are refused.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Already carried from the same body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDeclaration"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Carried",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDeclaration"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "delete": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "remove_provider",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Carried instance name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed, or never carried"
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
       }
     },
     "/v1/providers/{provider}/credential": {
@@ -4232,7 +4366,7 @@
       },
       "Parent": {
         "type": "object",
-        "description": "An instance's parent, by instance name, and the endpoint on the parent's machine.",
+        "description": "An instance's parent, by instance name, and where on it the instance's\nendpoint is: on the parent's machine, or inside one of its environments.",
         "required": [
           "instance",
           "endpoint"
@@ -4240,6 +4374,13 @@
         "properties": {
           "endpoint": {
             "$ref": "#/components/schemas/Carried"
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An environment of `instance` whose vessel agent opens each connection\nto `endpoint` inside it. Only a carried instance, put while drydockd\nruns, names one; the configuration file cannot."
           },
           "instance": {
             "type": "string"
@@ -4746,6 +4887,17 @@
           },
           "module": {
             "type": "string"
+          },
+          "parent": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Parent",
+                "description": "Server only: the instance's parent, from the configuration or, with an\nenvironment, from the `PUT` that carried it."
+              }
+            ]
           },
           "ports": {
             "$ref": "#/components/schemas/Ports"

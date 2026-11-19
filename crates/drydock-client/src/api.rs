@@ -104,6 +104,20 @@ pub trait ProviderApi: Send + Sync {
     async fn observe(&self, _since: Option<&str>) -> Result<ObservationStream, Error> {
         Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
     }
+    /// Server only: carry an instance under `provider`, its endpoint inside
+    /// the parent environment `configuration.parent` names. The same
+    /// configuration again answers with the same instance.
+    async fn put_provider(
+        &self,
+        _provider: &str,
+        _configuration: &ProviderConfiguration,
+    ) -> Result<Provisioned<ProviderDeclaration>, Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
+    /// Server only: remove a carried instance that holds no environments.
+    async fn remove_provider(&self, _provider: &str) -> Result<(), Error> {
+        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    }
     /// Server only: set an inward exposure, reporting whether it replaced one.
     async fn put_inward(&self, _provider: &str, _id: &str, _name: &str, _request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
@@ -239,6 +253,16 @@ impl ProviderApi for Client {
     async fn event(&self, provider: &str, delivery: &VendorDelivery) -> Result<Vec<VendorObservation>, Error> {
         self.call(Method::POST, &["v1", "providers", provider, "event"], Some(delivery)).await
     }
+    async fn put_provider(&self, provider: &str, configuration: &ProviderConfiguration) -> Result<Provisioned<ProviderDeclaration>, Error> {
+        let request = self.request(Method::PUT, &["v1", "providers", provider])?.json(configuration);
+        Ok(match self.execute_response(request).await? {
+            (201, declaration) => Provisioned::Created(declaration),
+            (_, declaration) => Provisioned::Existing(declaration),
+        })
+    }
+    async fn remove_provider(&self, provider: &str) -> Result<(), Error> {
+        self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider], None).await
+    }
     async fn put_inward(&self, provider: &str, id: &str, name: &str, request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
         let request =
             self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "exposures", "inward", name])?.json(request);
@@ -354,6 +378,7 @@ fn server_routes() -> OpenApiRouter<Surface> {
     routes()
         .routes(routes!(events))
         .routes(routes!(credential))
+        .routes(routes!(put_provider, remove_provider))
         .routes(routes!(inwards))
         .routes(routes!(inward, put_inward, remove_inward))
         .routes(routes!(outwards))
@@ -433,6 +458,25 @@ responses((status = 200, description = "Provider declaration", body = ProviderDe
 )]
 async fn provider(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<ProviderDeclaration>> {
     Ok(Json(api.provider(&p).await?))
+}
+#[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}",
+params(("provider" = String, Path, description = "Carried instance name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+request_body(content = ProviderConfiguration, description = "module, settings, and parent with an environment; ownership and semantics as in the configuration. credential, events and endpoint are refused."),
+responses((status = 201, description = "Carried", body = ProviderDeclaration), (status = 200, description = "Already carried from the same body", body = ProviderDeclaration), ErrorResponses)
+)]
+async fn put_provider(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(c): ApiJson<ProviderConfiguration>) -> ApiResult<Response> {
+    Ok(match api.put_provider(&p, &c).await? {
+        Provisioned::Created(declaration) => (StatusCode::CREATED, Json(declaration)).into_response(),
+        Provisioned::Existing(declaration) => Json(declaration).into_response(),
+    })
+}
+#[utoipa::path(delete, tag = "server", path = "/v1/providers/{provider}",
+params(("provider" = String, Path, description = "Carried instance name")),
+responses((status = 204, description = "Removed, or never carried"), ErrorResponses)
+)]
+async fn remove_provider(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<StatusCode> {
+    api.remove_provider(&p).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 #[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}/credential",
 params(("provider" = String, Path, description = "Opaque provider")),

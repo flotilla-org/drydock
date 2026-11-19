@@ -203,7 +203,10 @@ The daemon serves the public API, including prepare, provision, inspect,
 destroy, reach, optional operations, stream upgrades, `/v1/providers` and the
 server-only credential and event extensions, plus `/launch` and `/shell`
 conveniences. It reads its configuration file at start: a `PUT` or `PATCH
-/v1/config` that would change it is refused, so edit the file and restart it. The public `ProviderApi`
+/v1/config` that would change it is refused, so edit the file and restart it.
+[Carried instances](#carried-instances) are the exception: `PUT` and `DELETE
+/v1/providers/{name}` make and remove them while it runs, and the file never
+holds them. The public `ProviderApi`
 trait works against the embedded `Daemon` or a Unix-socket `Client`. `/v1/events`
 merges host streams with an opaque vector cursor; partial snapshots explicitly
 mark other hosts' providers unavailable so they cannot imply deletion.
@@ -273,6 +276,85 @@ since that line would shadow drydock's. Exposures sharing a guest name share its
 address. An environment destroyed while drydock was down is forgotten when
 drydock next finds it gone. Re-establishing a vessel holds its exposures, so
 reading them waits for at most the connect budget (20s).
+
+### Carried instances
+
+A provider instance can also be made while drydockd runs, for an engine that
+exists only once an environment does, such as `dockerd` started in a sandbox.
+Its endpoint is a socket inside an environment of another instance, and the
+client names it. A client makes the parent environment, starts the engine in
+it (through the vessel agent's services, or the image), then carries an
+instance there:
+
+```text
+PUT /v1/providers/sb7f3a-docker
+{"module": "docker_engine",
+ "semantics": {"settle": true, "idempotent": true},
+ "parent": {"instance": "daytona", "environment": "sb-7f3a",
+            "endpoint": {"unix": "/var/run/docker.sock"}}}
+
+201 {"provider": "sb7f3a-docker", "module": "docker_engine",
+     "capabilities": {...}, "readiness": {"status": "ready"}, "rate_limits": [],
+     "ports": {"exec": true, "quota": true, "files": true, ...},
+     "endpoint": {"unix": "/run/user/1000/drydock/parents/5d0c1e6f8a2b4c39.sock"},
+     "parent": {"instance": "daytona", "environment": "sb-7f3a",
+                "endpoint": {"unix": "/var/run/docker.sock"}}}
+```
+
+From then on it is an ordinary instance: `POST
+/v1/providers/sb7f3a-docker/environments` provisions through it.
+
+- The body is a [provider configuration](openapi.json) (`module`, `settings`,
+  `ownership`, `semantics`) whose `parent` names an `environment`. `credential`,
+  `events` and `endpoint` cannot be put. The name is the client's, under the
+  exposure-name rule: 1 to 64 letters, digits, `_`, `.` or `-`, starting with a
+  letter or digit. Nothing parses it.
+- The same body again answers 200 with the same instance. Carried instances
+  are listed by `GET /v1/providers` beside configured ones, and read with `GET
+  /v1/providers/{name}`, in the same shape: `parent` with its environment, and
+  `endpoint`, the socket drydockd made for it, as for a configured instance with
+  a parent.
+- Each connection to the instance's endpoint is one hop: drydockd opens a
+  stream through the parent environment's vessel agent, which opens the socket
+  inside the vessel, over the same link drydock keeps for that vessel's
+  [exposures](#exposures). A configured `parent`, without an environment, is the
+  same hop ending at the parent instance's machine instead. An instance carried
+  into an environment of a carried instance (Firecracker in a container in a
+  sandbox) is the hop repeated; the parent environment must already exist, so
+  there are no cycles.
+- Its capacity is the parent environment's granted size, as `Quota.limit` for
+  CPU, memory and disk. drydock enforces nothing beyond what the inner engine
+  refuses.
+- Egress: each layer reports its own. A container's row states the inner
+  engine's enforcement and the sandbox's row the sandbox's; the effective
+  policy is the narrower of the two, and drydock does not merge them.
+- `DELETE /v1/providers/sb7f3a-docker` removes it (204), and removing a name
+  that is not carried succeeds. When drydockd destroys the parent environment,
+  or finds it gone, the carried instance goes too, with every instance carried
+  into its environments, at every depth.
+- Carried instances are held in memory only. After drydockd restarts they are
+  gone until the client carries them again (the same `PUT`), and until then the
+  environment routes under their names answer `unavailable`, not `not_found`:
+  drydock does not know that those environments are gone.
+
+Refusals are `422` (`{"kind": "refused", "reason": ...}`):
+
+| Request | Reason |
+|---|---|
+| `PUT /v1/providers/sb%207f3a`, or any name outside the rule | `provider name must be 1 to 64 letters, digits, '_', '.' or '-', starting with a letter or digit` |
+| `PUT /v1/providers/b1`, a configured name | `provider b1 is configured; a configured instance changes only with the configuration file` |
+| `PUT` of a different body under a carried name | `provider sb7f3a-docker is carried from a different body; remove it first` |
+| `PUT` without `parent`, or a `parent` without `environment` | `a carried instance's parent names an environment` |
+| `PUT` with `credential`, `events` or `endpoint` | `credential, events and endpoint cannot be put` |
+| `PUT` of a module that cannot be given its endpoint | `module e2b cannot be given its endpoint, so it cannot be carried` |
+| `PUT` naming a parent that is not an instance | `parent daytna is not a provider` |
+| `PUT` naming a parent environment that does not exist | `parent environment sb-7f3a of daytona is gone` |
+| `PUT` into an environment without a vessel agent drydock holds a link to | as for exposures: `provider p declares no vessel agent, which exposures need`, or `environment has no drydock-managed SSH key` |
+| `DELETE` of a configured name | `provider b1 is configured; a configured instance changes only with the configuration file` |
+| `DELETE` while the instance holds environments | `sb7f3a-docker holds environments 4be1c0d2e9f3, 9a7713c05e21; destroy them first` |
+
+A carried instance's own environments are listed for the `DELETE`; when the
+list fails, the `DELETE` fails with that error.
 
 ## Protocol workspace
 

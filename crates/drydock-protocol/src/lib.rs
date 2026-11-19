@@ -90,11 +90,17 @@ impl ProviderConfiguration {
         Self { credential: None, semantics: Default::default(), events: None, parent: None, ..self.clone() }
     }
 }
-/// An instance's parent, by instance name, and the endpoint on the parent's machine.
+/// An instance's parent, by instance name, and where on it the instance's
+/// endpoint is: on the parent's machine, or inside one of its environments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Parent {
     pub instance: String,
+    /// An environment of `instance` whose vessel agent opens each connection
+    /// to `endpoint` inside it. Only a carried instance, put while drydockd
+    /// runs, names one; the configuration file cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     pub endpoint: Carried,
 }
 /// An endpoint on a provider's machine that it can open streams to.
@@ -254,6 +260,10 @@ pub struct ProviderDeclaration {
     /// for its endpoint, which a client can open too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Local>,
+    /// Server only: the instance's parent, from the configuration or, with an
+    /// environment, from the `PUT` that carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Parent>,
 }
 /// Which optional operations exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
