@@ -502,8 +502,10 @@ sends both to `/dev/null`, and `log` is null. A log an earlier `file` run left
 stays until a later `file` start moves it.
 
 The service directory is `<executable>.services` beside the installed agent
-(`/opt/drydock/drydock-agent.services`), on the same disk as the store rather
-than the `/run` tmpfs, so a chatty log does not take guest memory. Each
+(`/opt/drydock/drydock-agent.services`), on whatever filesystem holds the
+vessel's root. That may be tmpfs: an `ssh_host` vessel lives under
+`$XDG_RUNTIME_DIR`, so its logs use memory, bounded by rotation at about
+128 MiB per service. Each
 service has a record there, `<name>.json`, holding its body, PID and the
 process's start time. The agent finds its services again from these records: a
 record whose PID still names a process started at that time is running; any
