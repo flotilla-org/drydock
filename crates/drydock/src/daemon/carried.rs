@@ -294,7 +294,18 @@ impl Daemon {
         }
         let _turn = self.turn(name).await;
         let Some(carrier) = self.carrier(name).filter(|c| c.carriage.is_some()) else { return Ok(()) };
-        let held: Vec<String> = self.runtime(name)?.list(name).await?.into_iter().filter(Environment::live).map(|e| e.id).collect();
+        let listed = self.runtime(name)?.list(name).await;
+        // An engine that cannot be listed may have gone with its parent
+        // environment outside drydockd; then the instance goes as it would have.
+        if listed.is_err()
+            && let Some(environment) = carrier.environment()
+            && self.gone(&carrier.parent, environment).await
+        {
+            drop(_turn);
+            self.parent_gone(&carrier.parent, environment).await;
+            return Ok(());
+        }
+        let held: Vec<String> = listed?.into_iter().filter(Environment::live).map(|e| e.id).collect();
         if !held.is_empty() {
             return Err(refused(format!("{name} holds environments {}; destroy them first", held.join(", "))));
         }
@@ -308,6 +319,12 @@ impl Daemon {
         Ok(())
     }
 
+    async fn gone(&self, provider: &str, id: &str) -> bool {
+        match ProviderApi::inspect(self, provider, id).await {
+            Ok(row) => !row.live(),
+            Err(error) => matches!(error, Error::Protocol(ProtocolError::NotFound { missing: Some(Missing::Environment), .. })),
+        }
+    }
     /// Forget a carried instance, returning the environments it held.
     async fn forget_carried(&self, name: &str, cause: Option<GoneCause>) -> Vec<Environment> {
         let Some(carrier) = self.carried.write().unwrap().remove(name) else { return vec![] };

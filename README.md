@@ -355,7 +355,10 @@ From then on it is an ordinary instance: `POST
   carried instance goes, and with it every instance carried into its
   environments, at every depth. Each of their environments gets a `gone` event
   with the cause `{"kind": "parent_gone", "provider", "environment"}`, naming
-  the environment whose going took it.
+  the environment whose going took it. A parent environment that went outside
+  drydockd is found at the instance's `DELETE`: its environments cannot be
+  listed, the parent reads gone, and the `DELETE` removes it as a destroy
+  through drydockd would have.
 - **Restarts.** Carried instances are held in memory only. After drydockd
   restarts they are gone until the client carries them again (the same `PUT`).
   Until then routes under their names answer 404 with `missing: "provider"`:
