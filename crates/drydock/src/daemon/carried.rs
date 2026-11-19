@@ -55,7 +55,8 @@ impl Link {
             agent: Mutex::default(),
         }
     }
-    /// The agent, connected and holding the forward.
+    /// The agent, connected and holding the forward. Connections wait for
+    /// one link to be made rather than each making its own.
     async fn agent(&self, daemon: &Daemon) -> Result<Arc<drydock_agent::Client>, Error> {
         let mut held = self.agent.lock().await;
         if let Some(agent) = &*held {
@@ -81,8 +82,10 @@ impl Link {
         Ok(Box::new(stream))
     }
 }
+/// 128 bits of the name's SHA-256: short enough for a service name and a
+/// socket path, with no collision to fear between names.
 fn digest(name: &str) -> String {
-    format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes()))[..16].to_owned()
+    format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes()))[..32].to_owned()
 }
 /// A child's socket, named by the child so that it stays put across restarts
 /// and reordered configurations.
@@ -90,6 +93,9 @@ pub(super) fn child_socket(run: &FsPath, name: &str) -> Result<(PathBuf, tokio::
     let directory = run.join("parents");
     crate::local::private_dir(&directory)?;
     let socket = directory.join(format!("{}.sock", digest(name)));
+    if socket.as_os_str().len() > 107 {
+        return Err(format!("provider {name}: drydock's runtime directory is too long for the socket {}", socket.display()));
+    }
     let _ = std::fs::remove_file(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).map_err(|e| format!("provider {name}: socket {}: {e}", socket.display()))?;
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
@@ -109,16 +115,24 @@ pub(super) fn agent_error(error: std::io::Error) -> Error {
 }
 
 impl Daemon {
-    /// Requests under one name take turns.
-    async fn turn(&self, name: &str) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = {
-            let mut turns = self.turns.lock().unwrap();
-            turns.retain(|_, lock| lock.strong_count() > 0);
-            let lock = turns.get(name).and_then(std::sync::Weak::upgrade).unwrap_or_default();
-            turns.insert(name.to_owned(), Arc::downgrade(&lock));
-            lock
-        };
-        lock.lock_owned().await
+    fn turns(&self, name: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut turns = self.turns.lock().unwrap();
+        turns.retain(|_, lock| lock.strong_count() > 0);
+        let lock = turns.get(name).and_then(std::sync::Weak::upgrade).unwrap_or_default();
+        turns.insert(name.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+    /// Carrying, removing and teardown under one name take turns.
+    async fn turn(&self, name: &str) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.turns(name).write_owned().await
+    }
+    /// Provisions under a carried name go together, never while it is being
+    /// carried or removed; a removal finds what they made.
+    pub(super) async fn provisioning(&self, name: &str) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        if self.carrier(name).is_none_or(|c| c.carriage.is_none()) {
+            return None;
+        }
+        Some(self.turns(name).read_owned().await)
     }
     /// A stream to a child's endpoint, through its parent.
     pub(super) async fn hop(&self, child: &str) -> Result<rigging_stream::ByteStream, Error> {
@@ -151,14 +165,13 @@ impl Daemon {
         if !module.takes_endpoint {
             return Err(refused(format!("module {} cannot be given its endpoint, so it cannot be carried", body.module)).into());
         }
-        let recipe = match (&body.parent.endpoint, &module.recipe) {
-            (Some(_), _) => None,
-            (None, Some(recipe)) => Some(recipe.clone()),
+        let (endpoint, recipe) = match (&body.parent.endpoint, &module.recipe) {
+            (Some(endpoint), _) => (endpoint.clone(), None),
+            (None, Some(recipe)) => (recipe.endpoint.clone(), Some(recipe.clone())),
             (None, None) => {
                 return Err(refused(format!("module {} has no recipe; name the endpoint its engine answers on", body.module)).into());
             }
         };
-        let endpoint = body.parent.endpoint.clone().or_else(|| recipe.as_ref().map(|r| r.endpoint.clone())).expect("one of the two");
         let parent = &body.parent.instance;
         if !self.names().contains(parent) {
             return Err(refused(format!("parent {parent} is not a provider")).into());
@@ -212,7 +225,9 @@ impl Daemon {
         }
         // The host's next status lists it; until then it would read as absent.
         let mut status = handle.status.clone();
-        let _ = tokio::time::timeout(CONNECT, status.wait_for(|s| s.providers.iter().any(|p| p.provider == name))).await;
+        if tokio::time::timeout(CONNECT, status.wait_for(|s| s.providers.iter().any(|p| p.provider == name))).await.is_err() {
+            tracing::warn!(provider = name, "the host has not yet listed the carried instance; it reads as absent until it does");
+        }
         Ok(Provisioned::Created(self.declared(name, &self.statuses())))
     }
 
@@ -313,16 +328,26 @@ impl Daemon {
             let stopped = async { link.agent(self).await?.remove_service(service, None).await.map_err(agent_error) }.await;
             match stopped {
                 Ok(_) | Err(Error::Protocol(ProtocolError::NotFound { .. })) => {}
-                Err(error @ Error::Protocol(ProtocolError::Refused { .. })) => return Err(error),
-                // A service of a vessel that is not reachable ends with it,
-                // and no recipe runs for a forgotten instance.
-                Err(error) => tracing::warn!(provider = name, %service, %error, "the recipe's service could not be stopped"),
+                // A service of a vessel that is not running ends with it, and
+                // no recipe runs for a forgotten instance. In a running one it
+                // would be left without an owner.
+                Err(error) if !self.parent_running(&carrier).await => {
+                    tracing::warn!(provider = name, %service, %error, "the recipe's service ends with its vessel")
+                }
+                Err(error) => return Err(error),
             }
         }
         self.forget_carried(name, None).await;
         Ok(())
     }
 
+    async fn parent_running(&self, carrier: &Carrier) -> bool {
+        let Some(environment) = carrier.environment() else { return false };
+        match ProviderApi::inspect(self, &carrier.parent, environment).await {
+            Ok(row) => row.state == Observation::Running,
+            Err(error) => !matches!(error, Error::Protocol(ProtocolError::NotFound { .. })),
+        }
+    }
     async fn gone(&self, provider: &str, id: &str) -> bool {
         match ProviderApi::inspect(self, provider, id).await {
             Ok(row) => !row.live(),
@@ -341,15 +366,8 @@ impl Daemon {
     pub(super) async fn parent_gone(&self, provider: &str, id: &str) {
         let mut gone = vec![(provider.to_owned(), id.to_owned())];
         while let Some((parent, environment)) = gone.pop() {
-            let children: Vec<String> = self
-                .carried
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|(_, c)| c.carriage.is_some() && c.parent == parent && c.environment() == Some(environment.as_str()))
-                .map(|(name, _)| name.clone())
-                .collect();
-            for child in children {
+            // Again until none is left: a carry may finish into it meanwhile.
+            while let Some(child) = self.child_of(&parent, &environment) {
                 let _turn = self.turn(&child).await;
                 let cause = GoneCause::ParentGone { provider: parent.clone(), environment: environment.clone() };
                 for row in self.forget_carried(&child, Some(cause)).await {
@@ -358,6 +376,14 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    fn child_of(&self, parent: &str, environment: &str) -> Option<String> {
+        let carried = self.carried.read().unwrap();
+        carried
+            .iter()
+            .find(|(_, c)| c.carriage.is_some() && c.parent == parent && c.environment() == Some(environment))
+            .map(|(n, _)| n.clone())
     }
 
     /// The parent environment resumed: each recipe runs again, which leaves a

@@ -109,8 +109,9 @@ pub struct Inner {
     /// Each instance with a parent, by name: the configured ones, and those
     /// carried since drydockd started.
     carried: std::sync::RwLock<BTreeMap<String, Arc<Carrier>>>,
-    /// One lock per carried name, so requests under it take turns.
-    turns: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
+    /// One lock per carried name: carrying, removing and teardown take it
+    /// alone, provisions under the name together.
+    turns: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
     run: PathBuf,
     /// This daemon, for the relays of instances carried after it started.
     this: Arc<std::sync::OnceLock<std::sync::Weak<Inner>>>,
@@ -907,6 +908,7 @@ impl ProviderApi for Daemon {
         self.runtime(p)?.prepare(p, &request).await
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, ProvisionError> {
+        let _turn = self.provisioning(p).await;
         let keyed = self.keyed(p, request).await?;
         let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
         if self.uploads(p) {

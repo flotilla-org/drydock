@@ -320,7 +320,10 @@ From then on it is an ordinary instance: `POST
   letter or digit. Nothing parses it.
 - **Repeats.** The same body again answers 200 with the same instance. Requests
   under one name take turns, so concurrent `PUT`s of one body answer one 201
-  and then 200s. Carried instances are listed by `GET /v1/providers` beside
+  and then 200s, and a `DELETE` of a name being carried waits for the carry,
+  as long as its parent takes to start. Provisions under a carried name run
+  together, and wait while it is being carried or removed, so a `DELETE` finds
+  every environment they made. Carried instances are listed by `GET /v1/providers` beside
   configured ones, and read with `GET /v1/providers/{name}`: `parent` as put,
   and `endpoint`, the socket drydockd made for the instance, as for a
   configured instance with a parent.
@@ -348,9 +351,10 @@ From then on it is an ordinary instance: `POST
 - **Removal.** `DELETE /v1/providers/sb7f3a-docker` is refused while the
   instance holds environments, naming them. Otherwise drydockd stops the
   service it started, forgets the instance and answers 204. An engine the
-  client started itself (`parent.endpoint`) is left running. A service that
-  cannot be stopped because the vessel cannot be reached is left to end with
-  it, and the removal goes ahead. A name drydockd
+  client started itself (`parent.endpoint`) is left running. A service in a
+  vessel that is not running, or gone, ends with it, so the removal goes ahead
+  when it cannot be stopped; in a running vessel that failure fails the
+  `DELETE`. A name drydockd
   does not hold answers 204 too. The `DELETE` holds the name while it lists the
   instance's environments, so a provision under the name waits for it and then
   finds no instance.
@@ -363,7 +367,9 @@ From then on it is an ordinary instance: `POST
   listed, the parent reads gone, and the `DELETE` removes it as a destroy
   through drydockd would have.
 - **Restarts.** Carried instances are held in memory only. After drydockd
-  restarts they are gone until the client carries them again (the same `PUT`).
+  restarts they are gone until the client carries them again (the same `PUT`),
+  and the recipes' services keep running in their vessels without an owner;
+  carrying again finds each running and takes it up.
   Until then routes under their names answer 404 with `missing: "provider"`:
   drydockd does not know the name, which says nothing of whether the
   environments under it are gone. An environment route whose provider is known
