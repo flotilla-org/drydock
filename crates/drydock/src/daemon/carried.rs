@@ -231,6 +231,9 @@ impl Daemon {
             link: Some(link),
             carriage: Some(carriage),
         };
+        // Before the host has it: configuring may already dial the endpoint
+        // (docker_engine learns its platform), which hops through this entry.
+        // A GET meanwhile reads it as absent from its host.
         self.carried.write().unwrap().insert(name.to_owned(), Arc::new(carrier));
         let configuration = ProviderConfiguration {
             module: body.module.clone(),
