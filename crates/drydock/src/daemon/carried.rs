@@ -117,8 +117,11 @@ pub(super) fn agent_error(error: std::io::Error) -> Error {
 impl Daemon {
     fn turns(&self, name: &str) -> Arc<tokio::sync::RwLock<()>> {
         let mut turns = self.turns.lock().unwrap();
+        if let Some(lock) = turns.get(name).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
         turns.retain(|_, lock| lock.strong_count() > 0);
-        let lock = turns.get(name).and_then(std::sync::Weak::upgrade).unwrap_or_default();
+        let lock = Arc::default();
         turns.insert(name.to_owned(), Arc::downgrade(&lock));
         lock
     }
@@ -260,6 +263,8 @@ impl Daemon {
     /// endpoint to answer. Returns the service's name and body.
     async fn run_recipe(&self, name: &str, link: &Link, recipe: Recipe) -> Result<(String, Service), ProvisionError> {
         let agent = link.agent(self).await?;
+        // A pre-flight in the agent's shell, whose PATH the service shares
+        // unless the recipe sets its own; the service's exit is still reported.
         if !recipe.requires.is_empty() {
             let script = r#"for p; do command -v "$p" >/dev/null 2>&1 || printf '%s ' "$p"; done"#;
             let args = ["-c", script, "sh"].into_iter().map(str::to_owned).chain(recipe.requires.iter().cloned());
@@ -404,6 +409,8 @@ impl Daemon {
             let (Some(link), Some((service, body))) = (&carrier.link, carrier.carriage.as_ref().and_then(|c| c.service.clone())) else {
                 continue;
             };
+            // Connections opening meanwhile may make the link again and put the
+            // forward; putting it twice is the same forward.
             link.forget().await;
             let started = async { link.agent(self).await?.start_service(&service, &body).await.map_err(agent_error) }.await;
             if let Err(error) = started {

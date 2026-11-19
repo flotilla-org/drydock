@@ -397,7 +397,9 @@ Refusals are `422` (`{"kind": "refused", "reason": ...}`):
 
 An endpoint that does not answer within 20 seconds is `unavailable`, with
 `left`. A carried instance's environments are listed for the `DELETE`; when
-the list fails, the `DELETE` fails with that error.
+the list fails, its engine down for instance, the `DELETE` fails with that
+error, since the instance may still hold environments. Destroying the parent
+environment removes it then.
 
 ### Vessel services
 
