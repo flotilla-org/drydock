@@ -310,9 +310,13 @@ impl Daemon {
             return Err(refused(format!("{name} holds environments {}; destroy them first", held.join(", "))));
         }
         if let (Some(link), Some((service, _))) = (&carrier.link, &carrier.carriage.as_ref().and_then(|c| c.service.clone())) {
-            match link.agent(self).await?.remove_service(service, None).await {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(agent_error(error)),
-                _ => {}
+            let stopped = async { link.agent(self).await?.remove_service(service, None).await.map_err(agent_error) }.await;
+            match stopped {
+                Ok(_) | Err(Error::Protocol(ProtocolError::NotFound { .. })) => {}
+                Err(error @ Error::Protocol(ProtocolError::Refused { .. })) => return Err(error),
+                // A service of a vessel that is not reachable ends with it,
+                // and no recipe runs for a forgotten instance.
+                Err(error) => tracing::warn!(provider = name, %service, %error, "the recipe's service could not be stopped"),
             }
         }
         self.forget_carried(name, None).await;
@@ -359,9 +363,18 @@ impl Daemon {
     /// The parent environment resumed: each recipe runs again, which leaves a
     /// service still running alone.
     pub(super) async fn parent_resumed(&self, provider: &str, id: &str) {
-        let carriers: Vec<_> =
-            self.carried.read().unwrap().values().filter(|c| c.parent == provider && c.environment() == Some(id)).cloned().collect();
-        for carrier in carriers {
+        let children: Vec<String> = self
+            .carried
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| c.parent == provider && c.environment() == Some(id))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for child in children {
+            // Under the name's turn, so a DELETE cannot forget it meanwhile.
+            let _turn = self.turn(&child).await;
+            let Some(carrier) = self.carrier(&child) else { continue };
             let (Some(link), Some((service, body))) = (&carrier.link, carrier.carriage.as_ref().and_then(|c| c.service.clone())) else {
                 continue;
             };

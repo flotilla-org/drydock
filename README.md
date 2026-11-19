@@ -347,7 +347,10 @@ From then on it is an ordinary instance: `POST
   policy is the narrower of the two, and drydock does not merge them.
 - **Removal.** `DELETE /v1/providers/sb7f3a-docker` is refused while the
   instance holds environments, naming them. Otherwise drydockd stops the
-  service it started, forgets the instance and answers 204. A name drydockd
+  service it started, forgets the instance and answers 204. An engine the
+  client started itself (`parent.endpoint`) is left running. A service that
+  cannot be stopped because the vessel cannot be reached is left to end with
+  it, and the removal goes ahead. A name drydockd
   does not hold answers 204 too. The `DELETE` holds the name while it lists the
   instance's environments, so a provision under the name waits for it and then
   finds no instance.
