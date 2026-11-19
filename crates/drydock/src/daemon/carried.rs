@@ -108,7 +108,12 @@ pub(super) fn child_socket(run: &FsPath, name: &str) -> Result<(PathBuf, tokio::
     if socket.as_os_str().len() > 107 {
         return Err(format!("provider {name}: drydock's runtime directory is too long for the socket {}", socket.display()));
     }
-    let _ = std::fs::remove_file(&socket);
+    match std::fs::remove_file(&socket) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("provider {name}: socket {}: {error}", socket.display()));
+        }
+        _ => {}
+    }
     let listener = tokio::net::UnixListener::bind(&socket).map_err(|e| format!("provider {name}: socket {}: {e}", socket.display()))?;
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         .map_err(|e| format!("provider {name}: socket: {e}"))?;
