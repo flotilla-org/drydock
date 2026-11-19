@@ -329,13 +329,20 @@ From then on it is an ordinary instance: `POST
   engine's enforcement and the sandbox's row the sandbox's; the effective
   policy is the narrower of the two, and drydock does not merge them.
 - `DELETE /v1/providers/sb7f3a-docker` removes it (204), and removing a name
-  that is not carried succeeds. When drydockd destroys the parent environment,
+  that is not carried succeeds.
+- Requests under one carried name take turns: concurrent `PUT`s of one body
+  answer one 201 and then 200s, and a `DELETE` holds the name while it lists
+  the instance's environments and removes it, so a provision under the name
+  waits for it and then finds no instance. When drydockd destroys the parent environment,
   or finds it gone, the carried instance goes too, with every instance carried
   into its environments, at every depth.
 - Carried instances are held in memory only. After drydockd restarts they are
-  gone until the client carries them again (the same `PUT`), and until then the
-  environment routes under their names answer `unavailable`, not `not_found`:
-  drydock does not know that those environments are gone.
+  gone until the client carries them again (the same `PUT`). drydockd keeps
+  nothing about them, so it cannot tell a forgotten name from one it never
+  had: the environment routes under every name it does not know answer
+  `unavailable`, not `not_found`, since it does not know that their
+  environments are gone. `GET /v1/providers/{name}` of such a name is
+  `not_found`.
 
 Refusals are `422` (`{"kind": "refused", "reason": ...}`):
 
