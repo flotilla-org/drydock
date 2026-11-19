@@ -967,8 +967,8 @@ impl ProviderApi for Daemon {
         environment(self.invalidating(p, self.runtime(p)?.export(p, id).await).await)
     }
     async fn quota(&self, p: &str) -> Result<Quota, Error> {
-        if let Some(carrier) = self.carrier(p).filter(|c| c.carriage.is_some()) {
-            return self.carried_quota(p, &carrier).await;
+        if let Some(quota) = self.carried_quota(p).await {
+            return quota;
         }
         self.runtime(p)?.quota(p).await
     }

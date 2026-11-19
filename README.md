@@ -320,8 +320,11 @@ From then on it is an ordinary instance: `POST
   letter or digit. Nothing parses it.
 - **Repeats.** The same body again answers 200 with the same instance. Requests
   under one name take turns, so concurrent `PUT`s of one body answer one 201
-  and then 200s, and a `DELETE` of a name being carried waits for the carry,
-  as long as its parent takes to start. Provisions under a carried name run
+  and then 200s, and a `DELETE` of a name being carried waits for the carry:
+  as long as its parent takes to start, and up to 20 seconds each for the
+  recipe's endpoint and for the host to list the instance. A host slower than
+  that leaves the instance carried and working, but its declaration reads as
+  absent from its host until the host lists it. Provisions under a carried name run
   together, and wait while it is being carried or removed, so a `DELETE` finds
   every environment they made. Carried instances are listed by `GET /v1/providers` beside
   configured ones, and read with `GET /v1/providers/{name}`: `parent` as put,

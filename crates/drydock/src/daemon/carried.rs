@@ -72,14 +72,23 @@ impl Link {
         *self.agent.lock().await = None;
     }
     async fn open(&self, daemon: &Daemon) -> Result<rigging_stream::ByteStream, Error> {
-        let agent = self.agent(daemon).await?;
-        if let Ok(stream) = agent.open_inward(&self.forward.id).await {
-            return Ok(Box::new(stream));
+        let mut agent = self.agent(daemon).await?;
+        let error = match agent.open_inward(&self.forward.id).await {
+            Ok(stream) => return Ok(Box::new(stream)),
+            Err(error) => error,
+        };
+        match drydock_agent::AgentError::of(&error).map(|e| e.status) {
+            // A restarted agent has lost the forward.
+            Some(404) => agent.put_inward_forward(self.forward.clone()).await.map_err(agent_error)?,
+            // The agent answered: the endpoint itself refused.
+            Some(_) => return Err(agent_error(error)),
+            // The link is lost.
+            None => {
+                self.forget().await;
+                agent = self.agent(daemon).await?;
+            }
         }
-        // A restarted agent has lost the forward, and a lost link the agent.
-        self.forget().await;
-        let stream = self.agent(daemon).await?.open_inward(&self.forward.id).await.map_err(agent_error)?;
-        Ok(Box::new(stream))
+        Ok(Box::new(agent.open_inward(&self.forward.id).await.map_err(agent_error)?))
     }
 }
 /// 128 bits of the name's SHA-256: short enough for a service name and a
@@ -92,6 +101,8 @@ fn digest(name: &str) -> String {
 pub(super) fn child_socket(run: &FsPath, name: &str) -> Result<(PathBuf, tokio::net::UnixListener), String> {
     let directory = run.join("parents");
     crate::local::private_dir(&directory)?;
+    // A socket left here is stale: a name's live relay is dropped before
+    // its name can be carried again, under the name's turn.
     let socket = directory.join(format!("{}.sock", digest(name)));
     if socket.as_os_str().len() > 107 {
         return Err(format!("provider {name}: drydock's runtime directory is too long for the socket {}", socket.display()));
@@ -421,14 +432,19 @@ impl Daemon {
 
     /// A carried instance's quota: the module's own figures, and the parent
     /// environment's size as the limit of each resource it states.
-    pub(super) async fn carried_quota(&self, name: &str, carrier: &Carrier) -> Result<Quota, Error> {
+    /// None for an instance that is not carried.
+    pub(super) async fn carried_quota(&self, name: &str) -> Option<Result<Quota, Error>> {
+        let carrier = self.carrier(name).filter(|c| c.carriage.is_some())?;
+        let link = carrier.link.as_ref()?;
+        Some(self.quota_within(name, &link.provider, &link.environment).await)
+    }
+    async fn quota_within(&self, name: &str, parent: &str, environment: &str) -> Result<Quota, Error> {
         let ports = self.host(name)?.handle.status.borrow().providers.iter().find(|d| d.provider == name).map(|d| d.ports);
         let mut quota = match ports {
             Some(ports) if ports.quota => self.runtime(name)?.quota(name).await?,
             _ => Quota::default(),
         };
-        let environment = carrier.environment().expect("a carried instance has a parent environment");
-        if let Some(size) = ProviderApi::inspect(self, &carrier.parent, environment).await?.granted_size {
+        if let Some(size) = ProviderApi::inspect(self, parent, environment).await?.granted_size {
             let row = |resource, unit: &str, limit: f64| ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: unit.into(),
