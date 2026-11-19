@@ -29,6 +29,32 @@ pub(super) struct Pending {
     pub(super) vendor: Option<VendorState>,
     pub(super) kind: EventKind,
 }
+impl EventLog {
+    /// Environments that went with their instance: drydockd's own record,
+    /// since no observation of the provider will make one.
+    pub(super) fn gone(&self, provider: &str, rows: &[Environment], cause: &GoneCause) {
+        let mut log = self.log.recover();
+        for row in rows {
+            log.serial += 1;
+            let cursor = format!("{}:{}", log.epoch, log.serial);
+            log.records.push_back(Event {
+                cursor,
+                id: row.id.clone(),
+                provider: provider.to_owned(),
+                label: row.label.clone(),
+                timestamp: chrono::Utc::now().into(),
+                timestamp_source: TimestampSource::Adaptor,
+                event: EventKind::Gone { cause: Some(cause.clone()) },
+                vendor: None,
+                observed: None,
+            });
+            if log.records.len() > EVENT_HISTORY_CAPACITY {
+                log.records.pop_front();
+            }
+        }
+        self.changed.send_replace(log.serial);
+    }
+}
 impl EventSink {
     fn append(log: &mut Log, provider: &str, observed: &ObservedBy, p: Pending) {
         tracing::debug!(provider, environment_id = %p.id, route = "observe", "environment observation");

@@ -63,7 +63,7 @@ impl Failure<'_> {
             401 => ProtocolError::CredentialRejected { reason },
             402 => ProtocolError::QuotaExhausted { reason },
             403 => ProtocolError::Refused { reason: format!("permission denied; {reason}") },
-            404 => ProtocolError::NotFound { reason },
+            404 => ProtocolError::not_found(reason),
             429 => ProtocolError::RateLimited { reason, retry_after },
             408 | 500..=599 => ProtocolError::Unavailable { reason, retry_after, provider_error: None },
             400..=499 => ProtocolError::Refused { reason },

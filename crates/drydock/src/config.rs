@@ -228,8 +228,8 @@ impl Config {
         }
         Ok(config)
     }
-    /// Every parent is a configured instance and names no environment, and no
-    /// instance is its own ancestor.
+    /// Every parent is a configured instance, names an endpoint and no
+    /// environment, and no instance is its own ancestor.
     pub fn check_parents(&self) -> Result<(), String> {
         for (name, p) in &self.providers {
             let mut line = vec![name.as_str()];
@@ -237,6 +237,9 @@ impl Config {
             while let Some(parent) = &at.parent {
                 if parent.environment.is_some() {
                     return Err(format!("provider {name}: parent names an environment, which only a carried instance's parent can"));
+                }
+                if parent.endpoint.is_none() {
+                    return Err(format!("provider {name}: parent names no endpoint"));
                 }
                 at = self
                     .providers

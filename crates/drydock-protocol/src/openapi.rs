@@ -84,7 +84,8 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
         path::{ParameterBuilder, ParameterIn},
     };
     for (route, path) in document.paths.paths.iter_mut() {
-        let server_only = route == "/v1/events" || route.ends_with("/credential") || route.contains("/exposures/");
+        let server_only =
+            route == "/v1/events" || route.ends_with("/credential") || route.contains("/exposures/") || route.contains("/services");
         // Reading a provider is common; carrying and removing one are the server's.
         let carrying = route == "/v1/providers/{provider}";
         let operations = [

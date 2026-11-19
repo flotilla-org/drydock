@@ -454,7 +454,7 @@ systemctl --user reset-failed "$u" 2>/dev/null
             let row = |resource, unit: &str, in_use: f64, limit: f64| ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: unit.into(),
-                in_use,
+                in_use: Some(in_use),
                 limit: Some(limit),
             };
             Ok(Quota {

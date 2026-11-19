@@ -243,7 +243,7 @@ impl Exposures {
         if vessel.establish(&self.shared, &mut state, &key).await == Outcome::Gone {
             drop(state);
             self.forget(p, id).await;
-            return Err(Error::Protocol(ProtocolError::NotFound { reason: "the environment no longer exists".into() }));
+            return Err(Error::Protocol(ProtocolError::not_found("the environment no longer exists")));
         }
         vessel.announce(&self.shared, &state, &key);
         Ok((existed, vessel.inward(&state, name).expect("just set")))
@@ -300,7 +300,7 @@ impl Exposures {
         if vessel.establish(&self.shared, &mut state, &key).await == Outcome::Gone {
             drop(state);
             self.forget(p, id).await;
-            return Err(Error::Protocol(ProtocolError::NotFound { reason: "the environment no longer exists".into() }));
+            return Err(Error::Protocol(ProtocolError::not_found("the environment no longer exists")));
         }
         vessel.announce(&self.shared, &state, &key);
         Ok((previous.is_some(), vessel.outward(&state, name).expect("just set")))
@@ -312,7 +312,7 @@ impl Exposures {
             Some(vessel) => vessel.inward(&*vessel.state.lock().await, name),
             None => None,
         }
-        .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "no inward exposure with this name".into() }))
+        .ok_or_else(|| Error::Protocol(ProtocolError::not_found("no inward exposure with this name")))
     }
     pub(crate) async fn inwards(&self, daemon: &Daemon, p: &str, id: &str) -> Result<Vec<Inward>, Error> {
         let Some(vessel) = self.existing(daemon, p, id).await? else { return Ok(vec![]) };
@@ -325,7 +325,7 @@ impl Exposures {
             Some(vessel) => vessel.outward(&*vessel.state.lock().await, name),
             None => None,
         }
-        .ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "no outward exposure with this name".into() }))
+        .ok_or_else(|| Error::Protocol(ProtocolError::not_found("no outward exposure with this name")))
     }
     pub(crate) async fn outwards(&self, daemon: &Daemon, p: &str, id: &str) -> Result<Vec<Outward>, Error> {
         let Some(vessel) = self.existing(daemon, p, id).await? else { return Ok(vec![]) };
@@ -634,7 +634,7 @@ impl Vessel {
                 Observation::Running | Observation::Unknown { .. } => Ok(()),
                 other => Err(error(ExposureErrorCode::NotRunning, format!("the vessel is {}", describe(&other)))),
             },
-            Ok(Err(Error::Protocol(ProtocolError::NotFound { reason }))) => {
+            Ok(Err(Error::Protocol(ProtocolError::NotFound { reason, .. }))) => {
                 // Destroyed while drydock was not watching: forget it, unless
                 // it is the provider that is unknown (its configuration changed).
                 if daemon.provider(&self.provider).await.is_ok() {
@@ -876,7 +876,7 @@ fn free_loopback(record: &Record, name: &str) -> Option<IpAddr> {
         .find(|address| !used.contains(address))
 }
 
-fn describe(observation: &Observation) -> &'static str {
+pub(crate) fn describe(observation: &Observation) -> &'static str {
     match observation {
         Observation::Running => "running",
         Observation::Stopped { .. } => "stopped",
@@ -888,13 +888,17 @@ fn describe(observation: &Observation) -> &'static str {
 
 /// Names become file and agent IDs: a letter or digit, then letters, digits, `_`, `.` or `-`.
 fn check_name(name: &str) -> Result<(), Error> {
+    check_named("exposure", name)
+}
+/// An exposure's or a carried instance's name, under the same rule.
+pub(crate) fn check_named(what: &str, name: &str) -> Result<(), Error> {
     let valid = (1..=64).contains(&name.len())
         && name.as_bytes()[0].is_ascii_alphanumeric()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
     if !valid {
-        return Err(Error::InvalidRequest(
-            "exposure name must be 1 to 64 letters, digits, '_', '.' or '-', starting with a letter or digit".into(),
-        ));
+        return Err(Error::InvalidRequest(format!(
+            "{what} name must be 1 to 64 letters, digits, '_', '.' or '-', starting with a letter or digit"
+        )));
     }
     Ok(())
 }

@@ -694,7 +694,7 @@ impl QuotaOperation for Daytona {
         let row = |region: Option<&RegionUsage>, resource, unit: &str, factor: f64, in_use: Amount, limit: Amount| ResourceQuota {
             key: QuotaKey { region: region.map(|r| r.region_id.to_string()), class: region.map(|r| r.sandbox_class.to_string()), resource },
             unit: unit.into(),
-            in_use: in_use.get() * factor,
+            in_use: Some(in_use.get() * factor),
             limit: Some(limit.get() * factor),
         };
         let mut resources = Vec::new();

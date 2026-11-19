@@ -2,8 +2,9 @@
 
 `api::ProviderApi` is the provider API served by both the drydock server and
 language hosts, and `api::router` is its one HTTP adapter (`api::server_router`
-adds the server-only credential, event and exposure routes, and `PUT` and
-`DELETE /v1/providers/{provider}`, which carry and remove an instance).
+adds the server-only credential, event, exposure and vessel service routes,
+and `PUT` and `DELETE /v1/providers/{provider}`, which carry and remove an
+instance).
 `api::router` alone also serves `POST /v1/providers/{provider}/streams`, through which drydockd asks a
 parent for a stream to a child's endpoint. drydockd does not serve it, so it is
 not in `openapi.json`. `Client` implements every `/v1`

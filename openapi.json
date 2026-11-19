@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "15"
+    "version": "16"
   },
   "paths": {
     "/v1/config": {
@@ -410,11 +410,11 @@
           }
         ],
         "requestBody": {
-          "description": "module, settings, and parent with an environment; ownership and semantics as in the configuration. credential, events and endpoint are refused.",
+          "description": "A failure partway also says what it left, as `left`, as a failed provision does",
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ProviderConfiguration"
+                "$ref": "#/components/schemas/Carry"
               }
             }
           },
@@ -2074,6 +2074,347 @@
         }
       }
     },
+    "/v1/providers/{provider}/environments/{id}/services": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "services",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every service the vessel's agent has a record of",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
+    "/v1/providers/{provider}/environments/{id}/services/{name}": {
+      "get": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "service",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The service",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "put": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "put_service",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Service"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Already running from the same body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceInfo"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      },
+      "delete": {
+        "tags": [
+          "server"
+        ],
+        "operationId": "remove_service",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Opaque provider",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Opaque id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "grace_ms",
+            "in": "query",
+            "description": "How long after SIGTERM before SIGKILL: 10 seconds by default, at most 60.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stopped and forgotten; its last state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Loopback bearer authentication required; not used on managed UDS"
+          },
+          "402": {
+            "$ref": "#/components/responses/Error402"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error404"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error405"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error422"
+          },
+          "424": {
+            "$ref": "#/components/responses/Error424"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error429"
+          },
+          "500": {
+            "$ref": "#/components/responses/Error500"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error502"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error503"
+          }
+        },
+        "x-drydock-server-only": true
+      }
+    },
     "/v1/providers/{provider}/environments/{id}/suspend": {
       "post": {
         "tags": [
@@ -2704,6 +3045,30 @@
         "enum": [
           "unix"
         ]
+      },
+      "Carry": {
+        "type": "object",
+        "description": "A carried instance, as `PUT /v1/providers/{name}` takes it: the module,\nits settings and the parent environment. drydock owns what it makes, with\nthe default semantics.",
+        "required": [
+          "module",
+          "parent"
+        ],
+        "properties": {
+          "module": {
+            "type": "string"
+          },
+          "parent": {
+            "$ref": "#/components/schemas/Parent"
+          },
+          "settings": {
+            "type": "object",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "CheckoutStrategy": {
         "type": "string",
@@ -3451,6 +3816,29 @@
           }
         }
       },
+      "ExitStatus": {
+        "type": "object",
+        "description": "How a process ended. A process killed by a signal has no code; one killed\nfor exceeding its timeout also reports `timed_out`.",
+        "properties": {
+          "code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "signal": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "timed_out": {
+            "type": "boolean"
+          }
+        }
+      },
       "Export": {
         "type": "object",
         "required": [
@@ -3611,6 +3999,29 @@
                 "enum": [
                   "destroyed_by_request"
                 ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The environment of another instance that this one's instance was\ncarried in went, and with it this environment.",
+            "required": [
+              "provider",
+              "environment",
+              "kind"
+            ],
+            "properties": {
+              "environment": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "parent_gone"
+                ]
+              },
+              "provider": {
+                "type": "string"
               }
             }
           }
@@ -3989,6 +4400,29 @@
             }
           },
           {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LeftService",
+                "description": "A carry started this service in its parent environment before a\nlater step failed. It runs until the client stops it."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "service"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A carry started this service in its parent environment before a\nlater step failed. It runs until the client stops it."
+          },
+          {
             "type": "object",
             "description": "The vendor made nothing.",
             "required": [
@@ -4021,6 +4455,25 @@
         ],
         "description": "What a failed provision left at the vendor. Nothing removes what it left:\nit stays listed under the request's label, a provision under that label\ntakes it up, and destroy removes it."
       },
+      "LeftService": {
+        "type": "object",
+        "required": [
+          "provider",
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
       "LoadableModule": {
         "type": "object",
         "required": [
@@ -4031,6 +4484,17 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "recipe": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Recipe",
+                "description": "How the module's engine starts in a parent environment, for a module\nwhose instances can be carried without naming their endpoint."
+              }
+            ]
           },
           "smallest_size": {
             "$ref": "#/components/schemas/Size",
@@ -4067,6 +4531,14 @@
           "frozen",
           "pushed",
           "shared"
+        ]
+      },
+      "Missing": {
+        "type": "string",
+        "description": "What a `not_found` did not find.",
+        "enum": [
+          "provider",
+          "environment"
         ]
       },
       "Observation": {
@@ -4368,12 +4840,19 @@
         "type": "object",
         "description": "An instance's parent, by instance name, and where on it the instance's\nendpoint is: on the parent's machine, or inside one of its environments.",
         "required": [
-          "instance",
-          "endpoint"
+          "instance"
         ],
         "properties": {
           "endpoint": {
-            "$ref": "#/components/schemas/Carried"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Carried",
+                "description": "Required in the configuration file. A carried instance of a module\nwith a [`Recipe`] may leave it out, and the recipe's is used."
+              }
+            ]
           },
           "environment": {
             "type": [
@@ -4571,6 +5050,17 @@
                 "type": "string",
                 "enum": [
                   "not_found"
+                ]
+              },
+              "missing": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/Missing",
+                    "description": "What was not found, where the route says."
+                  }
                 ]
               },
               "reason": {
@@ -5323,6 +5813,31 @@
         ],
         "description": "`parent_not_ready`: the instance's parent is not ready, and `reason` is\nthe parent's readiness; nothing reaches the instance's endpoint until it is."
       },
+      "Recipe": {
+        "type": "object",
+        "description": "How a module's engine starts inside a parent environment, so that an\ninstance is carried there from the module and the environment alone.",
+        "required": [
+          "service",
+          "endpoint"
+        ],
+        "properties": {
+          "endpoint": {
+            "$ref": "#/components/schemas/Carried",
+            "description": "Where the engine answers inside the vessel once started."
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Programs the parent's image needs on its PATH."
+          },
+          "service": {
+            "$ref": "#/components/schemas/Service",
+            "description": "Started through the parent vessel's agent, as a service."
+          }
+        }
+      },
       "RegistryAuthKind": {
         "type": "string",
         "enum": [
@@ -5365,13 +5880,16 @@
         "description": "The same unit applies to current use and limit. Unknown limits stay unknown.\nA vector of these rows keeps structured keys representable as ordinary JSON.",
         "required": [
           "key",
-          "unit",
-          "in_use"
+          "unit"
         ],
         "properties": {
           "in_use": {
-            "type": "number",
-            "format": "double"
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Absent when not known."
           },
           "key": {
             "$ref": "#/components/schemas/QuotaKey"
@@ -5452,6 +5970,132 @@
             "default": false
           }
         }
+      },
+      "Service": {
+        "type": "object",
+        "description": "A long-lived service to keep running under a name the client chooses.\nUnlike a process, its output never passes through the agent, and it\noutlives agent restarts and re-execs.",
+        "required": [
+          "program"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": "object",
+            "description": "Added to the configured environment, overriding it per variable.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "output": {
+            "$ref": "#/components/schemas/ServiceOutput"
+          },
+          "program": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ServiceInfo": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ServiceState"
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "pid",
+              "service"
+            ],
+            "properties": {
+              "log": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Readable through `GET /files/{path}`; absent when output is discarded."
+              },
+              "name": {
+                "type": "string"
+              },
+              "pid": {
+                "type": "integer",
+                "format": "int32",
+                "description": "The PID the service last had; once it has exited, it may name\nanother process.",
+                "minimum": 0
+              },
+              "service": {
+                "$ref": "#/components/schemas/Service"
+              }
+            }
+          }
+        ],
+        "description": "A service's status."
+      },
+      "ServiceOutput": {
+        "type": "string",
+        "description": "Where a service's stdout and stderr go. Its stdin is always `/dev/null`.",
+        "enum": [
+          "file",
+          "discard"
+        ]
+      },
+      "ServiceState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`status` is known only to the agent process that started the service\nand saw it end; after a restart or re-exec it is absent.",
+            "required": [
+              "state"
+            ],
+            "properties": {
+              "state": {
+                "type": "string",
+                "enum": [
+                  "exited"
+                ]
+              },
+              "status": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ExitStatus"
+                  }
+                ]
+              }
+            }
+          }
+        ]
       },
       "Size": {
         "type": "object",
@@ -5880,6 +6524,17 @@
                     "not_found"
                   ]
                 },
+                "missing": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Missing",
+                      "description": "What was not found, where the route says."
+                    }
+                  ]
+                },
                 "reason": {
                   "type": "string"
                 }
@@ -6169,6 +6824,17 @@
                       "type": "string",
                       "enum": [
                         "not_found"
+                      ]
+                    },
+                    "missing": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Missing",
+                          "description": "What was not found, where the route says."
+                        }
                       ]
                     },
                     "reason": {

@@ -59,7 +59,7 @@ fn generated_period_ordering(tc: hegel::TestCase) {
 #[test]
 fn every_route_carries_typed_error_statuses() {
     let errors = [
-        ProtocolError::NotFound { reason: "r".into() },
+        ProtocolError::not_found("r"),
         ProtocolError::MethodNotAllowed { reason: "r".into() },
         ProtocolError::Refused { reason: "r".into() },
         ProtocolError::unavailable("r", None),

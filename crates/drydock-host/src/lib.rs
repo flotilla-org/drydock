@@ -64,7 +64,7 @@ impl Host {
     }
     async fn instance(&self, name: &str) -> Result<Arc<dyn Provider>> {
         let bindings = self.bindings.read().await;
-        bindings.get(name).map(|b| b.provider.clone()).ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })
+        bindings.get(name).map(|b| b.provider.clone()).ok_or_else(ProtocolError::unknown_provider)
     }
     /// Declarations refresh readiness, which can be a provider network call, so
     /// they never run under the bindings lock.
@@ -152,6 +152,7 @@ impl ProviderApi for Host {
                     version: m.version().into(),
                     smallest_size: m.smallest_size(),
                     takes_endpoint: m.takes_endpoint(),
+                    recipe: m.recipe(),
                 })
                 .collect(),
         })
@@ -189,7 +190,7 @@ impl ProviderApi for Host {
     }
     async fn provider(&self, p: &str) -> ApiResult<ProviderDeclaration> {
         let binding = self.bindings().await.into_iter().find(|(name, ..)| name == p);
-        let (name, module, provider) = binding.ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })?;
+        let (name, module, provider) = binding.ok_or_else(ProtocolError::unknown_provider)?;
         Ok(self.declaration(name, module, provider).await)
     }
     async fn prepare(&self, p: &str, r: &PrepareRequest) -> ApiResult<Prepared> {

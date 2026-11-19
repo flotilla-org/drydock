@@ -237,7 +237,7 @@ fn classify(f: &Failure) -> ProtocolError {
     let reason = f.reason(&if code.is_empty() { message } else { format!("{code}: {message}") });
     let quota = code == "quota_exceeded" || code.starts_with("no_credit_") || code.ends_with("_limit_reached") || code == "daily_limit";
     match f.status {
-        410 => ProtocolError::NotFound { reason },
+        410 => ProtocolError::not_found(reason),
         409 | 429 if quota => ProtocolError::QuotaExhausted { reason },
         429 => ProtocolError::RateLimited { reason, retry_after },
         400..=499 if retry_after.is_some() && ![401, 402, 403, 404].contains(&f.status) => {
@@ -261,7 +261,7 @@ fn is_uuid(id: &str) -> bool {
 impl Runtime {
     fn sandbox_url(&self, id: &str, action: Option<&str>, rest: &[&str]) -> Result<Url> {
         if !is_uuid(id) {
-            return Err(ProtocolError::NotFound { reason: "not a Runtime sandbox id".into() });
+            return Err(ProtocolError::not_found("not a Runtime sandbox id"));
         }
         let segment = match action {
             Some(action) => format!("{id}:{action}"),
@@ -660,7 +660,7 @@ impl QuotaOperation for Runtime {
             resources.push(ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: unit.into(),
-                in_use: row.used as f64 * factor,
+                in_use: Some(row.used as f64 * factor),
                 limit: Some(row.max as f64 * factor),
             });
         }

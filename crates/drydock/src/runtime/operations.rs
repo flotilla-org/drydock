@@ -62,6 +62,7 @@ impl ProviderApi for Runtime {
                     version: module.version().into(),
                     smallest_size: module.smallest_size(),
                     takes_endpoint: module.takes_endpoint(),
+                    recipe: module.recipe(),
                 })
                 .collect(),
         })

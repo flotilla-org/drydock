@@ -112,7 +112,7 @@ pub trait Machine: Send + Sync + 'static {
 }
 
 pub fn not_found() -> ProtocolError {
-    ProtocolError::NotFound { reason: "unknown environment".into() }
+    ProtocolError::not_found("unknown environment")
 }
 pub fn unavailable(reason: impl Into<String>) -> ProtocolError {
     ProtocolError::Unavailable { reason: reason.into(), retry_after: None, provider_error: None }

@@ -88,6 +88,11 @@ pub trait Module: Send + Sync {
     fn takes_endpoint(&self) -> bool {
         false
     }
+    /// How the module's engine starts in a parent environment, for a module
+    /// whose instances can be carried without naming their endpoint.
+    fn recipe(&self) -> Option<Recipe> {
+        None
+    }
     /// Cancelled when the host stops. Dropping the future must release uncommitted
     /// resources; factories must yield while waiting on external work.
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;

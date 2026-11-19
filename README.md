@@ -280,88 +280,132 @@ reading them waits for at most the connect budget (20s).
 ### Carried instances
 
 A provider instance can also be made while drydockd runs, for an engine that
-exists only once an environment does, such as `dockerd` started in a sandbox.
-Its endpoint is a socket inside an environment of another instance, and the
-client names it. A client makes the parent environment, starts the engine in
-it (through the vessel agent's services, or the image), then carries an
-instance there:
+exists only once an environment does, such as `dockerd` in a sandbox. Its
+endpoint is a socket inside an environment of another instance, the parent
+environment. The client names the instance and gives the module and the
+parent environment:
 
 ```text
 PUT /v1/providers/sb7f3a-docker
 {"module": "docker_engine",
- "semantics": {"settle": true, "idempotent": true},
- "parent": {"instance": "daytona", "environment": "sb-7f3a",
-            "endpoint": {"unix": "/var/run/docker.sock"}}}
+ "parent": {"instance": "daytona", "environment": "sb-7f3a"}}
 
 201 {"provider": "sb7f3a-docker", "module": "docker_engine",
      "capabilities": {...}, "readiness": {"status": "ready"}, "rate_limits": [],
      "ports": {"exec": true, "quota": true, "files": true, ...},
      "endpoint": {"unix": "/run/user/1000/drydock/parents/5d0c1e6f8a2b4c39.sock"},
-     "parent": {"instance": "daytona", "environment": "sb-7f3a",
-                "endpoint": {"unix": "/var/run/docker.sock"}}}
+     "parent": {"instance": "daytona", "environment": "sb-7f3a"}}
 ```
 
 From then on it is an ordinary instance: `POST
 /v1/providers/sb7f3a-docker/environments` provisions through it.
 
-- The body is a [provider configuration](openapi.json) (`module`, `settings`,
-  `ownership`, `semantics`) whose `parent` names an `environment`. `credential`,
-  `events` and `endpoint` cannot be put. The name is the client's, under the
+- **Recipe.** A module that can be carried states its recipe in hello
+  (`loadable_modules[].recipe`): the service that starts its engine, the
+  endpoint it then answers on, and the programs the parent's image needs on
+  its PATH. `docker_engine`'s runs `dockerd --host
+  unix:///var/run/docker.sock` and needs `dockerd`. drydockd checks the
+  programs, starts the service through the parent vessel's agent, under a name
+  of its own (`drydock-carried-…`), and waits up to 20 seconds for the endpoint
+  to answer; then it configures the instance. A `parent.endpoint` in the body
+  carries an engine the client started itself instead, and no recipe runs.
+- **What is left.** A carry that fails after the service started answers with
+  the failure and `left` naming it (`{"kind": "service", "provider", "id",
+  "name"}`), as a failed provision names its environment. The service keeps
+  running until the client stops it.
+- **The body** is `module`, `settings` and `parent`; anything else is refused.
+  drydock owns what the instance makes (`owned_account`), with the default
+  semantics, and it takes no credential. The name is the client's, under the
   exposure-name rule: 1 to 64 letters, digits, `_`, `.` or `-`, starting with a
   letter or digit. Nothing parses it.
-- The same body again answers 200 with the same instance. Carried instances
-  are listed by `GET /v1/providers` beside configured ones, and read with `GET
-  /v1/providers/{name}`, in the same shape: `parent` with its environment, and
-  `endpoint`, the socket drydockd made for it, as for a configured instance with
-  a parent.
-- Each connection to the instance's endpoint is one hop: drydockd opens a
-  stream through the parent environment's vessel agent, which opens the socket
-  inside the vessel, over the same link drydock keeps for that vessel's
-  [exposures](#exposures). A configured `parent`, without an environment, is the
-  same hop ending at the parent instance's machine instead. An instance carried
-  into an environment of a carried instance (Firecracker in a container in a
-  sandbox) is the hop repeated; the parent environment must already exist, so
-  there are no cycles.
-- Its capacity is the parent environment's granted size, as `Quota.limit` for
-  CPU, memory and disk. drydock enforces nothing beyond what the inner engine
-  refuses.
-- Egress: each layer reports its own. A container's row states the inner
+- **Repeats.** The same body again answers 200 with the same instance. Requests
+  under one name take turns, so concurrent `PUT`s of one body answer one 201
+  and then 200s. Carried instances are listed by `GET /v1/providers` beside
+  configured ones, and read with `GET /v1/providers/{name}`: `parent` as put,
+  and `endpoint`, the socket drydockd made for the instance, as for a
+  configured instance with a parent.
+- **The parent environment** must be running. One that is starting is waited
+  for, as long as a provision of its instance would wait; stopped, suspended,
+  stopping or in an unknown state is refused at once, naming the state, and
+  gone is refused. drydockd does not resume it. When it resumes after a
+  suspend, drydockd runs the recipe again, which leaves a service still running
+  alone.
+- **How a connection travels.** Each connection to the instance's socket is one
+  hop: drydockd asks the parent vessel's agent, over a link of its own to that
+  agent, to open the endpoint inside the vessel. A configured `parent`, which
+  names no environment, is the same hop ending at the parent instance's
+  machine instead. An instance carried into an environment of a carried
+  instance (Firecracker in a container in a sandbox) is the hop repeated; the
+  parent environment must already exist, so there are no cycles. The parent
+  vessel must be one drydock holds the key of, as for exposures.
+- **Capacity.** A carried instance declares `quota`. Its CPU, memory and disk
+  rows carry the parent environment's granted size as `limit`, and no
+  `in_use`; the module's own figures, such as `concurrency_in_use`, are passed
+  through. drydock enforces nothing beyond what the inner engine refuses.
+- **Egress.** Each layer reports its own. A container's row states the inner
   engine's enforcement and the sandbox's row the sandbox's; the effective
   policy is the narrower of the two, and drydock does not merge them.
-- `DELETE /v1/providers/sb7f3a-docker` removes it (204), and removing a name
-  that is not carried succeeds.
-- Requests under one carried name take turns: concurrent `PUT`s of one body
-  answer one 201 and then 200s, and a `DELETE` holds the name while it lists
-  the instance's environments and removes it, so a provision under the name
-  waits for it and then finds no instance. When drydockd destroys the parent environment,
-  or finds it gone, the carried instance goes too, with every instance carried
-  into its environments, at every depth.
-- Carried instances are held in memory only. After drydockd restarts they are
-  gone until the client carries them again (the same `PUT`). drydockd keeps
-  nothing about them, so it cannot tell a forgotten name from one it never
-  had: the environment routes under every name it does not know answer
-  `unavailable`, not `not_found`, since it does not know that their
-  environments are gone. `GET /v1/providers/{name}` of such a name is
-  `not_found`.
+- **Removal.** `DELETE /v1/providers/sb7f3a-docker` is refused while the
+  instance holds environments, naming them. Otherwise drydockd stops the
+  service it started, forgets the instance and answers 204. A name drydockd
+  does not hold answers 204 too. The `DELETE` holds the name while it lists the
+  instance's environments, so a provision under the name waits for it and then
+  finds no instance.
+- **Parent destroyed.** When drydockd destroys the parent environment, the
+  carried instance goes, and with it every instance carried into its
+  environments, at every depth. Each of their environments gets a `gone` event
+  with the cause `{"kind": "parent_gone", "provider", "environment"}`, naming
+  the environment whose going took it.
+- **Restarts.** Carried instances are held in memory only. After drydockd
+  restarts they are gone until the client carries them again (the same `PUT`).
+  Until then routes under their names answer 404 with `missing: "provider"`:
+  drydockd does not know the name, which says nothing of whether the
+  environments under it are gone. An environment route whose provider is known
+  answers 404 with `missing: "environment"` for an environment that is not.
 
 Refusals are `422` (`{"kind": "refused", "reason": ...}`):
 
 | Request | Reason |
 |---|---|
-| `PUT /v1/providers/sb%207f3a`, or any name outside the rule | `provider name must be 1 to 64 letters, digits, '_', '.' or '-', starting with a letter or digit` |
+| `PUT /v1/providers/sb%207f3a`, or any name outside the rule | `invalid request: provider name must be 1 to 64 letters, digits, '_', '.' or '-', starting with a letter or digit` |
 | `PUT /v1/providers/b1`, a configured name | `provider b1 is configured; a configured instance changes only with the configuration file` |
 | `PUT` of a different body under a carried name | `provider sb7f3a-docker is carried from a different body; remove it first` |
-| `PUT` without `parent`, or a `parent` without `environment` | `a carried instance's parent names an environment` |
-| `PUT` with `credential`, `events` or `endpoint` | `credential, events and endpoint cannot be put` |
+| `PUT` with a field other than `module`, `settings` and `parent`, or without `parent` | `invalid request: …`, naming the field |
+| `PUT` whose `parent` names no `environment` | `a carried instance's parent names an environment` |
 | `PUT` of a module that cannot be given its endpoint | `module e2b cannot be given its endpoint, so it cannot be carried` |
+| `PUT` without `parent.endpoint`, of a module without a recipe | `module m has no recipe; name the endpoint its engine answers on` |
 | `PUT` naming a parent that is not an instance | `parent daytna is not a provider` |
-| `PUT` naming a parent environment that does not exist | `parent environment sb-7f3a of daytona is gone` |
-| `PUT` into an environment without a vessel agent drydock holds a link to | as for exposures: `provider p declares no vessel agent, which exposures need`, or `environment has no drydock-managed SSH key` |
+| `PUT` naming a parent whose vessels run no agent | `provider p declares no vessel agent, which carrying needs` |
+| `PUT` into a parent environment that is gone | `parent environment sb-7f3a of daytona is gone` |
+| `PUT` into a parent environment that is not running or starting | `parent environment sb-7f3a of daytona is stopped; drydockd does not resume it` |
+| `PUT` into an image without what the recipe needs | `the parent's image has no dockerd on its PATH` |
+| `PUT` whose recipe's service exits before its endpoint answers | `the recipe's dockerd exited (…) before its endpoint answered; its log is …`, with `left` |
 | `DELETE` of a configured name | `provider b1 is configured; a configured instance changes only with the configuration file` |
 | `DELETE` while the instance holds environments | `sb7f3a-docker holds environments 4be1c0d2e9f3, 9a7713c05e21; destroy them first` |
 
-A carried instance's own environments are listed for the `DELETE`; when the
-list fails, the `DELETE` fails with that error.
+An endpoint that does not answer within 20 seconds is `unavailable`, with
+`left`. A carried instance's environments are listed for the `DELETE`; when
+the list fails, the `DELETE` fails with that error.
+
+### Vessel services
+
+A vessel agent's [services](crates/drydock-agent/README.md#services) are
+reached through drydockd, as exec and files are, for a vessel whose key drydock
+holds:
+
+```text
+PUT /v1/providers/daytona/environments/sb-7f3a/services/dockerd
+{"program": "/usr/bin/dockerd", "args": ["--host", "unix:///var/run/docker.sock"]}
+
+201 {"name": "dockerd", "pid": 812, "service": {...as sent...}, "state": "running",
+     "log": "/opt/drydock/drydock-agent.services/dockerd.log"}
+```
+
+`GET …/services/{name}`, `GET …/services` and `DELETE
+…/services/{name}?grace_ms=10000` read, list and stop them. The bodies and
+answers are the agent's own `Service` and `ServiceInfo`: a repeat `PUT` of the
+same body answers 200, a different body for a running service is refused, and
+an unknown name is 404.
 
 ## Protocol workspace
 
@@ -381,6 +425,13 @@ uvx --from openapi-spec-validator==0.7.2 openapi-spec-validator openapi.json
 The drift test compares deterministic generation with the checked-in document.
 Regenerate it whenever wire types or route descriptions change. CI separately
 validates the document against OpenAPI 3.1.
+
+Protocol version 16 adds carried instances and vessel services: the
+server-only `PUT` and `DELETE /v1/providers/{provider}` and `services` routes,
+`environment` on `parent`, a module's `recipe`, the `parent_gone` cause and a
+`service` left by a failed carry, which older clients cannot decode.
+`ResourceQuota.in_use` becomes optional, absent when not known, and `not_found`
+may say what was `missing`.
 
 Protocol version 10 adds exposures: the server-only `exposures` routes and
 the `exposure` event kind, which older clients cannot decode.

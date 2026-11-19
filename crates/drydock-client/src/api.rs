@@ -11,7 +11,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use drydock_protocol::openapi::ErrorResponses;
-use drydock_protocol::*;
+use drydock_protocol::{
+    service::{Service, ServiceInfo},
+    *,
+};
 pub use drydock_provider::Provisioned;
 use drydock_provider::rest::{ApiJson, ApiPath, ApiQuery, Refusal, switch, upgrade};
 use rigging_stream::ByteStream;
@@ -83,7 +86,7 @@ pub trait ProviderApi: Send + Sync {
     /// its streams port. drydockd opens these for its children alone and does
     /// not serve this.
     async fn stream(&self, _provider: &str, _endpoint: &Carried) -> Result<ByteStream, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Write one file into a guest, through the provider's files port.
     async fn put_file(&self, provider: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error>;
@@ -92,63 +95,76 @@ pub trait ProviderApi: Send + Sync {
     /// Host only: what one of the vendor's event deliveries says, read by the
     /// provider's module. drydockd reads deliveries itself and does not serve this.
     async fn event(&self, _provider: &str, _delivery: &VendorDelivery) -> Result<Vec<VendorObservation>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// The same API, using `credential` instead of any held one for each call.
     fn with_credential(&self, credential: Secret) -> Arc<dyn ProviderApi>;
     /// Server only: replace the held credential.
     async fn credential(&self, _provider: &str, _value: Secret) -> Result<(), Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only: billing events and inventory snapshots.
     async fn observe(&self, _since: Option<&str>) -> Result<ObservationStream, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
-    /// Server only: carry an instance under `provider`, its endpoint inside
-    /// the parent environment `configuration.parent` names. The same
-    /// configuration again answers with the same instance.
-    async fn put_provider(
-        &self,
-        _provider: &str,
-        _configuration: &ProviderConfiguration,
-    ) -> Result<Provisioned<ProviderDeclaration>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    /// Server only: carry an instance under `provider` into the parent
+    /// environment `carry.parent` names. The same body again answers with the
+    /// same instance; a failure partway says what it left.
+    async fn put_provider(&self, _provider: &str, _carry: &Carry) -> Result<Provisioned<ProviderDeclaration>, ProvisionError> {
+        Err(Error::from(ProtocolError::not_found("unknown route")).into())
     }
     /// Server only: remove a carried instance that holds no environments.
     async fn remove_provider(&self, _provider: &str) -> Result<(), Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
+    }
+    /// Server only: start a service in a vessel through its agent, unless it
+    /// already runs from the same body.
+    async fn put_service(&self, _provider: &str, _id: &str, _name: &str, _service: &Service) -> Result<Provisioned<ServiceInfo>, Error> {
+        Err(ProtocolError::not_found("unknown route").into())
+    }
+    /// Server only.
+    async fn service(&self, _provider: &str, _id: &str, _name: &str) -> Result<ServiceInfo, Error> {
+        Err(ProtocolError::not_found("unknown route").into())
+    }
+    /// Server only.
+    async fn services(&self, _provider: &str, _id: &str) -> Result<Vec<ServiceInfo>, Error> {
+        Err(ProtocolError::not_found("unknown route").into())
+    }
+    /// Server only: stop a service and forget it.
+    async fn remove_service(&self, _provider: &str, _id: &str, _name: &str, _grace_ms: Option<u64>) -> Result<ServiceInfo, Error> {
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only: set an inward exposure, reporting whether it replaced one.
     async fn put_inward(&self, _provider: &str, _id: &str, _name: &str, _request: &InwardRequest) -> Result<Exposed<Inward>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only.
     async fn inward(&self, _provider: &str, _id: &str, _name: &str) -> Result<Inward, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only.
     async fn inwards(&self, _provider: &str, _id: &str) -> Result<Vec<Inward>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only: removing an absent exposure succeeds.
     async fn remove_inward(&self, _provider: &str, _id: &str, _name: &str) -> Result<(), Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only: set an outward exposure, reporting whether it replaced one.
     async fn put_outward(&self, _provider: &str, _id: &str, _name: &str, _request: &OutwardRequest) -> Result<Exposed<Outward>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only.
     async fn outward(&self, _provider: &str, _id: &str, _name: &str) -> Result<Outward, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only.
     async fn outwards(&self, _provider: &str, _id: &str) -> Result<Vec<Outward>, Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
     /// Server only: removing an absent exposure succeeds.
     async fn remove_outward(&self, _provider: &str, _id: &str, _name: &str) -> Result<(), Error> {
-        Err(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+        Err(ProtocolError::not_found("unknown route").into())
     }
 }
 #[async_trait::async_trait]
@@ -253,12 +269,32 @@ impl ProviderApi for Client {
     async fn event(&self, provider: &str, delivery: &VendorDelivery) -> Result<Vec<VendorObservation>, Error> {
         self.call(Method::POST, &["v1", "providers", provider, "event"], Some(delivery)).await
     }
-    async fn put_provider(&self, provider: &str, configuration: &ProviderConfiguration) -> Result<Provisioned<ProviderDeclaration>, Error> {
-        let request = self.request(Method::PUT, &["v1", "providers", provider])?.json(configuration);
-        Ok(match self.execute_response(request).await? {
+    async fn put_provider(&self, provider: &str, carry: &Carry) -> Result<Provisioned<ProviderDeclaration>, ProvisionError> {
+        let request = self.request(Method::PUT, &["v1", "providers", provider])?.json(carry);
+        Ok(match self.execute_provision(request).await? {
             (201, declaration) => Provisioned::Created(declaration),
             (_, declaration) => Provisioned::Existing(declaration),
         })
+    }
+    async fn put_service(&self, provider: &str, id: &str, name: &str, service: &Service) -> Result<Provisioned<ServiceInfo>, Error> {
+        let request = self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "services", name])?.json(service);
+        Ok(match self.execute_response(request).await? {
+            (201, info) => Provisioned::Created(info),
+            (_, info) => Provisioned::Existing(info),
+        })
+    }
+    async fn service(&self, provider: &str, id: &str, name: &str) -> Result<ServiceInfo, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "services", name], None).await
+    }
+    async fn services(&self, provider: &str, id: &str) -> Result<Vec<ServiceInfo>, Error> {
+        self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "services"], None).await
+    }
+    async fn remove_service(&self, provider: &str, id: &str, name: &str, grace_ms: Option<u64>) -> Result<ServiceInfo, Error> {
+        let mut request = self.request(Method::DELETE, &["v1", "providers", provider, "environments", id, "services", name])?;
+        if let Some(grace_ms) = grace_ms {
+            request = request.query(&[("grace_ms", grace_ms)]);
+        }
+        Ok(self.execute_response(request).await?.1)
     }
     async fn remove_provider(&self, provider: &str) -> Result<(), Error> {
         self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider], None).await
@@ -379,6 +415,8 @@ fn server_routes() -> OpenApiRouter<Surface> {
         .routes(routes!(events))
         .routes(routes!(credential))
         .routes(routes!(put_provider, remove_provider))
+        .routes(routes!(services))
+        .routes(routes!(service, put_service, remove_service))
         .routes(routes!(inwards))
         .routes(routes!(inward, put_inward, remove_inward))
         .routes(routes!(outwards))
@@ -393,7 +431,7 @@ pub fn openapi_json() -> String {
 }
 
 pub async fn not_found() -> ApiError {
-    ApiError(ProtocolError::NotFound { reason: "unknown route".into() }.into())
+    ApiError(ProtocolError::not_found("unknown route").into())
 }
 pub async fn method_not_allowed() -> ApiError {
     ApiError(ProtocolError::MethodNotAllowed { reason: "unsupported method".into() }.into())
@@ -461,14 +499,65 @@ async fn provider(Api(api): Api, ApiPath(p): ApiPath<String>) -> ApiResult<Json<
 }
 #[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}",
 params(("provider" = String, Path, description = "Carried instance name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
-request_body(content = ProviderConfiguration, description = "module, settings, and parent with an environment; ownership and semantics as in the configuration. credential, events and endpoint are refused."),
+request_body(content = Carry, description = "A failure partway also says what it left, as `left`, as a failed provision does"),
 responses((status = 201, description = "Carried", body = ProviderDeclaration), (status = 200, description = "Already carried from the same body", body = ProviderDeclaration), ErrorResponses)
 )]
-async fn put_provider(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(c): ApiJson<ProviderConfiguration>) -> ApiResult<Response> {
-    Ok(match api.put_provider(&p, &c).await? {
+async fn put_provider(
+    api: Result<Api, ApiError>,
+    p: Result<ApiPath<String>, Refusal>,
+    body: Result<ApiJson<Carry>, Refusal>,
+) -> Result<Response, ProvisionAnswer> {
+    let (Api(api), ApiPath(p), ApiJson(body)) = (api.map_err(|e| e.0)?, p.map_err(|e| e.0)?, body.map_err(|e| e.0)?);
+    Ok(match api.put_provider(&p, &body).await.map_err(ProvisionAnswer)? {
         Provisioned::Created(declaration) => (StatusCode::CREATED, Json(declaration)).into_response(),
         Provisioned::Existing(declaration) => Json(declaration).into_response(),
     })
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/services",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
+responses((status = 200, description = "Every service the vessel's agent has a record of", body = Vec<ServiceInfo>), ErrorResponses)
+)]
+async fn services(Api(api): Api, ApiPath((p, id)): ApiPath<(String, String)>) -> ApiResult<Json<Vec<ServiceInfo>>> {
+    Ok(Json(api.services(&p, &id).await?))
+}
+#[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/services/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Service name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+responses((status = 200, description = "The service", body = ServiceInfo), ErrorResponses)
+)]
+async fn service(Api(api): Api, ApiPath((p, id, name)): ApiPath<(String, String, String)>) -> ApiResult<Json<ServiceInfo>> {
+    Ok(Json(api.service(&p, &id, &name).await?))
+}
+#[utoipa::path(put, tag = "server", path = "/v1/providers/{provider}/environments/{id}/services/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Service name: 1 to 64 of A-Z, a-z, 0-9, _, . and -, starting with a letter or digit")),
+request_body = Service,
+responses((status = 201, description = "Started", body = ServiceInfo), (status = 200, description = "Already running from the same body", body = ServiceInfo), ErrorResponses)
+)]
+async fn put_service(
+    Api(api): Api,
+    ApiPath((p, id, name)): ApiPath<(String, String, String)>,
+    ApiJson(service): ApiJson<Service>,
+) -> ApiResult<Response> {
+    Ok(match api.put_service(&p, &id, &name, &service).await? {
+        Provisioned::Created(info) => (StatusCode::CREATED, Json(info)).into_response(),
+        Provisioned::Existing(info) => Json(info).into_response(),
+    })
+}
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct Grace {
+    /// How long after SIGTERM before SIGKILL: 10 seconds by default, at most 60.
+    grace_ms: Option<u64>,
+}
+#[utoipa::path(delete, tag = "server", path = "/v1/providers/{provider}/environments/{id}/services/{name}",
+params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id"),("name" = String, Path, description = "Service name"), Grace),
+responses((status = 200, description = "Stopped and forgotten; its last state", body = ServiceInfo), ErrorResponses)
+)]
+async fn remove_service(
+    Api(api): Api,
+    ApiPath((p, id, name)): ApiPath<(String, String, String)>,
+    ApiQuery(grace): ApiQuery<Grace>,
+) -> ApiResult<Json<ServiceInfo>> {
+    Ok(Json(api.remove_service(&p, &id, &name, grace.grace_ms).await?))
 }
 #[utoipa::path(delete, tag = "server", path = "/v1/providers/{provider}",
 params(("provider" = String, Path, description = "Carried instance name")),

@@ -72,7 +72,9 @@ A Rust module is two types:
   carries those streams through the environment's vessel agent. A module
   whose instances can be given their endpoint by drydockd, so that they can
   have a parent, says so with `Module::takes_endpoint` and reads
-  `ProviderConfiguration::endpoint`.
+  `ProviderConfiguration::endpoint`. One that can be carried into an
+  environment from the module alone states `Module::recipe`: the service that
+  starts its engine, the endpoint it answers on and the programs it needs.
 
 Register the module in two places: `pub mod` in
 [`lib.rs`](../crates/drydock-host/src/lib.rs), and `registry.insert` in
