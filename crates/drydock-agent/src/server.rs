@@ -102,6 +102,7 @@ pub(crate) struct Shared {
     /// The name this agent records beside the links it places.
     pub(crate) holder: Option<String>,
     processes: crate::process::Processes,
+    services: Arc<crate::service::Services>,
 }
 impl Shared {
     /// The way out for a fetch: the configured egress, as for guest traffic.
@@ -160,6 +161,7 @@ impl Agent {
             egress_system: crate::egress::System::default(),
             outward: Arc::new(crate::streams::Outward::new(events.clone(), crate::streams::CLAIM_DEADLINE)),
             processes: crate::process::Processes::new(buffer, events.clone()),
+            services: Arc::new(crate::service::Services::new(crate::upgrade::sidecar(&executable, "services"), events.clone())),
             events,
             settings: Mutex::new(Settings::default()),
             controls: std::sync::Mutex::new(JoinSet::new()),
@@ -228,8 +230,12 @@ impl Agent {
         if let Err(error) = self.shared.store.sweep_staging(crate::store::ABANDONED) {
             tracing::warn!(%error, "could not sweep abandoned artifact staging");
         }
+        self.shared.services.adopt();
         let router = self.router();
         let mut tasks = JoinSet::new();
+        // Dropped, and so stopped, when the agent stops serving.
+        let mut background = JoinSet::new();
+        background.spawn(self.shared.services.clone().rotate_logs());
         for mut listener in self.listeners.drain(..) {
             let router = router.clone();
             tasks.spawn(async move {
@@ -299,6 +305,8 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/processes/{id}/output", get(attach))
         .route("/processes/{id}/stdin", put(write_stdin))
         .route("/processes/{id}/signals", post(signal))
+        .route("/services", get(list_services))
+        .route("/services/{name}", get(service).put(put_service).delete(remove_service))
         .route("/files/{*path}", get(get_file).head(head_file).put(put_file))
         .route("/entries/", get(get_entry).delete(delete_entry).patch(patch_entry))
         .route("/entries/{*path}", get(get_entry).delete(delete_entry).patch(patch_entry))
@@ -673,6 +681,29 @@ pub(crate) struct Signal {
 async fn signal(State(s): State<Arc<Shared>>, Path(id): Path<String>, Json(request): Json<Signal>) -> Refusal<StatusCode> {
     s.processes.get(&id)?.signal(request.signal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_services(State(s): State<Arc<Shared>>) -> Refusal<Json<Vec<ServiceInfo>>> {
+    Ok(Json(s.services.list()?))
+}
+async fn service(State(s): State<Arc<Shared>>, Path(name): Path<String>) -> Refusal<Json<ServiceInfo>> {
+    Ok(Json(s.services.get(&name)?))
+}
+async fn put_service(State(s): State<Arc<Shared>>, Path(name): Path<String>, Json(request): Json<Service>) -> Refusal<Response> {
+    let environment = s.settings.lock().await.config.environment.clone();
+    let (info, started) = s.services.put(&name, request, environment).await?;
+    Ok((if started { StatusCode::CREATED } else { StatusCode::OK }, Json(info)).into_response())
+}
+async fn remove_service(
+    State(s): State<Arc<Shared>>,
+    Path(name): Path<String>,
+    Query(query): Query<crate::query::StopQuery>,
+) -> Refusal<Json<ServiceInfo>> {
+    let grace = query.grace_ms.map_or(crate::service::DEFAULT_GRACE, std::time::Duration::from_millis).min(crate::service::MAX_GRACE);
+    // Run to the end even if the client goes away, so a stop is never left
+    // half done with its record kept.
+    let stop = tokio::spawn(async move { s.services.remove(&name, grace).await });
+    Ok(Json(stop.await.map_err(|e| AgentError::new("service.stop", "", ErrorKind::Other, e.to_string()))??))
 }
 
 fn sha256_header(digest: &str) -> [(header::HeaderName, header::HeaderValue); 1] {

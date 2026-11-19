@@ -190,6 +190,8 @@ refused. Forward IDs are one percent-encoded route segment.
 | GET | `/processes/{id}/output?stdout=N&stderr=M` | Become the reader; framed output from those offsets, then the exit |
 | PUT | `/processes/{id}/stdin` | Stream the body to stdin, then close it |
 | POST | `/processes/{id}/signals` | `{ "signal": N }` to the process group |
+| GET | `/services` | Every service the agent has a record of, as `ServiceInfo` |
+| GET / PUT / DELETE | `/services/{name}` | `ServiceInfo` / start a `Service` unless it already runs (201 or 200) / stop it and forget it |
 | GET / HEAD / PUT | `/files/{path}` | Stream a file (Range, `ETag`, `If-Match`) / its size / an atomic streamed write |
 | GET / PATCH / DELETE | `/entries/{path}` | Stat without following links / change mode and owner / remove (`?recursive=true`) |
 | GET / PUT | `/dirs/{path}` | List a directory / create one |
@@ -445,12 +447,94 @@ them is trusted with the vessel. Where pidfds are unavailable (before Linux
 `Client::run` starts a process, collects its output and removes the handle,
 so callers that only need whole outputs leave nothing held on the agent.
 
-An agent restart or re-exec ends its process handles. A child that survives
+An agent restart or re-exec ends its process handles; run what must outlive
+one as a [service](#services). A child that survives
 it has lost its output reader: it can keep running and is reaped after it
 exits, but writing to stdout or stderr then raises SIGPIPE. On Linux, startup
 reaps children inherited across re-exec after they exit. Discovery is best
 effort when procfs child lists are unavailable. The provider's init reaps
 children orphaned by an agent crash.
+
+### Services
+
+A service is a long-lived process, such as an engine (`dockerd`, Firecracker),
+kept running under a name the client chooses: letters, digits, `_`, `.` and
+`-`, starting with a letter or digit, at most 64 bytes, one route segment.
+Unlike a process, its output never passes through the agent, so unread output
+cannot block it, and it outlives agent restarts and re-execs, upgrades
+included. After one, the new agent still reports it and can stop it.
+
+```text
+PUT /services/dockerd
+{"program": "/usr/bin/dockerd", "args": ["--host", "unix:///var/run/docker.sock"],
+ "cwd": null, "environment": {"DOCKER_RAMDISK": "1"}, "output": "file"}
+
+201 {"name": "dockerd", "pid": 812, "service": {...as sent...}, "state": "running",
+     "log": "/opt/drydock/drydock-agent.services/dockerd.log"}
+
+GET /services/dockerd
+200 {"name": "dockerd", "pid": 812, "service": {...}, "state": "exited",
+     "status": {"code": 1, "signal": null, "timed_out": false}, "log": "..."}
+
+DELETE /services/dockerd?grace_ms=10000
+200 {"name": "dockerd", "pid": 812, "service": {...}, "state": "exited", "status": null, "log": "..."}
+```
+
+`PUT` is idempotent on the name: a service of that name still running from the
+same `Service` body is left alone (200); one running from a different body is
+a 409, so stop it first; otherwise, never started, exited, or gone with an
+earlier boot, the service is started (201). Concurrent requests for one name
+take turns. The service leads its own process group with stdin `/dev/null` and
+the configured environment, then the request's `environment`, without the
+pipeline defaults a process gets (`CI=1`, `TERM=dumb`, pagers); only the body
+is compared, not the configuration, which a restarted agent no longer holds.
+`output: "file"` (the default) sends stdout and stderr, in the order written,
+straight to `<name>.log` in the agent's service directory, mode 0600; read it
+with `GET /files/{path}`, ranged to follow it. Each start moves a nonempty
+previous log to `<name>.log.1`, so a start that fails to spawn, which leaves
+an empty log, never displaces the last run's. The agent checks the log every
+second and, once it is past 64 MiB, copies it to `<name>.log.1` and empties it
+in place (the service holds it open for appending); bytes written between the
+copy and the emptying are lost, and a log can pass 64 MiB by what the service
+writes in a second. A reader following the log sees it shrink to nothing at
+each rotation. Without a running agent nothing rotates it. `output: "discard"`
+sends both to `/dev/null`, and `log` is null. A log an earlier `file` run left
+stays until a later `file` start moves it.
+
+The service directory is `<executable>.services` beside the installed agent
+(`/opt/drydock/drydock-agent.services`), on whatever filesystem holds the
+vessel's root. That may be tmpfs: an `ssh_host` vessel lives under
+`$XDG_RUNTIME_DIR`, so its logs use memory, bounded by rotation at about
+128 MiB per service. Each
+service has a record there, `<name>.json`, holding its body, PID and the
+process's start time. The agent finds its services again from these records: a
+record whose PID still names a process started at that time is running; any
+other has exited. So a record left by an earlier boot reads as exited, and a
+reused PID never passes for the service. An unreadable record is ignored with
+a warning, as if the service had never started, and the next start replaces
+it. If the service it named still runs, the agent can no longer find or stop
+it. The record keeps the request as sent, `environment` included, and every
+reply carries it back, so a secret in a service's environment is readable by
+every client of the agent, as it is to the vessel's root. While the agent that
+started a service runs it waits for it and keeps its exit status; across a
+re-exec the new agent still reaps it but the status is not known (`status:
+null`), and after a crash the provider's init reaps it. `pid` is the PID the
+service last had; once it has exited it may name another process. Each exit
+the agent sees is pushed on `/events` as `{"kind": "service_exited", "name",
+"pid", "status"}`. On Linux an agent that finds a running service at startup
+watches it through a pidfd, opened after the start-time check, so its exit is
+announced too, with `status: null`. Elsewhere only the agent that started a
+service announces its exit. Absent and null `status` mean the same: not known.
+
+`DELETE /services/{name}` sends SIGTERM to the service's process group and, if
+it is still running after `grace_ms` (10 seconds by default; anything over 60
+seconds counts as 60), SIGKILL, waiting at most five seconds more; each signal
+goes only to a process group the recorded process still leads, checked just
+before. Once the leader has exited the group is not signalled, so descendants
+it left running are left alone. It replies with the last `ServiceInfo` once
+the service has exited, and removes the record but keeps the log until the
+name starts again. An upgrade's drain does not wait for services, and
+`Activated.running` does not list them.
 
 ### Configuration, forwards and restarts
 
@@ -498,6 +582,7 @@ own `/v1/events` does. Events are tagged by `kind`:
 {"cursor":"<boot>:17","event":{"kind":"outward_connection","forward":"crew","connection":4}}
 {"cursor":"<boot>:18","event":{"kind":"process_exited","id":"3-812","status":{"code":0,"signal":null,"timed_out":false}}}
 {"cursor":"<boot>:19","event":{"kind":"forward_failed","forward":"crew","reason":"connection 5 was not claimed within 30s"}}
+{"cursor":"<boot>:20","event":{"kind":"service_exited","name":"dockerd","pid":812,"status":null}}
 ```
 
 A cursor is `<boot_id>:<serial>`. `?since=` resumes after that event while
@@ -527,9 +612,9 @@ waits for the running ones to exit, up to `drain_ms` from the request body
 the processes still running at the limit; they keep running across the
 re-exec, but lose their handles and output reader. The agent then re-execs
 with the original flags; the host reconnects with a fresh connection and
-verifies the new fingerprint. The agent's processes are short calls:
-anything long-running that holds file descriptors belongs under cleat, not
-the agent.
+verifies the new fingerprint. The agent's processes are short calls: a
+long-running service is started as a [service](#services) instead, and an
+interactive one belongs under cleat.
 
 The candidate runs on probation: a durable `.probation` marker records it,
 and it runs from `.upgrade` while the installed entry point stays the previous
@@ -719,7 +804,9 @@ chunked bodies, TCP and Unix endpoints, isolation, an outward connection held
 until its HTTP/1.1 claim, an unclaimed one closed at its deadline, and `curl`
 reaching `/hello` and following `/events` on the socket (`tests/contract.rs`);
 processes with stdin, separate streams, exit codes, signals, kill, timeout,
-reattach and bounded output (`tests/processes.rs`); file operations, ranges,
+reattach and bounded output (`tests/processes.rs`); services with unread
+output, log rotation, idempotent starts, stops escalating to SIGKILL, and
+status, stop and the exit event across a re-exec (`tests/services.rs`); file operations, ranges,
 modes, digests, resumable uploads and tree unpacks (`tests/files.rs`);
 fetches by digest from upstream, OCI and push sources against in-process
 stand-ins, with resume, fall-through, unpack refusals and links

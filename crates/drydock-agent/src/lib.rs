@@ -17,6 +17,7 @@ pub use reach::{Attempt, Attempted, Attempts, DEFAULT_TIMEOUT_MS, Identity, MAX_
 mod rest;
 pub use error::{AgentError, ErrorKind};
 mod server;
+mod service;
 pub mod socket;
 pub mod stand_in;
 mod store;
@@ -32,7 +33,7 @@ pub use server::Agent;
 use std::{collections::BTreeMap, io, net::SocketAddr, path::PathBuf};
 
 pub const FEATURES: &[&str] =
-    &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts", "destinations"];
+    &["configuration", "processes", "files", "uploads", "trees", "forwards", "egress", "upgrade", "artifacts", "destinations", "services"];
 /// Fingerprint of the actual executable, including its linked implementation.
 pub fn fingerprint() -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -218,6 +219,56 @@ pub struct ProcessInfo {
     /// reattach at lower offsets moves them back.
     pub stdout: u64,
     pub stderr: u64,
+}
+/// A long-lived service to keep running under a name the client chooses.
+/// Unlike a process, its output never passes through the agent, and it
+/// outlives agent restarts and re-execs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Service {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    /// Added to the configured environment, overriding it per variable.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub output: ServiceOutput,
+}
+/// Where a service's stdout and stderr go. Its stdin is always `/dev/null`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOutput {
+    /// Both streams, in the order written, to the file [`ServiceInfo::log`]
+    /// names. Each start, and each pass of 64 MiB, keeps the previous content
+    /// as `<log>.1`.
+    #[default]
+    File,
+    Discard,
+}
+/// A service's status.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceInfo {
+    pub name: String,
+    /// The PID the service last had; once it has exited, it may name
+    /// another process.
+    pub pid: u32,
+    pub service: Service,
+    #[serde(flatten)]
+    pub state: ServiceState,
+    /// Readable through `GET /files/{path}`; absent when output is discarded.
+    pub log: Option<PathBuf>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ServiceState {
+    Running,
+    /// `status` is known only to the agent process that started the service
+    /// and saw it end; after a restart or re-exec it is absent.
+    Exited {
+        status: Option<ExitStatus>,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecEvent {

@@ -87,6 +87,13 @@ pub(crate) struct AttachQuery {
     pub stderr: u64,
 }
 
+/// How long a stopping service gets between SIGTERM and SIGKILL.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StopQuery {
+    pub grace_ms: Option<u64>,
+}
+
 /// The digest an upgrade image must have.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
