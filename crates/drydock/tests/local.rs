@@ -48,12 +48,19 @@ async fn start(dir: &Path) -> Arc<Daemon> {
         .await
         .unwrap();
     }
+    // An agent that exits as it starts.
+    let broken = dir.join("broken-agent");
+    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
     // The provider has no `credential`: a local vessel needs none.
     let text = format!(
         "[providers.local]\nmodule='local'\nimage='image@sha256:{digest}'\nsettings={{root='{}', agent='{}'}}\n\
+         [providers.broken]\nmodule='local'\nimage='image@sha256:{digest}'\nsettings={{root='{}', agent='{}'}}\n\
          [providers.guarded]\nmodule='reference'\nimage='image@sha256:{digest}'\n",
         dir.join("vessels").display(),
         agent::agent_binary().display(),
+        dir.join("broken").display(),
+        broken.display(),
         digest = "a".repeat(64)
     );
     let run = dir.join("run");
@@ -93,6 +100,22 @@ async fn launch_reaches_an_agent_and_the_vessel_lives_through_its_lifecycle() {
     daemon.destroy("local", &vessel.id).await.unwrap();
     assert!(daemon.list("local").await.unwrap().is_empty());
     assert!(!dir.path().join("vessels").join(&vessel.id).exists());
+}
+
+// A provision whose agent cannot start fails, and names the vessel it left,
+// which stays listed under its label until the client destroys it.
+#[tokio::test]
+async fn a_failed_provision_names_what_it_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = start(dir.path()).await;
+    let (prepared, size) = daemon.prepare("broken", &LaunchOptions::default()).await.unwrap();
+    let request = ProvisionRequest { label: "left".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None };
+    let failure = daemon.provision("broken", &request).await.unwrap_err();
+    let Left::Made { provider, id } = failure.left else { panic!("{failure}") };
+    assert_eq!(provider, "broken");
+    let listed = daemon.list("broken").await.unwrap();
+    assert_eq!(listed.iter().map(|e| (e.id.as_str(), e.label.as_deref())).collect::<Vec<_>>(), [(id.as_str(), Some("left"))]);
+    daemon.destroy("broken", &id).await.unwrap();
 }
 
 /// Connects from inside a local vessel by running a command through its agent.

@@ -623,7 +623,7 @@ impl Provider for Tensorlake {
             suspend_preserves_memory: Some(true),
             bootstrap: BootstrapRoute::Upload,
             agent_tcp_port: Some(self.settings.tunnel_port),
-            // A name Tensorlake already holds is refused, not returned.
+            // Concurrent creates of one name are refused (409), not returned.
             exclusive_label: false,
             platforms: vec![platform()],
             image_routes: vec![ImageRoute::RegistryPull {
@@ -678,12 +678,21 @@ impl Provider for Tensorlake {
         }
         Ok(Prepared { provider: self.name.clone(), id: name, platform, image_digest: r.image_digest, tools_digest: r.tools_digest })
     }
-    /// One create, answered with what Tensorlake's answer states. Tensorlake
-    /// refuses a name it already holds (409), in its own words.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    /// The live sandbox the label's name already names, or one create,
+    /// answered with what Tensorlake's answer states. The name is found by
+    /// the label's translation, since a long label cannot be read back from
+    /// a listed name: drydockd's own lookup by label misses it.
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         check_prepared(TENSORLAKE, &self.name, &r.prepared, &image_name(&r.prepared.image_digest, &r.prepared.platform))?;
         let policy = Policy::request(&r.egress)?;
         let name = sandbox_name(&self.name, &r.label);
+        let rows: Vec<Sandbox> = self.paged(&["sandboxes"], "sandboxes", c).await?;
+        for row in rows.into_iter().filter(|row| row.name.as_deref() == Some(name.as_str())) {
+            let environment = self.environment(row)?;
+            if environment.live() {
+                return Ok(Provisioned::Existing(Environment { label: Some(r.label), ..environment }));
+            }
+        }
         let body = CreateSandbox {
             name: &name,
             image: &r.prepared.id,
@@ -695,7 +704,8 @@ impl Provider for Tensorlake {
             wait: false,
             network: policy.wire(),
         };
-        let v: Created = self.api.call(Method::POST, self.api.url(&["sandboxes"])?, Body::json(&body)?, c).await?;
+        let v: Created =
+            self.api.call(Method::POST, self.api.url(&["sandboxes"])?, Body::json(&body)?, c).await.map_err(ProvisionFailure::creating)?;
         Ok(Provisioned::Created(Environment {
             id: v.sandbox_id.to_string(),
             label: Some(r.label),
@@ -969,10 +979,15 @@ mod tests {
         assert!(matches!(malformed, Err(ProtocolError::Refused { .. })), "{malformed:?}");
     }
     // Provision is one create, answered with what Tensorlake's answer states;
-    // a name Tensorlake already holds is refused in its words.
+    // a later one takes up the live sandbox the label's name names, a long
+    // label's digest name included.
     #[tokio::test]
-    async fn provision_is_one_create() {
-        let script = script(&[(202, r#"{"sandbox_id":"sbx1","name":"n","state":"pending"}"#), (409, "sandbox name already exists")]);
+    async fn provision_creates_once_per_label() {
+        let label = "crew-".repeat(20);
+        let listed: &'static str =
+            format!(r#"{{"sandboxes":[{{"id":"sbx1","name":"{}","status":"running"}}]}}"#, sandbox_name("lab", &label)).leak();
+        let created = r#"{"sandbox_id":"sbx1","name":"n","state":"pending"}"#;
+        let script = script(&[(200, r#"{"sandboxes":[]}"#), (202, created), (200, listed)]);
         let provider = configure(serde_json::json!({}), script.clone()).await.unwrap();
         let prepared = Prepared {
             provider: "lab".into(),
@@ -982,19 +997,22 @@ mod tests {
             tools_digest: "tools".into(),
         };
         let request = ProvisionRequest {
-            label: "crew-1".into(),
+            label: label.clone(),
             prepared,
             size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 10 * GIB },
             egress: EgressRequest::Open,
             ssh_public_key: None,
         };
-        let made = provider.provision(request.clone(), &credentials()).await.unwrap().into_inner();
-        assert_eq!((made.id.as_str(), made.label.as_deref(), &made.state), ("sbx1", Some("crew-1"), &kit::starting()));
+        let made = provider.provision(request.clone(), &credentials()).await.unwrap();
+        let Provisioned::Created(made) = made else { panic!("{made:?}") };
+        assert_eq!((made.id.as_str(), made.label.as_deref(), &made.state), ("sbx1", Some(label.as_str()), &kit::starting()));
         let vendor = made.vendor.unwrap();
-        assert_eq!((vendor.state.as_str(), vendor.tags), ("pending", tags("lab", &sandbox_name("lab", "crew-1"))));
-        let refused = provider.provision(request, &credentials()).await;
-        assert!(matches!(&refused, Err(ProtocolError::Refused { reason }) if reason.contains("already exists")), "{refused:?}");
-        assert_eq!(*script.asked.lock().unwrap(), [("POST".into(), "/sandboxes".into()), ("POST".into(), "/sandboxes".into())]);
+        assert_eq!((vendor.state.as_str(), vendor.tags), ("pending", tags("lab", &sandbox_name("lab", &label))));
+        let again = provider.provision(request, &credentials()).await.unwrap();
+        let Provisioned::Existing(again) = again else { panic!("{again:?}") };
+        assert_eq!((again.id.as_str(), again.label.as_deref()), ("sbx1", Some(label.as_str())));
+        let asked = script.asked.lock().unwrap().iter().map(|(method, path)| format!("{method} {path}")).collect::<Vec<_>>();
+        assert_eq!(asked, ["GET /sandboxes", "POST /sandboxes", "GET /sandboxes"]);
     }
     // Destroy deletes, then sweeps the snapshots the delete leaves. A retry
     // once Tensorlake has forgotten the sandbox still sweeps, then answers not found.

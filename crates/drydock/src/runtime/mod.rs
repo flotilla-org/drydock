@@ -189,6 +189,7 @@ impl Runtime {
             let observed = Observed::new(&self.events, name, relay.is_some(), auth.clone());
             let declared = provider.capabilities().semantics;
             let foreign_possible = p.ownership == Ownership::SharedAccount && !declared.owner_scoped;
+            let exclusive = provider.capabilities().exclusive_label;
             let provider = semantics::apply(p, observed.clone(), provider)?;
             let capabilities = provider.capabilities();
             let ports = provider.operations();
@@ -237,6 +238,7 @@ impl Runtime {
                     egress_measured_at: Mutex::new(BTreeMap::new()),
                     request_timeout: self.request_timeout,
                     observed,
+                    labels: (!exclusive).then(semantics::Labels::default),
                 }),
             );
         }

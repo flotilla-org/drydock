@@ -13,7 +13,7 @@ pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "14";
+pub const PROTOCOL_VERSION: &str = "15";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -409,7 +409,9 @@ pub struct Capabilities {
     /// Provision of a label that names an environment returns it, concurrent
     /// provisions included: the module refuses a second sandbox for a label.
     /// Without it a label is only the client's name for what it made, and
-    /// every provision may create an environment.
+    /// every provision may create an environment. drydockd states it for every
+    /// instance; where the module does not, it holds within that drydockd
+    /// only, not at the vendor.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exclusive_label: bool,
     /// The ways, beyond the guest's own egress, that a vessel can reach a
@@ -1349,6 +1351,76 @@ pub struct ResumeToken {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Export {
     pub reference: String,
+}
+/// The answer to a failed provision: the error, and what it left at the
+/// vendor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProvisionFailure {
+    #[serde(flatten)]
+    pub error: ProtocolError,
+    pub left: Left,
+}
+/// What a failed provision left at the vendor. Nothing removes what it left:
+/// it stays listed under the request's label, a provision under that label
+/// takes it up, and destroy removes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Left {
+    /// The vendor made this environment before a later step failed. It names
+    /// its provider, as the request path did, so that it is the whole of what
+    /// destroy needs.
+    Made { provider: String, id: String },
+    /// The vendor made nothing.
+    None,
+    /// Whether the vendor made anything cannot be known: its answer to the
+    /// create was lost.
+    Unknown,
+}
+impl ProvisionFailure {
+    pub fn made(error: ProtocolError, provider: &str, id: &str) -> Self {
+        Self { error, left: Left::Made { provider: provider.to_owned(), id: id.to_owned() } }
+    }
+    pub fn unknown(error: ProtocolError) -> Self {
+        Self { error, left: Left::Unknown }
+    }
+    /// The failure of the vendor call that creates the environment: a
+    /// refusal, a rate limit or quota included, made nothing, and any other
+    /// failure may have.
+    pub fn creating(error: ProtocolError) -> Self {
+        match error {
+            ProtocolError::NotFound { .. }
+            | ProtocolError::MethodNotAllowed { .. }
+            | ProtocolError::Refused { .. }
+            | ProtocolError::ImageRefused { .. }
+            | ProtocolError::RateLimited { .. }
+            | ProtocolError::QuotaExhausted { .. }
+            | ProtocolError::CredentialRejected { .. } => error.into(),
+            ProtocolError::Unavailable { .. } | ProtocolError::CommandFailed { .. } | ProtocolError::Internal { .. } => {
+                Self::unknown(error)
+            }
+        }
+    }
+}
+/// A failure before the vendor was asked to create anything.
+impl From<ProtocolError> for ProvisionFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self { error, left: Left::None }
+    }
+}
+impl std::fmt::Display for ProvisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.error, self.left)
+    }
+}
+/// What a failure's text adds after the error: nothing when nothing was left.
+impl std::fmt::Display for Left {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Left::Made { provider, id } => write!(f, "; left environment {id} of provider {provider}"),
+            Left::None => Ok(()),
+            Left::Unknown => write!(f, "; whether the vendor made an environment is unknown"),
+        }
+    }
 }
 /// Adaptors never retry. Internal preserves the vendor's raw error text.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]

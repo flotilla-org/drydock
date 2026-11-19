@@ -499,10 +499,10 @@ impl Provider for Runtime {
     }
     /// One create, answered with Runtime's row. The owner tag goes on only on
     /// a shared account.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         check_prepared(RUNTIME, &self.name, &r.prepared, &image_name(&r.prepared.image_digest, &r.prepared.platform))?;
         if r.label.len() > LABEL_LIMIT {
-            return Err(refused("Runtime labels hold at most 256 characters"));
+            return Err(refused("Runtime labels hold at most 256 characters").into());
         }
         SIZES.check(RUNTIME, &r.size)?;
         let policy = Policy::request(&r.egress)?;
@@ -522,8 +522,13 @@ impl Provider for Runtime {
             "idlePauseSeconds": 0,
         });
         let prefer = [(HeaderName::from_static("prefer"), HeaderValue::from_static(PREFER_WAIT))];
-        let created: Sandbox = self.api.call_with(Method::POST, self.api.url(&["sandboxes"])?, Body::json(&body)?, c, &prefer).await?;
-        Ok(Provisioned::Created(self.environment(created)?))
+        let created: Sandbox = self
+            .api
+            .call_with(Method::POST, self.api.url(&["sandboxes"])?, Body::json(&body)?, c, &prefer)
+            .await
+            .map_err(ProvisionFailure::creating)?;
+        let id = created.id.to_string();
+        Ok(Provisioned::Created(self.environment(created).map_err(|e| ProvisionFailure::made(e, &self.name, &id))?))
     }
     /// Every sandbox Runtime lists, stopped ones included: on a shared
     /// account, those carrying this instance's owner tag, as Runtime filters.

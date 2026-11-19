@@ -20,6 +20,8 @@ import {
   type Fetch,
 } from "../oci.js";
 import {
+  creating,
+  made,
   ProtocolFailure,
   refused,
   type Context,
@@ -547,16 +549,13 @@ class Namespace implements Provider {
           throw error;
         }
       },
-    );
+    ).catch((error: unknown) => {
+      throw creating(protocolError(error));
+    });
     try {
       await this.addAgent(box, signal);
     } catch (error) {
-      // The devbox stays for the client to inspect or destroy; the failure
-      // names it, since a failed provision returns no environment.
-      const failure = protocolError(error);
-      const detail = failure.detail as { reason?: string };
-      detail.reason = `${detail.reason ?? failure.detail.kind}; devbox ${box.id} was left for inspection`;
-      throw failure;
+      throw made(protocolError(error), this.name, box.id);
     }
     return { created: true, environment: this.row(box) };
   }

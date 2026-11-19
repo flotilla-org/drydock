@@ -61,9 +61,37 @@ export function ports(provider: Provider): Types["Ports"] {
   };
 }
 export class ProtocolFailure extends Error {
-  constructor(readonly detail: Types["ProtocolError"]) {
+  /** On a provision, what the failure left at the vendor; absent is none. */
+  constructor(
+    readonly detail: Types["ProtocolError"],
+    readonly left?: Types["Left"],
+  ) {
     super(detail.kind);
   }
+}
+/** A step's failure after the vendor made `id`, which it leaves as it is. */
+export function made(
+  failure: ProtocolFailure,
+  provider: string,
+  id: string,
+): ProtocolFailure {
+  return new ProtocolFailure(failure.detail, { kind: "made", provider, id });
+}
+/** The vendor's create call failed: a refusal made nothing, and any other
+ * failure may have. The refusal kinds are those of the Rust
+ * `ProvisionFailure::creating`; a kind not listed is safely unknown. */
+export function creating(failure: ProtocolFailure): ProtocolFailure {
+  const answered = [
+    "not_found",
+    "method_not_allowed",
+    "refused",
+    "image_refused",
+    "rate_limited",
+    "quota_exhausted",
+    "credential_rejected",
+  ];
+  if (answered.includes(failure.detail.kind)) return failure;
+  return new ProtocolFailure(failure.detail, { kind: "unknown" });
 }
 export function refused(reason: string): never {
   throw new ProtocolFailure({ kind: "refused", reason });

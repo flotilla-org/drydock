@@ -2,7 +2,7 @@
 use super::*;
 use crate::{
     api::{ConfigUpdate, ObservationStream, ProviderApi, Provisioned},
-    client::Error,
+    client::{Error, ProvisionError},
 };
 use module::{
     ByteStream,
@@ -97,13 +97,17 @@ impl ProviderApi for Runtime {
             .call(Gate::Prepare, self.credential.clone(), |p, c| async move { prepare_for_platform(&*p, r, &c).await })
             .await?)
     }
-    async fn provision(&self, p: &str, r: &ProvisionRequest) -> ApiResult<Provisioned<Environment>> {
+    async fn provision(&self, p: &str, r: &ProvisionRequest) -> std::result::Result<Provisioned<Environment>, ProvisionError> {
         if r.prepared.provider != p {
             return Err(refused("invalid size, label or prepared provider").into());
         }
         let instance = self.instance(p).await?;
-        let generation = *instance.observation_generation.recover();
         let r = ProvisionRequest { egress: normal(&r.egress), ..r.clone() };
+        let _held = match &instance.labels {
+            Some(labels) => Some(labels.hold(&r.label).await),
+            None => None,
+        };
+        let generation = *instance.observation_generation.recover();
         let result = instance.call(Gate::Provision, self.credential.clone(), |p, c| async move { p.provision(r, &c).await }).await?;
         let (Provisioned::Created(row) | Provisioned::Existing(row)) = &result;
         cache_observation(&instance, row, generation);

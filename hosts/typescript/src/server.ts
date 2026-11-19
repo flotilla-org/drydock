@@ -54,6 +54,20 @@ function sendError(reply: FastifyReply, error: unknown) {
   return reply.code(result.status).headers(result.headers).send(result.detail);
 }
 
+/** A provision's failure says what it left: one that is not the module's
+ * own answer leaves it unknown. */
+function sendProvisionError(reply: FastifyReply, error: unknown) {
+  const result = errorResponse(error);
+  const left: Types["Left"] =
+    error instanceof ProtocolFailure
+      ? (error.left ?? { kind: "none" })
+      : { kind: "unknown" };
+  return reply
+    .code(result.status)
+    .headers(result.headers)
+    .send({ ...result.detail, left });
+}
+
 function isUnreadableBody(error: FastifyError) {
   const codes = Fastify.errorCodes;
   return (
@@ -347,7 +361,14 @@ export async function serve(modules: ProviderModule[], unix: string) {
 
   app.post<{ Params: Instance; Body: Types["ProvisionRequest"] }>(
     environments,
-    { schema: { body: bodySchema("ProvisionRequest") } },
+    {
+      schema: { body: bodySchema("ProvisionRequest") },
+      errorHandler: (error: FastifyError, _request, reply) =>
+        sendProvisionError(
+          reply,
+          isUnreadableBody(error) ? invalidRequest() : error,
+        ),
+    },
     async (request, reply) => {
       const result = await provider(request).provision(
         request.body,

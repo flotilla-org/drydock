@@ -586,7 +586,7 @@ impl Provider for Daytona {
         }
     }
     /// One create. The sandbox is named by Daytona, not by the label.
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
         let mut labels = BTreeMap::from([(LABEL_TAG, r.label.as_str())]);
         if self.ownership == Ownership::SharedAccount {
             labels.insert(OWNER_TAG, &self.name);
@@ -603,8 +603,10 @@ impl Provider for Daytona {
         if let (Some(body), serde_json::Value::Object(policy)) = (body.as_object_mut(), json!(allowlist(r.egress)?)) {
             body.extend(policy);
         }
-        let v: Sandbox = self.api.call(Method::POST, self.api.url(&["sandbox"])?, Body::json(&body)?, c).await?;
-        Ok(Provisioned::Created(self.environment(v)?))
+        let v: Sandbox =
+            self.api.call(Method::POST, self.api.url(&["sandbox"])?, Body::json(&body)?, c).await.map_err(ProvisionFailure::creating)?;
+        let id = v.id.to_string();
+        Ok(Provisioned::Created(self.environment(v).map_err(|e| ProvisionFailure::made(e, &self.name, &id))?))
     }
     /// Every sandbox Daytona lists, in whatever state it reports.
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {

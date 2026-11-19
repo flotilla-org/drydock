@@ -270,7 +270,7 @@ pub async fn optional_contract(
     )?;
     let mut cross = request.clone();
     cross.prepared = prepared;
-    let refused = matches!(client.provision(peer, &cross).await, Err(Error::Protocol(ProtocolError::Refused { .. })));
+    let refused = matches!(client.provision(peer, &cross).await.map_err(|e| e.error), Err(Error::Protocol(ProtocolError::Refused { .. })));
     let mut peer_resources = Resources::new(&cross.label);
     peer_resources.register(&cross);
     cleanup(client, peer, &peer_resources).await?;

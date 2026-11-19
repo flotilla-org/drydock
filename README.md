@@ -353,7 +353,9 @@ Wire conventions chosen for this first protocol version:
 
 - Names follow the ADR amendment: configured `providers` load `modules`;
   environment `id` is opaque and `label` is the client's environment ID. Provision
-  repeats by label return 200; new creations return 201. Inspect and destroy
+  repeats by label return 200; new creations return 201. A failed provision
+  answers with `left` beside the error: what it left at the vendor (see
+  [Labels](#labels)). Inspect and destroy
   use IDs even when a environment has no label. Destroying an absent ID succeeds.
 - Configuration contains non-secret settings and, on the server, where each
   credential comes from. Credential values travel separately: to the server
@@ -705,8 +707,8 @@ The values shown are the defaults.
   A wait ends early, refused, when the environment is gone or its
   state unknown, and unavailable at its deadline, naming the last poll's
   error if the observer's polls were failing. A provision whose wait fails has
-  still made its environment: the error names its id, and `list` shows it
-  under the client's label for the client to use or destroy. Prepare is not
+  still made its environment: the failure's `left` names it (see
+  [Labels](#labels)). Prepare is not
   waited on: a module may answer unavailable while a form is built, and the
   client asks again.
 - `idempotent`: resume of an environment the observer holds running or
@@ -731,6 +733,49 @@ The values shown are the defaults.
   environment. Inspect is not checked: it changes nothing. On an
   `owned_account` nothing is tagged, filtered or refused. Only a module that leaves ownership to drydockd (does
   not declare `owner_scoped`) takes `owned_account`.
+
+### Labels
+
+A provision under a label that already names a live environment of the
+instance answers that environment (200) instead of making a second one. A
+module that declares `exclusive_label` does this itself; for any other,
+drydockd lists the instance's environments before the create, one list per
+provision, and holds one provision of a label at a time, through its settle
+wait, so a second provision of the label waits for the first to answer. That
+hold is within one drydockd: two drydockds sharing an instance on one account
+can still race.
+The declaration clients read states `exclusive_label` for every instance.
+A take-up answers like a create: under `settle` a running or starting
+environment is waited on as usual, and a stopped one, or one in an unknown
+state, fails at once with `left` naming it, until the client destroys it. That
+holds for a module that declares `exclusive_label` too: a `local` or `ssh_host`
+vessel taken up stopped fails where it was once answered. A successful
+provision is a usable environment. The module's own steps after create (a module that starts the
+agent, for one) do not run again; drydockd's own agent upload runs again where
+it is the bootstrap, putting the agent in only when it is absent.
+
+Once the vendor has made an environment, nothing removes it after a failed
+provision, neither drydockd nor a module; a module undoes only a half-made
+environment that nothing could find later (a `local` or `ssh_host` vessel
+whose record was never written). The failure answer says what it left beside
+the error, in `left`:
+
+```json
+{"kind": "unavailable", "reason": "environment sb-7f3a is still \"starting\" after 120s waiting to be running",
+ "left": {"kind": "made", "provider": "modal", "id": "sb-7f3a"}}
+```
+
+`made` names the environment the vendor made, or the provision took up,
+before a later step failed: start, the agent's upload or hello, the settle
+wait, or a take-up found stopped. `none` says the vendor made nothing.
+`unknown` says whether it did cannot be known: the answer to the create was
+lost or unreadable (a proxy's included), the vendor failed the create other
+than by refusing it, or the provision's deadline passed, during the settle
+wait too. A retry of the label finds what an `unknown` provision made. A
+client reads `left` on every failed provision, whatever its class: a `refused`
+one can still name an environment. What a provision left stays listed under
+its label: the client destroys it, retries the label into it, or keeps it to
+look at. A launch's failure says the same.
 
 ### Vendor events
 
@@ -770,10 +815,6 @@ state, only Daytona's own (`unknown`). On a `shared_account` deliveries for an
 id this instance neither listed nor made are held until its own provision
 returns that id, then applied in order; the next list drops any still held. Several drydockd instances reading one account's events are not
 designed for. Without `events`, observation is polling alone, as before.
-
-A label is the client's name for what it made, not a handle: drydockd does
-not adopt environments by label. Only a module that declares
-`exclusive_label` returns the environment a label names.
 
 With `settle` and `idempotent` false, each verb is the module's own
 operation, answered as the vendor answers it. `semantics` is server-only:

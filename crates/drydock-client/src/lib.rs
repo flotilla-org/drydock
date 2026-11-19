@@ -51,6 +51,35 @@ impl Error {
         Self::InvalidResponse(error.to_string())
     }
 }
+/// A failed provision: the error, and what it left at the vendor.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}{left}")]
+pub struct ProvisionError {
+    pub error: Error,
+    pub left: Left,
+}
+impl ProvisionError {
+    pub fn made(error: impl Into<Error>, provider: &str, id: &str) -> Self {
+        Self { error: error.into(), left: Left::Made { provider: provider.to_owned(), id: id.to_owned() } }
+    }
+}
+/// A failure before the vendor was asked to create anything.
+impl From<Error> for ProvisionError {
+    fn from(error: Error) -> Self {
+        Self { error, left: Left::None }
+    }
+}
+/// A failure before the vendor was asked to create anything.
+impl From<ProtocolError> for ProvisionError {
+    fn from(error: ProtocolError) -> Self {
+        Error::Protocol(error).into()
+    }
+}
+impl From<ProvisionFailure> for ProvisionError {
+    fn from(failure: ProvisionFailure) -> Self {
+        Self { error: Error::Protocol(failure.error), left: failure.left }
+    }
+}
 /// An error and its sources, outermost first: "error sending request: ...: Connection refused".
 pub fn chain(error: &(dyn std::error::Error + 'static)) -> String {
     std::iter::successors(Some(error), |error| error.source()).map(ToString::to_string).collect::<Vec<_>>().join(": ")
@@ -171,6 +200,12 @@ impl Client {
         }
         Ok(self.execute_response(request).await?.1)
     }
+    async fn execute_provision<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> std::result::Result<(u16, T), ProvisionError> {
+        provisioned(self.bounded(self.execute_buffered(request)).await)
+    }
     async fn execute_response<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<(u16, T)> {
         decode(self.bounded(self.execute_buffered(request)).await?)
     }
@@ -254,6 +289,26 @@ fn protocol_error(status: http::StatusCode, body: &[u8]) -> Error {
         Ok(error) if error.status() == status.as_u16() => Error::Protocol(error),
         Ok(error) => Error::InvalidResponse(format!("HTTP {status} carried a {} error", error.class())),
         Err(error) => Error::InvalidResponse(format!("HTTP {status} without a protocol error body: {error}")),
+    }
+}
+/// A provision's answer. A request that may have reached the host, with no
+/// answer read, leaves it unknown whether the vendor made anything.
+fn provisioned<T: DeserializeOwned>(response: Result<http::Response<bytes::Bytes>>) -> std::result::Result<(u16, T), ProvisionError> {
+    let unknown = |error| ProvisionError { error, left: Left::Unknown };
+    let response = response.map_err(|error| match error {
+        Error::InvalidRequest(_) => error.into(),
+        error => unknown(error),
+    })?;
+    let status = response.status();
+    if status.is_success() {
+        return serde_json::from_slice(response.body()).map(|body| (status.as_u16(), body)).map_err(|e| unknown(Error::response(e)));
+    }
+    match serde_json::from_slice::<ProvisionFailure>(response.body()) {
+        Ok(failure) if failure.error.status() == status.as_u16() => Err(failure.into()),
+        Ok(failure) => Err(unknown(Error::InvalidResponse(format!("HTTP {status} carried a {} error", failure.error.class())))),
+        // Refused before any handler: the route's answers for no credential and a wrong method.
+        Err(_) if matches!(status.as_u16(), 401 | 405) => Err(protocol_error(status, response.body()).into()),
+        Err(error) => Err(unknown(Error::InvalidResponse(format!("HTTP {status} without a provision failure body: {error}")))),
     }
 }
 fn decode<T: DeserializeOwned>(response: http::Response<bytes::Bytes>) -> Result<(u16, T)> {

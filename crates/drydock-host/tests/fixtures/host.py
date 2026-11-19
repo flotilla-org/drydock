@@ -100,6 +100,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             value = {**value, "granted_size": None, "state": {"state": "unknown", "reason": "provider_api_error"}}
         if fault == "provision" and self.command == "POST" and self.path.endswith("/environments") and isinstance(value, dict) and "id" in value:
             value = {**value, "label": "wrong-label"}
+        if status >= 400 and self.command == "POST" and self.path.split("?")[0].endswith("/environments"):
+            value = {"left": {"kind": "none"}, **value}
         body = b"" if status == 204 else json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -133,7 +135,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.respond(401, {"kind": "refused", "reason": "unauthorized"})
         provider = parts[3] if len(parts) > 3 else "a"
         if parsed.path == "/v1/hello":
-            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "14", "host_version": "fixture",
+            return self.respond(200, {"protocol_version": "wrong" if fault == "hello" else "15", "host_version": "fixture",
                 "loadable_modules": [{"name": "reference", "version": "fixture", "smallest_size": size}]})
         if parsed.path == "/v1/providers":
             return self.respond(200, [self.declaration(name) for name in providers])

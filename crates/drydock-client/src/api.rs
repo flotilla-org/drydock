@@ -1,7 +1,7 @@
 //! The one provider API, served by the drydock server and by language hosts.
 //! [`ProviderApi`] is the seam; [`router`] is the one HTTP adapter over it, and
 //! the socket [`Client`] implements it over HTTP for remote callers.
-use crate::{Client, Error, Method};
+use crate::{Client, Error, Method, ProvisionError};
 use axum::{
     Json, Router,
     body::Body,
@@ -67,7 +67,7 @@ pub trait ProviderApi: Send + Sync {
     async fn providers(&self) -> Result<Vec<ProviderDeclaration>, Error>;
     async fn provider(&self, provider: &str) -> Result<ProviderDeclaration, Error>;
     async fn prepare(&self, provider: &str, request: &PrepareRequest) -> Result<Prepared, Error>;
-    async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Provisioned<Environment>, Error>;
+    async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Provisioned<Environment>, ProvisionError>;
     async fn list(&self, provider: &str) -> Result<Vec<Environment>, Error>;
     async fn inspect(&self, provider: &str, id: &str) -> Result<Environment, Error>;
     async fn destroy(&self, provider: &str, id: &str) -> Result<(), Error>;
@@ -181,9 +181,9 @@ impl ProviderApi for Client {
     async fn prepare(&self, provider: &str, request: &PrepareRequest) -> Result<Prepared, Error> {
         self.call(Method::POST, &["v1", "providers", provider, "prepare"], Some(request)).await
     }
-    async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Provisioned<Environment>, Error> {
+    async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Provisioned<Environment>, ProvisionError> {
         let request = self.request(Method::POST, &["v1", "providers", provider, "environments"])?.json(request);
-        Ok(match self.execute_response(request).await? {
+        Ok(match self.execute_provision(request).await? {
             (201, environment) => Provisioned::Created(environment),
             (_, environment) => Provisioned::Existing(environment),
         })
@@ -382,16 +382,19 @@ impl<E: Into<Error>> From<E> for ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        Refusal(match self.0 {
-            Error::Protocol(error) => error,
-            Error::InvalidRequest(reason) => ProtocolError::Refused { reason: format!("invalid request: {reason}") },
-            Error::RateLimited => ProtocolError::RateLimited { reason: "status budget exhausted".into(), retry_after: None },
-            Error::InvalidResponse(reason) => {
-                ProtocolError::Internal { reason: format!("invalid host response: {reason}"), provider_error: String::new() }
-            }
-            other => ProtocolError::unavailable(other.to_string(), None),
-        })
-        .into_response()
+        Refusal(protocol(self.0)).into_response()
+    }
+}
+/// An error as the protocol states it.
+fn protocol(error: Error) -> ProtocolError {
+    match error {
+        Error::Protocol(error) => error,
+        Error::InvalidRequest(reason) => ProtocolError::Refused { reason: format!("invalid request: {reason}") },
+        Error::RateLimited => ProtocolError::RateLimited { reason: "status budget exhausted".into(), retry_after: None },
+        Error::InvalidResponse(reason) => {
+            ProtocolError::Internal { reason: format!("invalid host response: {reason}"), provider_error: String::new() }
+        }
+        other => ProtocolError::unavailable(other.to_string(), None),
     }
 }
 type ApiResult<T> = Result<T, ApiError>;
@@ -453,11 +456,32 @@ params(("provider" = String, Path, description = "Opaque provider")),
 request_body = ProvisionRequest,
 responses((status = 200, description = "Environment", body = Environment), (status = 201, description = "Created; repeats by label return 200", body = Environment), ErrorResponses)
 )]
-async fn provision(Api(api): Api, ApiPath(p): ApiPath<String>, ApiJson(r): ApiJson<ProvisionRequest>) -> ApiResult<Response> {
-    Ok(match api.provision(&p, &r).await? {
+async fn provision(
+    api: Result<Api, ApiError>,
+    p: Result<ApiPath<String>, Refusal>,
+    r: Result<ApiJson<ProvisionRequest>, Refusal>,
+) -> Result<Response, ProvisionAnswer> {
+    let (Api(api), ApiPath(p), ApiJson(r)) = (api.map_err(|e| e.0)?, p.map_err(|e| e.0)?, r.map_err(|e| e.0)?);
+    Ok(match api.provision(&p, &r).await.map_err(ProvisionAnswer)? {
         Provisioned::Created(environment) => (StatusCode::CREATED, Json(environment)).into_response(),
         Provisioned::Existing(environment) => Json(environment).into_response(),
     })
+}
+/// A provision's failure as its HTTP response: the error, and what it left.
+pub struct ProvisionAnswer(pub ProvisionError);
+impl<E: Into<ProvisionError>> From<E> for ProvisionAnswer {
+    fn from(error: E) -> Self {
+        Self(error.into())
+    }
+}
+impl IntoResponse for ProvisionAnswer {
+    fn into_response(self) -> Response {
+        let failure = ProvisionFailure { error: protocol(self.0.error), left: self.0.left };
+        // The error's own response gives the status and Retry-After; only the body differs.
+        let (mut parts, _) = Refusal(failure.error.clone()).into_response().into_parts();
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+        Response::from_parts(parts, Body::from(serde_json::to_vec(&failure).expect("a provision failure serializes")))
+    }
 }
 #[utoipa::path(get, tag = "host", path = "/v1/providers/{provider}/environments",
 params(("provider" = String, Path, description = "Opaque provider")),

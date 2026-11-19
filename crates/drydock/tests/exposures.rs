@@ -319,7 +319,7 @@ async fn a_client_label_never_takes_a_launchs_key() {
     let h = Harness::start().await;
     let launched = h.api.inspect(PROVIDER, &h.id).await.unwrap().label.unwrap();
     let request = labelled(&h, &launched, None).await;
-    let refused = h.api.provision(PROVIDER, &request).await.map(drop);
+    let refused = h.api.provision(PROVIDER, &request).await.map(drop).map_err(|e| e.error);
     assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
     let launch = std::fs::read(h.path("run/keys").join(&launched).join("request.json")).unwrap();
     assert!(!String::from_utf8_lossy(&launch).contains("\"tools\""), "the launch's record is its own");
@@ -344,7 +344,7 @@ async fn a_label_drydock_holds_no_key_for_is_refused() {
     let own = labelled(&h, "own-key", Some("ssh-ed25519 AAAA client".into())).await;
     h.api.provision(PROVIDER, &own).await.unwrap();
     let keyless = ProvisionRequest { ssh_public_key: None, ..own };
-    let refused = h.api.provision(PROVIDER, &keyless).await.map(drop);
+    let refused = h.api.provision(PROVIDER, &keyless).await.map(drop).map_err(|e| e.error);
     assert!(matches!(refused, Err(drydock::client::Error::Protocol(ProtocolError::Refused { .. }))), "{refused:?}");
 }
 

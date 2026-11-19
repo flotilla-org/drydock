@@ -195,7 +195,9 @@ egress, so its routes lack `None`.
   Docker declares only `token_is_id`, because it starts a sandbox by id
   alone.
 - **`exclusive_label`** only when a second provision of a label returns the
-  first environment. Docker's labels are tags, so it is false.
+  first environment. Docker's labels are tags, so it is false, and drydockd
+  takes up a label's environment from the list. `list` must report each
+  environment's label for that.
 - **`ways_in`.** `WayIn::Poll { interval_ms }` from a `poll_seconds` setting.
   A vendor with webhooks also declares `WayIn::Webhook` and implements
   `VendorEvents`; see the Tensorlake and E2B modules.

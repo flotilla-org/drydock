@@ -7,7 +7,7 @@
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
     },
-    "version": "14"
+    "version": "15"
   },
   "paths": {
     "/v1/config": {
@@ -591,31 +591,31 @@
             "description": "Loopback bearer authentication required; not used on managed UDS"
           },
           "402": {
-            "$ref": "#/components/responses/Error402"
+            "$ref": "#/components/responses/ProvisionError402"
           },
           "404": {
-            "$ref": "#/components/responses/Error404"
+            "$ref": "#/components/responses/ProvisionError404"
           },
           "405": {
             "$ref": "#/components/responses/Error405"
           },
           "422": {
-            "$ref": "#/components/responses/Error422"
+            "$ref": "#/components/responses/ProvisionError422"
           },
           "424": {
-            "$ref": "#/components/responses/Error424"
+            "$ref": "#/components/responses/ProvisionError424"
           },
           "429": {
-            "$ref": "#/components/responses/Error429"
+            "$ref": "#/components/responses/ProvisionError429"
           },
           "500": {
-            "$ref": "#/components/responses/Error500"
+            "$ref": "#/components/responses/ProvisionError500"
           },
           "502": {
-            "$ref": "#/components/responses/Error502"
+            "$ref": "#/components/responses/ProvisionError502"
           },
           "503": {
-            "$ref": "#/components/responses/Error503"
+            "$ref": "#/components/responses/ProvisionError503"
           }
         }
       }
@@ -2477,7 +2477,7 @@
           },
           "exclusive_label": {
             "type": "boolean",
-            "description": "Provision of a label that names an environment returns it, concurrent\nprovisions included: the module refuses a second sandbox for a label.\nWithout it a label is only the client's name for what it made, and\nevery provision may create an environment."
+            "description": "Provision of a label that names an environment returns it, concurrent\nprovisions included: the module refuses a second sandbox for a label.\nWithout it a label is only the client's name for what it made, and\nevery provision may create an environment. drydockd states it for every\ninstance; where the module does not, it holds within that drydockd\nonly, not at the vendor."
           },
           "export": {
             "type": "boolean"
@@ -3829,6 +3829,64 @@
         ],
         "description": "Where an inward exposure's connections go, in the vessel."
       },
+      "Left": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "The vendor made this environment before a later step failed. It names\nits provider, as the request path did, so that it is the whole of what\ndestroy needs.",
+            "required": [
+              "provider",
+              "id",
+              "kind"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "made"
+                ]
+              },
+              "provider": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The vendor made nothing.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Whether the vendor made anything cannot be known: its answer to the\ncreate was lost.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "unknown"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a failed provision left at the vendor. Nothing removes what it left:\nit stays listed under the request's label, a provision under that label\ntakes it up, and destroy removes it."
+      },
       "LoadableModule": {
         "type": "object",
         "required": [
@@ -4713,6 +4771,17 @@
               "$ref": "#/components/schemas/WayIn"
             },
             "description": "The ways the vendor offers to hear about environments; absent when\nthe provider's host did not declare them."
+          }
+        }
+      },
+      "ProvisionLeft": {
+        "type": "object",
+        "required": [
+          "left"
+        ],
+        "properties": {
+          "left": {
+            "$ref": "#/components/schemas/Left"
           }
         }
       },
@@ -5895,6 +5964,319 @@
                   "minimum": 0
                 }
               }
+            }
+          }
+        }
+      },
+      "ProvisionError402": {
+        "description": "QuotaExhausted",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "quota_exhausted"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError404": {
+        "description": "NotFound: route, provider or environment does not exist",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "not_found"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError422": {
+        "description": "Refused: request cannot be met",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "refused"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError424": {
+        "description": "CommandFailed: completed guest command failed; includes exit code and sensitive merged output",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "description": "A completed guest command failed, distinct from a vendor/transport outage.",
+                  "required": [
+                    "reason",
+                    "exit_code",
+                    "output",
+                    "kind"
+                  ],
+                  "properties": {
+                    "exit_code": {
+                      "type": "integer",
+                      "format": "int32"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "command_failed"
+                      ]
+                    },
+                    "output": {
+                      "$ref": "#/components/schemas/Secret",
+                      "description": "Vendor-merged guest output. Sensitive diagnostics; never log it."
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError429": {
+        "description": "RateLimited: retry_after is whole seconds",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Optional whole seconds until retry; adaptors do not retry automatically"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "rate_limited"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "retry_after": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "int64",
+                      "minimum": 0
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError500": {
+        "description": "Internal: sensitive provider error for supervisor diagnostics",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "provider_error",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "internal"
+                      ]
+                    },
+                    "provider_error": {
+                      "type": "string",
+                      "description": "Provider explanation, masked for credentials before leaving the host."
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError502": {
+        "description": "CredentialRejected: vendor rejected delivered credentials",
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "credential_rejected"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ProvisionError503": {
+        "description": "Unavailable: provider not ready or temporarily unavailable",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "Optional whole seconds until retry; adaptors do not retry automatically"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "allOf": [
+                {
+                  "type": "object",
+                  "required": [
+                    "reason",
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "unavailable"
+                      ]
+                    },
+                    "provider_error": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Bounded provider/transport detail, masked for credentials by the host."
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "retry_after": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ],
+                      "format": "int64",
+                      "minimum": 0
+                    }
+                  }
+                },
+                {
+                  "$ref": "#/components/schemas/ProvisionLeft"
+                }
+              ]
             }
           }
         }

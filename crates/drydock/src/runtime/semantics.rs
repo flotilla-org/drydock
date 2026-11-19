@@ -8,7 +8,7 @@
 //! changes only by listing, it asks the observer to poll once. It makes no
 //! vendor calls of its own.
 use super::*;
-use module::{ByteStream, Exec, ExportOperation, GuestFiles, Operations, Provisioned, SuspendResume};
+use module::{ByteStream, Exec, ExportOperation, GuestFiles, Operations, ProvisionResult, Provisioned, SuspendResume};
 use std::time::Duration;
 use tokio::{sync::Notify, time::Instant};
 
@@ -78,6 +78,7 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
     }
     let o = &config.semantics;
     let added = Added {
+        exclusive: provider.capabilities().exclusive_label,
         owner: (shared && !declared.owner_scoped).then(|| observed.provider.clone()),
         settle: o.settle && !declared.settles,
         idempotent: o.idempotent && !declared.idempotent,
@@ -93,6 +94,8 @@ pub(super) fn apply(config: &ProviderConfiguration, observed: Arc<Observed>, pro
 
 struct Added {
     inner: Arc<dyn Provider>,
+    /// The module returns the environment a label names itself.
+    exclusive: bool,
     /// The instance whose tag marks what it may list and act on by id, on a
     /// shared account.
     owner: Option<String>,
@@ -196,6 +199,22 @@ impl Added {
     }
 }
 
+/// One provision of a label at a time, within this drydockd.
+#[derive(Default)]
+pub(super) struct Labels(Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>);
+impl Labels {
+    pub(super) async fn hold(&self, label: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.recover();
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks.get(label).and_then(std::sync::Weak::upgrade).unwrap_or_default();
+            locks.insert(label.to_owned(), Arc::downgrade(&lock));
+            lock
+        };
+        lock.lock_owned().await
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for Added {
     fn operations(&self) -> Operations<'_> {
@@ -221,6 +240,7 @@ impl Provider for Added {
         s.settles |= self.settle;
         s.idempotent |= self.idempotent;
         s.owner_scoped |= self.owner.is_some();
+        capabilities.exclusive_label = true;
         capabilities
     }
     fn ways_in(&self) -> Vec<WayIn> {
@@ -238,15 +258,43 @@ impl Provider for Added {
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
         self.inner.prepare(r, c).await
     }
-    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> Result<Provisioned> {
-        match self.inner.provision(r, c).await? {
-            Provisioned::Created(e) => {
-                self.observed.claimed.recover().insert(e.id.clone(), e.clone());
-                self.observed.claimed_now.notify_one();
-                Ok(Provisioned::Created(if self.settle { self.running(&e.id).await? } else { e }))
-            }
-            provisioned => Ok(provisioned),
+    /// The live environment of this instance the label already names, or
+    /// the module's provision. An environment whose wait fails is left, and
+    /// so is one taken up stopped or in an unknown state.
+    async fn provision(&self, r: ProvisionRequest, c: &Credentials) -> ProvisionResult {
+        let label = r.label.clone();
+        let named = match self.exclusive {
+            true => None,
+            false => self.list(c).await?.into_iter().find(|e| e.label.as_deref() == Some(r.label.as_str()) && e.live()),
+        };
+        let (e, created) = match named {
+            Some(e) => (e, false),
+            None => match self.inner.provision(r, c).await? {
+                Provisioned::Created(e) => {
+                    self.observed.claimed.recover().insert(e.id.clone(), e.clone());
+                    self.observed.claimed_now.notify_one();
+                    (e, true)
+                }
+                Provisioned::Existing(e) => (e, false),
+            },
+        };
+        let left = |error| ProvisionFailure::made(error, &self.observed.provider, &e.id);
+        let unusable = matches!(
+            e.state,
+            Observation::Stopped { .. } | Observation::Transitioning { phase: TransitionPhase::Stopping } | Observation::Unknown { .. }
+        );
+        if !created && unusable {
+            return Err(left(refused(format!(
+                "environment {} under label {label} is {}; destroy it to provision the label again",
+                e.id,
+                described(&e)
+            ))));
         }
+        let e = match self.settle && (created || e.state != Observation::Running) {
+            true => self.running(&e.id).await.map_err(left)?,
+            false => e,
+        };
+        Ok(if created { Provisioned::Created(e) } else { Provisioned::Existing(e) })
     }
     async fn list(&self, c: &Credentials) -> Result<Vec<Environment>> {
         Ok(self.inner.list(c).await?.into_iter().filter(|e| self.ours(e)).collect())

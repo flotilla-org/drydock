@@ -292,7 +292,7 @@ test("provision is one create and the agent service", async () => {
 });
 
 // A devbox whose agent service cannot be added is left in place, and
-// provision answers with the service's failure, naming the devbox.
+// provision answers with the service's failure and the devbox it left.
 test("provision leaves the devbox and names it when the agent service fails", async () => {
   const { standIn, provision } = await setup();
   standIn.box = (box) => {
@@ -304,7 +304,8 @@ test("provision leaves the devbox and names it when the agent service fails", as
     provision("vessel"),
     (e: any) =>
       e.detail?.kind === "unavailable" &&
-      /devbox devbox-\d+ was left for inspection$/.test(e.detail?.reason),
+      e.left?.kind === "made" &&
+      standIn.rows.has(e.left.id),
   );
   assert.equal(standIn.rows.size, 1);
   assert.equal(standIn.count("delete"), 0);

@@ -9,7 +9,9 @@ use drydock::{
     config::Config,
     daemon::{Daemon, HostOption, ProviderApi, Seams},
 };
-use drydock_host::module::{ByteStream, Credentials, HttpClient, Module, Operations, Provider, Provisioned, Result as ModuleResult};
+use drydock_host::module::{
+    ByteStream, Credentials, HttpClient, Module, Operations, Provider, ProvisionResult, Provisioned, Result as ModuleResult,
+};
 use drydock_protocol::*;
 use futures::StreamExt;
 use serde_json::Value;
@@ -80,7 +82,7 @@ impl<V: Vendor> Provider for RecordedProvider<V> {
     async fn prepare(&self, _: PrepareRequest, _: &Credentials) -> ModuleResult<Prepared> {
         unimplemented!()
     }
-    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ModuleResult<Provisioned> {
+    async fn provision(&self, _: ProvisionRequest, _: &Credentials) -> ProvisionResult {
         Ok(self.stand_in.provision(&self.name).await)
     }
     async fn list(&self, _: &Credentials) -> ModuleResult<Vec<Environment>> {

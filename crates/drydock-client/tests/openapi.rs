@@ -88,3 +88,36 @@ fn serialized_values_match_the_document() {
         assert!(!validator.is_valid(&invalid), "{schema}: {invalid}");
     }
 }
+
+// A provision's failure answer, each error class with each thing it can
+// leave, is what the document declares for its status and reads back the
+// same; an answer that does not say what it left is refused by both.
+#[test]
+fn provision_failures_match_the_document() {
+    let document = serde_json::to_value(drydock_client::api::openapi()).unwrap();
+    let components = &document["components"];
+    let errors = [
+        ProtocolError::NotFound { reason: "r".into() },
+        ProtocolError::Refused { reason: "r".into() },
+        ProtocolError::unavailable("r", Some(3)),
+        ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },
+        ProtocolError::QuotaExhausted { reason: "r".into() },
+        ProtocolError::CredentialRejected { reason: "r".into() },
+        ProtocolError::CommandFailed { reason: "r".into(), exit_code: 7, output: Secret::new("output") },
+        ProtocolError::Internal { reason: "r".into(), provider_error: "detail".into() },
+    ];
+    let lefts = [Left::Made { provider: "p".into(), id: "e".into() }, Left::None, Left::Unknown];
+    for error in errors {
+        let schema = &components["responses"][format!("ProvisionError{}", error.status())]["content"]["application/json"]["schema"];
+        let validator = jsonschema::draft202012::new(&serde_json::json!({"allOf": [schema], "components": components})).unwrap();
+        for left in &lefts {
+            let failure = ProvisionFailure { error: error.clone(), left: left.clone() };
+            let wire = serde_json::to_value(&failure).unwrap();
+            assert!(validator.is_valid(&wire), "{wire}");
+            assert_eq!(serde_json::from_value::<ProvisionFailure>(wire).unwrap(), failure);
+        }
+        let silent = serde_json::to_value(&error).unwrap();
+        assert!(!validator.is_valid(&silent), "{silent}");
+        assert!(serde_json::from_value::<ProvisionFailure>(silent).is_err());
+    }
+}

@@ -206,7 +206,7 @@ async fn deny_all_egress_is_refused_with_a_reason() {
     let root = Root::new();
     let p = provider(&root).await;
     for egress in [EgressRequest::DenyAll { direct: vec![] }, EgressRequest::default()] {
-        let error = p.provision(ProvisionRequest { egress, ..request(&*p, "denied").await }, &credentials()).await.unwrap_err();
+        let error = p.provision(ProvisionRequest { egress, ..request(&*p, "denied").await }, &credentials()).await.unwrap_err().error;
         let ProtocolError::Refused { reason } = error else { panic!("{error:?}") };
         assert!(reason.contains("deny-all"), "{reason}");
     }
@@ -220,7 +220,7 @@ async fn a_foreign_prepared_form_is_refused() {
     let p = provider(&root).await;
     let mut foreign = request(&*p, "foreign").await;
     foreign.prepared.provider = "elsewhere".into();
-    assert!(matches!(p.provision(foreign, &credentials()).await, Err(ProtocolError::Refused { .. })));
+    assert!(matches!(p.provision(foreign, &credentials()).await.map_err(|e| e.error), Err(ProtocolError::Refused { .. })));
     assert!(!root.path().exists());
 }
 
@@ -229,22 +229,9 @@ async fn a_foreign_prepared_form_is_refused() {
 async fn provision_without_an_agent_build_leaves_nothing() {
     let root = Root::new();
     let p = configured(serde_json::json!({"root": root.path(), "agent": root.path().join("absent")})).await.unwrap();
-    let error = p.provision(request(&*p, "nothing").await, &credentials()).await.unwrap_err();
+    let error = p.provision(request(&*p, "nothing").await, &credentials()).await.unwrap_err().error;
     assert!(matches!(error, ProtocolError::Unavailable { .. }), "{error:?}");
     assert!(p.list(&credentials()).await.unwrap().is_empty());
-}
-
-// An agent that dies while starting fails the provision and cleans up.
-#[tokio::test]
-async fn provision_cleans_up_when_the_agent_cannot_start() {
-    let root = Root::new();
-    let broken = root.0.path().join("broken-agent");
-    std::fs::write(&broken, "#!/bin/sh\nexit 1\n").unwrap();
-    let p = configured(serde_json::json!({"root": root.path(), "agent": broken})).await.unwrap();
-    let error = p.provision(request(&*p, "broken").await, &credentials()).await.unwrap_err();
-    assert!(matches!(error, ProtocolError::Unavailable { .. }), "{error:?}");
-    assert!(p.list(&credentials()).await.unwrap().is_empty());
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 // Suspend stops the agent and keeps the files; resume starts it again. The
@@ -676,7 +663,7 @@ async fn a_corrupt_record_is_not_overwritten_by_provision() {
     let environment = provision(&*p, "precious").await;
     let record = root.path().join(&environment.id).join("environment.json");
     std::fs::write(&record, "not json").unwrap();
-    let error = p.provision(request(&*p, "precious").await, &credentials()).await.unwrap_err();
+    let error = p.provision(request(&*p, "precious").await, &credentials()).await.unwrap_err().error;
     assert!(matches!(error, ProtocolError::Internal { .. }), "{error:?}");
     assert_eq!(std::fs::read_to_string(&record).unwrap(), "not json");
     assert!(alive(pid(&root, &environment.id)), "the running agent was left alone");
@@ -691,7 +678,7 @@ async fn a_colliding_label_is_refused() {
     let record = root.path().join(&environment.id).join("environment.json");
     // Another label's environment sits where "owner" hashes to.
     std::fs::write(&record, r#"{"label":"someone-else"}"#).unwrap();
-    let error = p.provision(request(&*p, "owner").await, &credentials()).await.unwrap_err();
+    let error = p.provision(request(&*p, "owner").await, &credentials()).await.unwrap_err().error;
     assert!(matches!(error, ProtocolError::Refused { .. }), "{error:?}");
     assert_eq!(std::fs::read_to_string(&record).unwrap(), r#"{"label":"someone-else"}"#);
 }

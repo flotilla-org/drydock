@@ -1,7 +1,7 @@
 //! Endpoint-driven ADR 0070 scenarios. No reference-host implementation is used.
 //! The caller configures/authenticates the client and owns the host's lifetime.
 use drydock_client::{
-    Client, Error, Method, Records,
+    Client, Error, Method, ProvisionError, Records,
     api::{ConfigUpdate, ProviderApi, Provisioned},
 };
 use drydock_protocol::*;
@@ -193,6 +193,11 @@ impl SafeError for Error {
             Error::NotReady(readiness) => format!("not ready: {readiness}"),
             Error::ReadinessTimeout(readiness) => format!("startup timeout: {readiness}"),
         }
+    }
+}
+impl SafeError for ProvisionError {
+    fn category(self) -> String {
+        self.error.category()
     }
 }
 impl SafeError for std::io::Error {
@@ -728,6 +733,9 @@ impl Target<'_> {
         let environment = match first {
             Ok(row) => row.into_inner(),
             Err(error) => {
+                if let Left::Made { id, .. } = &error.left {
+                    owned_ids.insert(id.clone());
+                }
                 report.record("provision", Err(error.category()));
                 report.record("cleanup_after_failed_provision", cleanup(client, provider, owned_ids).await);
                 return None;
@@ -1024,7 +1032,7 @@ impl Target<'_> {
                 let mut invalid = options.request.clone();
                 invalid.prepared.provider = format!("{provider}-other");
                 invalid.label = owned_ids.label(ProbeLabel::Refused);
-                match client.provision(provider, &invalid).await.map(Provisioned::into_inner) {
+                match client.provision(provider, &invalid).await.map(Provisioned::into_inner).map_err(|e| e.error) {
                     Err(Error::Protocol(ProtocolError::Refused { .. })) => Ok(()),
                     Ok(unexpected) => {
                         owned_ids.insert(unexpected.id);

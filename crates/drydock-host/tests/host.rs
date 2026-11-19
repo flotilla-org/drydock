@@ -265,7 +265,9 @@ async fn transport_drop_mid_provision_is_unknown_and_not_retried() {
         egress: EgressRequest::Open,
         ssh_public_key: None,
     };
-    let error = host.client.provision("p", &request).await.unwrap_err();
+    let failure = host.client.provision("p", &request).await.unwrap_err();
+    assert_eq!(failure.left, Left::Unknown);
+    let error = failure.error;
     assert!(matches!(&error, drydock::client::Error::Protocol(ProtocolError::Unavailable { provider_error: Some(_), .. })), "{error}");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(provisions.load(SeqCst), 1);
