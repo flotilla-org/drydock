@@ -288,7 +288,7 @@ impl Registry {
         match status {
             401 | 403 if self.expired() => self.expired_error(),
             401 | 403 => self.refusal(reason),
-            404 => ProtocolError::NotFound { reason },
+            404 => ProtocolError::not_found(reason),
             429 => ProtocolError::RateLimited { reason, retry_after },
             408 | 500..=599 => ProtocolError::unavailable(reason, retry_after),
             400..=499 if self.staging.is_some() => self.refusal(reason),

@@ -88,6 +88,10 @@ pub trait Module: Send + Sync {
     fn takes_endpoint(&self) -> bool {
         false
     }
+    /// How the module's engine starts in a parent environment.
+    fn recipe(&self) -> Option<Recipe> {
+        None
+    }
     /// Cancelled when the host stops. Dropping the future must release uncommitted
     /// resources; factories must yield while waiting on external work.
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>>;
@@ -110,6 +114,9 @@ pub enum Provisioned<T = Environment> {
     Existing(T),
 }
 impl<T> Provisioned<T> {
+    pub fn new(created: bool, row: T) -> Self {
+        if created { Self::Created(row) } else { Self::Existing(row) }
+    }
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Provisioned<U> {
         match self {
             Self::Created(row) => Provisioned::Created(f(row)),

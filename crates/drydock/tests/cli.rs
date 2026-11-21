@@ -626,6 +626,7 @@ async fn advertised_host(
                 version: version.into(),
                 smallest_size: Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 },
                 takes_endpoint: false,
+                recipe: None,
             });
             if incompatible {
                 hello.protocol_version = "incompatible".into();

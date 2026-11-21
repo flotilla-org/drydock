@@ -26,7 +26,10 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+mod carried;
 pub use crate::api::ProviderApi;
+use carried::{Carrier, agent_error, child_socket};
+use drydock_protocol::service::{Service, ServiceInfo};
 pub struct HostOption {
     pub name: String,
     pub connection: HostConnection,
@@ -104,22 +107,14 @@ pub struct Inner {
     /// and provisions of other labels never wait on it.
     keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     stopping: tokio::sync::watch::Sender<bool>,
-    /// Each instance with a parent, by name.
-    carried: BTreeMap<String, Carrier>,
-    /// Held for their lifetime: dropping one ends its socket.
-    _relays: Vec<Relay>,
-}
-/// A child's endpoint on its parent's machine, and the socket drydockd made
-/// for it, whose connections the parent carries there.
-struct Carrier {
-    parent: String,
-    endpoint: Carried,
-    socket: PathBuf,
-}
-impl Carrier {
-    fn local(&self) -> Local {
-        Local::Unix(self.socket.to_string_lossy().into_owned())
-    }
+    /// Each instance with a parent, configured or carried, by name.
+    carried: std::sync::RwLock<BTreeMap<String, Arc<Carrier>>>,
+    /// Each carried name's turn.
+    turns: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
+    run: PathBuf,
+    /// This daemon, for the relays of instances carried after it started.
+    this: Arc<std::sync::OnceLock<std::sync::Weak<Inner>>>,
+    starting: tokio::sync::watch::Sender<BTreeMap<String, Client>>,
 }
 /// A child's socket, served until the daemon goes.
 struct Relay {
@@ -214,7 +209,7 @@ async fn relay(
                 }
                 let inner = daemon.get().and_then(std::sync::Weak::upgrade);
                 let inner = inner.ok_or_else(|| Error::Transport("drydockd did not start".into()))?;
-                Daemon::from_inner(inner).runtime(&parent)?.stream(&parent, &endpoint).await
+                Daemon::from_inner(inner).hop(&child).await
             };
             let opened = tokio::select! {
                 _ = stopping.wait_for(|stopped| *stopped) => return,
@@ -309,7 +304,6 @@ impl Daemon {
         }
         config.check_parents()?;
         let mut carried = BTreeMap::new();
-        let mut relays = Vec::new();
         let daemon = Arc::new(std::sync::OnceLock::new());
         // Each parent's host, from when it is started until the daemon is.
         let starting = tokio::sync::watch::channel(BTreeMap::new()).0;
@@ -321,20 +315,13 @@ impl Daemon {
             {
                 return Err(format!("provider {name}: module {} cannot be given its endpoint, so it has no parent", provider.module));
             }
-            let directory = run.join("parents");
-            crate::local::private_dir(&directory)?;
-            // Named by the child, so a reordered configuration keeps each path.
-            let digest = <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes());
-            let socket = directory.join(format!("{}.sock", &format!("{digest:x}")[..16]));
-            let _ = std::fs::remove_file(&socket);
-            let listener =
-                tokio::net::UnixListener::bind(&socket).map_err(|e| format!("provider {name}: socket {}: {e}", socket.display()))?;
-            std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-                .map_err(|e| format!("provider {name}: socket: {e}"))?;
-            let carrier = (parent.instance.clone(), parent.endpoint.clone());
+            let endpoint = parent.endpoint.clone().expect("a configured parent names its endpoint");
+            let (socket, listener) = child_socket(run, name)?;
+            let carrier = (parent.instance.clone(), endpoint.clone());
             let task = tokio::spawn(relay(daemon.clone(), starting.subscribe(), name.clone(), carrier, listener, stopping.subscribe()));
-            relays.push(Relay { task, socket: socket.clone() });
-            carried.insert(name.clone(), Carrier { parent: parent.instance.clone(), endpoint: parent.endpoint.clone(), socket });
+            let relay = Relay { task, socket: socket.clone() };
+            let carrier = Carrier { parent: parent.instance.clone(), endpoint, socket, _relay: relay, carriage: None };
+            carried.insert(name.clone(), Arc::new(carrier));
         }
         let mut hosts = Vec::new();
         let mut placements = BTreeMap::new();
@@ -345,7 +332,7 @@ impl Daemon {
             for name in &assignments[i] {
                 let p = &config.providers[name];
                 let mut configuration = p.configuration();
-                configuration.endpoint = carried.get(name).map(Carrier::local);
+                configuration.endpoint = carried.get(name).map(|c| c.local());
                 providers.insert(name.clone(), configuration);
                 // A credential path that cannot be resolved (for example, no
                 // HOME for ~/...) is missing evidence, not a daemon failure.
@@ -371,7 +358,7 @@ impl Daemon {
                 Err(error) => return Err(error.to_string()),
             };
             starting.send_modify(|hosts| {
-                for name in assignments[i].iter().filter(|name| carried.values().any(|c: &Carrier| &c.parent == *name)) {
+                for name in assignments[i].iter().filter(|name| carried.values().any(|c| &c.parent == *name)) {
                     hosts.insert(name.clone(), handle.host.clone());
                 }
             });
@@ -401,8 +388,11 @@ impl Daemon {
         }
         let staging = crate::staging::Staging::new(registries, config.registries.clone());
         let inner = Arc::new_cyclic(|weak| Inner {
-            _relays: relays,
-            carried,
+            carried: std::sync::RwLock::new(carried),
+            turns: Default::default(),
+            run: run.to_owned(),
+            this: daemon.clone(),
+            starting,
             config,
             staging,
             modules,
@@ -417,7 +407,7 @@ impl Daemon {
             keying: Default::default(),
             stopping,
         });
-        let _ = daemon.set(Arc::downgrade(&inner));
+        let _ = inner.this.set(Arc::downgrade(&inner));
         inner.exposures.restore();
         Ok(Arc::new(Self { inner, credential: None }))
     }
@@ -428,14 +418,22 @@ impl Daemon {
         Self { inner, credential: None }
     }
     fn host(&self, provider: &str) -> Result<&ManagedHost, Error> {
-        let placement = self.placements.get(provider).ok_or_else(|| {
-            if let Some(readiness) = self.unavailable.get(provider) {
-                Error::NotReady(readiness.clone())
-            } else {
-                Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() })
-            }
-        })?;
-        Ok(&self.hosts[placement.host])
+        Ok(&self.hosts[self.host_index(provider)?])
+    }
+    fn host_index(&self, provider: &str) -> Result<usize, Error> {
+        if let Some(placement) = self.placements.get(provider) {
+            return Ok(placement.host);
+        }
+        if let Some(carriage) = self.carrier(provider).and_then(|c| c.carriage.clone()) {
+            return Ok(carriage.host);
+        }
+        Err(match self.unavailable.get(provider) {
+            Some(readiness) => Error::NotReady(readiness.clone()),
+            None => Error::Protocol(ProtocolError::unknown_provider()),
+        })
+    }
+    fn carrier(&self, name: &str) -> Option<Arc<Carrier>> {
+        self.carried.read().unwrap().get(name).cloned()
     }
     /// Host readiness gates here. Each provider's own readiness, including a
     /// stored credential rejection, is the host Runtime's admission policy.
@@ -489,12 +487,11 @@ impl Daemon {
                 .collect(),
         }
     }
-    /// Every configured provider, including those no host can serve, with the reason.
+    /// Every configured provider, including those no host can serve, with the reason, and every carried one.
     pub fn providers(&self) -> Vec<ProviderDeclaration> {
         let statuses = self.statuses();
-        self.config
-            .providers
-            .keys()
+        self.names()
+            .iter()
             .map(|name| {
                 let mut declaration = self.declared(name, &statuses);
                 if let Some(readiness) = self.parent_unready(name, &statuses) {
@@ -504,33 +501,51 @@ impl Daemon {
             })
             .collect()
     }
+    fn names(&self) -> BTreeSet<String> {
+        let carried = self.carried.read().unwrap();
+        let carried = carried.iter().filter(|(_, c)| c.carriage.is_some()).map(|(name, _)| name.clone());
+        self.config.providers.keys().cloned().chain(carried).collect()
+    }
     fn statuses(&self) -> Vec<crate::HostStatus> {
         self.hosts.iter().map(|h| h.handle.status.borrow().clone()).collect()
     }
     /// A child's readiness while its parent, or one above it, is not ready.
     fn parent_unready(&self, name: &str, statuses: &[crate::HostStatus]) -> Option<Readiness> {
-        let parent = &self.carried.get(name)?.parent;
+        let parent = &self.carrier(name)?.parent;
         let readiness = self.parent_unready(parent, statuses).unwrap_or_else(|| self.declared(parent, statuses).readiness);
         (readiness != Readiness::Ready).then(|| Readiness::ParentNotReady { parent: parent.clone(), reason: readiness.to_string() })
     }
     /// What the provider's host declares, or why there is no declaration.
     fn declared(&self, name: &str, statuses: &[crate::HostStatus]) -> ProviderDeclaration {
-        let configured = &self.config.providers[name];
-        let status = self.placements.get(name).map(|p| &statuses[p.host]);
+        let carrier = self.carrier(name);
+        let carriage = carrier.as_ref().and_then(|c| c.carriage.clone());
+        let (module, parent, host) = match (self.config.providers.get(name), &carriage) {
+            (Some(configured), _) => (configured.module.clone(), configured.parent.clone(), self.placements.get(name).map(|p| p.host)),
+            (None, Some(carriage)) => (carriage.body.module.clone(), Some(carriage.body.parent.clone()), Some(carriage.host)),
+            (None, None) => (String::new(), None, None),
+        };
+        let status = host.map(|host| &statuses[host]);
         let mut declaration = status
-            .and_then(|s| s.providers.iter().find(|p| p.provider == name && p.module == configured.module))
+            .and_then(|s| s.providers.iter().find(|p| p.provider == name && p.module == module))
             .cloned()
             .unwrap_or_else(|| ProviderDeclaration {
                 provider: name.to_owned(),
-                module: configured.module.clone(),
+                module: module.clone(),
                 capabilities: conservative_capabilities(),
                 rate_limits: vec![],
                 readiness: Readiness::Unknown { reason: "provider absent from its host".into() },
                 ports: Ports::default(),
                 ways_in: None,
                 endpoint: None,
+                parent: None,
             });
-        declaration.endpoint = self.carried.get(name).map(Carrier::local);
+        declaration.endpoint = carrier.map(|c| c.local());
+        declaration.parent = parent;
+        if carriage.is_some() {
+            // Its capacity is the parent environment's size, which drydockd states.
+            declaration.capabilities.quota = true;
+            declaration.ports.quota = true;
+        }
         if let Some(readiness) = self.unavailable.get(name) {
             declaration.readiness = readiness.clone();
         } else if let Some(status) = status
@@ -577,7 +592,7 @@ impl Daemon {
     pub async fn prepare(&self, provider: &str, options: &LaunchOptions) -> Result<(Prepared, Size), Error> {
         let host = self.ready_host(provider)?;
         let request =
-            launch::prepare_request(&self.config.providers[provider], &self.placements[provider].minimum, options, self.resolver.as_ref())
+            launch::prepare_request(self.configured(provider)?, &self.placements[provider].minimum, options, self.resolver.as_ref())
                 .await?;
         let request = self.staged(provider, request).await?;
         let prepared = host.handle.client.credentialed(self.credential.clone()).prepare(provider, &request).await?;
@@ -630,7 +645,7 @@ impl Daemon {
             label,
             prepared,
             size,
-            egress: options.egress.or(self.config.providers[provider].egress).unwrap_or(Egress::Open).request(),
+            egress: options.egress.or(self.configured(provider)?.egress).unwrap_or(Egress::Open).request(),
             ssh_public_key: Some(public),
         };
         // Retain key and the resolved digests even on an ambiguous provision error.
@@ -654,6 +669,15 @@ impl Daemon {
             self.agent_ready(provider, environment, &platform, &build).await.map_err(left)?;
         }
         Ok(provisioned.into_inner())
+    }
+    /// A configured provider's launch defaults. A carried instance has none.
+    fn configured(&self, provider: &str) -> Result<&crate::config::Provider, Error> {
+        self.config.providers.get(provider).ok_or_else(|| match self.carrier(provider) {
+            Some(_) => {
+                launch::refused(format!("provider {provider} is carried and has no launch defaults; prepare it with a whole request"))
+            }
+            None => Error::Protocol(ProtocolError::unknown_provider()),
+        })
     }
     /// Whether drydock puts and starts this provider's vessel agents itself:
     /// its vessels run one, on the upload route, through its files and exec ports.
@@ -863,7 +887,7 @@ impl ProviderApi for Daemon {
             return self.runtime(p)?.provider(p).await;
         }
         let declaration = Daemon::providers(self).into_iter().find(|d| d.provider == p);
-        declaration.ok_or_else(|| Error::Protocol(ProtocolError::NotFound { reason: "unknown provider".into() }))
+        declaration.ok_or_else(|| Error::Protocol(ProtocolError::unknown_provider()))
     }
     async fn credential(&self, p: &str, value: Secret) -> Result<(), Error> {
         self.runtime(p)?.credential(p, value).await.map_err(Error::Protocol)
@@ -879,6 +903,7 @@ impl ProviderApi for Daemon {
         self.runtime(p)?.prepare(p, &request).await
     }
     async fn provision(&self, p: &str, request: &ProvisionRequest) -> Result<crate::api::Provisioned<Environment>, ProvisionError> {
+        let _turn = self.provisioning(p).await;
         let keyed = self.keyed(p, request).await?;
         let provisioned = self.invalidating(p, self.runtime(p)?.provision(p, keyed.as_ref().unwrap_or(request)).await).await?;
         if self.uploads(p) {
@@ -897,22 +922,23 @@ impl ProviderApi for Daemon {
     }
     async fn inspect(&self, p: &str, id: &str) -> Result<Environment, Error> {
         if self.credential.is_some() {
-            return self.runtime(p)?.inspect(p, id).await;
+            return environment(self.runtime(p)?.inspect(p, id).await);
         }
-        self.cache(p).await?.inspect(p, id).await
+        environment(self.cache(p).await?.inspect(p, id).await)
     }
     async fn destroy(&self, p: &str, id: &str) -> Result<(), Error> {
-        self.invalidating(p, self.runtime(p)?.destroy(p, id).await).await?;
+        environment(self.invalidating(p, self.runtime(p)?.destroy(p, id).await).await)?;
         self.exposures.forget(p, id).await;
+        self.parent_gone(p, id).await;
         Ok(())
     }
     async fn reach(&self, p: &str, id: &str) -> Result<Reach, Error> {
-        self.runtime(p)?.reach(p, id).await
+        environment(self.runtime(p)?.reach(p, id).await)
     }
     async fn suspend(&self, p: &str, id: &str) -> Result<ResumeToken, Error> {
         let result = self.invalidating(p, self.runtime(p)?.suspend(p, id).await).await;
         self.exposures.poke(p, id);
-        result
+        environment(result)
     }
     async fn resume(&self, p: &str, id: &str, token: &ResumeToken) -> Result<(), Error> {
         let mut result = self.invalidating(p, self.runtime(p)?.resume(p, id, token).await).await;
@@ -927,25 +953,53 @@ impl ProviderApi for Daemon {
             .await;
         }
         self.exposures.poke(p, id);
-        result
+        if result.is_ok() {
+            self.parent_resumed(p, id).await;
+        }
+        environment(result)
     }
     async fn export(&self, p: &str, id: &str) -> Result<Export, Error> {
-        self.invalidating(p, self.runtime(p)?.export(p, id).await).await
+        environment(self.invalidating(p, self.runtime(p)?.export(p, id).await).await)
     }
     async fn quota(&self, p: &str) -> Result<Quota, Error> {
+        if let Some(carrier) = self.carrier(p)
+            && let Some(link) = carrier.link()
+        {
+            return self.carried_quota(p, link).await;
+        }
         self.runtime(p)?.quota(p).await
     }
     async fn usage(&self, p: &str, period: &Period) -> Result<Usage, Error> {
         self.runtime(p)?.usage(p, period).await
     }
     async fn relay(&self, p: &str, id: &str) -> Result<rigging_stream::ByteStream, Error> {
-        self.runtime(p)?.relay(p, id).await
+        environment(self.runtime(p)?.relay(p, id).await)
     }
     async fn exec(&self, p: &str, id: &str, command: &ExecRequest) -> Result<rigging_stream::ByteStream, Error> {
-        self.runtime(p)?.exec(p, id, command).await
+        environment(self.runtime(p)?.exec(p, id, command).await)
     }
     async fn put_file(&self, p: &str, id: &str, file: &GuestFile, bytes: bytes::Bytes) -> Result<(), Error> {
-        self.runtime(p)?.put_file(p, id, file, bytes).await
+        environment(self.runtime(p)?.put_file(p, id, file, bytes).await)
+    }
+    async fn put_provider(&self, name: &str, body: &Carry) -> Result<crate::api::Provisioned<ProviderDeclaration>, ProvisionError> {
+        self.carry(name, body).await
+    }
+    async fn remove_provider(&self, name: &str) -> Result<(), Error> {
+        self.uncarry(name).await
+    }
+    async fn put_service(&self, p: &str, id: &str, name: &str, service: &Service) -> Result<crate::api::Provisioned<ServiceInfo>, Error> {
+        crate::exposures::check_named("service", name)?;
+        let (started, info) = self.vessel_agent(p, id).await?.start_service(name, service).await.map_err(agent_error)?;
+        Ok(crate::api::Provisioned::new(started, info))
+    }
+    async fn service(&self, p: &str, id: &str, name: &str) -> Result<ServiceInfo, Error> {
+        self.vessel_agent(p, id).await?.service(name).await.map_err(agent_error)
+    }
+    async fn services(&self, p: &str, id: &str) -> Result<Vec<ServiceInfo>, Error> {
+        self.vessel_agent(p, id).await?.services().await.map_err(agent_error)
+    }
+    async fn remove_service(&self, p: &str, id: &str, name: &str, grace_ms: Option<u64>) -> Result<ServiceInfo, Error> {
+        self.vessel_agent(p, id).await?.remove_service(name, grace_ms.map(Duration::from_millis)).await.map_err(agent_error)
     }
     async fn push_access(&self, p: &str) -> Result<PushAccess, Error> {
         self.runtime(p)?.push_access(p).await
@@ -976,6 +1030,15 @@ impl ProviderApi for Daemon {
     async fn remove_outward(&self, p: &str, id: &str, name: &str) -> Result<(), Error> {
         self.exposures.remove(self, p, id, Direction::Outward, name).await
     }
+}
+/// A `not_found` from an environment's route, its provider found, is the environment's.
+fn environment<T>(result: Result<T, Error>) -> Result<T, Error> {
+    result.map_err(|error| match error {
+        Error::Protocol(ProtocolError::NotFound { reason, missing: None }) => {
+            Error::Protocol(ProtocolError::NotFound { reason, missing: Some(Missing::Environment) })
+        }
+        other => other,
+    })
 }
 async fn discover(option: &HostOption, run: &FsPath) -> Result<Hello, String> {
     let socket = run.join(format!("discover-{}.sock", option.name));
@@ -1101,7 +1164,7 @@ impl Daemon {
             })
             .collect();
         let providers: BTreeMap<String, Option<usize>> =
-            self.config.providers.keys().map(|name| (name.clone(), self.placements.get(name).map(|p| p.host))).collect();
+            self.names().into_iter().map(|name| (name.clone(), self.host_index(&name).ok())).collect();
         let mut stopping = self.stopping.subscribe();
         let mut exposures = self.exposures.subscribe();
         Box::pin(async_stream::stream! {

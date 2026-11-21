@@ -217,6 +217,7 @@ async fn transport_drop_mid_provision_is_unknown_and_not_retried() {
         ports: reference.operations().into(),
         ways_in: Some(vec![WayIn::Poll { interval_ms: 3_600_000 }]),
         endpoint: None,
+        parent: None,
     };
     let provisions = Arc::new(AtomicUsize::new(0));
     let hello = serde_json::json!({

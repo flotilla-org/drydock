@@ -48,6 +48,12 @@ impl Module for RemoteModule {
     fn smallest_size(&self) -> Size {
         self.module.smallest_size.clone()
     }
+    fn takes_endpoint(&self) -> bool {
+        self.module.takes_endpoint
+    }
+    fn recipe(&self) -> Option<Recipe> {
+        self.module.recipe.clone()
+    }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let config = config.for_host();
         let patch = serde_json::json!({ "providers": { name: config } });

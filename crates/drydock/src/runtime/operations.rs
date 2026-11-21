@@ -43,6 +43,7 @@ impl Runtime {
             ports: i.provider.operations().into(),
             ways_in: Some(i.ways_in.clone()),
             endpoint: i.config.endpoint.clone(),
+            parent: None,
         }
     }
 }
@@ -61,6 +62,7 @@ impl ProviderApi for Runtime {
                     version: module.version().into(),
                     smallest_size: module.smallest_size(),
                     takes_endpoint: module.takes_endpoint(),
+                    recipe: module.recipe(),
                 })
                 .collect(),
         })

@@ -97,7 +97,7 @@ fn provision_failures_match_the_document() {
     let document = serde_json::to_value(drydock_client::api::openapi()).unwrap();
     let components = &document["components"];
     let errors = [
-        ProtocolError::NotFound { reason: "r".into() },
+        ProtocolError::not_found("r"),
         ProtocolError::Refused { reason: "r".into() },
         ProtocolError::unavailable("r", Some(3)),
         ProtocolError::RateLimited { reason: "r".into(), retry_after: Some(2) },

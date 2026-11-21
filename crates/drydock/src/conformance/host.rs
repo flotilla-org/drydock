@@ -117,7 +117,7 @@ fn error_cases() -> Vec<ProtocolError> {
         ProtocolError::QuotaExhausted { reason: "fixture".into() },
         ProtocolError::CredentialRejected { reason: "fixture".into() },
         ProtocolError::Internal { reason: "fixture".into(), provider_error: "vendor raw".into() },
-        ProtocolError::NotFound { reason: "fixture".into() },
+        ProtocolError::not_found("fixture"),
         ProtocolError::MethodNotAllowed { reason: "fixture".into() },
     ]
 }

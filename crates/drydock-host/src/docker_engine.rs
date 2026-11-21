@@ -177,6 +177,18 @@ impl Module for DockerEngineModule {
     fn takes_endpoint(&self) -> bool {
         true
     }
+    /// `dockerd` run as the parent vessel's user, on its default socket.
+    fn recipe(&self) -> Option<Recipe> {
+        Some(Recipe {
+            service: drydock_protocol::service::Service {
+                program: "dockerd".into(),
+                args: vec!["--host".into(), "unix:///var/run/docker.sock".into()],
+                ..Default::default()
+            },
+            endpoint: Carried::Unix("/var/run/docker.sock".into()),
+            requires: vec!["dockerd".into()],
+        })
+    }
     /// The engine is reached through its own endpoint, never the host's HTTPS
     /// client.
     async fn configure(&self, name: &str, config: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
@@ -284,7 +296,7 @@ impl DockerEngine {
     }
     fn container_url(&self, id: &str, rest: &[&str]) -> Result<reqwest::Url> {
         if id.is_empty() || id == "." || id == ".." {
-            return Err(ProtocolError::NotFound { reason: "not a Docker Engine container id".into() });
+            return Err(ProtocolError::not_found("not a Docker Engine container id"));
         }
         self.url(&[&["containers", id][..], rest].concat())
     }

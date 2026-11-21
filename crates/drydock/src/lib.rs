@@ -92,8 +92,11 @@ pub struct HostHandle {
     pub host: Client,
     pub status: watch::Receiver<HostStatus>,
     instances: Vec<String>,
+    /// Instances carried while the host runs, configured again after it restarts.
+    carried: Carried,
     task: JoinHandle<()>,
 }
+type Carried = Arc<std::sync::Mutex<BTreeMap<String, ProviderConfiguration>>>;
 impl Drop for HostHandle {
     fn drop(&mut self) {
         self.task.abort();
@@ -101,6 +104,21 @@ impl Drop for HostHandle {
     }
 }
 impl HostHandle {
+    /// Configure `name` on the host, now and after each restart.
+    pub async fn carry(&self, name: &str, configuration: ProviderConfiguration) -> Result<(), client::Error> {
+        let patch = serde_json::json!({ "providers": { name: &configuration } });
+        self.client.configure(ConfigUpdate::MergePatch(patch)).await.map_err(client::Error::Protocol)?;
+        // Held once configured, so supervision never takes the host for restarted meanwhile.
+        self.carried.lock().unwrap().insert(name.to_owned(), configuration);
+        Ok(())
+    }
+    /// Forget a carried instance, returning its environments, each recorded gone for `cause`.
+    pub async fn uncarry(&self, name: &str, cause: Option<GoneCause>) -> Vec<Environment> {
+        self.carried.lock().unwrap().remove(name);
+        let known = self.client.remove(name, cause).await;
+        let _ = self.host.configure(ConfigUpdate::MergePatch(serde_json::json!({ "providers": { name: null } }))).await;
+        known
+    }
     /// Configured instances remain visible even when no host can answer hello.
     pub fn instances(&self) -> BTreeMap<String, Readiness> {
         let status = self.status.borrow();
@@ -226,11 +244,13 @@ impl Supervisor {
         }
         let policy = public_client.clone();
         let instances = spec.configuration.providers.keys().cloned().collect();
+        let carried = Carried::default();
+        let held = carried.clone();
         let task = tokio::spawn(async move {
             let _lease = lease;
-            supervisor.run(spec, socket, host_client, policy, status).await;
+            supervisor.run(spec, held, socket, host_client, policy, status).await;
         });
-        Ok(HostHandle { client: public_client, host: client, status: receiver, instances, task })
+        Ok(HostHandle { client: public_client, host: client, status: receiver, instances, carried, task })
     }
     async fn refresh(
         &self,
@@ -271,7 +291,15 @@ impl Supervisor {
         }
         Ok(unavailable)
     }
-    async fn run(&self, spec: HostSpec, socket: PathBuf, raw_client: Client, client: runtime::Runtime, status: watch::Sender<HostStatus>) {
+    async fn run(
+        &self,
+        spec: HostSpec,
+        carried: Carried,
+        socket: PathBuf,
+        raw_client: Client,
+        client: runtime::Runtime,
+        status: watch::Sender<HostStatus>,
+    ) {
         let mut masker = DiagnosticMasker::default();
         // Settings are not diagnostics. Mask string values even if a host
         // mistakenly includes them in its readiness reason.
@@ -328,12 +356,14 @@ impl Supervisor {
             let mut initialized = false;
             let mut previous = BTreeMap::new();
             let mut changes = self.credentials.changes();
-            // The host receives the document without server-only keys.
-            let mut document = spec.configuration.clone();
-            for provider in document.providers.values_mut() {
-                *provider = provider.for_host();
-            }
             loop {
+                let mut configuration = spec.configuration.clone();
+                configuration.providers.extend(carried.lock().unwrap().clone());
+                // The host receives the document without server-only keys.
+                let mut document = configuration.clone();
+                for provider in document.providers.values_mut() {
+                    *provider = provider.for_host();
+                }
                 if let Some(child) = &mut child
                     && !matches!(child.try_wait(), Ok(None))
                 {
@@ -344,14 +374,14 @@ impl Supervisor {
                     // A host that lost its providers, for example by restarting,
                     // invalidates the server's remote providers.
                     let listed = raw_client.providers().await?;
-                    if initialized && spec.configuration.providers.keys().any(|name| !listed.iter().any(|d| &d.provider == name)) {
+                    if initialized && configuration.providers.keys().any(|name| !listed.iter().any(|d| &d.provider == name)) {
                         initialized = false;
                     }
                     if !initialized {
                         raw_client.configure(ConfigUpdate::Replace(document.clone())).await?;
                         client.reconnect(runtime::remote::registry(raw_client.clone(), &raw_hello)).await;
                         // Runtime calls carry their own deadlines.
-                        client.configure(ConfigUpdate::Replace(spec.configuration.clone())).await?;
+                        client.configure(ConfigUpdate::Replace(configuration.clone())).await?;
                         generation += 1;
                         initialized = true;
                         previous.clear();
@@ -462,6 +492,7 @@ mod tests {
                 host: Client::unix(Path::new("/nonexistent")).unwrap(),
                 status,
                 instances: vec![],
+                carried: Default::default(),
                 task: tokio::spawn(std::future::pending()),
             };
             let error = handle.ready(Duration::from_secs(1)).await.unwrap_err();
