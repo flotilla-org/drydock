@@ -340,7 +340,8 @@ From then on it is an ordinary instance: `POST
   stopping or in an unknown state is refused at once, naming the state, and
   gone is refused. drydockd does not resume it. When it resumes after a
   suspend, drydockd ensures the recipe again, which leaves an engine that still
-  answers alone.
+  answers alone; provisions under the carried name wait for it, up to 20
+  seconds.
 - **How a connection travels.** Each connection to the instance's socket is one
   hop: drydockd asks the parent vessel's agent, over a link of its own to that
   agent, to open the endpoint inside the vessel. A configured `parent`, which

@@ -244,6 +244,7 @@ impl Daemon {
     async fn ensure(&self, link: &Link, recipe: &Recipe) -> Result<bool, ProvisionError> {
         let agent = link.agent(self).await?;
         if agent.open_inward(&link.forward.id).await.is_ok() {
+            tracing::info!(parent = %link.provider, environment = %link.environment, "an engine already answers; carrying onto it");
             return Ok(false);
         }
         let script = r#"for p; do command -v "$p" >/dev/null 2>&1 || printf '%s ' "$p"; done"#;
