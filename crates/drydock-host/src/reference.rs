@@ -22,6 +22,23 @@ impl Module for ReferenceModule {
         Ok(Arc::new(Reference { name: name.to_owned(), state: Mutex::new(Memory::default()), settings }))
     }
 }
+/// The reference module with a recipe, so a carry can be shown without a vendor.
+pub struct CarriedReference(pub Recipe);
+#[async_trait]
+impl Module for CarriedReference {
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+    fn takes_endpoint(&self) -> bool {
+        true
+    }
+    fn recipe(&self) -> Option<Recipe> {
+        Some(self.0.clone())
+    }
+    async fn configure(&self, name: &str, c: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
+        ReferenceModule.configure(name, c, http).await
+    }
+}
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReferenceSettings {
@@ -40,6 +57,9 @@ struct ReferenceSettings {
     /// Declare that vessels run the drydock agent (no guest exists here).
     #[serde(default)]
     agent: bool,
+    /// Drydock's own account: not owner scoped, and ready with no credential.
+    #[serde(default)]
+    owned: bool,
     /// Platforms to declare, preferred first. The default models Linux vessels
     /// on both published tools platforms, so results don't depend on the host.
     #[serde(default = "default_platforms")]
@@ -104,7 +124,7 @@ impl Memory {
 }
 impl Reference {
     fn find(&self, id: &str) -> Result<Environment> {
-        self.state.recover().environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })
+        self.state.recover().environments.get(id).cloned().ok_or_else(|| ProtocolError::not_found("unknown environment"))
     }
     fn check(&self) -> Result<()> {
         if let Some(e) = &self.settings.fault { Err(e.clone()) } else { Ok(()) }
@@ -112,6 +132,12 @@ impl Reference {
 }
 #[async_trait]
 impl Provider for Reference {
+    fn readiness(&self, c: &Credentials) -> Readiness {
+        match !self.settings.owned && c.token().is_none() {
+            true => Readiness::MissingCredential { reason: "credential not delivered".into() },
+            false => Readiness::Ready,
+        }
+    }
     fn rate_limits(&self) -> Vec<RateLimit> {
         self.settings.rate_limits.clone()
     }
@@ -168,7 +194,7 @@ impl Provider for Reference {
             exclusive_label: self.settings.exclusive_label,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
-            semantics: Semantics { settles: true, idempotent: true, owner_scoped: true, token_is_id: false },
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: !self.settings.owned, token_is_id: false },
             carries: vec![],
         }
     }
@@ -380,7 +406,7 @@ impl SuspendResume for Reference {
     async fn suspend(&self, id: &str, _: &Credentials) -> Result<ResumeToken> {
         self.check()?;
         let mut state = self.state.recover();
-        let mut s = state.environments.get(id).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })?;
+        let mut s = state.environments.get(id).cloned().ok_or_else(|| ProtocolError::not_found("unknown environment"))?;
         if matches!(s.state, Observation::Stopped { .. }) {
             return state.tokens.get(id).cloned().ok_or_else(|| refused("missing resume token"));
         }
@@ -395,14 +421,13 @@ impl SuspendResume for Reference {
         self.check()?;
         let mut state = self.state.recover();
         if !state.environments.contains_key(id) {
-            return Err(ProtocolError::NotFound { reason: "unknown environment".into() });
+            return Err(ProtocolError::not_found("unknown environment"));
         }
         if state.tokens.get(id) != Some(&token) {
             return Err(refused("invalid resume token for this provider/environment"));
         }
         state.running_since.entry(id.into()).or_insert_with(chrono::Utc::now);
-        state.environments.get_mut(id).ok_or_else(|| ProtocolError::NotFound { reason: "unknown environment".into() })?.state =
-            Observation::Running;
+        state.environments.get_mut(id).ok_or_else(|| ProtocolError::not_found("unknown environment"))?.state = Observation::Running;
         Ok(())
     }
 }

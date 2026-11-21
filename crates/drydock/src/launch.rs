@@ -55,7 +55,7 @@ impl LaunchOptions {
         .resolve(minimum)
     }
 }
-fn refused(reason: impl Into<String>) -> Error {
+pub(crate) fn refused(reason: impl Into<String>) -> Error {
     Error::Protocol(ProtocolError::Refused { reason: reason.into() })
 }
 #[async_trait::async_trait]

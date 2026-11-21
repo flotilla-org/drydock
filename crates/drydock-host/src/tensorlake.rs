@@ -272,7 +272,7 @@ impl Tensorlake {
     fn guest(&self, id: &str, segments: &[&str]) -> Result<Url> {
         // The proxy host is the sandbox's id or name, as one DNS label.
         if !name_valid(id) {
-            return Err(ProtocolError::NotFound { reason: "not a Tensorlake sandbox id".into() });
+            return Err(ProtocolError::not_found("not a Tensorlake sandbox id"));
         }
         let base = Url::parse(&format!("https://{id}.{}/api/v1", self.settings.sandbox_domain)).map_err(|_| TENSORLAKE.bad_response())?;
         kit::api::join(&base, segments)
@@ -728,9 +728,9 @@ impl Provider for Tensorlake {
     /// One read by id; a sandbox Tensorlake no longer lists is read from its archive.
     async fn inspect(&self, id: &str, c: &Credentials) -> Result<Environment> {
         match self.sandbox(id, c).await {
-            Err(ProtocolError::NotFound { reason }) => match self.archived(id, c).await? {
+            Err(ProtocolError::NotFound { reason, .. }) => match self.archived(id, c).await? {
                 Some(row) => self.environment(row),
-                None => Err(ProtocolError::NotFound { reason }),
+                None => Err(ProtocolError::not_found(reason)),
             },
             row => self.environment(row?),
         }
@@ -753,7 +753,7 @@ impl Provider for Tensorlake {
                 self.api.call::<IgnoredAny>(Method::DELETE, self.api.url(&["snapshots", &snapshot_id])?, Body::None, c).await,
             )?;
         }
-        deleted.map(drop).ok_or_else(|| ProtocolError::NotFound { reason: format!("Tensorlake has no sandbox {id}") })
+        deleted.map(drop).ok_or_else(|| ProtocolError::not_found(format!("Tensorlake has no sandbox {id}")))
     }
     async fn reach(&self, id: &str, _: &Credentials) -> Result<Reach> {
         Ok(Reach::relay(&self.name, id))

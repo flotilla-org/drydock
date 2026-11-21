@@ -123,7 +123,7 @@ impl DiagnosticMasker {
     pub fn context(&self, mut error: ProtocolError, provider: &str, operation: &str) -> ProtocolError {
         let patterns = &self.patterns;
         let reason = match &mut error {
-            ProtocolError::NotFound { reason }
+            ProtocolError::NotFound { reason, .. }
             | ProtocolError::MethodNotAllowed { reason }
             | ProtocolError::Refused { reason }
             | ProtocolError::ImageRefused { reason, .. }

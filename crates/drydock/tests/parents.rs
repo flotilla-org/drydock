@@ -181,6 +181,14 @@ fn parents_forming_a_cycle_are_refused_when_the_configuration_is_read() {
 }
 
 #[test]
+fn a_configured_parent_naming_an_environment_is_refused_when_the_configuration_is_read() {
+    let providers = "[providers.box]\nmodule='local'\n\
+        [providers.engine]\nmodule='docker_engine'\nparent={instance='box', environment='v1', endpoint={unix='/run/engine.sock'}}\n";
+    let error = Config::parse(providers).err().unwrap();
+    assert_eq!(error, "provider engine: parent names an environment, which only a carried instance's parent can");
+}
+
+#[test]
 fn a_relative_endpoint_or_an_operators_endpoint_is_refused_when_the_configuration_is_read() {
     let parent = "[providers.box]\nmodule='local'\n";
     assert!(Config::parse(&format!("{parent}{}", engine(Path::new("engine.sock")))).is_err());

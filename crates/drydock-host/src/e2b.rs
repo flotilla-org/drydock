@@ -357,7 +357,7 @@ fn template_name(image: &str, platform: &Platform, size: &Size) -> String {
 /// `id`, refused as not found unless it has the shape of E2B's sandbox ids.
 fn checked(id: &str) -> Result<&str> {
     if !sandbox_id_valid(id) {
-        return Err(ProtocolError::NotFound { reason: "not an E2B sandbox id".into() });
+        return Err(ProtocolError::not_found("not an E2B sandbox id"));
     }
     Ok(id)
 }

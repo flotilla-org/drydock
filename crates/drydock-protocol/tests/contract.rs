@@ -45,7 +45,7 @@ fn diagnostic_masking_preserves_error_contract() {
         for copies in [0, 1, 3] {
             let text = format!("vendor validation {}", secret.repeat(copies));
             let errors = [
-                ProtocolError::NotFound { reason: text.clone() },
+                ProtocolError::not_found(text.clone()),
                 ProtocolError::MethodNotAllowed { reason: text.clone() },
                 ProtocolError::Refused { reason: text.clone() },
                 ProtocolError::CredentialRejected { reason: text.clone() },

@@ -295,7 +295,7 @@ impl DockerSandboxes {
     }
     fn sandbox_url(&self, id: &str, rest: &[&str]) -> Result<reqwest::Url> {
         if id.is_empty() || id == "." || id == ".." {
-            return Err(ProtocolError::NotFound { reason: "not a Docker Sandboxes sandbox id".into() });
+            return Err(ProtocolError::not_found("not a Docker Sandboxes sandbox id"));
         }
         self.api.url(&[&["v1", "sandboxes", id][..], rest].concat())
     }

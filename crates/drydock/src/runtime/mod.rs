@@ -125,7 +125,7 @@ impl Runtime {
         }
     }
     async fn instance(&self, name: &str) -> Result<Arc<Instance>> {
-        self.config.read().await.providers.get(name).cloned().ok_or_else(|| ProtocolError::NotFound { reason: "unknown provider".into() })
+        self.config.read().await.providers.get(name).cloned().ok_or_else(ProtocolError::unknown_provider)
     }
     pub fn stopping(&self) -> watch::Receiver<bool> {
         self.stopping.subscribe()
@@ -262,6 +262,19 @@ impl Runtime {
         }
         self.events.changed.send_modify(|serial| *serial += 1);
         Ok(())
+    }
+    /// Forget an instance, returning its live environments, each recorded gone for `cause`.
+    pub(crate) async fn remove(&self, name: &str, cause: Option<GoneCause>) -> Vec<Environment> {
+        let _transaction = self.configuring.lock().await;
+        let Some(instance) = self.config.write().await.providers.remove(name) else { return vec![] };
+        let mut known = instance.inspected.recover().clone();
+        let listed = self.events.log.recover().inventories.remove(name).unwrap_or_default();
+        known.extend(listed.into_iter().map(|row| (row.id.clone(), row)));
+        let known: Vec<_> = known.into_values().filter(Environment::live).collect();
+        if let Some(cause) = cause {
+            self.events.gone(name, &known, &cause);
+        }
+        known
     }
     pub async fn credential(&self, p: &str, value: Secret) -> Result<()> {
         let instance = self.instance(p).await?;

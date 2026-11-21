@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 pub mod openapi;
+pub mod service;
 pub mod validation;
 pub use validation::{Cidr, HostAddress, Port, Timestamp};
 
 /// Increment when making an incompatible wire change. A mismatch is not ready.
-pub const PROTOCOL_VERSION: &str = "15";
+pub const PROTOCOL_VERSION: &str = "16";
 
 /// Secret wire string. Debug output is redacted; serialization deliberately exposes the value.
 /// PartialEq is for wire-value comparisons, NOT constant-time authentication.
@@ -90,12 +91,38 @@ impl ProviderConfiguration {
         Self { credential: None, semantics: Default::default(), events: None, parent: None, ..self.clone() }
     }
 }
-/// An instance's parent, by instance name, and the endpoint on the parent's machine.
+/// An instance's parent, and where its endpoint is: on the parent's machine, or inside one of its environments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Parent {
     pub instance: String,
+    /// The environment whose vessel agent reaches `endpoint`. Only a carried instance names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// Required in the configuration file. With `environment`, an explicit endpoint names a service
+    /// inside the parent environment; left out, the module's [`Recipe`] gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Carried>,
+}
+/// A carried instance, as `PUT /v1/providers/{name}` takes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Carry {
+    pub module: String,
+    #[serde(default)]
+    pub settings: BTreeMap<String, serde_json::Value>,
+    pub parent: Parent,
+}
+/// How a module's engine starts inside a parent environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct Recipe {
+    /// Started through the parent vessel's agent, as a service.
+    pub service: service::Service,
+    /// Where the engine answers inside the vessel once started.
     pub endpoint: Carried,
+    /// Programs the parent's image needs on its PATH.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 /// An endpoint on a provider's machine that it can open streams to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -236,6 +263,9 @@ pub struct LoadableModule {
     /// [`ProviderConfiguration::endpoint`], so they can have a parent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takes_endpoint: bool,
+    /// How the module's engine starts in a parent environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Recipe>,
 }
 /// A configured provider, the same on the server and on hosts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -254,6 +284,9 @@ pub struct ProviderDeclaration {
     /// for its endpoint, which a client can open too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Local>,
+    /// Server only: the instance's parent, configured or carried into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Parent>,
 }
 /// Which optional operations exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1062,6 +1095,11 @@ pub enum GoneCause {
     MissingOnList,
     /// The provider confirmed deletion requested by the client.
     DestroyedByRequest,
+    /// The parent environment this environment's instance was carried into went.
+    ParentGone {
+        provider: String,
+        environment: String,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1284,7 +1322,9 @@ pub struct QuotaKey {
 pub struct ResourceQuota {
     pub key: QuotaKey,
     pub unit: ResourceUnit,
-    pub in_use: f64,
+    /// Absent when not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_use: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<f64>,
 }
@@ -1370,11 +1410,19 @@ pub enum Left {
     /// its provider, as the request path did, so that it is the whole of what
     /// destroy needs.
     Made { provider: String, id: String },
+    /// A carry started this service in its parent environment; it runs until the client stops it.
+    Service(Box<LeftService>),
     /// The vendor made nothing.
     None,
     /// Whether the vendor made anything cannot be known: its answer to the
     /// create was lost.
     Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct LeftService {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
 }
 impl ProvisionFailure {
     pub fn made(error: ProtocolError, provider: &str, id: &str) -> Self {
@@ -1417,6 +1465,7 @@ impl std::fmt::Display for Left {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Left::Made { provider, id } => write!(f, "; left environment {id} of provider {provider}"),
+            Left::Service(s) => write!(f, "; left service {} running in environment {} of provider {}", s.name, s.id, s.provider),
             Left::None => Ok(()),
             Left::Unknown => write!(f, "; whether the vendor made an environment is unknown"),
         }
@@ -1428,6 +1477,9 @@ impl std::fmt::Display for Left {
 pub enum ProtocolError {
     NotFound {
         reason: String,
+        /// What was not found, where the route says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        missing: Option<Missing>,
     },
     MethodNotAllowed {
         reason: String,
@@ -1477,6 +1529,14 @@ pub enum ProtocolError {
     },
 }
 
+/// What a `not_found` did not find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Missing {
+    Provider,
+    Environment,
+}
+
 #[derive(Deserialize)]
 struct UncheckedPeriod {
     start: Timestamp,
@@ -1489,6 +1549,13 @@ impl TryFrom<UncheckedPeriod> for Period {
     }
 }
 impl ProtocolError {
+    pub fn not_found(reason: impl Into<String>) -> Self {
+        Self::NotFound { reason: reason.into(), missing: None }
+    }
+    /// The route's provider is not one drydock holds.
+    pub fn unknown_provider() -> Self {
+        Self::NotFound { reason: "unknown provider".into(), missing: Some(Missing::Provider) }
+    }
     /// Retryable unavailability without sensitive provider diagnostics.
     pub fn unavailable(reason: impl Into<String>, retry_after: Option<u64>) -> Self {
         Self::Unavailable { provider_error: None, reason: reason.into(), retry_after }
@@ -1496,7 +1563,7 @@ impl ProtocolError {
 
     /// The same error, its reason saying what was being done: `"{doing}: {reason}"`.
     pub fn context(mut self, doing: &str) -> Self {
-        let (Self::NotFound { reason }
+        let (Self::NotFound { reason, .. }
         | Self::MethodNotAllowed { reason }
         | Self::Refused { reason }
         | Self::ImageRefused { reason, .. }
@@ -1551,7 +1618,7 @@ impl ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let reason = match self {
-            Self::NotFound { reason }
+            Self::NotFound { reason, .. }
             | Self::MethodNotAllowed { reason }
             | Self::Refused { reason }
             | Self::ImageRefused { reason, .. }

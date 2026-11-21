@@ -29,8 +29,20 @@ pub(super) struct Pending {
     pub(super) vendor: Option<VendorState>,
     pub(super) kind: EventKind,
 }
+impl EventLog {
+    /// Environments that went with their instance, which no observation will record.
+    pub(super) fn gone(&self, provider: &str, rows: &[Environment], cause: &GoneCause) {
+        let mut log = self.log.recover();
+        for row in rows {
+            let kind = EventKind::Gone { cause: Some(cause.clone()) };
+            let gone = Pending { id: row.id.clone(), label: row.label.clone(), timestamp: None, vendor: None, kind };
+            EventSink::append(&mut log, provider, None, gone);
+        }
+        self.changed.send_replace(log.serial);
+    }
+}
 impl EventSink {
-    fn append(log: &mut Log, provider: &str, observed: &ObservedBy, p: Pending) {
+    fn append(log: &mut Log, provider: &str, observed: Option<&ObservedBy>, p: Pending) {
         tracing::debug!(provider, environment_id = %p.id, route = "observe", "environment observation");
         log.serial += 1;
         let cursor = format!("{}:{}", log.epoch, log.serial);
@@ -45,7 +57,7 @@ impl EventSink {
             event: p.kind,
             // An event carries the vendor's state and reason, not its tags.
             vendor: p.vendor.map(|v| VendorState { tags: None, ..v }),
-            observed: Some(observed.clone()),
+            observed: observed.cloned(),
         });
         if log.records.len() > EVENT_HISTORY_CAPACITY {
             log.records.pop_front();
@@ -56,7 +68,7 @@ impl EventSink {
         let mut log = self.shared.log.recover();
         log.inventories.insert(self.provider.clone(), rows);
         for event in events {
-            Self::append(&mut log, &self.provider, observed, event);
+            Self::append(&mut log, &self.provider, Some(observed), event);
         }
         self.shared.changed.send_replace(log.serial);
     }
@@ -69,7 +81,7 @@ impl EventSink {
             rows.push(row);
         }
         for event in events {
-            Self::append(&mut log, &self.provider, observed, event);
+            Self::append(&mut log, &self.provider, Some(observed), event);
         }
         self.shared.changed.send_replace(log.serial);
     }

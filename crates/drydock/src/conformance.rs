@@ -326,8 +326,7 @@ fn valid_quota(quota: &Quota) -> Result<()> {
     require(
         quota.resources.iter().all(|r| {
             r.key.resource.accepts_unit(&r.unit)
-                && r.in_use.is_finite()
-                && r.in_use >= 0.0
+                && r.in_use.is_none_or(|in_use| in_use.is_finite() && in_use >= 0.0)
                 && r.limit.is_none_or(|limit| limit.is_finite() && limit >= 0.0)
         }),
         "invalid resource quota",
@@ -1554,7 +1553,7 @@ mod tests {
                 resources: vec![ResourceQuota {
                     key: QuotaKey { region: None, class: None, resource: ResourceKind::Cpu },
                     unit: "{vCPU}".into(),
-                    in_use: value,
+                    in_use: Some(value),
                     limit: Some(10.0),
                 }],
                 credits_remaining: None,
