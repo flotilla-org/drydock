@@ -261,23 +261,22 @@ impl Daemon {
             None => left_service(agent_error(e), link),
         };
         agent.put_service(service, &recipe.service).await.map_err(lost)?;
-        let deadline = tokio::time::Instant::now() + CONNECT;
-        loop {
-            let answered = agent.open_inward(&link.forward.id).await.is_ok();
-            let info = agent.service(service).await.map_err(|e| left_service(agent_error(e), link))?;
-            if let ServiceInfo { state: ServiceState::Exited { status }, log, .. } = info {
-                let log = log.map(|log| format!("; its log is {}", log.display())).unwrap_or_default();
-                return Err(left_service(refused(format!("the recipe's {} exited ({status:?}){log}", recipe.service.program)), link));
+        let waited = tokio::time::timeout(CONNECT, async {
+            loop {
+                let answered = agent.open_inward(&link.forward.id).await.is_ok();
+                let info = agent.service(service).await.map_err(|e| left_service(agent_error(e), link))?;
+                if let ServiceInfo { state: ServiceState::Exited { status }, log, .. } = info {
+                    let log = log.map(|log| format!("; its log is {}", log.display())).unwrap_or_default();
+                    return Err(left_service(refused(format!("the recipe's {} exited ({status:?}){log}", recipe.service.program)), link));
+                }
+                if answered {
+                    return Ok(true);
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            if answered {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let reason = format!("the recipe's endpoint did not answer within {} s", CONNECT.as_secs());
-                return Err(left_service(Error::Protocol(ProtocolError::unavailable(reason, None)), link));
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        });
+        let reason = format!("the recipe's endpoint did not answer within {} s", CONNECT.as_secs());
+        waited.await.unwrap_or_else(|_| Err(left_service(Error::Protocol(ProtocolError::unavailable(reason, None)), link)))
     }
 
     fn not_configured(&self, name: &str) -> Result<(), Error> {

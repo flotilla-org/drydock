@@ -307,7 +307,7 @@ From then on it is an ordinary instance: `POST
   unix:///var/run/docker.sock` and needs `dockerd`. A carry is an ensure:
   drydockd first opens the endpoint through the parent vessel's agent, and an
   engine already answering there, such as one the image's entrypoint started,
-  is carried onto as it is. Otherwise drydockd checks the programs, starts the
+  is carried onto as it is; nothing checks that it is the module's engine. Otherwise drydockd checks the programs, starts the
   service under a name of its own (`drydock-carried-…`), and waits up to 20
   seconds for the endpoint to answer, opening and closing a connection to it
   every quarter second; a service that has exited by then refuses the carry.
