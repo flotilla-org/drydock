@@ -304,11 +304,16 @@ From then on it is an ordinary instance: `POST
   (`loadable_modules[].recipe`): the service that starts its engine, the
   endpoint it then answers on, and the programs the parent's image needs on
   its PATH. `docker_engine`'s runs `dockerd --host
-  unix:///var/run/docker.sock` and needs `dockerd`. drydockd checks the
-  programs, starts the service through the parent vessel's agent, under a name
-  of its own (`drydock-carried-…`), and waits up to 20 seconds for the endpoint
-  to answer, opening and closing a connection to it every quarter second; then it configures the instance. A `parent.endpoint` in the body
-  carries an engine the client started itself instead, and no recipe runs.
+  unix:///var/run/docker.sock` and needs `dockerd`. A carry is an ensure:
+  drydockd first opens the endpoint through the parent vessel's agent, and an
+  engine already answering there, such as one the image's entrypoint started,
+  is carried onto as it is. Otherwise drydockd checks the programs, starts the
+  service under a name of its own (`drydock-carried-…`), and waits up to 20
+  seconds for the endpoint to answer, opening and closing a connection to it
+  every quarter second; a service that has exited by then refuses the carry.
+  Then it configures the instance. A `parent.endpoint` in the body names a
+  service inside the parent environment, one the client started itself, and no
+  recipe runs.
 - **What is left.** A carry that fails after the service started answers with
   the failure and `left` naming it (`{"kind": "service", "provider", "id",
   "name"}`), as a failed provision names its environment. The service keeps
@@ -334,8 +339,8 @@ From then on it is an ordinary instance: `POST
   for, as long as a provision of its instance would wait; stopped, suspended,
   stopping or in an unknown state is refused at once, naming the state, and
   gone is refused. drydockd does not resume it. When it resumes after a
-  suspend, drydockd runs the recipe again, which leaves a service still running
-  alone.
+  suspend, drydockd ensures the recipe again, which leaves an engine that still
+  answers alone.
 - **How a connection travels.** Each connection to the instance's socket is one
   hop: drydockd asks the parent vessel's agent, over a link of its own to that
   agent, to open the endpoint inside the vessel. A configured `parent`, which
@@ -353,7 +358,7 @@ From then on it is an ordinary instance: `POST
   policy is the narrower of the two, and drydock does not merge them.
 - **Removal.** `DELETE /v1/providers/sb7f3a-docker` is refused while the
   instance holds environments, naming them. Otherwise drydockd stops the
-  service it started, forgets the instance and answers 204. An engine the
+  service it started, if it started one, forgets the instance and answers 204. An engine the
   client started itself (`parent.endpoint`) is left running. A service in a
   vessel that is not running, or gone, ends with it, so the removal goes ahead
   when it cannot be stopped; in a running vessel that failure fails the
@@ -394,7 +399,7 @@ Refusals are `422` (`{"kind": "refused", "reason": ...}`):
 | `PUT` into a parent environment that is gone | `parent environment sb-7f3a of daytona is gone` |
 | `PUT` into a parent environment that is not running or starting | `parent environment sb-7f3a of daytona is stopped; drydockd does not resume it` |
 | `PUT` into an image without what the recipe needs | `the parent's image has no dockerd on its PATH` |
-| `PUT` whose recipe's service exits before its endpoint answers | `the recipe's dockerd exited (…) before its endpoint answered; its log is …`, with `left` |
+| `PUT` whose recipe's service has exited by the time its endpoint answers | `the recipe's dockerd exited (…); its log is …`, with `left` |
 | `DELETE` of a configured name | `provider b1 is configured; a configured instance changes only with the configuration file` |
 | `DELETE` while the instance holds environments | `sb7f3a-docker holds environments 4be1c0d2e9f3, 9a7713c05e21; destroy them first` |
 

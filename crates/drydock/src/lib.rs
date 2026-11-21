@@ -108,13 +108,11 @@ impl HostHandle {
     pub async fn carry(&self, name: &str, configuration: ProviderConfiguration) -> Result<(), client::Error> {
         let patch = serde_json::json!({ "providers": { name: &configuration } });
         self.client.configure(ConfigUpdate::MergePatch(patch)).await.map_err(client::Error::Protocol)?;
-        // Held only once configured, so supervision never takes the host
-        // for restarted while the instance is still being added.
+        // Held once configured, so supervision never takes the host for restarted meanwhile.
         self.carried.lock().unwrap().insert(name.to_owned(), configuration);
         Ok(())
     }
-    /// Forget a carried instance, and the environments the host knew it to
-    /// hold; each is recorded gone, for `cause`, when there is one.
+    /// Forget a carried instance, returning its environments, each recorded gone for `cause`.
     pub async fn uncarry(&self, name: &str, cause: Option<GoneCause>) -> Vec<Environment> {
         self.carried.lock().unwrap().remove(name);
         let known = self.client.remove(name, cause).await;

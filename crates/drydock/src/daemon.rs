@@ -28,7 +28,8 @@ use tokio::sync::Mutex;
 
 mod carried;
 pub use crate::api::ProviderApi;
-use carried::{Carrier, child_socket};
+use carried::{Carrier, agent_error, child_socket};
+use drydock_protocol::service::{Service, ServiceInfo};
 pub struct HostOption {
     pub name: String,
     pub connection: HostConnection,
@@ -106,11 +107,9 @@ pub struct Inner {
     /// and provisions of other labels never wait on it.
     keying: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     stopping: tokio::sync::watch::Sender<bool>,
-    /// Each instance with a parent, by name: the configured ones, and those
-    /// carried since drydockd started.
+    /// Each instance with a parent, configured or carried, by name.
     carried: std::sync::RwLock<BTreeMap<String, Arc<Carrier>>>,
-    /// One lock per carried name: carrying, removing and teardown take it
-    /// alone, provisions under the name together.
+    /// Each carried name's turn.
     turns: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
     run: PathBuf,
     /// This daemon, for the relays of instances carried after it started.
@@ -172,8 +171,7 @@ impl AgentBuilds for InstalledBuilds {
     }
 }
 /// Serves a child's socket: for each connection, the parent opens a stream to
-/// the child's endpoint, on its machine or in its environment's vessel, and
-/// the two are joined until either ends. While the
+/// the child's endpoint, and the two are joined until either ends. While the
 /// daemon starts, the parent's host opens it once that host is configured, so
 /// a child's first connection, made while it is configured, reaches its
 /// endpoint.
@@ -322,10 +320,8 @@ impl Daemon {
             let carrier = (parent.instance.clone(), endpoint.clone());
             let task = tokio::spawn(relay(daemon.clone(), starting.subscribe(), name.clone(), carrier, listener, stopping.subscribe()));
             let relay = Relay { task, socket: socket.clone() };
-            carried.insert(
-                name.clone(),
-                Arc::new(Carrier { parent: parent.instance.clone(), endpoint, socket, _relay: relay, link: None, carriage: None }),
-            );
+            let carrier = Carrier { parent: parent.instance.clone(), endpoint, socket, _relay: relay, carriage: None };
+            carried.insert(name.clone(), Arc::new(carrier));
         }
         let mut hosts = Vec::new();
         let mut placements = BTreeMap::new();
@@ -491,8 +487,7 @@ impl Daemon {
                 .collect(),
         }
     }
-    /// Every configured provider, including those no host can serve, with the
-    /// reason, and every carried one.
+    /// Every configured provider, including those no host can serve, with the reason, and every carried one.
     pub fn providers(&self) -> Vec<ProviderDeclaration> {
         let statuses = self.statuses();
         self.names()
@@ -678,9 +673,9 @@ impl Daemon {
     /// A configured provider's launch defaults. A carried instance has none.
     fn configured(&self, provider: &str) -> Result<&crate::config::Provider, Error> {
         self.config.providers.get(provider).ok_or_else(|| match self.carrier(provider) {
-            Some(_) => Error::Protocol(ProtocolError::Refused {
-                reason: format!("provider {provider} is carried and has no launch defaults; prepare it with a whole request"),
-            }),
+            Some(_) => {
+                launch::refused(format!("provider {provider} is carried and has no launch defaults; prepare it with a whole request"))
+            }
             None => Error::Protocol(ProtocolError::unknown_provider()),
         })
     }
@@ -990,29 +985,19 @@ impl ProviderApi for Daemon {
     async fn remove_provider(&self, name: &str) -> Result<(), Error> {
         self.uncarry(name).await
     }
-    async fn put_service(
-        &self,
-        p: &str,
-        id: &str,
-        name: &str,
-        service: &drydock_protocol::service::Service,
-    ) -> Result<crate::api::Provisioned<drydock_protocol::service::ServiceInfo>, Error> {
-        self.put_vessel_service(p, id, name, service).await
+    async fn put_service(&self, p: &str, id: &str, name: &str, service: &Service) -> Result<crate::api::Provisioned<ServiceInfo>, Error> {
+        crate::exposures::check_named("service", name)?;
+        let (started, info) = self.vessel_agent(p, id).await?.start_service(name, service).await.map_err(agent_error)?;
+        Ok(crate::api::Provisioned::new(started, info))
     }
-    async fn service(&self, p: &str, id: &str, name: &str) -> Result<drydock_protocol::service::ServiceInfo, Error> {
-        self.vessel_service(p, id, name).await
+    async fn service(&self, p: &str, id: &str, name: &str) -> Result<ServiceInfo, Error> {
+        self.vessel_agent(p, id).await?.service(name).await.map_err(agent_error)
     }
-    async fn services(&self, p: &str, id: &str) -> Result<Vec<drydock_protocol::service::ServiceInfo>, Error> {
-        self.vessel_services(p, id).await
+    async fn services(&self, p: &str, id: &str) -> Result<Vec<ServiceInfo>, Error> {
+        self.vessel_agent(p, id).await?.services().await.map_err(agent_error)
     }
-    async fn remove_service(
-        &self,
-        p: &str,
-        id: &str,
-        name: &str,
-        grace_ms: Option<u64>,
-    ) -> Result<drydock_protocol::service::ServiceInfo, Error> {
-        self.remove_vessel_service(p, id, name, grace_ms).await
+    async fn remove_service(&self, p: &str, id: &str, name: &str, grace_ms: Option<u64>) -> Result<ServiceInfo, Error> {
+        self.vessel_agent(p, id).await?.remove_service(name, grace_ms.map(Duration::from_millis)).await.map_err(agent_error)
     }
     async fn push_access(&self, p: &str) -> Result<PushAccess, Error> {
         self.runtime(p)?.push_access(p).await

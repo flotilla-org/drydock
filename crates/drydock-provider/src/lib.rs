@@ -88,8 +88,7 @@ pub trait Module: Send + Sync {
     fn takes_endpoint(&self) -> bool {
         false
     }
-    /// How the module's engine starts in a parent environment, for a module
-    /// whose instances can be carried without naming their endpoint.
+    /// How the module's engine starts in a parent environment.
     fn recipe(&self) -> Option<Recipe> {
         None
     }
@@ -115,6 +114,9 @@ pub enum Provisioned<T = Environment> {
     Existing(T),
 }
 impl<T> Provisioned<T> {
+    pub fn new(created: bool, row: T) -> Self {
+        if created { Self::Created(row) } else { Self::Existing(row) }
+    }
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Provisioned<U> {
         match self {
             Self::Created(row) => Provisioned::Created(f(row)),

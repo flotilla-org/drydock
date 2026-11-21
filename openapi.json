@@ -3048,7 +3048,7 @@
       },
       "Carry": {
         "type": "object",
-        "description": "A carried instance, as `PUT /v1/providers/{name}` takes it: the module,\nits settings and the parent environment. drydock owns what it makes, with\nthe default semantics.",
+        "description": "A carried instance, as `PUT /v1/providers/{name}` takes it.",
         "required": [
           "module",
           "parent"
@@ -4004,7 +4004,7 @@
           },
           {
             "type": "object",
-            "description": "The environment of another instance that this one's instance was\ncarried in went, and with it this environment.",
+            "description": "The parent environment this environment's instance was carried into went.",
             "required": [
               "provider",
               "environment",
@@ -4403,7 +4403,7 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/LeftService",
-                "description": "A carry started this service in its parent environment before a\nlater step failed. It runs until the client stops it."
+                "description": "A carry started this service in its parent environment; it runs until the client stops it."
               },
               {
                 "type": "object",
@@ -4420,7 +4420,7 @@
                 }
               }
             ],
-            "description": "A carry started this service in its parent environment before a\nlater step failed. It runs until the client stops it."
+            "description": "A carry started this service in its parent environment; it runs until the client stops it."
           },
           {
             "type": "object",
@@ -4492,7 +4492,7 @@
               },
               {
                 "$ref": "#/components/schemas/Recipe",
-                "description": "How the module's engine starts in a parent environment, for a module\nwhose instances can be carried without naming their endpoint."
+                "description": "How the module's engine starts in a parent environment."
               }
             ]
           },
@@ -4838,7 +4838,7 @@
       },
       "Parent": {
         "type": "object",
-        "description": "An instance's parent, by instance name, and where on it the instance's\nendpoint is: on the parent's machine, or inside one of its environments.",
+        "description": "An instance's parent, and where its endpoint is: on the parent's machine, or inside one of its environments.",
         "required": [
           "instance"
         ],
@@ -4850,7 +4850,7 @@
               },
               {
                 "$ref": "#/components/schemas/Carried",
-                "description": "Required in the configuration file. A carried instance of a module\nwith a [`Recipe`] may leave it out, and the recipe's is used."
+                "description": "Required in the configuration file. With `environment`, an explicit endpoint names a service\ninside the parent environment; left out, the module's [`Recipe`] gives it."
               }
             ]
           },
@@ -4859,7 +4859,7 @@
               "string",
               "null"
             ],
-            "description": "An environment of `instance` whose vessel agent opens each connection\nto `endpoint` inside it. Only a carried instance, put while drydockd\nruns, names one; the configuration file cannot."
+            "description": "The environment whose vessel agent reaches `endpoint`. Only a carried instance names one."
           },
           "instance": {
             "type": "string"
@@ -5385,7 +5385,7 @@
               },
               {
                 "$ref": "#/components/schemas/Parent",
-                "description": "Server only: the instance's parent, from the configuration or, with an\nenvironment, from the `PUT` that carried it."
+                "description": "Server only: the instance's parent, configured or carried into."
               }
             ]
           },
@@ -5815,7 +5815,7 @@
       },
       "Recipe": {
         "type": "object",
-        "description": "How a module's engine starts inside a parent environment, so that an\ninstance is carried there from the module and the environment alone.",
+        "description": "How a module's engine starts inside a parent environment.",
         "required": [
           "service",
           "endpoint"

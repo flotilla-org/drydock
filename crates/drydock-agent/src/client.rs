@@ -487,8 +487,7 @@ impl Client {
     pub async fn put_service(&self, name: &str, service: &crate::Service) -> io::Result<crate::ServiceInfo> {
         self.link.json("PUT", &format!("/services/{}", encode_segment(name)), json_body(service)?).await
     }
-    /// As [`Self::put_service`], and whether this call started it (the
-    /// agent's 201) rather than finding it running from the same body.
+    /// As [`Self::put_service`], and whether this call started it.
     pub async fn start_service(&self, name: &str, service: &crate::Service) -> io::Result<(bool, crate::ServiceInfo)> {
         let uri = format!("/services/{}", encode_segment(name));
         let response = self.link.send("PUT", &uri, &[("content-type", "application/json".into())], json_body(service)?).await?;

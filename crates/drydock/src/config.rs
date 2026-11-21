@@ -228,8 +228,7 @@ impl Config {
         }
         Ok(config)
     }
-    /// Every parent is a configured instance, names an endpoint and no
-    /// environment, and no instance is its own ancestor.
+    /// Every parent is a configured instance naming an endpoint and no environment, and no instance is its own ancestor.
     pub fn check_parents(&self) -> Result<(), String> {
         for (name, p) in &self.providers {
             let mut line = vec![name.as_str()];

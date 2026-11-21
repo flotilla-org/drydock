@@ -18,7 +18,7 @@ use drydock_protocol::{
 pub use drydock_provider::Provisioned;
 use drydock_provider::rest::{ApiJson, ApiPath, ApiQuery, Refusal, switch, upgrade};
 use rigging_stream::ByteStream;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -107,9 +107,7 @@ pub trait ProviderApi: Send + Sync {
     async fn observe(&self, _since: Option<&str>) -> Result<ObservationStream, Error> {
         Err(ProtocolError::not_found("unknown route").into())
     }
-    /// Server only: carry an instance under `provider` into the parent
-    /// environment `carry.parent` names. The same body again answers with the
-    /// same instance; a failure partway says what it left.
+    /// Server only: carry an instance into the parent environment `carry.parent` names.
     async fn put_provider(&self, _provider: &str, _carry: &Carry) -> Result<Provisioned<ProviderDeclaration>, ProvisionError> {
         Err(Error::from(ProtocolError::not_found("unknown route")).into())
     }
@@ -117,8 +115,7 @@ pub trait ProviderApi: Send + Sync {
     async fn remove_provider(&self, _provider: &str) -> Result<(), Error> {
         Err(ProtocolError::not_found("unknown route").into())
     }
-    /// Server only: start a service in a vessel through its agent, unless it
-    /// already runs from the same body.
+    /// Server only: start a service in a vessel, unless it runs from the same body.
     async fn put_service(&self, _provider: &str, _id: &str, _name: &str, _service: &Service) -> Result<Provisioned<ServiceInfo>, Error> {
         Err(ProtocolError::not_found("unknown route").into())
     }
@@ -213,10 +210,8 @@ impl ProviderApi for Client {
     }
     async fn provision(&self, provider: &str, request: &ProvisionRequest) -> Result<Provisioned<Environment>, ProvisionError> {
         let request = self.request(Method::POST, &["v1", "providers", provider, "environments"])?.json(request);
-        Ok(match self.execute_provision(request).await? {
-            (201, environment) => Provisioned::Created(environment),
-            (_, environment) => Provisioned::Existing(environment),
-        })
+        let (status, environment) = self.execute_provision(request).await?;
+        Ok(Provisioned::new(status == 201, environment))
     }
     async fn list(&self, provider: &str) -> Result<Vec<Environment>, Error> {
         self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments"], None).await
@@ -271,17 +266,13 @@ impl ProviderApi for Client {
     }
     async fn put_provider(&self, provider: &str, carry: &Carry) -> Result<Provisioned<ProviderDeclaration>, ProvisionError> {
         let request = self.request(Method::PUT, &["v1", "providers", provider])?.json(carry);
-        Ok(match self.execute_provision(request).await? {
-            (201, declaration) => Provisioned::Created(declaration),
-            (_, declaration) => Provisioned::Existing(declaration),
-        })
+        let (status, declaration) = self.execute_provision(request).await?;
+        Ok(Provisioned::new(status == 201, declaration))
     }
     async fn put_service(&self, provider: &str, id: &str, name: &str, service: &Service) -> Result<Provisioned<ServiceInfo>, Error> {
         let request = self.request(Method::PUT, &["v1", "providers", provider, "environments", id, "services", name])?.json(service);
-        Ok(match self.execute_response(request).await? {
-            (201, info) => Provisioned::Created(info),
-            (_, info) => Provisioned::Existing(info),
-        })
+        let (status, info) = self.execute_response(request).await?;
+        Ok(Provisioned::new(status == 201, info))
     }
     async fn service(&self, provider: &str, id: &str, name: &str) -> Result<ServiceInfo, Error> {
         self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "services", name], None).await
@@ -290,11 +281,8 @@ impl ProviderApi for Client {
         self.call::<_, ()>(Method::GET, &["v1", "providers", provider, "environments", id, "services"], None).await
     }
     async fn remove_service(&self, provider: &str, id: &str, name: &str, grace_ms: Option<u64>) -> Result<ServiceInfo, Error> {
-        let mut request = self.request(Method::DELETE, &["v1", "providers", provider, "environments", id, "services", name])?;
-        if let Some(grace_ms) = grace_ms {
-            request = request.query(&[("grace_ms", grace_ms)]);
-        }
-        Ok(self.execute_response(request).await?.1)
+        let request = self.request(Method::DELETE, &["v1", "providers", provider, "environments", id, "services", name])?;
+        Ok(self.execute_response(request.query(&Grace { grace_ms })).await?.1)
     }
     async fn remove_provider(&self, provider: &str) -> Result<(), Error> {
         self.call::<_, ()>(Method::DELETE, &["v1", "providers", provider], None).await
@@ -508,10 +496,7 @@ async fn put_provider(
     body: Result<ApiJson<Carry>, Refusal>,
 ) -> Result<Response, ProvisionAnswer> {
     let (Api(api), ApiPath(p), ApiJson(body)) = (api.map_err(|e| e.0)?, p.map_err(|e| e.0)?, body.map_err(|e| e.0)?);
-    Ok(match api.put_provider(&p, &body).await.map_err(ProvisionAnswer)? {
-        Provisioned::Created(declaration) => (StatusCode::CREATED, Json(declaration)).into_response(),
-        Provisioned::Existing(declaration) => Json(declaration).into_response(),
-    })
+    Ok(answer(api.put_provider(&p, &body).await.map_err(ProvisionAnswer)?))
 }
 #[utoipa::path(get, tag = "server", path = "/v1/providers/{provider}/environments/{id}/services",
 params(("provider" = String, Path, description = "Opaque provider"),("id" = String, Path, description = "Opaque id")),
@@ -537,12 +522,9 @@ async fn put_service(
     ApiPath((p, id, name)): ApiPath<(String, String, String)>,
     ApiJson(service): ApiJson<Service>,
 ) -> ApiResult<Response> {
-    Ok(match api.put_service(&p, &id, &name, &service).await? {
-        Provisioned::Created(info) => (StatusCode::CREATED, Json(info)).into_response(),
-        Provisioned::Existing(info) => Json(info).into_response(),
-    })
+    Ok(answer(api.put_service(&p, &id, &name, &service).await?))
 }
-#[derive(Deserialize, utoipa::IntoParams)]
+#[derive(Serialize, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 struct Grace {
     /// How long after SIGTERM before SIGKILL: 10 seconds by default, at most 60.
@@ -595,10 +577,14 @@ async fn provision(
     r: Result<ApiJson<ProvisionRequest>, Refusal>,
 ) -> Result<Response, ProvisionAnswer> {
     let (Api(api), ApiPath(p), ApiJson(r)) = (api.map_err(|e| e.0)?, p.map_err(|e| e.0)?, r.map_err(|e| e.0)?);
-    Ok(match api.provision(&p, &r).await.map_err(ProvisionAnswer)? {
-        Provisioned::Created(environment) => (StatusCode::CREATED, Json(environment)).into_response(),
-        Provisioned::Existing(environment) => Json(environment).into_response(),
-    })
+    Ok(answer(api.provision(&p, &r).await.map_err(ProvisionAnswer)?))
+}
+/// 201 for what this call made, 200 for what it found.
+fn answer<T: Serialize>(provisioned: Provisioned<T>) -> Response {
+    match provisioned {
+        Provisioned::Created(row) => (StatusCode::CREATED, Json(row)).into_response(),
+        Provisioned::Existing(row) => Json(row).into_response(),
+    }
 }
 /// A provision's failure as its HTTP response: the error, and what it left.
 pub struct ProvisionAnswer(pub ProvisionError);

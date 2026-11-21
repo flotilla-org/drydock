@@ -263,8 +263,7 @@ impl Runtime {
         self.events.changed.send_modify(|serial| *serial += 1);
         Ok(())
     }
-    /// Forget an instance. Its observer stops, and the live environments last
-    /// known under it are returned, each recorded gone for `cause` when given.
+    /// Forget an instance, returning its live environments, each recorded gone for `cause`.
     pub(crate) async fn remove(&self, name: &str, cause: Option<GoneCause>) -> Vec<Environment> {
         let _transaction = self.configuring.lock().await;
         let Some(instance) = self.config.write().await.providers.remove(name) else { return vec![] };

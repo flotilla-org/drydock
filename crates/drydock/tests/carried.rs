@@ -46,6 +46,8 @@ struct Harness {
     api: Client,
     /// The parent environment.
     id: String,
+    /// The recipe's service.
+    engine: Service,
 }
 impl Drop for Harness {
     /// Services outlive the agent that started them, so the recipe's engine
@@ -71,12 +73,13 @@ impl Harness {
         std::fs::create_dir(&vessel).unwrap();
         let gateway = Gateway::start_as(&vessel, BUILD, Platform::new("linux", "amd64")).unwrap();
         let engine = dir.path().join("engine").join("agent.sock");
+        let service = Service {
+            program: agent::agent_binary().to_string_lossy().into_owned(),
+            args: vec!["--socket".into(), engine.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
         let recipe = Recipe {
-            service: Service {
-                program: agent::agent_binary().to_string_lossy().into_owned(),
-                args: vec!["--socket".into(), engine.to_string_lossy().into_owned()],
-                ..Default::default()
-            },
+            service: service.clone(),
             endpoint: Carried::Unix(engine.to_string_lossy().into_owned()),
             requires: vec!["sh".into()],
         };
@@ -111,12 +114,12 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let id = daemon.launch(PARENT, &Default::default()).await.unwrap().id;
-        Self { _dir: dir, _gateway: gateway, host, server, _daemon: daemon, api, id }
+        Self { _dir: dir, _gateway: gateway, host, server, _daemon: daemon, api, id, engine: service }
     }
     fn carry(&self) -> Carry {
         Carry {
             module: ENGINE.into(),
-            settings: [("poll_interval_ms".into(), 10.into())].into(),
+            settings: [("poll_interval_ms".into(), 10.into()), ("owned".into(), true.into())].into(),
             parent: Parent { instance: PARENT.into(), environment: Some(self.id.clone()), endpoint: None },
         }
     }
@@ -164,6 +167,21 @@ async fn a_carry_by_recipe_starts_the_engine_and_provisions_through_it() {
 
     let environment = h.provision("inner", "inner/one").await;
     assert_eq!(h.api.inspect("inner", &environment.id).await.unwrap().id, environment.id);
+}
+
+// A carry is an ensure: an engine already answering at the recipe's endpoint,
+// as when the image's entrypoint started one, is carried onto as it is.
+#[tokio::test]
+async fn a_carry_onto_an_engine_already_answering_starts_no_service() {
+    let h = Harness::start().await;
+    h.api.put_service(PARENT, &h.id, "entrypoint", &h.engine).await.unwrap();
+    while tokio::net::UnixStream::connect(&h.engine.args[1]).await.is_err() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(matches!(h.api.put_provider("inner", &h.carry()).await.unwrap(), Provisioned::Created(_)));
+    let services = h.api.services(PARENT, &h.id).await.unwrap();
+    assert_eq!(services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["entrypoint"]);
+    h.provision("inner", "inner/one").await;
 }
 
 // The same body again is the same instance; a different body under the name

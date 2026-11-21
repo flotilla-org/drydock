@@ -22,9 +22,7 @@ impl Module for ReferenceModule {
         Ok(Arc::new(Reference { name: name.to_owned(), state: Mutex::new(Memory::default()), settings }))
     }
 }
-/// The reference module with a recipe: its instances are the reference's,
-/// and their engine is whatever the recipe starts, so a carry can be shown
-/// without a vendor.
+/// The reference module with a recipe, so a carry can be shown without a vendor.
 pub struct CarriedReference(pub Recipe);
 #[async_trait]
 impl Module for CarriedReference {
@@ -37,13 +35,8 @@ impl Module for CarriedReference {
     fn recipe(&self) -> Option<Recipe> {
         Some(self.0.clone())
     }
-    /// A carried instance's account is drydock's own, and its engine takes
-    /// no credential.
     async fn configure(&self, name: &str, c: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
-        let mut c = c.clone();
-        c.settings.entry("owner_scoped".into()).or_insert(false.into());
-        c.settings.entry("credential".into()).or_insert(false.into());
-        ReferenceModule.configure(name, &c, http).await
+        ReferenceModule.configure(name, c, http).await
     }
 }
 #[derive(serde::Deserialize)]
@@ -64,13 +57,9 @@ struct ReferenceSettings {
     /// Declare that vessels run the drydock agent (no guest exists here).
     #[serde(default)]
     agent: bool,
-    /// Declare that the module keeps to what it made itself, as a module on
-    /// a shared account does. Off, an owned account takes it.
-    #[serde(default = "yes")]
-    owner_scoped: bool,
-    /// Ready only once a credential is delivered, as a vendor's account is.
-    #[serde(default = "yes")]
-    credential: bool,
+    /// Drydock's own account: not owner scoped, and ready with no credential.
+    #[serde(default)]
+    owned: bool,
     /// Platforms to declare, preferred first. The default models Linux vessels
     /// on both published tools platforms, so results don't depend on the host.
     #[serde(default = "default_platforms")]
@@ -144,7 +133,7 @@ impl Reference {
 #[async_trait]
 impl Provider for Reference {
     fn readiness(&self, c: &Credentials) -> Readiness {
-        match self.settings.credential && c.token().is_none() {
+        match !self.settings.owned && c.token().is_none() {
             true => Readiness::MissingCredential { reason: "credential not delivered".into() },
             false => Readiness::Ready,
         }
@@ -205,7 +194,7 @@ impl Provider for Reference {
             exclusive_label: self.settings.exclusive_label,
             agent_tcp_port: None,
             reach_ways: if self.settings.agent { vec![ReachWay::OutwardExposure] } else { vec![] },
-            semantics: Semantics { settles: true, idempotent: true, owner_scoped: self.settings.owner_scoped, token_is_id: false },
+            semantics: Semantics { settles: true, idempotent: true, owner_scoped: !self.settings.owned, token_is_id: false },
             carries: vec![],
         }
     }
@@ -495,7 +484,4 @@ impl QuotaOperation for Reference {
             concurrency_limit: None,
         })
     }
-}
-fn yes() -> bool {
-    true
 }

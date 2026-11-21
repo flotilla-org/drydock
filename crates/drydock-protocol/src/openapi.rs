@@ -86,18 +86,10 @@ pub fn document(routes: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenApi {
     for (route, path) in document.paths.paths.iter_mut() {
         let server_only =
             route == "/v1/events" || route.ends_with("/credential") || route.contains("/exposures/") || route.contains("/services");
-        // Reading a provider is common; carrying and removing one are the server's.
-        let carrying = route == "/v1/providers/{provider}";
-        let operations = [
-            (&mut path.get, false),
-            (&mut path.put, carrying),
-            (&mut path.patch, false),
-            (&mut path.post, false),
-            (&mut path.delete, carrying),
-        ];
-        for (operation, carries) in operations {
-            let Some(operation) = operation else { continue };
-            if server_only || carries {
+        for operation in [&mut path.get, &mut path.put, &mut path.patch, &mut path.post, &mut path.delete].into_iter().flatten() {
+            // Reading a provider is common; carrying and removing one are the server's.
+            let carrying = matches!(operation.operation_id.as_deref(), Some("put_provider" | "remove_provider"));
+            if server_only || carrying {
                 operation.extensions = Some(ExtensionsBuilder::new().add("x-drydock-server-only", true).build());
             } else {
                 let header = ParameterBuilder::new()

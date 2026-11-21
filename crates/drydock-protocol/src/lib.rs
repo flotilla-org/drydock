@@ -91,25 +91,20 @@ impl ProviderConfiguration {
         Self { credential: None, semantics: Default::default(), events: None, parent: None, ..self.clone() }
     }
 }
-/// An instance's parent, by instance name, and where on it the instance's
-/// endpoint is: on the parent's machine, or inside one of its environments.
+/// An instance's parent, and where its endpoint is: on the parent's machine, or inside one of its environments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Parent {
     pub instance: String,
-    /// An environment of `instance` whose vessel agent opens each connection
-    /// to `endpoint` inside it. Only a carried instance, put while drydockd
-    /// runs, names one; the configuration file cannot.
+    /// The environment whose vessel agent reaches `endpoint`. Only a carried instance names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
-    /// Required in the configuration file. A carried instance of a module
-    /// with a [`Recipe`] may leave it out, and the recipe's is used.
+    /// Required in the configuration file. With `environment`, an explicit endpoint names a service
+    /// inside the parent environment; left out, the module's [`Recipe`] gives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Carried>,
 }
-/// A carried instance, as `PUT /v1/providers/{name}` takes it: the module,
-/// its settings and the parent environment. drydock owns what it makes, with
-/// the default semantics.
+/// A carried instance, as `PUT /v1/providers/{name}` takes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Carry {
@@ -118,8 +113,7 @@ pub struct Carry {
     pub settings: BTreeMap<String, serde_json::Value>,
     pub parent: Parent,
 }
-/// How a module's engine starts inside a parent environment, so that an
-/// instance is carried there from the module and the environment alone.
+/// How a module's engine starts inside a parent environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Recipe {
     /// Started through the parent vessel's agent, as a service.
@@ -269,8 +263,7 @@ pub struct LoadableModule {
     /// [`ProviderConfiguration::endpoint`], so they can have a parent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub takes_endpoint: bool,
-    /// How the module's engine starts in a parent environment, for a module
-    /// whose instances can be carried without naming their endpoint.
+    /// How the module's engine starts in a parent environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<Recipe>,
 }
@@ -291,8 +284,7 @@ pub struct ProviderDeclaration {
     /// for its endpoint, which a client can open too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<Local>,
-    /// Server only: the instance's parent, from the configuration or, with an
-    /// environment, from the `PUT` that carried it.
+    /// Server only: the instance's parent, configured or carried into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
 }
@@ -1103,8 +1095,7 @@ pub enum GoneCause {
     MissingOnList,
     /// The provider confirmed deletion requested by the client.
     DestroyedByRequest,
-    /// The environment of another instance that this one's instance was
-    /// carried in went, and with it this environment.
+    /// The parent environment this environment's instance was carried into went.
     ParentGone {
         provider: String,
         environment: String,
@@ -1419,8 +1410,7 @@ pub enum Left {
     /// its provider, as the request path did, so that it is the whole of what
     /// destroy needs.
     Made { provider: String, id: String },
-    /// A carry started this service in its parent environment before a
-    /// later step failed. It runs until the client stops it.
+    /// A carry started this service in its parent environment; it runs until the client stops it.
     Service(Box<LeftService>),
     /// The vendor made nothing.
     None,
@@ -1559,7 +1549,6 @@ impl TryFrom<UncheckedPeriod> for Period {
     }
 }
 impl ProtocolError {
-    /// Retryable unavailability without sensitive provider diagnostics.
     pub fn not_found(reason: impl Into<String>) -> Self {
         Self::NotFound { reason: reason.into(), missing: None }
     }
@@ -1567,7 +1556,7 @@ impl ProtocolError {
     pub fn unknown_provider() -> Self {
         Self::NotFound { reason: "unknown provider".into(), missing: Some(Missing::Provider) }
     }
-
+    /// Retryable unavailability without sensitive provider diagnostics.
     pub fn unavailable(reason: impl Into<String>, retry_after: Option<u64>) -> Self {
         Self::Unavailable { provider_error: None, reason: reason.into(), retry_after }
     }
