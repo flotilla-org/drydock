@@ -20,7 +20,7 @@ impl Carrier {
     pub(super) fn local(&self) -> Local {
         Local::Unix(self.socket.to_string_lossy().into_owned())
     }
-    fn link(&self) -> Option<&Link> {
+    pub(super) fn link(&self) -> Option<&Link> {
         self.carriage.as_ref().map(|c| &c.link)
     }
 }
@@ -31,7 +31,7 @@ pub(super) struct Carriage {
 }
 /// The parent vessel's agent, holding a forward to the instance's endpoint,
 /// whose id also names the recipe's service.
-struct Link {
+pub(super) struct Link {
     provider: String,
     environment: String,
     forward: InwardForward,
@@ -254,15 +254,19 @@ impl Daemon {
             return Err(refused(format!("the parent's image has no {} on its PATH", missing.trim())).into());
         }
         let service = &link.forward.id;
-        agent.put_service(service, &recipe.service).await.map_err(agent_error)?;
+        // An agent's refusal started nothing; a lost answer may have started it.
+        let lost = |e: std::io::Error| match drydock_agent::AgentError::of(&e) {
+            Some(_) => agent_error(e).into(),
+            None => left_service(agent_error(e), link),
+        };
+        agent.put_service(service, &recipe.service).await.map_err(lost)?;
         let deadline = tokio::time::Instant::now() + CONNECT;
         loop {
             let answered = agent.open_inward(&link.forward.id).await.is_ok();
             let info = agent.service(service).await.map_err(|e| left_service(agent_error(e), link))?;
             if let ServiceInfo { state: ServiceState::Exited { status }, log, .. } = info {
                 let log = log.map(|log| format!("; its log is {}", log.display())).unwrap_or_default();
-                let program = &recipe.service.program;
-                return Err(left_service(refused(format!("the recipe's {program} exited ({status:?}){log}")), link));
+                return Err(left_service(refused(format!("the recipe's {} exited ({status:?}){log}", recipe.service.program)), link));
             }
             if answered {
                 return Ok(true);
@@ -298,6 +302,7 @@ impl Daemon {
         if carriage.body.parent.endpoint.is_none() {
             let service = &link.forward.id;
             match async { link.agent(self).await?.remove_service(service, None).await.map_err(agent_error) }.await {
+                // None when the carry found its engine already answering.
                 Ok(_) | Err(Error::Protocol(ProtocolError::NotFound { .. })) => {}
                 // A service ends with its vessel; in a running one it would be left without an owner.
                 Err(error) if matches!(self.parent_state(link).await, Some(state) if state != Observation::Running) => {
@@ -361,31 +366,24 @@ impl Daemon {
     }
 
     /// The module's own figures, and the parent environment's size as the limits.
-    pub(super) async fn carried_quota(&self, name: &str) -> Option<Result<Quota, Error>> {
-        let carrier = self.carrier(name)?;
-        let link = carrier.link()?;
-        Some(
-            async {
-                let ports = self.host(name)?.handle.status.borrow().providers.iter().find(|d| d.provider == name).map(|d| d.ports);
-                let mut quota = if ports.is_some_and(|p| p.quota) { self.runtime(name)?.quota(name).await? } else { Quota::default() };
-                if let Some(size) = ProviderApi::inspect(self, &link.provider, &link.environment).await?.granted_size {
-                    let row = |resource, unit: &str, limit: f64| ResourceQuota {
-                        key: QuotaKey { region: None, class: None, resource },
-                        unit: unit.into(),
-                        in_use: None,
-                        limit: Some(limit),
-                    };
-                    quota.resources.retain(|r| !matches!(r.key.resource, ResourceKind::Cpu | ResourceKind::Memory | ResourceKind::Disk));
-                    quota.resources.extend([
-                        row(ResourceKind::Cpu, "{vCPU}", size.cpus),
-                        row(ResourceKind::Memory, "By", size.memory_bytes as f64),
-                        row(ResourceKind::Disk, "By", size.disk_bytes as f64),
-                    ]);
-                }
-                Ok(quota)
-            }
-            .await,
-        )
+    pub(super) async fn carried_quota(&self, name: &str, link: &Link) -> Result<Quota, Error> {
+        let ports = self.host(name)?.handle.status.borrow().providers.iter().find(|d| d.provider == name).map(|d| d.ports);
+        let mut quota = if ports.is_some_and(|p| p.quota) { self.runtime(name)?.quota(name).await? } else { Quota::default() };
+        if let Some(size) = ProviderApi::inspect(self, &link.provider, &link.environment).await?.granted_size {
+            let row = |resource, unit: &str, limit: f64| ResourceQuota {
+                key: QuotaKey { region: None, class: None, resource },
+                unit: unit.into(),
+                in_use: None,
+                limit: Some(limit),
+            };
+            quota.resources.retain(|r| !matches!(r.key.resource, ResourceKind::Cpu | ResourceKind::Memory | ResourceKind::Disk));
+            quota.resources.extend([
+                row(ResourceKind::Cpu, "{vCPU}", size.cpus),
+                row(ResourceKind::Memory, "By", size.memory_bytes as f64),
+                row(ResourceKind::Disk, "By", size.disk_bytes as f64),
+            ]);
+        }
+        Ok(quota)
     }
 
     pub(super) async fn vessel_agent(&self, provider: &str, id: &str) -> Result<drydock_agent::Client, Error> {
