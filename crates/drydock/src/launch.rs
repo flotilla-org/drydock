@@ -228,9 +228,9 @@ pub fn supervise(tcp_port: Option<std::num::NonZeroU16>) -> Vec<String> {
 /// then start it. Returns what the start printed, which carries the
 /// `drydock-tcp-token` line when the start asks for one. A failure names the
 /// step ([`step`]). An exec port that reports no exit status shows a failed
-/// start as no hello, the caller's proof that the agent runs. The presence check is
-/// deliberately weak (any executable file there): the hello replaces an agent
-/// that is not this build.
+/// start as no hello, the caller's proof that the agent runs. The presence
+/// check is deliberately weak (any executable file there): the hello replaces
+/// an agent that is not this build.
 pub(crate) async fn upload_agent(
     api: &dyn ProviderApi,
     provider: &str,
