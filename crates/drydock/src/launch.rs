@@ -254,14 +254,23 @@ pub(crate) async fn upload_agent(
         run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;
     Ok(Secret::new(output))
 }
-/// `error` naming the step it failed in; a failed guest command also its exit
-/// status and what it printed but a TCP token, since only the reason reaches
-/// the caller and drydockd's log.
+/// Names the step `error` failed in. A failed guest command's reason also
+/// gets its exit status and the tail of what it printed, without the TCP token
+/// line: the reason is all the caller and drydockd's log show, as the output
+/// field is never logged.
 fn step(doing: &'static str) -> impl Fn(Error) -> Error {
+    const SHOWN: usize = 2 << 10;
     move |error: Error| match error {
         Error::Protocol(ProtocolError::CommandFailed { reason, exit_code, output }) => {
-            let printed: Vec<_> = output.expose().lines().filter(|line| !line.starts_with("drydock-tcp-token ")).collect();
-            let reason = format!("{doing}: {reason} with exit status {exit_code}: {}", printed.join("\n").trim());
+            let printed: Vec<_> = output.expose().lines().filter(|line| !line.contains("drydock-tcp-token ")).collect();
+            let printed = printed.join("\n");
+            let printed = printed.trim();
+            let mut reason = format!("{doing}: {reason} with exit status {exit_code}");
+            if printed.len() > SHOWN {
+                reason.push_str(&format!(": ...{}", &printed[printed.ceil_char_boundary(printed.len() - SHOWN)..]));
+            } else if !printed.is_empty() {
+                reason.push_str(&format!(": {printed}"));
+            }
             Error::Protocol(ProtocolError::CommandFailed { reason, exit_code, output })
         }
         Error::Protocol(error) => Error::Protocol(error.context(doing)),
@@ -421,10 +430,10 @@ mod tests {
         }
     }
     // A step's failed guest command says how it ended and what it printed,
-    // but never the agent's TCP token.
+    // but never the agent's TCP token, even where it does not start a line.
     #[test]
     fn a_failed_step_reports_its_exit_status_and_output_but_the_token() {
-        let printed = "drydock-tcp-token secret\nError: the agent is not serving on /run/drydock/agent.sock after 10s\n";
+        let printed = "starting drydock-tcp-token secret\nError: the agent is not serving on /run/drydock/agent.sock after 10s\n";
         let failed =
             ProtocolError::CommandFailed { reason: "Test guest command failed".into(), exit_code: 1, output: Secret::new(printed) };
         let Error::Protocol(error @ ProtocolError::CommandFailed { .. }) = step("start the vessel agent")(Error::Protocol(failed)) else {
@@ -435,5 +444,20 @@ mod tests {
             "command_failed: start the vessel agent: Test guest command failed with exit status 1: \
              Error: the agent is not serving on /run/drydock/agent.sock after 10s"
         );
+    }
+    // What a failed step printed shows at most its last 2 KiB, and nothing
+    // follows the exit status when it printed nothing.
+    #[test]
+    fn a_failed_step_shows_the_tail_of_its_output() {
+        let reason = |printed: String| {
+            let failed = ProtocolError::CommandFailed { reason: "failed".into(), exit_code: -1, output: Secret::new(printed) };
+            match step("start")(Error::Protocol(failed)) {
+                Error::Protocol(ProtocolError::CommandFailed { reason, .. }) => reason,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(reason(String::new()), "start: failed with exit status -1");
+        let long = reason(format!("{}{}", "a".repeat(4096), "b".repeat(2048)));
+        assert_eq!(long, format!("start: failed with exit status -1: ...{}", "b".repeat(2048)));
     }
 }
