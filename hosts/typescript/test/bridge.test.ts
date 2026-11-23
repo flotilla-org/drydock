@@ -16,7 +16,7 @@ import type {
   Context,
   Types,
 } from "../src/provider.ts";
-const size = { cpus: 1, memory_bytes: 1024, disk_bytes: 0 };
+const size = { cpus: 1, memory_bytes: 1024 };
 const environment: Types["Environment"] = {
   id: "opaque /%",
   provider: "a",

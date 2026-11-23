@@ -126,7 +126,7 @@ fn instants_and_shared_constraints() {
 fn generated_request_semantics(tc: hegel::TestCase) {
     use hegel::generators as gs;
     let cpus = tc.draw(gs::integers::<i32>().min_value(-2).max_value(2));
-    assert_eq!(serde_json::from_value::<Size>(json!({"cpus":cpus,"memory_bytes":0,"disk_bytes":0})).is_ok(), cpus > 0);
+    assert_eq!(serde_json::from_value::<Size>(json!({"cpus":cpus,"memory_bytes":0})).is_ok(), cpus > 0);
     let nonempty = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) != 0;
     let text = if nonempty { "ok" } else { "" };
     assert_eq!(
@@ -144,7 +144,7 @@ fn generated_request_semantics(tc: hegel::TestCase) {
 // Size is mandatory at prepare, and its existing CPU constraints apply there too.
 #[test]
 fn preparation_requires_valid_size() {
-    for size in [json!(null), json!({"cpus":0,"memory_bytes":0,"disk_bytes":0})] {
+    for size in [json!(null), json!({"cpus":0,"memory_bytes":0})] {
         assert!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":"image","tools_digest":"tools","size":size})).is_err());
     }
     assert!(serde_json::from_value::<PrepareRequest>(json!({"image_digest":"image","tools_digest":"tools"})).is_err());

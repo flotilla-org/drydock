@@ -92,11 +92,15 @@ pub struct SizeLimits {
     pub disk_step: u64,
 }
 impl SizeLimits {
+    /// The disk to ask the vendor for: the size's, or the smallest when it asks for none.
+    pub fn disk(&self, size: &Size) -> u64 {
+        size.disk_bytes.unwrap_or(self.disk.0)
+    }
     /// The size, refused naming the limits when it doesn't fit them.
     pub fn check(&self, vendor: Vendor, size: &Size) -> Result<()> {
         let within = |v: u64, (lo, hi): (u64, u64), step: u64| (lo..=hi).contains(&v) && v.is_multiple_of(step);
         let cpus_ok = size.cpus.is_finite() && size.cpus.fract() == 0.0 && (self.cpus.0 as f64..=self.cpus.1 as f64).contains(&size.cpus);
-        if cpus_ok && within(size.memory_bytes, self.memory, self.memory_step) && within(size.disk_bytes, self.disk, self.disk_step) {
+        if cpus_ok && within(size.memory_bytes, self.memory, self.memory_step) && within(self.disk(size), self.disk, self.disk_step) {
             return Ok(());
         }
         Err(refused(format!(
@@ -138,7 +142,7 @@ pub fn granted(
         return Ok(None);
     };
     let bytes = |n: u64, unit: u64| n.checked_mul(unit).ok_or_else(|| vendor.bad_response());
-    Ok(Some(Size { cpus: cpus as f64, memory_bytes: bytes(memory, memory_unit)?, disk_bytes: bytes(disk, disk_unit)? }))
+    Ok(Some(Size { cpus: cpus as f64, memory_bytes: bytes(memory, memory_unit)?, disk_bytes: Some(bytes(disk, disk_unit)?) }))
 }
 
 /// What a remote sandbox declares unless its vendor differs: a frozen
@@ -198,12 +202,12 @@ mod tests {
     fn size_limits() {
         let limits = SizeLimits { cpus: (1, 4), memory: (GIB, 8 * GIB), memory_step: GIB, disk: (GIB, 10 * GIB), disk_step: GIB };
         let v = Vendor("Test");
-        assert!(limits.check(v, &Size { cpus: 2.0, memory_bytes: 4 * GIB, disk_bytes: 10 * GIB }).is_ok());
+        assert!(limits.check(v, &Size { cpus: 2.0, memory_bytes: 4 * GIB, disk_bytes: Some(10 * GIB) }).is_ok());
         for bad in [
-            Size { cpus: 1.5, memory_bytes: GIB, disk_bytes: GIB },
-            Size { cpus: 5.0, memory_bytes: GIB, disk_bytes: GIB },
-            Size { cpus: 1.0, memory_bytes: GIB + 1, disk_bytes: GIB },
-            Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 11 * GIB },
+            Size { cpus: 1.5, memory_bytes: GIB, disk_bytes: Some(GIB) },
+            Size { cpus: 5.0, memory_bytes: GIB, disk_bytes: Some(GIB) },
+            Size { cpus: 1.0, memory_bytes: GIB + 1, disk_bytes: Some(GIB) },
+            Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(11 * GIB) },
         ] {
             assert!(limits.check(v, &bad).is_err(), "{bad:?}");
         }

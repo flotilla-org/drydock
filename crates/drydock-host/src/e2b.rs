@@ -279,7 +279,7 @@ impl Module for E2bModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: 512 * MIB, disk_bytes: 1 << 30 }
+        Size { cpus: 1.0, memory_bytes: 512 * MIB, disk_bytes: Some(1 << 30) }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
@@ -931,7 +931,7 @@ mod tests {
                 image_digest: "img".into(),
                 tools_digest: "tools".into(),
             };
-            let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 };
+            let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) };
             let request = ProvisionRequest { label: "crew-1".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None };
             let Provisioned::Created(e) = e2b.provision(request, &key()).await.unwrap() else { panic!("not created") };
             assert_eq!(

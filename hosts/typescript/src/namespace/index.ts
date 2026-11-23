@@ -127,10 +127,11 @@ function machine(size: Types["Size"]) {
         .map((s) => `${s.cpus} CPUs with ${s.memoryMB / 1024} GiB`)
         .join(", ")}`,
     );
-  if (size.disk_bytes % GiB !== 0) refused("Namespace volumes are whole GiB");
+  if (size.disk_bytes != null && size.disk_bytes % GiB !== 0)
+    refused("Namespace volumes are whole GiB");
   return {
     size: name,
-    volumeSizeGB: size.disk_bytes ? size.disk_bytes / GiB : undefined,
+    volumeSizeGB: size.disk_bytes == null ? undefined : size.disk_bytes / GiB,
   };
 }
 
@@ -210,7 +211,7 @@ export function namespaceModule(
   return {
     name: "namespace",
     version: "0.1.0",
-    smallestSize: { cpus: 4, memory_bytes: 8 * GiB, disk_bytes: 0 },
+    smallestSize: { cpus: 4, memory_bytes: 8 * GiB },
     async configure(name, config) {
       if (!settingsValid(config.settings ?? {}))
         refused("invalid namespace settings");

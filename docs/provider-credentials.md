@@ -41,7 +41,7 @@ Docker's spec names the permission each call needs: `sandboxesRead`, `sandboxesC
 
 - Every change of a sandbox (delete, stop, start) needs the etag of its last read, so each is a read and the change. A sandbox that changed in between is Docker's 412, reported as unavailable.
 - Images: Docker runs a public image by digest (`imageRef`). Its API takes no credential for a private registry, so prepare refuses one, and a private image needs a staging registry (`pull_from`) that Docker can pull from anonymously. Prepare makes nothing at Docker.
-- Sizes are Docker's fixed shapes: Micro (1 CPU / 2048 MiB), Small (2 / 4096), Medium (4 / 8192), Large (8 / 16384) and XL (16 / 32768). Any other size is refused before the call. Docker takes no disk size, so ask for a disk of 0; rows report no granted size, since Docker states no disk.
+- Sizes are Docker's fixed shapes: Micro (1 CPU / 2048 MiB), Small (2 / 4096), Medium (4 / 8192), Large (8 / 16384) and XL (16 / 32768). Any other size is refused before the call. Docker takes no disk size, so ask for no disk; rows report no granted size, since Docker states no disk.
 - drydockd uploads the agent (upload bootstrap) through the sandbox's file API and starts it through exec. Docker's PID 1 is its own init, not the image's entrypoint, and a process started through exec keeps running between execs and across stop and start.
 - Reach is a relay: a process running `drydock-agent --bridge`, its stdin and stdout carried over the interact WebSocket with the endpoint credential. The endpoint credential lasts at most five minutes; whether Docker closes an interact stream when it expires is for the live run to show.
 - Egress: open only. Docker's create takes a sandbox's own policy (`networkPolicies`), but installs it beside the account's default layer, which allows every network: a live deny-all create left the sandbox open (effective `allowNetworks` `**` from layer `default`, no `attached` document installed). The spec states no way for a sandbox's own policy to narrow egress below that default, so the module refuses deny-all in those terms and sends no policy. Restricting egress is the account's governance (org or owner layers), outside this API. Inspect still reports what Docker states: `enforced` only when, for that sandbox, a deny-all policy holds its own (`attached`) document and every effective allowed network comes from that document. The policy identity is Docker's `revision`. Docker states a sandbox's policy only while it runs (otherwise 409 `failedPrecondition`), so inspect of a stopped or starting sandbox states no egress.
@@ -61,7 +61,7 @@ Credential: none. The engine has no authentication of its own: whoever can open 
 [providers.engine]
 module = "docker_engine"
 image = "ubuntu@sha256:…"
-size = { cpus = 2, memory = "4GiB", disk = 0 }   # the engine sets no per-container disk
+size = { cpus = 2, memory = "4GiB" }   # no disk: the engine sets no per-container disk
 egress = "open"
 semantics = { settle = true, idempotent = true }
 
@@ -83,7 +83,7 @@ or, for an engine on another machine, a Unix socket on a parent instance's machi
 [providers.b1-engine]
 module = "docker_engine"
 image = "ubuntu@sha256:…"
-size = { cpus = 2, memory = "4GiB", disk = 0 }
+size = { cpus = 2, memory = "4GiB" }
 egress = "open"
 semantics = { settle = true, idempotent = true }
 parent = { instance = "b1", endpoint = { unix = "/run/user/1002/docker.sock" } }
@@ -114,7 +114,7 @@ The module speaks Engine API v1.44 (Engine 25 and later): every request path sta
 
 - Control is the Engine API alone: the module runs no command on the engine's machine, assumes no shared user id and mounts nothing. The checkout is a clone inside the vessel.
 - Images: the engine pulls by digest, for the platform the engine states, with the prepare request's registry credential sent in that pull alone. Nothing is stored on the engine's machine, and pulled images stay there (drydock does not remove them).
-- Sizes: CPUs as `NanoCpus`, memory as `Memory` (and `MemorySwap` the same, when the engine states it can limit swap). A provision is refused, with the engine's own words, when `/info` does not state that it enforces memory limits and CPU quotas (rootless Docker without cgroups is one such engine), and a container whose create answers with warnings is refused with them, the container left as the engine made it (named in the failure's `left`; a retry of the label finds it stopped and fails the same way): the engine discards a limit it cannot apply and warns. The engine sets no per-container disk, so ask for a disk of 0; rows report no granted size.
+- Sizes: CPUs as `NanoCpus`, memory as `Memory` (and `MemorySwap` the same, when the engine states it can limit swap). A provision is refused, with the engine's own words, when `/info` does not state that it enforces memory limits and CPU quotas (rootless Docker without cgroups is one such engine), and a container whose create answers with warnings is refused with them, the container left as the engine made it (named in the failure's `left`; a retry of the label finds it stopped and fails the same way): the engine discards a limit it cannot apply and warns. The engine sets no per-container disk, so ask for no disk; rows report no granted size.
 - Each container runs `sleep infinity` under the engine's init (`Init`), with the image's entrypoint replaced, so the image needs `sleep` and `sh`. Every exec, the agent's included, runs as root (`User` 0), whatever the image's `USER`. drydockd uploads the agent after start and runs it through exec. When the engine refuses the start, or the inspect after it fails, the provision answers with that failure, and its `left` names the container, which stays on the engine until the client destroys it. An image without `sleep` still starts: the provision succeeds, the container exits with 127, the launch fails at the agent upload (409, the container is not running), and the stopped container stays listed until destroy removes it.
 - Reach is a relay: a process running `drydock-agent --bridge` through exec, its stdin and stdout carried over the connection the engine takes over. The engine has no port or socket forwarding.
 - Egress: open, or deny-all with no destinations, which is `NetworkMode: none`: the container has no network at all, and exec and the file calls still work. Inspect and list report egress enforced when the container's `NetworkMode` is `none`. Deny-all with destinations is refused: the engine has no allow-list.
@@ -131,7 +131,7 @@ Credential: none. The private key drydock signs in with is a file named in the s
 [providers.b1]
 module = "ssh_host"
 image = "ubuntu@sha256:…"   # recorded, not pulled: vessels run on the machine itself
-size = { cpus = 2, memory = "4GiB", disk = 0 }   # no per-vessel disk
+size = { cpus = 2, memory = "4GiB" }   # no disk: no per-vessel disk
 egress = "open"
 
 [providers.b1.settings]
@@ -172,7 +172,7 @@ Every call is a command or a stream over one SSH session:
 - The agent runs unprivileged from the vessel's own copy, `<id>/opt/drydock/drydock-agent`, with its socket at `<id>/run/drydock/agent.sock`, as the service `drydock-<id>.service` of the user's manager. Stopping the unit ends the agent and everything it started. A vessel whose unit is not active is stopped: suspended when it was asked to be, otherwise halted. Resume starts the unit again; the directory stays. Rows carry the unit's `ActiveState` in `vendor`.
 - Sizes, where the manager has the controllers: each vessel's unit has `MemoryMax` (with `MemorySwapMax=0`) and `CPUQuota` from the size asked for, and that size is the vessel's granted size. Provisions on one instance are serialised.
 - The whole-machine case, where it does not: the machine takes one vessel at a time, granted the whole machine, and its unit carries no limits. The granted size is the machine's CPUs (`nproc`) and memory (`MemTotal`), shared with whatever else runs on the machine outside drydock, and the row's `vendor.reason` says so. A provision while one of this instance's vessels exists, running or suspended, is refused as exhausted quota naming it; destroying that vessel frees the machine.
-- Disk: no per-vessel disk is set, so ask for a disk of 0; granted sizes have a disk of 0.
+- Disk: no per-vessel disk is set, so ask for no disk; a granted size's disk is the size of the filesystem holding the vessels' directory.
 - Quota is what the machine states: its CPUs and memory as the limits, the CPU and memory limits its running vessels' cgroups hold summed as in use (a vessel with the whole machine holds all of it), the count of running vessels, and a concurrency limit of 1 in the whole-machine case. The module refuses nothing on free room; that is the caller's to decide.
 - Each command may take 60 seconds, and the agent's upload 300. drydockd lists the vessels every 5 seconds.
 - An instance carries streams (`capabilities.carries` is `["unix"]`), so it can be the `parent` of another instance whose endpoint is on the machine: each stream is a stream to a Unix socket, by absolute path, over the session, as the agents' are, opened as `user` with that user's access. A path that is not absolute is refused; a socket that is missing or that `user` cannot open fails the stream with the session's words. Only Unix sockets are carried. drydockd asks for a stream only to the endpoint a child's `parent` names.

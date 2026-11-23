@@ -874,7 +874,9 @@ pub struct Size {
     #[schema(exclusive_minimum = 0)]
     pub cpus: f64,
     pub memory_bytes: u64,
-    pub disk_bytes: u64,
+    /// In a request, absent asks for no disk; in a grant, absent is not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 /// Repeated creation with the same label returns the existing environment (200).
 /// Prepared forms belong to one provider; cross-provider use is Refused.

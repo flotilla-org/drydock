@@ -473,7 +473,7 @@ fn tools() -> String {
 }
 fn request(image: &str, image_pull: Option<RegistryCredential>) -> PrepareRequest {
     PrepareRequest {
-        size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 },
+        size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) },
         platform: None,
         route: None,
         image_pull,

@@ -216,7 +216,7 @@ impl Module for TensorlakeModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: DISK_MB.start() * MIB }
+        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(DISK_MB.start() * MIB) }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
@@ -394,7 +394,8 @@ impl Tensorlake {
         built.ok_or_else(|| ProtocolError::unavailable(format!("Tensorlake image build {id} is still running"), Some(30)))
     }
     fn resources(&self, size: &Size) -> Result<SizeRequest> {
-        let (memory_mb, disk_mb, cpus) = (size.memory_bytes / MIB, size.disk_bytes / MIB, size.cpus);
+        let disk_bytes = size.disk_bytes.unwrap_or(DISK_MB.start() * MIB);
+        let (memory_mb, disk_mb, cpus) = (size.memory_bytes / MIB, disk_bytes / MIB, size.cpus);
         let limit = |what: &str| refused(format!("Tensorlake sandbox size: {what}"));
         if !cpus.is_finite() || cpus.fract() != 0.0 || cpus < 1.0 || cpus > f64::from(self.settings.max_cpus) {
             return Err(limit(&format!("1 to {} whole vCPUs", self.settings.max_cpus)));
@@ -407,7 +408,7 @@ impl Tensorlake {
         {
             return Err(limit(&format!("whole MiB of RAM, 1 to 8 GiB per vCPU and at most {} MiB", self.settings.max_memory / MIB)));
         }
-        if !size.disk_bytes.is_multiple_of(MIB) || !DISK_MB.contains(&disk_mb) {
+        if !disk_bytes.is_multiple_of(MIB) || !DISK_MB.contains(&disk_mb) {
             return Err(limit("whole MiB of disk, 10 to 100 GiB"));
         }
         Ok(SizeRequest { cpus, memory_mb, disk_mb })
@@ -999,7 +1000,7 @@ mod tests {
         let request = ProvisionRequest {
             label: label.clone(),
             prepared,
-            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 10 * GIB },
+            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(10 * GIB) },
             egress: EgressRequest::Open,
             ssh_public_key: None,
         };

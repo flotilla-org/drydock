@@ -210,7 +210,7 @@ impl Module for DockerSandboxesModule {
     }
     fn smallest_size(&self) -> Size {
         let (_, cpus, mib) = SHAPES[0];
-        Size { cpus: cpus as f64, memory_bytes: mib * MIB, disk_bytes: 0 }
+        Size { cpus: cpus as f64, memory_bytes: mib * MIB, disk_bytes: None }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
@@ -353,10 +353,11 @@ const SHAPES: &[(&str, u64, u64)] = &[("Micro", 1, 2048), ("Small", 2, 4096), ("
 
 /// The size as Docker's resources, when it is one of Docker's shapes.
 fn resources(size: &Size) -> Result<Value> {
-    let shape = SHAPES.iter().find(|(_, cpus, mib)| size.cpus == *cpus as f64 && size.memory_bytes == mib * MIB && size.disk_bytes == 0);
+    let shape =
+        SHAPES.iter().find(|(_, cpus, mib)| size.cpus == *cpus as f64 && size.memory_bytes == mib * MIB && size.disk_bytes.is_none());
     let Some((_, cpus, mib)) = shape else {
         let shapes: Vec<_> = SHAPES.iter().map(|(name, cpus, mib)| format!("{name} ({cpus} CPU / {mib} MiB)")).collect();
-        return Err(refused(format!("Docker Sandboxes' supported shapes are {}, with a disk of 0", shapes.join(", "))));
+        return Err(refused(format!("Docker Sandboxes' supported shapes are {}, with no disk", shapes.join(", "))));
     };
     Ok(json!({"cpus": cpus, "memoryMib": mib}))
 }

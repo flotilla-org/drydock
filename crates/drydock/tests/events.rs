@@ -54,7 +54,7 @@ fn sandbox(provider: &str, state: Observation, vendor: &str) -> Environment {
         label: Some("vessel".into()),
         provider: provider.into(),
         state,
-        granted_size: Some(Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 }),
+        granted_size: Some(Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(3 << 30) }),
         egress: Enforcement::Advisory,
         platform: None,
         egress_measured: false,
@@ -110,7 +110,7 @@ fn provision(daemon: &Arc<Daemon>) -> tokio::task::JoinHandle<Result<Provisioned
     let request = ProvisionRequest {
         label: "vessel".into(),
         prepared,
-        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 },
+        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(3 << 30) },
         egress: EgressRequest::Open,
         ssh_public_key: Some("ssh-ed25519 AAAA".into()),
     };
@@ -333,7 +333,7 @@ async fn deliveries_before_a_provision_returns_count_once_it_does() {
     let events = events(&mut stream, |e| matches!(e.event, EventKind::Running { .. })).await;
     let kinds: Vec<_> = events.iter().map(|e| (e.event.clone(), delivery(e))).collect();
     let id = |i: usize| frames[i]["delivery_id"].as_str();
-    let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 3 << 30 };
+    let size = Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(3 << 30) };
     assert_eq!(
         kinds,
         [

@@ -6101,8 +6101,7 @@
         "type": "object",
         "required": [
           "cpus",
-          "memory_bytes",
-          "disk_bytes"
+          "memory_bytes"
         ],
         "properties": {
           "cpus": {
@@ -6111,8 +6110,12 @@
             "exclusiveMinimum": 0
           },
           "disk_bytes": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
+            "description": "In a request, absent asks for no disk; in a grant, absent is not known.",
             "minimum": 0
           },
           "memory_bytes": {

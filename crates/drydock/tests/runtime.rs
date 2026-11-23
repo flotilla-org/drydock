@@ -70,7 +70,7 @@ impl Harness {
         self.ok(
             Method::POST,
             &format!("/providers/{p}/prepare"),
-            json!({"image_digest":"sha256:image","tools_digest":"sha256:tools","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}),
+            json!({"image_digest":"sha256:image","tools_digest":"sha256:tools","size":{"cpus":1.0,"memory_bytes":1024}}),
             200,
         )
         .await
@@ -115,7 +115,7 @@ fn document(providers: Vec<Value>) -> Value {
     json!({ "providers": providers })
 }
 fn request(label: &str, p: &Prepared) -> Value {
-    json!({"label":label,"prepared":p,"size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}})
+    json!({"label":label,"prepared":p,"size":{"cpus":1.0,"memory_bytes":1024}})
 }
 struct Records {
     stream: BoxStream<'static, std::result::Result<axum::body::Bytes, reqwest::Error>>,
@@ -339,7 +339,7 @@ async fn transport_rejections_are_typed() {
         assert!(matches!(response.json::<ProtocolError>().await.unwrap(), ProtocolError::Refused { .. }));
     }
     // A malformed field is named with the decoder's reason, never its value.
-    let body = json!({"image_digest":"i","tools_digest":"t","size":{"cpus":"secret-value","memory_bytes":1,"disk_bytes":0}});
+    let body = json!({"image_digest":"i","tools_digest":"t","size":{"cpus":"secret-value","memory_bytes":1}});
     let error: ProtocolError = h.ok(Method::POST, "/providers/a/prepare", body, 422).await.json().await.unwrap();
     assert!(matches!(&error, ProtocolError::Refused { reason } if reason.contains("size.cpus") && !reason.contains("secret")), "{error}");
     let response = h.ok(Method::POST, "/hello", Value::Null, 405).await;
@@ -385,7 +385,7 @@ async fn independent_providers_and_inflight_credential_refresh() {
     let pending = tokio::spawn(async move {
         client
             .post("http://localhost/v1/providers/a/prepare")
-            .json(&json!({"image_digest":"image","tools_digest":"tools","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}))
+            .json(&json!({"image_digest":"image","tools_digest":"tools","size":{"cpus":1.0,"memory_bytes":1024}}))
             .send()
             .await
             .unwrap()
@@ -678,7 +678,7 @@ interactions:
                 platform: Some(drydock_protocol::Platform::new("linux", "amd64")),
                 route: None,
                 image_pull: None,
-                size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: Some(10 << 30) },
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),
             },
@@ -734,7 +734,7 @@ async fn poll_uses_matching_inspect_timestamp() {
         label: None,
         provider: "a".into(),
         state: Observation::Running,
-        granted_size: Some(Size { cpus: 1.0, memory_bytes: 0, disk_bytes: 0 }),
+        granted_size: Some(Size { cpus: 1.0, memory_bytes: 0, disk_bytes: None }),
         egress: Enforcement::Advisory,
         egress_measured: false,
         egress_policy: None,
@@ -832,7 +832,7 @@ async fn poll_rejection_survives_stale_success_until_refresh() {
     let pending = tokio::spawn(async move {
         client
             .post("http://localhost/v1/providers/a/prepare")
-            .json(&json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}))
+            .json(&json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024}}))
             .send()
             .await
             .unwrap()
@@ -986,7 +986,7 @@ async fn progress_retains_billing_baseline_and_inventory() {
         provider: "a".into(),
         label: None,
         state: Observation::Stopped { cause: Some(StopCause::SuspendedByRequest) },
-        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 }),
+        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: None }),
         egress: Enforcement::Advisory,
         egress_measured: false,
         egress_policy: None,
@@ -1053,7 +1053,7 @@ async fn an_unsized_row_becoming_running_emits_running_without_a_size() {
 // observation and no Running, since it did not become running.
 #[tokio::test]
 async fn a_running_row_whose_size_changes_reports_the_size_and_not_running() {
-    let size = |cpus| Size { cpus, memory_bytes: 0, disk_bytes: 0 };
+    let size = |cpus| Size { cpus, memory_bytes: 0, disk_bytes: None };
     let (_h, control, mut next) = running_row(Some(size(1.))).await;
     assert_eq!(next().await, EventKind::Created);
     assert_eq!(next().await, EventKind::Running { granted_size: Some(size(1.)) });
@@ -1065,7 +1065,7 @@ async fn a_running_row_whose_size_changes_reports_the_size_and_not_running() {
 // change with that size, and no Running.
 #[tokio::test]
 async fn a_size_first_stated_on_a_running_row_reports_the_size_and_not_running() {
-    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: None };
     let (_h, control, mut next) = running_row(None).await;
     assert_eq!(next().await, EventKind::Created);
     assert_eq!(next().await, EventKind::Running { granted_size: None });
@@ -1078,7 +1078,7 @@ async fn a_size_first_stated_on_a_running_row_reports_the_size_and_not_running()
 #[tokio::test]
 async fn a_size_a_list_omits_is_kept() {
     use std::sync::atomic::Ordering::SeqCst;
-    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: None };
     let (_h, control, mut next) = running_row(Some(size.clone())).await;
     assert_eq!(next().await, EventKind::Created);
     assert_eq!(next().await, EventKind::Running { granted_size: Some(size.clone()) });
@@ -1137,7 +1137,7 @@ async fn cheap_inventory_carries_measured_egress() {
         provider: "a".into(),
         label: None,
         state: Observation::Running,
-        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 }),
+        granted_size: Some(Size { cpus: 1., memory_bytes: 0, disk_bytes: None }),
         egress: Enforcement::Enforced,
         egress_measured: false,
         egress_policy: None,
@@ -1226,7 +1226,7 @@ async fn request_credential_overrides_held_credential_for_one_call() {
         client
             .post("http://localhost/v1/providers/a/prepare")
             .header("drydock-credential", "old")
-            .json(&json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024,"disk_bytes":0}}))
+            .json(&json!({"image_digest":"i","tools_digest":"t","size":{"cpus":1.0,"memory_bytes":1024}}))
             .send()
             .await
             .unwrap()

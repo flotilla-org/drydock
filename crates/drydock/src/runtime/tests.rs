@@ -298,7 +298,7 @@ mod operation_tests {
                         platform: Some(Platform::new("linux", "amd64")),
                         route: None,
                         image_pull: None,
-                        size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+                        size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: Some(10 << 30) },
                         image_digest: "image".into(),
                         tools_digest: "tools".into(),
                     },
@@ -324,7 +324,7 @@ mod operation_tests {
             platform,
             route: None,
             image_pull: None,
-            size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 },
+            size: drydock_protocol::Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: Some(10 << 30) },
             image_digest: "image".into(),
             tools_digest: "tools".into(),
         };
@@ -796,7 +796,7 @@ mod semantics_layer {
     }
     // A provision request of the `vessel` label, prepared through `api`.
     async fn vessel(api: &dyn ProviderApi) -> ProvisionRequest {
-        let size = drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 0 };
+        let size = drydock_protocol::Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: None };
         let prepare = PrepareRequest {
             platform: Some(Platform::new("linux", "amd64")),
             route: None,

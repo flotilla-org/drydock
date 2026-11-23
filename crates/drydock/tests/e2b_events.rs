@@ -46,7 +46,7 @@ fn listed() -> Environment {
         label: Some("vessel".into()),
         provider: "e2b".into(),
         state: Observation::Running,
-        granted_size: Some(Size { cpus: 2.0, memory_bytes: 512 << 20, disk_bytes: 10 << 30 }),
+        granted_size: Some(Size { cpus: 2.0, memory_bytes: 512 << 20, disk_bytes: Some(10 << 30) }),
         egress: Enforcement::Advisory,
         platform: None,
         egress_measured: false,

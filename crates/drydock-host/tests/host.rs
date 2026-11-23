@@ -32,7 +32,7 @@ fn configuration(value: serde_json::Value) -> Configuration {
 }
 fn preparation() -> PrepareRequest {
     PrepareRequest {
-        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
         platform: None,
         route: None,
         image_pull: None,
@@ -115,7 +115,7 @@ async fn binary_sigterm_drains_and_removes_socket() {
     let request = ProvisionRequest {
         label: "stream".into(),
         prepared,
-        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
         egress: EgressRequest::Open,
         ssh_public_key: None,
     };
@@ -222,7 +222,7 @@ async fn transport_drop_mid_provision_is_unknown_and_not_retried() {
     let provisions = Arc::new(AtomicUsize::new(0));
     let hello = serde_json::json!({
         "protocol_version": PROTOCOL_VERSION, "host_version": "fake",
-        "loadable_modules": [{"name": "fake", "version": "1", "smallest_size": {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}}],
+        "loadable_modules": [{"name": "fake", "version": "1", "smallest_size": {"cpus": 1.0, "memory_bytes": 1024}}],
     });
     let (listed, counter) = (declaration.clone(), provisions.clone());
     let router = axum::Router::new()
@@ -262,7 +262,7 @@ async fn transport_drop_mid_provision_is_unknown_and_not_retried() {
             image_digest: "image".into(),
             tools_digest: "tools".into(),
         },
-        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
         egress: EgressRequest::Open,
         ssh_public_key: None,
     };

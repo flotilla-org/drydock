@@ -32,7 +32,7 @@ async fn prepare(client: &(impl ProviderApi + ?Sized)) -> Prepared {
                 platform: None,
                 route: None,
                 image_pull: None,
-                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
                 image_digest: "sha256:image".into(),
                 tools_digest: "sha256:tools".into(),
             },
@@ -44,7 +44,7 @@ fn request(prepared: Prepared) -> ProvisionRequest {
     ProvisionRequest {
         label: "label".into(),
         prepared,
-        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+        size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
         egress: EgressRequest::default(),
         ssh_public_key: None,
     }
@@ -595,10 +595,10 @@ async fn reference_preparation_ignores_size() {
         image_pull: None,
         image_digest: "image".into(),
         tools_digest: "tools".into(),
-        size: Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 },
+        size: Size { cpus: 1., memory_bytes: 0, disk_bytes: None },
     };
     let first = host.client.prepare("a", &preparation).await.unwrap();
-    preparation.size = Size { cpus: 4., memory_bytes: u64::MAX, disk_bytes: u64::MAX };
+    preparation.size = Size { cpus: 4., memory_bytes: u64::MAX, disk_bytes: Some(u64::MAX) };
     let second = host.client.prepare("a", &preparation).await.unwrap();
     assert_eq!(first, second);
     let mut provision = request(first);

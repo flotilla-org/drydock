@@ -468,7 +468,7 @@ pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &st
     let result = async {
         // Reference-host scenarios accept tiny sizes; vendor conformance uses options.request.size.
         let preparation = PrepareRequest {
-            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
             platform: None,
             route: None,
             image_pull: None,
@@ -493,7 +493,7 @@ pub async fn lifecycle_sequence(client: &Client, providers: [&str; 2], base: &st
                 let request = ProvisionRequest {
                     label,
                     prepared: prepared[index].clone(),
-                    size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                    size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
                     egress: EgressRequest::default(),
                     ssh_public_key: None,
                 };

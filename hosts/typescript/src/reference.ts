@@ -33,7 +33,7 @@ const digest = (value: unknown) =>
 const reference: ProviderModule = {
   name: "reference",
   version: "0.1.0",
-  smallestSize: { cpus: 1, memory_bytes: 1, disk_bytes: 0 },
+  smallestSize: { cpus: 1, memory_bytes: 1 },
   async configure(name, config) {
     if (!settingsValid(config.settings ?? {}))
       refused("invalid reference settings");

@@ -197,7 +197,7 @@ impl Module for RuntimeModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: SIZES.disk.0 }
+        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(SIZES.disk.0) }
     }
     async fn configure(&self, name: &str, config: &ProviderConfiguration, http: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings =
@@ -516,7 +516,7 @@ impl Provider for Runtime {
             "image": r.prepared.id,
             "vcpu": r.size.cpus as u64,
             "memoryMiB": r.size.memory_bytes / MIB,
-            "diskMiB": r.size.disk_bytes / MIB,
+            "diskMiB": SIZES.disk(&r.size) / MIB,
             "network": policy,
             "persistent": self.settings.persistent,
             "idlePauseSeconds": 0,
@@ -739,7 +739,7 @@ mod tests {
                 image_digest: digest.into(),
                 tools_digest: "tools".into(),
             };
-            let size = Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 4 * GIB };
+            let size = Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(4 * GIB) };
             let request = ProvisionRequest { label: "crew-1".into(), prepared, size, egress: EgressRequest::Open, ssh_public_key: None };
             let Provisioned::Created(e) = runtime.provision(request, &key()).await.unwrap() else { panic!("not created") };
             assert_eq!((e.id.as_str(), e.label.as_deref(), &e.state), (ID, Some("crew-1"), &kit::starting()));
@@ -892,7 +892,7 @@ mod tests {
         )
         .await;
         let request = PrepareRequest {
-            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 4 * GIB },
+            size: Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: Some(4 * GIB) },
             platform: Some(platform()),
             route: Some(ImageRouteKind::RegistryPull),
             image_pull: None,

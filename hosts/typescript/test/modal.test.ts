@@ -5,7 +5,7 @@ import { AGENT_TOKEN, CREDENTIAL, StandIn } from "./support/modal.ts";
 import type { Provider, Types } from "../src/provider.ts";
 
 const MiB = 1024 ** 2;
-const SIZE = { cpus: 2, memory_bytes: 512 * MiB, disk_bytes: 0 };
+const SIZE = { cpus: 2, memory_bytes: 512 * MiB };
 const DIGEST = `sha256:${"0".repeat(64)}`;
 const kind = (k: string) => (e: any) => e.detail?.kind === k;
 
@@ -50,9 +50,7 @@ test("a requested disk is accepted and not applied", () => {
 });
 
 test("memory still must be whole MiB", () => {
-  assert.throws(() =>
-    resources({ cpus: 1, memory_bytes: MiB + 1, disk_bytes: 0 }),
-  );
+  assert.throws(() => resources({ cpus: 1, memory_bytes: MiB + 1 }));
 });
 
 test("the module declares that it settles, dedupes and scopes nothing itself", async () => {

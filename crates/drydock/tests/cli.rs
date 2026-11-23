@@ -147,7 +147,7 @@ async fn cli_starts_reuses_and_observes_between_calls() {
         return;
     }
     let environment: Environment = serde_json::from_value(json(cli_xdg(&xdg, &shim, &["launch", "demo"]).await)).unwrap();
-    assert_eq!(environment.granted_size, Some(Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 }));
+    assert_eq!(environment.granted_size, Some(Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) }));
     assert_eq!(environment.egress, Enforcement::Advisory);
     let label = environment.label.as_ref().unwrap();
     let request: ProvisionRequest =
@@ -189,7 +189,7 @@ async fn cli_starts_reuses_and_observes_between_calls() {
         .await,
     ))
     .unwrap();
-    assert_eq!(override_env.granted_size, Some(Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 3 << 30 }));
+    assert_eq!(override_env.granted_size, Some(Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: Some(3 << 30) }));
     let override_request: ProvisionRequest =
         serde_json::from_slice(&std::fs::read(run.join("keys").join(override_env.label.as_ref().unwrap()).join("request.json")).unwrap())
             .unwrap();
@@ -213,7 +213,7 @@ async fn routing_environment(daemon: &Daemon, socket: &std::path::Path) -> Envir
         return daemon.launch("demo", &drydock::launch::LaunchOptions::default()).await.unwrap();
     }
     let host = Client::unix(socket).unwrap();
-    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: None };
     let prepared = host
         .prepare(
             "demo",
@@ -348,7 +348,7 @@ fn generated_provider_lifecycle(tc: hegel::TestCase) {
             let provider = ["demo", "other"][p];
             match operation {
                 0 => {
-                    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+                    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: None };
                     let prepared = api
                         .prepare(
                             provider,
@@ -624,7 +624,7 @@ async fn advertised_host(
             hello.loadable_modules.push(LoadableModule {
                 name: format!("unused-{version}"),
                 version: version.into(),
-                smallest_size: Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 },
+                smallest_size: Size { cpus: 1., memory_bytes: 1, disk_bytes: Some(1) },
                 takes_endpoint: false,
                 recipe: None,
             });

@@ -23,7 +23,7 @@ prepared, prepare_calls, quota_calls = {}, 0, 0
 providers = {"a": {"module": "reference", "settings": {}}}
 readiness = {"a": "ready"}
 provider_timestamp, inventory_error = None, False
-size = {"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0}
+size = {"cpus": 1.0, "memory_bytes": 1024}
 capabilities = {"material_modes": ["frozen"], "checkout_strategies": ["host_clone"],
                 "workspace_root": "/workspace", "suspend_resume": True, "export": True, "exclusive_label": True,
                 "egress": {"routes": ["none"], "model": {"shapes": ["open"], "enforced": "none", "mutable_while_running": False}},
