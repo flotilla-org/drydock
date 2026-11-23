@@ -70,7 +70,8 @@ fn echo(path: &Path) {
         }
     });
 }
-/// Answers each request with a Docker Engine's version, one per connection.
+/// Answers each request with a Docker Engine's version, or with no containers
+/// when asked for them, one per connection.
 fn docker(path: &Path) {
     let listener = tokio::net::UnixListener::bind(path).unwrap();
     tokio::spawn(async move {
@@ -84,7 +85,7 @@ fn docker(path: &Path) {
                     }
                     request.push(byte[0]);
                 }
-                let body = r#"{"Os":"linux","Arch":"amd64"}"#;
+                let body = if request.starts_with(b"GET /v1.44/containers/json") { "[]" } else { r#"{"Os":"linux","Arch":"amd64"}"# };
                 let answer = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -133,6 +134,36 @@ async fn a_child_configured_at_start_reaches_its_endpoint_on_its_first_connectio
     let daemon = start(dir.path(), &agent::agent_binary(), &engine(&target)).await.unwrap();
     let engine = daemon.providers().into_iter().find(|p| p.provider == "engine").unwrap();
     assert_eq!(engine.capabilities.platforms, vec![Platform::new("linux", "amd64")]);
+}
+
+// Docker Engine sets no per-container disk, so any stated disk is refused,
+// 0 included, before the engine is asked anything.
+#[tokio::test]
+async fn a_docker_engine_provision_stating_a_disk_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("engine.sock");
+    docker(&target);
+    let daemon = start(dir.path(), &agent::agent_binary(), &engine(&target)).await.unwrap();
+    let prepared = Prepared {
+        provider: "engine".into(),
+        id: "sha256:image".into(),
+        platform: Platform::new("linux", "amd64"),
+        image_digest: "image".into(),
+        tools_digest: "tools".into(),
+    };
+    let request = ProvisionRequest {
+        label: "disk".into(),
+        prepared,
+        size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(0) },
+        egress: EgressRequest::Open,
+        ssh_public_key: None,
+    };
+    match ProviderApi::provision(&*daemon, "engine", &request).await.map_err(|e| e.error) {
+        Err(drydock::client::Error::Protocol(ProtocolError::Refused { reason })) => {
+            assert!(reason.ends_with("Docker Engine sets no per-container disk size: ask for no disk"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 // A stream the parent cannot open ends the child's connection; the child's

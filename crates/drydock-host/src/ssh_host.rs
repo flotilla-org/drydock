@@ -340,7 +340,9 @@ impl Machine for SshHost {
         self.facts()?.platform
     }
     /// Limits where the machine enforces them; otherwise the whole machine, to
-    /// one vessel at a time. A vessel has the machine's disk either way.
+    /// one vessel at a time. A vessel has the machine's disk either way: the
+    /// whole filesystem its directory is on, shared with every other vessel
+    /// there, and its total size rather than the space free.
     async fn grant(&self, size: &Size, _: &Credentials) -> Result<(Size, Option<Grant>)> {
         if size.disk_bytes.is_some() {
             return Err(refused("ssh_host sets no per-vessel disk size: ask for no disk"));
