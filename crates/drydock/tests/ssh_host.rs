@@ -34,6 +34,7 @@ struct Reap(u32);
 impl Drop for Reap {
     fn drop(&mut self) {
         for (pid, _) in descendants(self.0) {
+            // SAFETY: kill takes no pointers.
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
     }
@@ -110,6 +111,7 @@ async fn ssh_sessions_end_when_drydockd_is_killed() {
     .await;
     let left: Vec<_> = started.iter().filter(|&&(pid, _)| running(pid)).collect();
     for &&(pid, _) in &left {
+        // SAFETY: kill takes no pointers.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
     assert!(ended.is_ok(), "still running after drydockd was killed: {left:?}");
