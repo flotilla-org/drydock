@@ -20,7 +20,7 @@ import {
 import type { Provider, Types } from "../src/provider.ts";
 
 const GiB = 1024 ** 3;
-const SIZE = { cpus: 4, memory_bytes: 8 * GiB, disk_bytes: 0 };
+const SIZE = { cpus: 4, memory_bytes: 8 * GiB };
 const kind = (k: string) => (e: any) => e.detail?.kind === k;
 
 async function setup(

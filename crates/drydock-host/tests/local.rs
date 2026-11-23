@@ -65,7 +65,7 @@ fn credentials() -> Credentials {
 async fn prepared(p: &dyn Provider) -> Prepared {
     p.prepare(
         PrepareRequest {
-            size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 },
+            size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) },
             platform: Some(Platform::current()),
             route: Some(ImageRouteKind::RegistryPull),
             image_pull: None,
@@ -81,7 +81,7 @@ async fn request(p: &dyn Provider, label: &str) -> ProvisionRequest {
     ProvisionRequest {
         label: label.into(),
         prepared: prepared(p).await,
-        size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 },
+        size: Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) },
         egress: EgressRequest::Open,
         ssh_public_key: None,
     }
@@ -608,7 +608,7 @@ async fn local_passes_conformance() {
     managed.ready(Duration::from_secs(10)).await.unwrap();
     let client = public_server::client(managed.client.clone(), dir.path().join("public.sock")).await;
 
-    let size = Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: 1 << 30 };
+    let size = Size { cpus: 1., memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) };
     let prepared = managed
         .client
         .prepare(

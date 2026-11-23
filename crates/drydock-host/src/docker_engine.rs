@@ -172,7 +172,7 @@ impl Module for DockerEngineModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: 0 }
+        Size { cpus: 1.0, memory_bytes: GIB, disk_bytes: None }
     }
     fn takes_endpoint(&self) -> bool {
         true
@@ -467,8 +467,8 @@ impl Provider for DockerEngine {
         if !(r.size.cpus.is_finite() && r.size.cpus > 0.0) {
             return Err(refused("Docker Engine takes a positive number of CPUs").into());
         }
-        if r.size.disk_bytes != 0 {
-            return Err(refused("Docker Engine sets no per-container disk size: ask for a disk of 0").into());
+        if r.size.disk_bytes.is_some() {
+            return Err(refused("Docker Engine sets no per-container disk size: ask for no disk").into());
         }
         let info: Info = self.api.get(self.url(&["info"])?, c).await?;
         if let Some(reason) = unenforced(&info) {

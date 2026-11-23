@@ -199,7 +199,7 @@ async fn a_resume_is_reported_with_every_option_off() {
     let request = ProvisionRequest {
         label: "vessel".into(),
         prepared,
-        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 10 << 30 },
+        size: Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(10 << 30) },
         egress: EgressRequest::Open,
         ssh_public_key: None,
     };

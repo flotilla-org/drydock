@@ -166,7 +166,7 @@ impl SizeDefaults {
         let size = Size {
             cpus: self.cpus.unwrap_or(minimum.cpus),
             memory_bytes: self.memory.as_ref().map(Quantity::bytes).transpose()?.unwrap_or(minimum.memory_bytes),
-            disk_bytes: self.disk.as_ref().map(Quantity::bytes).transpose()?.unwrap_or(minimum.disk_bytes),
+            disk_bytes: self.disk.as_ref().map(Quantity::bytes).transpose()?.or(minimum.disk_bytes),
         };
         if !size.cpus.is_finite() || size.cpus <= 0. {
             return Err("cpus must be positive".into());
@@ -211,7 +211,7 @@ impl Config {
             if name.is_empty() || p.module.is_empty() {
                 return Err("provider and module names must not be empty".into());
             }
-            p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 1 })?;
+            p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: Some(1) })?;
             if let Some(events) = &p.events {
                 crate::runtime::relay::stream(events).map_err(|e| format!("provider {name}: {e}"))?;
             }
@@ -336,8 +336,8 @@ settings = {{
             serde_json::json!({"organization_id":"org","nested":{"value":n,"enabled":enabled},"array":["a","b"]})
         );
         assert_eq!(
-            p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: 9 }).unwrap(),
-            Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: 9 }
+            p.size.resolve(&Size { cpus: 1., memory_bytes: 1, disk_bytes: Some(9) }).unwrap(),
+            Size { cpus: 2., memory_bytes: 2 << 30, disk_bytes: Some(9) }
         );
     }
     // Every `pull_from` name is a declared registry, every registry's

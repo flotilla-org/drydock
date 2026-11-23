@@ -33,7 +33,7 @@ fn serialized_values_match_the_document() {
         timestamp: Some("2026-01-01T00:00:00Z".parse().unwrap()),
         vendor: None,
     };
-    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: None };
     let prepared = Prepared {
         provider: "a".into(),
         id: "opaque".into(),
@@ -53,7 +53,7 @@ fn serialized_values_match_the_document() {
                 image_pull: None,
             })
             .unwrap(),
-            serde_json::json!({"image_digest":"","tools_digest":"tools","size":{"cpus":1,"memory_bytes":0,"disk_bytes":0}}),
+            serde_json::json!({"image_digest":"","tools_digest":"tools","size":{"cpus":1,"memory_bytes":0}}),
         ),
         (
             "ProvisionRequest",

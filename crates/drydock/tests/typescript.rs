@@ -88,7 +88,7 @@ settings = {{ seed_unlabelled = true }}
     })
     .await
     .unwrap();
-    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: None };
     let options = Options {
         request: ProvisionRequest {
             label: "typescript-conformance".into(),

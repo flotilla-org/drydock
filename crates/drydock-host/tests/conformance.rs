@@ -21,7 +21,7 @@ async fn reference_binary_passes_conformance() {
         .prepare(
             "a",
             &PrepareRequest {
-                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                size: drydock_protocol::Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
                 platform: None,
                 route: None,
                 image_pull: None,
@@ -40,7 +40,7 @@ async fn reference_binary_passes_conformance() {
             &ProvisionRequest {
                 label: "tools-model".into(),
                 prepared: prepared.clone(),
-                size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+                size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
                 egress: EgressRequest::Open,
                 ssh_public_key: None,
             },
@@ -64,7 +64,7 @@ async fn reference_binary_passes_conformance() {
         request: ProvisionRequest {
             label: "conformance".into(),
             prepared,
-            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
             // The reference module enforces no egress.
             egress: EgressRequest::Open,
             ssh_public_key: None,
@@ -178,7 +178,7 @@ async fn python_report_selection(
                 image_digest: "image".into(),
                 tools_digest: "tools".into(),
             },
-            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 },
+            size: Size { cpus: 1., memory_bytes: 1024, disk_bytes: None },
             egress: EgressRequest::Open,
             ssh_public_key: None,
         },
@@ -357,7 +357,7 @@ async fn declared_reach_recipes_and_faults() {
         for broken in [false, true] {
             let provider = format!("{kind}-{broken}");
             let options: Options = serde_json::from_value(serde_json::json!({
-                "request":{"label":"recipes","prepared":{"provider":provider,"id":"prepare-in-run","image_digest":"image","tools_digest":"tools","platform":{"os":"linux","architecture":"amd64"}},"size":{"cpus":1.,"memory_bytes":1024,"disk_bytes":0}},
+                "request":{"label":"recipes","prepared":{"provider":provider,"id":"prepare-in-run","image_digest":"image","tools_digest":"tools","platform":{"os":"linux","architecture":"amd64"}},"size":{"cpus":1.,"memory_bytes":1024}},
                 "scenarios":["prepare","reach","destroy"],"echo_relay":kind=="relay",
                 "reach_probe":if kind=="relay" {serde_json::Value::Null} else {serde_json::json!(["python3",concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/recipe-probe.py"),"--identity",manifest["identity"]])}
             })).unwrap();

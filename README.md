@@ -164,7 +164,7 @@ Defaults belong beside settings: `image`, `size = { cpus, memory, disk }`, and
 `egress = "open"` or `"deny-all"`. Memory/disk accept bytes or integer quantities
 such as `2GiB`/`512MiB`. Suffixes are case-sensitive; `"5 GiB"` also works,
 and a numeric string such as `"12"` means bytes. Missing size fields use the module's declared smallest
-size. The standalone default is Open, reported Advisory by today's modules;
+size; where that states no disk, none is asked for. The standalone default is Open, reported Advisory by today's modules;
 low-level protocol requests retain deny-all as their default. Image tags are
 resolved through the OCI registry at prepare/launch and recorded as immutable
 SHA-256 references in the prepared form and local launch evidence. A key pair
@@ -352,7 +352,7 @@ From then on it is an ordinary instance: `POST
   vessel must be one drydock holds the key of, as for exposures.
 - **Capacity.** A carried instance declares `quota`. Its CPU, memory and disk
   rows carry the parent environment's granted size as `limit`, and no
-  `in_use`; the module's own figures, such as `concurrency_in_use`, are passed
+  `in_use`; a disk the grant does not state has no `limit`; the module's own figures, such as `concurrency_in_use`, are passed
   through. drydock enforces nothing beyond what the inner engine refuses.
 - **Egress.** Each layer reports its own. A container's row states the inner
   engine's enforcement and the sandbox's row the sandbox's; the effective
@@ -674,7 +674,7 @@ For example, choose the image and tools digests in the request:
       "image_digest": "sha256:image", "tools_digest": "sha256:tools",
       "platform": {"os": "linux", "architecture": "amd64"}
     },
-    "size": {"cpus": 1, "memory_bytes": 1024, "disk_bytes": 0},
+    "size": {"cpus": 1, "memory_bytes": 1024},
     "egress": {"mode": "deny_all", "direct": []},
     "ssh_public_key": null
   },

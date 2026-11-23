@@ -530,14 +530,16 @@ impl Provider for Daytona {
     async fn prepare(&self, r: PrepareRequest, c: &Credentials) -> Result<Prepared> {
         let routes = [ImageRouteKind::ProviderPush, ImageRouteKind::RegistryPull];
         let (route, platform) = check_prepare(DAYTONA, &r, &routes, &platform())?;
-        self.settings.sizes().check(DAYTONA, &r.size)?;
+        let sizes = self.settings.sizes();
+        sizes.check(DAYTONA, &r.size)?;
+        let disk = sizes.disk(&r.size);
         // CreateSnapshot labels memory/disk "GB", but the resource guide and
         // default snapshot table specify GiB for the resulting sandbox:
         // https://www.daytona.io/docs/en/sandboxes/#resources (checked 2026-10-21).
         // Both routes produce the same filesystem, the base's, so the route
         // is not part of the key; nor is the tools image, which no snapshot
         // holds: drydock uploads the agent to each sandbox.
-        let snapshot_name = snapshot_name(&r.image_digest, &platform, &r.size);
+        let snapshot_name = snapshot_name(&r.image_digest, &platform, &r.size, disk);
         let snapshot = match self.api.find::<Snapshot>(self.api.url(&["snapshots", &snapshot_name])?, c).await? {
             Some(v) => v,
             None => {
@@ -547,7 +549,7 @@ impl Provider for Daytona {
                     "sandboxClass": "container",
                     "cpu": r.size.cpus as u64,
                     "memory": r.size.memory_bytes / GIB,
-                    "disk": r.size.disk_bytes / GIB,
+                    "disk": disk / GIB,
                 });
                 match route {
                     // drydockd has put the amd64 image in Daytona's registry.
@@ -763,8 +765,8 @@ fn retry_delay(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// a Daytona snapshot fixes. "base-only" sets apart snapshots of the base
 /// alone from older ones carrying a baked agent. Call after the size check:
 /// whole positive CPUs make the integer cast lossless.
-fn snapshot_name(image: &str, platform: &Platform, size: &Size) -> String {
-    name("snapshot", &format!("base-only\0{image}\0{platform}\0{}\0{}\0{}", size.cpus as u64, size.memory_bytes, size.disk_bytes))
+fn snapshot_name(image: &str, platform: &Platform, size: &Size, disk: u64) -> String {
+    name("snapshot", &format!("base-only\0{image}\0{platform}\0{}\0{}\0{disk}", size.cpus as u64, size.memory_bytes))
 }
 /// Daytona runs x86_64 sandboxes only: "Daytona expects the local image to be
 /// built for AMD64 architecture" (docs, per the sandbox survey, 2026-10).
@@ -778,10 +780,10 @@ mod tests {
     // The snapshot is built for one platform, so the platform is part of its name.
     #[test]
     fn snapshot_name_includes_platform() {
-        let size = Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: 10 << 30 };
-        let amd = snapshot_name("image", &Platform::new("linux", "amd64"), &size);
-        assert_eq!(amd, snapshot_name("image", &platform(), &size));
-        assert_ne!(amd, snapshot_name("image", &Platform::new("linux", "arm64"), &size));
+        let size = Size { cpus: 2.0, memory_bytes: 4 << 30, disk_bytes: None };
+        let amd = snapshot_name("image", &Platform::new("linux", "amd64"), &size, 10 << 30);
+        assert_eq!(amd, snapshot_name("image", &platform(), &size, 10 << 30));
+        assert_ne!(amd, snapshot_name("image", &Platform::new("linux", "arm64"), &size, 10 << 30));
     }
     // One Daytona control per request: domains, addresses, or block-all.
     #[test]

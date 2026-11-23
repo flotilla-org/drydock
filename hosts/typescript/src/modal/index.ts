@@ -297,7 +297,7 @@ export function modalModule(connect: Connect = sdkClient): ProviderModule {
   return {
     name: "modal",
     version: "0.1.0",
-    smallestSize: { cpus: 0.25, memory_bytes: 512 * MiB, disk_bytes: 0 },
+    smallestSize: { cpus: 0.25, memory_bytes: 512 * MiB },
     async configure(name, config) {
       if (!settingsValid(config.settings ?? {}))
         refused("invalid modal settings");

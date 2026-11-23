@@ -59,7 +59,7 @@ impl Module for SshHostModule {
         env!("CARGO_PKG_VERSION")
     }
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: kit::GIB, disk_bytes: 0 }
+        Size { cpus: 1.0, memory_bytes: kit::GIB, disk_bytes: None }
     }
     async fn configure(&self, name: &str, c: &ProviderConfiguration, _: Arc<dyn HttpClient>) -> Result<Arc<dyn Provider>> {
         let settings: Settings = serde_json::from_value(serde_json::to_value(&c.settings).expect("settings map")).map_err(|e| {
@@ -96,6 +96,8 @@ struct Facts {
     root: Option<PathBuf>,
     cpus: f64,
     memory_bytes: u64,
+    /// The size of the filesystem that holds the vessels' directories.
+    disk_bytes: Option<u64>,
     /// The user's systemd manager answers, and keeps running without a login.
     manager: bool,
     lingering: bool,
@@ -179,6 +181,9 @@ impl SshHost {
         const SCRIPT: &str = r#"
 printf 'os=%s\narch=%s\nruntime=%s\ncpus=%s\n' "$(uname -s)" "$(uname -m)" "${XDG_RUNTIME_DIR-}" "$(nproc)"
 awk '/^MemTotal:/ { print "memory_kib=" $2 }' /proc/meminfo
+d=${1:-${XDG_RUNTIME_DIR:-/}}
+while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+df -Pk "$d" | awk 'NR == 2 { print "disk_kib=" $2 }'
 cg=$(systemctl --user show --value -p ControlGroup 2>/dev/null) || cg=
 printf 'manager=%s\n' "$cg"
 if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.controllers" ]; then
@@ -186,7 +191,7 @@ if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.controllers" ]; then
 fi
 printf 'linger=%s\n' "$(loginctl show-user "$(id -u)" --value -p Linger 2>/dev/null)"
 "#;
-        let text = self.ok("reading the machine's facts", SCRIPT, &[]).await?;
+        let text = self.ok("reading the machine's facts", SCRIPT, &[self.settings.directory.as_deref().unwrap_or("")]).await?;
         let value = |key: &str| text.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix('=')).unwrap_or("").trim();
         let platform = (value("os") == "Linux").then(|| {
             let architecture = match value("arch") {
@@ -206,6 +211,7 @@ printf 'linger=%s\n' "$(loginctl show-user "$(id -u)" --value -p Linger 2>/dev/n
             root,
             cpus: value("cpus").parse().unwrap_or(0.0),
             memory_bytes: value("memory_kib").parse::<u64>().unwrap_or(0).saturating_mul(1024),
+            disk_bytes: value("disk_kib").parse::<u64>().ok().map(|kib| kib.saturating_mul(1024)),
             manager: !value("manager").is_empty(),
             lingering: value("linger") == "yes",
             enforced: controllers.contains(&"memory") && controllers.contains(&"cpu"),
@@ -333,17 +339,20 @@ impl Machine for SshHost {
     fn platform(&self) -> Option<Platform> {
         self.facts()?.platform
     }
-    /// Limits where the machine enforces them; otherwise the whole machine, to one vessel at a time.
+    /// Limits where the machine enforces them; otherwise the whole machine, to
+    /// one vessel at a time. A vessel has the machine's disk either way: the
+    /// whole filesystem its directory is on, shared with every other vessel
+    /// there, and its total size rather than the space free.
     async fn grant(&self, size: &Size, _: &Credentials) -> Result<(Size, Option<Grant>)> {
-        if size.disk_bytes != 0 {
-            return Err(refused("ssh_host sets no per-vessel disk size: ask for a disk of 0"));
+        if size.disk_bytes.is_some() {
+            return Err(refused("ssh_host sets no per-vessel disk size: ask for no disk"));
         }
         let facts = self.probe().await?;
         if facts.enforced {
             if size.memory_bytes == 0 {
                 return Err(refused("ssh_host takes a positive memory size"));
             }
-            return Ok((size.clone(), Some(Grant::Limits)));
+            return Ok((Size { disk_bytes: facts.disk_bytes, ..size.clone() }, Some(Grant::Limits)));
         }
         if let Some((held, _)) = self.survey(None).await?.first() {
             return Err(ProtocolError::QuotaExhausted {
@@ -354,7 +363,7 @@ impl Machine for SshHost {
                 ),
             });
         }
-        Ok((Size { cpus: facts.cpus, memory_bytes: facts.memory_bytes, disk_bytes: 0 }, Some(Grant::WholeMachine)))
+        Ok((Size { cpus: facts.cpus, memory_bytes: facts.memory_bytes, disk_bytes: facts.disk_bytes }, Some(Grant::WholeMachine)))
     }
     async fn vessels(&self, only: Option<&str>, _: &Credentials) -> Result<Vec<Found>> {
         Ok(self.survey(only).await?.into_iter().map(|(found, _)| found).collect())

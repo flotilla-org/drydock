@@ -254,7 +254,7 @@ async fn labelled(h: &Harness, label: &str, ssh_public_key: Option<String>) -> P
     labelled_on(h, PROVIDER, label, ssh_public_key).await
 }
 async fn labelled_on(h: &Harness, provider: &str, label: &str, ssh_public_key: Option<String>) -> ProvisionRequest {
-    let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 };
+    let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: Some(1024) };
     let request = PrepareRequest {
         platform: None,
         route: None,

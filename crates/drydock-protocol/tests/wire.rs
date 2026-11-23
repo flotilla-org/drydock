@@ -56,9 +56,9 @@ fn tagged_wire_fixtures() {
         "unavailable_providers":{"a":{"kind":"unavailable","reason":"not ready"}}}));
     for event in [
         json!({"kind":"created"}),
-        json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0,"disk_bytes":0}}),
+        json!({"kind":"running","granted_size":{"cpus":1.0,"memory_bytes":0}}),
         json!({"kind":"running"}),
-        json!({"kind":"size_changed","granted_size":{"cpus":2.0,"memory_bytes":0,"disk_bytes":0}}),
+        json!({"kind":"size_changed","granted_size":{"cpus":2.0,"memory_bytes":0}}),
         json!({"kind":"stopped","cause":"guest_halted"}),
         json!({"kind":"paused","cause":"paused_by_provider"}),
         json!({"kind":"resumed"}),
@@ -190,7 +190,7 @@ fn image_route_wire_shapes() {
     ] {
         fixture::<ProtocolError>(value);
     }
-    let size = json!({"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0});
+    let size = json!({"cpus": 1.0, "memory_bytes": 1024});
     fixture::<PrepareRequest>(json!({"size": size, "route": "registry_pull", "image_pull": {"username": "u", "secret": "s"},
         "image_digest": "image", "tools_digest": "tools"}));
     for route in [ImageRouteKind::ProviderPush, ImageRouteKind::RegistryPull, ImageRouteKind::RemoteBuild] {
@@ -205,7 +205,7 @@ fn image_route_wire_shapes() {
 #[test]
 fn platform_wire_shapes() {
     let amd64 = json!({"os": "linux", "architecture": "amd64"});
-    let size = json!({"cpus": 1.0, "memory_bytes": 1024, "disk_bytes": 0});
+    let size = json!({"cpus": 1.0, "memory_bytes": 1024});
     fixture::<Prepared>(json!({"provider": "p", "id": "i", "platform": amd64, "image_digest": "image", "tools_digest": "tools"}));
     assert!(
         serde_json::from_value::<Prepared>(json!({"provider": "p", "id": "i", "image_digest": "image", "tools_digest": "tools"})).is_err()

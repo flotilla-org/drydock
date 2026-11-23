@@ -1,8 +1,9 @@
 //! Instances carried into an environment while drydockd runs, through its
-//! HTTP API. The parent is a reference vessel whose agent the stand-in
-//! gateway serves on this host, so paths in the vessel are this host's. The
-//! carried module is the reference module with a recipe whose engine is a
-//! second `drydock-agent`, answering on a socket in the vessel.
+//! HTTP API. The parent is a reference vessel, asking for no disk, whose
+//! agent the stand-in gateway serves on this host, so paths in the vessel are
+//! this host's. The carried module is the reference module with a recipe
+//! whose engine is a second `drydock-agent`, answering on a socket in the
+//! vessel.
 #![cfg(target_os = "linux")]
 #[path = "../../drydock-host/tests/support/agent.rs"]
 mod agent;
@@ -20,6 +21,26 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 const BUILD: &[u8] = b"carried test agent";
 const PARENT: &str = "vessels";
 const ENGINE: &str = "engine";
+
+/// The reference module asking for no disk, so its vessels' grants state none.
+struct Diskless;
+#[async_trait::async_trait]
+impl drydock_host::module::Module for Diskless {
+    fn smallest_size(&self) -> Size {
+        Size { disk_bytes: None, ..drydock_host::reference::ReferenceModule.smallest_size() }
+    }
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+    async fn configure(
+        &self,
+        name: &str,
+        c: &ProviderConfiguration,
+        http: Arc<dyn drydock_host::module::HttpClient>,
+    ) -> Result<Arc<dyn drydock_host::module::Provider>, ProtocolError> {
+        drydock_host::reference::ReferenceModule.configure(name, c, http).await
+    }
+}
 
 struct Digests;
 #[async_trait::async_trait]
@@ -85,6 +106,7 @@ impl Harness {
         };
         let mut registry = drydock_host::reference::registry();
         registry.insert(ENGINE.into(), Arc::new(drydock_host::reference::CarriedReference(recipe)));
+        registry.insert("diskless".into(), Arc::new(Diskless));
         let reference = dir.path().join("reference.sock");
         let socket = reference.clone();
         let host = tokio::spawn(async move { drydock_host::Host::new(registry).serve_unix(socket, std::future::pending()).await.unwrap() });
@@ -95,7 +117,7 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let text = format!(
-            "[providers.{PARENT}]\nmodule='reference'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\n\
+            "[providers.{PARENT}]\nmodule='diskless'\ncredential={{env='PATH'}}\nimage='image@sha256:{}'\n\
              settings={{agent=true, poll_interval_ms=10, reach={{kind='ssh', endpoint='gateway.test:22', user='minted', host_key='ssh-ed25519 AAAA'}}}}\n",
             "a".repeat(64)
         );
@@ -125,7 +147,7 @@ impl Harness {
     }
     /// An environment provisioned through the carried instance `name`.
     async fn provision(&self, name: &str, label: &str) -> Environment {
-        let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: 1024 };
+        let size = Size { cpus: 1.0, memory_bytes: 1024, disk_bytes: Some(1024) };
         let request = PrepareRequest {
             platform: None,
             route: None,
@@ -182,6 +204,21 @@ async fn a_carry_onto_an_engine_already_answering_starts_no_service() {
     let services = h.api.services(PARENT, &h.id).await.unwrap();
     assert_eq!(services.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["entrypoint"]);
     h.provision("inner", "inner/one").await;
+}
+
+// The carried instance's limits are the parent environment's grant as it
+// stands: a disk the grant does not state has no limit.
+#[tokio::test]
+async fn a_carried_instances_limits_are_the_parent_environments_grant() {
+    let h = Harness::start().await;
+    h.api.put_provider("inner", &h.carry()).await.unwrap();
+    let granted = h.api.inspect(PARENT, &h.id).await.unwrap().granted_size.unwrap();
+    assert_eq!(granted.disk_bytes, None);
+    let quota = h.api.quota("inner").await.unwrap();
+    let limit = |kind| quota.resources.iter().find(|r| r.key.resource == kind).map(|r| r.limit);
+    assert_eq!(limit(ResourceKind::Cpu), Some(Some(granted.cpus)));
+    assert_eq!(limit(ResourceKind::Memory), Some(Some(granted.memory_bytes as f64)));
+    assert_eq!(limit(ResourceKind::Disk), Some(None));
 }
 
 // The same body again is the same instance; a different body under the name

@@ -1526,7 +1526,7 @@ mod tests {
     fn numeric_output_boundaries() {
         let period = Period::new("2026-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();
         for value in [f64::NEG_INFINITY, -1., -0., 0., f64::MIN_POSITIVE, 1., f64::MAX, f64::INFINITY, f64::NAN] {
-            let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: 0 };
+            let size = Size { cpus: 1., memory_bytes: 0, disk_bytes: None };
             let usage = Usage { measurements: None, period: period.clone(), environment_hours: vec![SizeUsage { size, hours: value }] };
             assert_eq!(valid_usage(&usage, &period).is_ok(), value.is_finite() && value >= 0.);
             let quota = Quota {
@@ -1560,7 +1560,7 @@ mod tests {
                 ..quota
             };
             assert_eq!(valid_quota(&resources).is_ok(), value.is_finite() && value >= 0.0);
-            assert_eq!(valid_size(&Size { cpus: value, memory_bytes: 0, disk_bytes: 0 }), value.is_finite() && value > 0.);
+            assert_eq!(valid_size(&Size { cpus: value, memory_bytes: 0, disk_bytes: None }), value.is_finite() && value > 0.);
         }
         assert!(valid_usage(&Usage { measurements: None, period: period.clone(), environment_hours: vec![] }, &period).is_ok());
         let other = Period::new("2025-01-01T00:00:00Z".parse().unwrap(), "2026-01-01T00:00:00Z".parse().unwrap()).unwrap();

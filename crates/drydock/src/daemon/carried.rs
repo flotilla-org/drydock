@@ -370,17 +370,17 @@ impl Daemon {
         let ports = self.host(name)?.handle.status.borrow().providers.iter().find(|d| d.provider == name).map(|d| d.ports);
         let mut quota = if ports.is_some_and(|p| p.quota) { self.runtime(name)?.quota(name).await? } else { Quota::default() };
         if let Some(size) = ProviderApi::inspect(self, &link.provider, &link.environment).await?.granted_size {
-            let row = |resource, unit: &str, limit: f64| ResourceQuota {
+            let row = |resource, unit: &str, limit: Option<f64>| ResourceQuota {
                 key: QuotaKey { region: None, class: None, resource },
                 unit: unit.into(),
                 in_use: None,
-                limit: Some(limit),
+                limit,
             };
             quota.resources.retain(|r| !matches!(r.key.resource, ResourceKind::Cpu | ResourceKind::Memory | ResourceKind::Disk));
             quota.resources.extend([
-                row(ResourceKind::Cpu, "{vCPU}", size.cpus),
-                row(ResourceKind::Memory, "By", size.memory_bytes as f64),
-                row(ResourceKind::Disk, "By", size.disk_bytes as f64),
+                row(ResourceKind::Cpu, "{vCPU}", Some(size.cpus)),
+                row(ResourceKind::Memory, "By", Some(size.memory_bytes as f64)),
+                row(ResourceKind::Disk, "By", size.disk_bytes.map(|disk| disk as f64)),
             ]);
         }
         Ok(quota)

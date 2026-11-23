@@ -80,7 +80,7 @@ pub async fn prepare_for_platform(p: &dyn Provider, mut r: PrepareRequest, c: &C
 pub trait Module: Send + Sync {
     /// Modules override this when their minimum differs from one CPU/GiB.
     fn smallest_size(&self) -> Size {
-        Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: 1 << 30 }
+        Size { cpus: 1.0, memory_bytes: 1 << 30, disk_bytes: Some(1 << 30) }
     }
     fn version(&self) -> &str;
     /// Whether instances can be given their endpoint as
@@ -309,7 +309,7 @@ mod tests {
             platform,
             route,
             image_pull: None,
-            size: Size { cpus: 1.0, memory_bytes: 1, disk_bytes: 1 },
+            size: Size { cpus: 1.0, memory_bytes: 1, disk_bytes: Some(1) },
             image_digest: "i".into(),
             tools_digest: "t".into(),
         }

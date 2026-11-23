@@ -23,7 +23,7 @@ async fn provider_with(settings: serde_json::Value) -> (Runtime, String) {
     .unwrap();
     runtime.configure(crate::api::ConfigUpdate::Replace(configuration)).await.unwrap();
     runtime.credential("a", Secret::new("reference-only-test-key")).await.unwrap();
-    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: 0 };
+    let size = Size { cpus: 1., memory_bytes: 1024, disk_bytes: None };
     let request = PrepareRequest {
         platform: None,
         route: None,

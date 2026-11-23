@@ -28,7 +28,7 @@ test("reference validates settings and owns deterministic prepared keys", async 
   const input = {
     platform: { os: "linux", architecture: "amd64" },
     route: "remote_build",
-    size: { cpus: 1, memory_bytes: 1, disk_bytes: 0 },
+    size: { cpus: 1, memory_bytes: 1 },
     image_digest: "image",
     tools_digest: "tools",
   };
@@ -46,7 +46,7 @@ test("reference validates settings and owns deterministic prepared keys", async 
       {
         ...input,
         platform: { architecture: "amd64", os: "linux" },
-        size: { disk_bytes: 0, memory_bytes: 1, cpus: 1 },
+        size: { memory_bytes: 1, cpus: 1 },
       },
       context,
     ),
