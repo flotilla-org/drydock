@@ -28,6 +28,16 @@ fn descendants(root: u32) -> Vec<(u32, String)> {
     }
     found
 }
+/// Kills what drydockd started if the test fails while drydockd still runs:
+/// `kill_on_drop` kills drydockd alone, the very case under test.
+struct Reap(u32);
+impl Drop for Reap {
+    fn drop(&mut self) {
+        for (pid, _) in descendants(self.0) {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
+    }
+}
 
 // Killed outright, drydockd runs no cleanup of its own; its host and the SSH
 // session to the machine must still end with it.
@@ -63,8 +73,10 @@ async fn ssh_sessions_end_when_drydockd_is_killed() {
         .spawn()
         .unwrap();
     let pid = drydockd.id().unwrap();
+    let _reap = Reap(pid);
     // Readiness is known once the machine has answered over the session.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let mut last = String::new();
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let providers = tokio::process::Command::new(env!("CARGO_BIN_EXE_drydock"))
                 .arg("--config")
@@ -76,6 +88,7 @@ async fn ssh_sessions_end_when_drydockd_is_killed() {
                 .output()
                 .await
                 .unwrap();
+            last = format!("{}{}", String::from_utf8_lossy(&providers.stdout), String::from_utf8_lossy(&providers.stderr));
             let providers: serde_json::Value = serde_json::from_slice(&providers.stdout).unwrap_or_default();
             if providers[0]["readiness"]["status"].as_str().is_some_and(|status| status != "unknown") {
                 break;
@@ -83,8 +96,8 @@ async fn ssh_sessions_end_when_drydockd_is_killed() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("drydockd never heard from the machine");
+    .await;
+    assert!(ready.is_ok(), "drydockd never heard from the machine; `drydock providers` last said: {last}");
     let started = descendants(pid);
     assert!(started.iter().any(|(_, comm)| comm == "ssh"), "no SSH session: {started:?}");
     drydockd.start_kill().unwrap();
