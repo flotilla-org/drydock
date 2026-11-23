@@ -227,8 +227,8 @@ pub fn supervise(tcp_port: Option<std::num::NonZeroU16>) -> Vec<String> {
 /// in place, unless the vessel is not `fresh` and already holds an agent,
 /// then start it. Returns what the start printed, which carries the
 /// `drydock-tcp-token` line when the start asks for one. A failure names the
-/// step. The exec port reports no exit status, so a start that fails shows as
-/// no hello, the caller's proof that the agent runs. The presence check is
+/// step ([`step`]). An exec port that reports no exit status shows a failed
+/// start as no hello, the caller's proof that the agent runs. The presence check is
 /// deliberately weak (any executable file there): the hello replaces an agent
 /// that is not this build.
 pub(crate) async fn upload_agent(
@@ -239,15 +239,6 @@ pub(crate) async fn upload_agent(
     fresh: bool,
     tcp_port: Option<std::num::NonZeroU16>,
 ) -> Result<Secret, Error> {
-    let step = |doing: &'static str| {
-        move |error: Error| match error {
-            Error::Protocol(error) => Error::Protocol(error.context(doing)),
-            Error::Transport(reason) => Error::Transport(format!("{doing}: {reason}")),
-            Error::InvalidResponse(reason) => Error::InvalidResponse(format!("{doing}: {reason}")),
-            Error::InvalidRequest(reason) => Error::InvalidRequest(format!("{doing}: {reason}")),
-            other => other,
-        }
-    };
     let present = !fresh
         && run(api, provider, id, &["sh", "-c", &format!("if test -x {AGENT_EXECUTABLE}; then echo present; fi")])
             .await
@@ -262,6 +253,23 @@ pub(crate) async fn upload_agent(
     let output =
         run(api, provider, id, &argv.iter().map(String::as_str).collect::<Vec<_>>()).await.map_err(step("start the vessel agent"))?;
     Ok(Secret::new(output))
+}
+/// `error` naming the step it failed in; a failed guest command also its exit
+/// status and what it printed but a TCP token, since only the reason reaches
+/// the caller and drydockd's log.
+fn step(doing: &'static str) -> impl Fn(Error) -> Error {
+    move |error: Error| match error {
+        Error::Protocol(ProtocolError::CommandFailed { reason, exit_code, output }) => {
+            let printed: Vec<_> = output.expose().lines().filter(|line| !line.starts_with("drydock-tcp-token ")).collect();
+            let reason = format!("{doing}: {reason} with exit status {exit_code}: {}", printed.join("\n").trim());
+            Error::Protocol(ProtocolError::CommandFailed { reason, exit_code, output })
+        }
+        Error::Protocol(error) => Error::Protocol(error.context(doing)),
+        Error::Transport(reason) => Error::Transport(format!("{doing}: {reason}")),
+        Error::InvalidResponse(reason) => Error::InvalidResponse(format!("{doing}: {reason}")),
+        Error::InvalidRequest(reason) => Error::InvalidRequest(format!("{doing}: {reason}")),
+        other => other,
+    }
 }
 /// A guest command's output, up to 64 KiB, once it has ended.
 async fn run(api: &dyn ProviderApi, provider: &str, id: &str, argv: &[&str]) -> Result<String, Error> {
@@ -411,5 +419,21 @@ mod tests {
         for image in ["", "-", "a@sha256:bad", "https://registry/image", "a/../b", "a?x", "a:", "a b"] {
             assert!(ImageReference::parse(image).is_err(), "{image}");
         }
+    }
+    // A step's failed guest command says how it ended and what it printed,
+    // but never the agent's TCP token.
+    #[test]
+    fn a_failed_step_reports_its_exit_status_and_output_but_the_token() {
+        let printed = "drydock-tcp-token secret\nError: the agent is not serving on /run/drydock/agent.sock after 10s\n";
+        let failed =
+            ProtocolError::CommandFailed { reason: "Test guest command failed".into(), exit_code: 1, output: Secret::new(printed) };
+        let Error::Protocol(error @ ProtocolError::CommandFailed { .. }) = step("start the vessel agent")(Error::Protocol(failed)) else {
+            panic!("still a failed command")
+        };
+        assert_eq!(
+            error.to_string(),
+            "command_failed: start the vessel agent: Test guest command failed with exit status 1: \
+             Error: the agent is not serving on /run/drydock/agent.sock after 10s"
+        );
     }
 }
