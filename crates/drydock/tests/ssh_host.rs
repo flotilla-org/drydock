@@ -28,14 +28,17 @@ fn descendants(root: u32) -> Vec<(u32, String)> {
     }
     found
 }
+fn kill(pid: u32) {
+    // SAFETY: kill takes no pointers.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+}
 /// Kills what drydockd started if the test fails while drydockd still runs:
 /// `kill_on_drop` kills drydockd alone, the very case under test.
 struct Reap(u32);
 impl Drop for Reap {
     fn drop(&mut self) {
         for (pid, _) in descendants(self.0) {
-            // SAFETY: kill takes no pointers.
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            kill(pid);
         }
     }
 }
@@ -111,8 +114,7 @@ async fn ssh_sessions_end_when_drydockd_is_killed() {
     .await;
     let left: Vec<_> = started.iter().filter(|&&(pid, _)| running(pid)).collect();
     for &&(pid, _) in &left {
-        // SAFETY: kill takes no pointers.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        kill(pid);
     }
     assert!(ended.is_ok(), "still running after drydockd was killed: {left:?}");
 }
