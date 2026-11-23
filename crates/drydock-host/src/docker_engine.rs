@@ -489,9 +489,22 @@ impl Provider for DockerEngine {
         let body = json!({
             "Image": r.prepared.id, "Entrypoint": ["sleep"], "Cmd": ["infinity"], "Labels": labels, "HostConfig": host,
         });
+        // The engine holds a name once, so it decides between two creates of
+        // the label that drydockd's hold did not order.
+        let name = format!("drydock-{}", &kit::digest(&format!("{}\0{}", self.name, r.label))[..40]);
         let mut url = self.url(&["containers", "create"])?;
-        url.query_pairs_mut().append_pair("platform", &r.prepared.platform.to_string());
-        let made: Made = self.api.call(Method::POST, url, Body::json(&body)?, c).await.map_err(ProvisionFailure::creating)?;
+        url.query_pairs_mut().append_pair("name", &name).append_pair("platform", &r.prepared.platform.to_string());
+        let response =
+            self.api.send(Method::POST, url.clone(), Body::json(&body)?, c, true, &[]).await.map_err(ProvisionFailure::creating)?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            let mut found = self.inspected(self.container(&name, c).await?);
+            // Its maker starts it next.
+            if found.vendor.as_ref().is_some_and(|v| v.state == "created") {
+                found.state = kit::starting();
+            }
+            return Ok(Provisioned::Existing(found));
+        }
+        let made: Made = self.api.answer(&operation(&Method::POST, &url), &response).map_err(ProvisionFailure::creating)?;
         let left = |e: ProtocolError, doing: &str| ProvisionFailure::made(e.context(doing), &self.name, &made.id);
         // The engine discards a limit it cannot apply and warns.
         if let Some(warnings) = made.warnings.filter(|w| !w.is_empty()) {
