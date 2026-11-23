@@ -490,14 +490,18 @@ impl Provider for DockerEngine {
             "Image": r.prepared.id, "Entrypoint": ["sleep"], "Cmd": ["infinity"], "Labels": labels, "HostConfig": host,
         });
         // The engine holds a name once, so it decides between two creates of
-        // the label that drydockd's hold did not order.
+        // the instance's label that drydockd's hold did not order.
         let name = format!("drydock-{}", &kit::digest(&format!("{}\0{}", self.name, r.label))[..40]);
         let mut url = self.url(&["containers", "create"])?;
         url.query_pairs_mut().append_pair("name", &name).append_pair("platform", &r.prepared.platform.to_string());
         let response =
             self.api.send(Method::POST, url.clone(), Body::json(&body)?, c, true, &[]).await.map_err(ProvisionFailure::creating)?;
         if response.status() == reqwest::StatusCode::CONFLICT {
-            let mut found = self.inspected(self.container(&name, c).await?);
+            let mut found =
+                self.inspected(self.container(&name, c).await.map_err(|e| e.context("taking up the container the name holds"))?);
+            if found.label.as_deref() != Some(r.label.as_str()) {
+                return Err(refused(format!("container {name} does not carry label {}", r.label)).into());
+            }
             // Its maker starts it next.
             if found.vendor.as_ref().is_some_and(|v| v.state == "created") {
                 found.state = kit::starting();
